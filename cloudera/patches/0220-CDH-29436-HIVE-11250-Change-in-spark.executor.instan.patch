@@ -1,0 +1,107 @@
+From eb37fd8e2964751b86f5dee7f59b72277db15fae Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@cloudera.com>
+Date: Tue, 4 Aug 2015 11:23:34 -0700
+Subject: [PATCH 0220/1164] CDH-29436: HIVE-11250: Change in
+ spark.executor.instances (and others) doesn't
+ take effect after RSC is launched for HS2 (Jimmy,
+ reviewed by Xuefu)
+
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    1 +
+ .../spark/status/impl/LocalSparkJobStatus.java     |    2 +-
+ .../spark/status/impl/RemoteSparkJobStatus.java    |    2 +-
+ .../hadoop/hive/ql/processors/SetProcessor.java    |    4 ++++
+ .../hadoop/hive/ql/session/SessionState.java       |   10 +++++++---
+ 5 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index cf6e2fb..c1d2e40 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2563,6 +2563,7 @@ public HiveConf(HiveConf other) {
+     super(other);
+     hiveJar = other.hiveJar;
+     auxJars = other.auxJars;
++    isSparkConfigUpdated = other.isSparkConfigUpdated;
+     origProp = (Properties)other.origProp.clone();
+     restrictList.addAll(other.restrictList);
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java
+index 5d62596..c6f1b8d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java
+@@ -203,7 +203,7 @@ public void cleanup() {
+       }
+     }
+ 
+-    results.put("EexcutorDeserializeTime", executorDeserializeTime);
++    results.put("ExecutorDeserializeTime", executorDeserializeTime);
+     results.put("ExecutorRunTime", executorRunTime);
+     results.put("ResultSize", resultSize);
+     results.put("JvmGCTime", jvmGCTime);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java
+index 9b1ef2c..072bac9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java
+@@ -220,7 +220,7 @@ public SparkStageInfo call(JobContext jc) throws Exception {
+     Map<String, Long> results = new LinkedHashMap<String, Long>();
+     Metrics allMetrics = metricsCollection.getAllMetrics();
+ 
+-    results.put("EexcutorDeserializeTime", allMetrics.executorDeserializeTime);
++    results.put("ExecutorDeserializeTime", allMetrics.executorDeserializeTime);
+     results.put("ExecutorRunTime", allMetrics.executorRunTime);
+     results.put("ResultSize", allMetrics.resultSize);
+     results.put("JvmGCTime", allMetrics.jvmGCTime);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java
+index 3d504e8..21494ec 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java
+@@ -168,6 +168,10 @@ private static void setConf(String varname, String key, String varvalue, boolean
+       }
+     }
+     conf.verifyAndSet(key, value);
++    if (HiveConf.ConfVars.HIVE_EXECUTION_ENGINE.varname.equals(key)
++        && !"spark".equals(value)) {
++      SessionState.get().closeSparkSession();
++    }
+     if (register) {
+       SessionState.get().getOverriddenConfigurations().put(key, value);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index 06435e2..c711fef 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -739,7 +739,7 @@ public Object getActiveAuthorizer() {
+         getAuthorizer() : getAuthorizerV2();
+   }
+ 
+-  public Class getAuthorizerInterface() {
++  public Class<?> getAuthorizerInterface() {
+     return getAuthorizationMode() == AuthorizationMode.V1 ?
+         HiveAuthorizationProvider.class : HiveAuthorizer.class;
+   }
+@@ -1351,6 +1351,12 @@ public void close() throws IOException {
+       tezSessionState = null;
+     }
+ 
++    closeSparkSession();
++    registry.closeCUDFLoaders();
++    dropSessionPaths(conf);
++  }
++
++  public void closeSparkSession() {
+     if (sparkSession != null) {
+       try {
+         SparkSessionManagerImpl.getInstance().closeSession(sparkSession);
+@@ -1360,8 +1366,6 @@ public void close() throws IOException {
+         sparkSession = null;
+       }
+     }
+-    registry.closeCUDFLoaders();
+-    dropSessionPaths(conf);
+   }
+ 
+   public AuthorizationMode getAuthorizationMode(){
+-- 
+1.7.9.5
+

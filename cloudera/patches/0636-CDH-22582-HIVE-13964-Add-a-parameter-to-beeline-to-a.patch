@@ -1,0 +1,122 @@
+From 371f1fb7f5cc3b5ebf120ae0a9889ed273df1d4e Mon Sep 17 00:00:00 2001
+From: Abdullah Yousufi <abdullah.yousufi@cloudera.com>
+Date: Mon, 20 Jun 2016 13:22:37 -0500
+Subject: [PATCH 0636/1164] CDH-22582: HIVE-13964: Add a parameter to beeline
+ to allow a properties file to be passed in
+ (Abdullah Yousufi, reviewed by Sergio Pena)
+
+Change-Id: I998100eb02a160cfc4e70d829e343dbf1a4ca51f
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |   27 ++++++++++++++++----
+ beeline/src/main/resources/BeeLine.properties      |    1 +
+ .../apache/hive/beeline/TestBeelineArgParsing.java |   11 +++++++-
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index 9d43d17..f6b2e61 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -147,6 +147,7 @@
+ 
+   private static final String HIVE_VAR_PREFIX = "--hivevar";
+   private static final String HIVE_CONF_PREFIX = "--hiveconf";
++  private static final String PROP_FILE_PREFIX = "--property-file";
+   static final String PASSWD_MASK = "[passwd stripped]";
+ 
+   private final Map<Object, Object> formats = map(new Object[] {
+@@ -365,6 +366,13 @@
+         .withLongOpt("hiveconf")
+         .withDescription("Use value for given property")
+         .create());
++
++    // --property-file <file>
++    options.addOption(OptionBuilder
++        .hasArg()
++        .withLongOpt("property-file")
++        .withDescription("the file to read configuration properties from")
++        .create());
+   }
+ 
+ 
+@@ -626,7 +634,8 @@ ColorBuffer getColorBuffer(String msg) {
+ 
+     @Override
+     protected void processOption(final String arg, final ListIterator iter) throws  ParseException {
+-      if ((arg.startsWith("--")) && !(arg.equals(HIVE_VAR_PREFIX) || (arg.equals(HIVE_CONF_PREFIX)) || (arg.equals("--help")))) {
++      if ((arg.startsWith("--")) && !(arg.equals(HIVE_VAR_PREFIX) || (arg.equals(HIVE_CONF_PREFIX))
++          || (arg.equals("--help") || (arg.equals(PROP_FILE_PREFIX))))) {
+         String stripped = arg.substring(2, arg.length());
+         String[] parts = split(stripped, "=");
+         debug(loc("setting-prop", Arrays.asList(parts)));
+@@ -700,7 +709,6 @@ int initArgsFromCliVars(String[] args) {
+ 
+   int initArgs(String[] args) {
+     List<String> commands = Collections.emptyList();
+-    List<String> files = Collections.emptyList();
+ 
+     CommandLine cl;
+     BeelineParser beelineParser;
+@@ -767,9 +775,18 @@ int initArgs(String[] args) {
+       dispatch(com);
+     }
+ 
+-    // now load properties files
+-    for (Iterator<String> i = files.iterator(); i.hasNext();) {
+-      dispatch("!properties " + i.next());
++    // load property file
++    String propertyFile = cl.getOptionValue("property-file");
++    if (propertyFile != null) {
++      try {
++        this.consoleReader = new ConsoleReader();
++      } catch (IOException e) {
++        handleException(e);
++      }
++      if (!dispatch("!properties " + propertyFile)) {
++        exit = true;
++        return 1;
++      }
+     }
+ 
+     int code = 0;
+diff --git a/beeline/src/main/resources/BeeLine.properties b/beeline/src/main/resources/BeeLine.properties
+index b05e41e..7e57c39 100644
+--- a/beeline/src/main/resources/BeeLine.properties
++++ b/beeline/src/main/resources/BeeLine.properties
+@@ -158,6 +158,7 @@ cmd-usage: Usage: java org.apache.hive.cli.beeline.BeeLine \n \
+ \                                  This is Hive specific settings in which variables\n \
+ \                                  can be set at session level and referenced in Hive\n \
+ \                                  commands or queries.\n \
++\  --property-file=<property-file> the file to read connection properties (url, driver, user, password) from\n \
+ \  --color=[true/false]            control whether color is used for display\n \
+ \  --showHeader=[true/false]       show column names in query results\n \
+ \  --headerInterval=ROWS;          the interval between which heades are displayed\n \
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java b/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
+index 50d38f8..35de426 100644
+--- a/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
++++ b/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
+@@ -67,7 +67,7 @@ public TestBeelineArgParsing(String connectionString, String driverClazzName, St
+     @Override
+     boolean dispatch(String command) {
+       String connectCommand = "!connect";
+-      String propertyCommand = "!property";
++      String propertyCommand = "!properties";
+       if (command.startsWith(connectCommand)) {
+         this.connectArgs = command.substring(connectCommand.length() + 1, command.length());
+       } else if (command.startsWith(propertyCommand)) {
+@@ -243,4 +243,13 @@ public void testAddLocalJarWithoutAddDriverClazz() throws Exception {
+       Assert.assertEquals(bl.findLocalDriver(connectionString).getClass().getName(), driverClazzName);
+     }
+   }
++
++  @Test
++  public void testPropertyFile() throws Exception {
++    TestBeeline bl = new TestBeeline();
++    String args[] = new String[] {"--property-file", "props"};
++    Assert.assertEquals(0, bl.initArgs(args));
++    Assert.assertTrue(bl.properties.get(0).equals("props"));
++    bl.close();
++  }
+ }
+-- 
+1.7.9.5
+

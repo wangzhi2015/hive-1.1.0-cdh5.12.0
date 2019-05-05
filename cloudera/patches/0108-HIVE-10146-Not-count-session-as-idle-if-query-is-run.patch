@@ -1,0 +1,118 @@
+From b4c8982e234db804f9968d7980dad338ad749f20 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Mon, 6 Apr 2015 16:19:57 +0000
+Subject: [PATCH 0108/1164] HIVE-10146: Not count session as idle if query is
+ running
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1671573 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    4 ++++
+ .../hive/service/cli/session/HiveSession.java      |    2 ++
+ .../hive/service/cli/session/HiveSessionImpl.java  |   12 ++++++++++++
+ .../hive/service/cli/session/SessionManager.java   |    6 +++++-
+ 4 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 6e77832..95fc6a4 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1834,6 +1834,10 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "Operation will be closed when it's not accessed for this duration of time, which can be disabled by setting to zero value.\n" +
+         "  With positive value, it's checked for operations in terminal state only (FINISHED, CANCELED, CLOSED, ERROR).\n" +
+         "  With negative value, it's checked for all of the operations regardless of state."),
++    HIVE_SERVER2_IDLE_SESSION_CHECK_OPERATION("hive.server2.idle.session.check.operation", false,
++        "Session will be considered to be idle only if there is no activity, and there is no pending operation.\n" +
++        "This setting takes effect only if session idle timeout (hive.server2.idle.session.timeout) and checking\n" +
++        "(hive.server2.session.check.interval) are enabled."),
+ 
+     HIVE_CONF_RESTRICTED_LIST("hive.conf.restricted.list",
+         "hive.security.authenticator.manager,hive.security.authorization.manager,hive.users.in.admin.role",
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSession.java b/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
+index 45e0e96..65f9b29 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
+@@ -151,4 +151,6 @@ void renewDelegationToken(HiveAuthFactory authFactory, String tokenStr)
+       throws HiveSQLException;
+ 
+   void closeExpiredOperations();
++
++  long getNoOperationTime();
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+index ccc1f5e..f14b974 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+@@ -91,6 +91,7 @@
+   private boolean isOperationLogEnabled;
+   private File sessionLogDir;
+   private volatile long lastAccessTime;
++  private volatile long lastIdleTime;
+ 
+   public HiveSessionImpl(TProtocolVersion protocol, String username, String password,
+       HiveConf serverhiveConf, String ipAddress) {
+@@ -147,6 +148,7 @@ public void open(Map<String, String> sessionConfMap) throws HiveSQLException {
+       configureSession(sessionConfMap);
+     }
+     lastAccessTime = System.currentTimeMillis();
++    lastIdleTime = lastAccessTime;
+   }
+ 
+   /**
+@@ -295,6 +297,11 @@ protected synchronized void release(boolean userAccess) {
+     if (userAccess) {
+       lastAccessTime = System.currentTimeMillis();
+     }
++    if (opHandleSet.isEmpty()) {
++      lastIdleTime = System.currentTimeMillis();
++    } else {
++      lastIdleTime = 0;
++    }
+   }
+ 
+   @Override
+@@ -605,6 +612,11 @@ public void closeExpiredOperations() {
+     }
+   }
+ 
++  @Override
++  public long getNoOperationTime() {
++    return lastIdleTime > 0 ? System.currentTimeMillis() - lastIdleTime : 0;
++  }
++
+   private void closeTimedOutOperations(List<Operation> operations) {
+     acquire(false);
+     try {
+diff --git a/service/src/java/org/apache/hive/service/cli/session/SessionManager.java b/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+index 8ade297..e02997a 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
++++ b/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+@@ -62,6 +62,7 @@
+ 
+   private long checkInterval;
+   private long sessionTimeout;
++  private boolean checkOperation;
+ 
+   private volatile boolean shutdown;
+   // The HiveServer2 instance running this service
+@@ -107,6 +108,8 @@ private void createBackgroundOperationPool() {
+         hiveConf, ConfVars.HIVE_SERVER2_SESSION_CHECK_INTERVAL, TimeUnit.MILLISECONDS);
+     sessionTimeout = HiveConf.getTimeVar(
+         hiveConf, ConfVars.HIVE_SERVER2_IDLE_SESSION_TIMEOUT, TimeUnit.MILLISECONDS);
++    checkOperation = HiveConf.getBoolVar(hiveConf,
++        ConfVars.HIVE_SERVER2_IDLE_SESSION_CHECK_OPERATION);
+   }
+ 
+   private void initOperationLogRootDir() {
+@@ -155,7 +158,8 @@ public void run() {
+         for (sleepInterval(interval); !shutdown; sleepInterval(interval)) {
+           long current = System.currentTimeMillis();
+           for (HiveSession session : new ArrayList<HiveSession>(handleToSession.values())) {
+-            if (sessionTimeout > 0 && session.getLastAccessTime() + sessionTimeout <= current) {
++            if (sessionTimeout > 0 && session.getLastAccessTime() + sessionTimeout <= current
++                && (!checkOperation || session.getNoOperationTime() > sessionTimeout)) {
+               SessionHandle handle = session.getSessionHandle();
+               LOG.warn("Session " + handle + " is Timed-out (last access : " +
+                   new Date(session.getLastAccessTime()) + ") and will be closed");
+-- 
+1.7.9.5
+

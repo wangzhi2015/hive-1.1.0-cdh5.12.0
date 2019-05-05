@@ -1,0 +1,4083 @@
+From 04b4af06f8eada557cf928571de329dccb3848ad Mon Sep 17 00:00:00 2001
+From: ctang <ctang@cloudera.com>
+Date: Fri, 23 Sep 2016 15:50:32 -0400
+Subject: [PATCH 0989/1164] CDH-50740: HIVE-14713: LDAP Authentication
+ Provider should be covered with unit tests (Illya
+ Yalovyy, reviewed by Chaoyu Tang, Szehon Ho)
+
+Change-Id: I4ba5df18c59c46e123d84420d09d751cdc233789
+---
+ service/pom.xml                                    |    7 +
+ .../java/org/apache/hive/service/ServiceUtils.java |   25 +
+ .../auth/LdapAuthenticationProviderImpl.java       |  665 ++------------------
+ .../hive/service/auth/ldap/ChainFilterFactory.java |   78 +++
+ .../auth/ldap/CustomQueryFilterFactory.java        |   84 +++
+ .../apache/hive/service/auth/ldap/DirSearch.java   |   52 ++
+ .../hive/service/auth/ldap/DirSearchFactory.java   |   37 ++
+ .../org/apache/hive/service/auth/ldap/Filter.java  |   36 ++
+ .../hive/service/auth/ldap/FilterFactory.java      |   33 +
+ .../hive/service/auth/ldap/GroupFilterFactory.java |   90 +++
+ .../apache/hive/service/auth/ldap/LdapSearch.java  |  155 +++++
+ .../hive/service/auth/ldap/LdapSearchFactory.java  |   64 ++
+ .../apache/hive/service/auth/ldap/LdapUtils.java   |  228 +++++++
+ .../org/apache/hive/service/auth/ldap/Query.java   |  154 +++++
+ .../hive/service/auth/ldap/QueryFactory.java       |  135 ++++
+ .../service/auth/ldap/SearchResultHandler.java     |  163 +++++
+ .../hive/service/auth/ldap/UserFilterFactory.java  |   75 +++
+ .../service/auth/ldap/UserSearchFilterFactory.java |   65 ++
+ .../auth/TestLdapAtnProviderWithMiniDS.java        |    3 +-
+ .../auth/TestLdapAuthenticationProviderImpl.java   |  295 ++++++++-
+ .../apache/hive/service/auth/ldap/Credentials.java |   41 ++
+ .../hive/service/auth/ldap/LdapTestUtils.java      |  126 ++++
+ .../hive/service/auth/ldap/TestChainFilter.java    |  103 +++
+ .../service/auth/ldap/TestCustomQueryFilter.java   |   85 +++
+ .../hive/service/auth/ldap/TestGroupFilter.java    |  101 +++
+ .../hive/service/auth/ldap/TestLdapSearch.java     |  209 ++++++
+ .../hive/service/auth/ldap/TestLdapUtils.java      |  103 +++
+ .../apache/hive/service/auth/ldap/TestQuery.java   |   59 ++
+ .../hive/service/auth/ldap/TestQueryFactory.java   |   79 +++
+ .../service/auth/ldap/TestSearchResultHandler.java |  222 +++++++
+ .../hive/service/auth/ldap/TestUserFilter.java     |   75 +++
+ .../service/auth/ldap/TestUserSearchFilter.java    |   94 +++
+ 32 files changed, 3110 insertions(+), 631 deletions(-)
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/ChainFilterFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/CustomQueryFilterFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/DirSearch.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/DirSearchFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/Filter.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/FilterFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/GroupFilterFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/LdapSearch.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/LdapSearchFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/LdapUtils.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/Query.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/QueryFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/SearchResultHandler.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/UserFilterFactory.java
+ create mode 100644 service/src/java/org/apache/hive/service/auth/ldap/UserSearchFilterFactory.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/Credentials.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/LdapTestUtils.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestChainFilter.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestCustomQueryFilter.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestGroupFilter.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestLdapSearch.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestLdapUtils.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestQuery.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestQueryFactory.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestSearchResultHandler.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestUserFilter.java
+ create mode 100644 service/src/test/org/apache/hive/service/auth/ldap/TestUserSearchFilter.java
+
+diff --git a/service/pom.xml b/service/pom.xml
+index 6520091..f66e7e4 100644
+--- a/service/pom.xml
++++ b/service/pom.xml
+@@ -148,6 +148,13 @@
+     </dependency>
+ 
+     <dependency>
++      <groupId>org.mockito</groupId>
++      <artifactId>mockito-all</artifactId>
++      <version>${mockito-all.version}</version>
++      <scope>test</scope>
++    </dependency>
++
++    <dependency>
+       <groupId>org.apache.directory.client.ldap</groupId>
+       <artifactId>ldap-client-api</artifactId>
+       <version>${apache-directory-clientapi.version}</version>
+diff --git a/service/src/java/org/apache/hive/service/ServiceUtils.java b/service/src/java/org/apache/hive/service/ServiceUtils.java
+index e712aaf..f0d0afc 100644
+--- a/service/src/java/org/apache/hive/service/ServiceUtils.java
++++ b/service/src/java/org/apache/hive/service/ServiceUtils.java
+@@ -17,6 +17,10 @@
+  */
+ package org.apache.hive.service;
+ 
++import org.slf4j.Logger;
++
++import java.io.IOException;
++
+ public class ServiceUtils {
+ 
+   /*
+@@ -41,4 +45,25 @@ public static int indexOfDomainMatch(String userName) {
+     }
+     return endIdx;
+   }
++
++  /**
++   * Close the Closeable objects and <b>ignore</b> any {@link IOException} or
++   * null pointers. Must only be used for cleanup in exception handlers.
++   *
++   * @param log the log to record problems to at debug level. Can be null.
++   * @param closeables the objects to close
++   */
++  public static void cleanup(Logger log, java.io.Closeable... closeables) {
++    for (java.io.Closeable c : closeables) {
++      if (c != null) {
++        try {
++          c.close();
++        } catch(IOException e) {
++          if (log != null && log.isDebugEnabled()) {
++            log.debug("Exception in closing " + c, e);
++          }
++        }
++      }
++    }
++  }
+ }
+\ No newline at end of file
+diff --git a/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java b/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java
+index e614349..c21da28 100644
+--- a/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java
++++ b/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java
+@@ -17,633 +17,106 @@
+  */
+ package org.apache.hive.service.auth;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hive.service.ServiceUtils;
++import javax.security.sasl.AuthenticationException;
+ 
+-import java.util.ArrayList;
+-import java.util.Hashtable;
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableList;
++import java.util.Iterator;
+ import java.util.List;
+-import java.util.ListIterator;
+-
+-import javax.naming.Context;
+-import javax.naming.NamingException;
+-import javax.naming.NamingEnumeration;
+-import javax.naming.directory.Attribute;
+-import javax.naming.directory.Attributes;
+-import javax.naming.directory.DirContext;
+-import javax.naming.directory.InitialDirContext;
+-import javax.naming.directory.SearchControls;
+-import javax.naming.directory.SearchResult;
+-import javax.security.sasl.AuthenticationException;
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hive.service.ServiceUtils;
++import org.apache.hive.service.auth.ldap.ChainFilterFactory;
++import org.apache.hive.service.auth.ldap.CustomQueryFilterFactory;
++import org.apache.hive.service.auth.ldap.LdapSearchFactory;
++import org.apache.hive.service.auth.ldap.Filter;
++import org.apache.hive.service.auth.ldap.DirSearch;
++import org.apache.hive.service.auth.ldap.DirSearchFactory;
++import org.apache.hive.service.auth.ldap.FilterFactory;
++import org.apache.hive.service.auth.ldap.GroupFilterFactory;
++import org.apache.hive.service.auth.ldap.LdapUtils;
++import org.apache.hive.service.auth.ldap.UserFilterFactory;
++import org.apache.hive.service.auth.ldap.UserSearchFilterFactory;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ public class LdapAuthenticationProviderImpl implements PasswdAuthenticationProvider {
+ 
+-  private static final Log LOG        = LogFactory.getLog(LdapAuthenticationProviderImpl.class);
+-
+-  private String ldapURL;
+-  private String baseDN;
+-  private String ldapDomain;
+-  private static List<String> groupBases;
+-  private static List<String> userBases;
+-  private static List<String> userFilter;
+-  private static List<String> groupFilter;
+-  private String customQuery;
+-  private static String guid_attr;
+-  private static String groupMembership_attr;
+-  private static String groupClass_attr;
+-
+-  LdapAuthenticationProviderImpl(HiveConf conf) {
+-    init(conf);
+-  }
+-
+-  protected void init(HiveConf conf) {
+-    ldapURL     = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_URL);
+-    baseDN      = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN);
+-    ldapDomain  = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_DOMAIN);
+-    customQuery = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY);
+-    guid_attr   = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GUIDKEY);
+-    groupBases  = new ArrayList<String>();
+-    userBases   = new ArrayList<String>();
+-    userFilter  = new ArrayList<String>();
+-    groupFilter = new ArrayList<String>();
++  private static final Logger LOG = LoggerFactory.getLogger(LdapAuthenticationProviderImpl.class);
+ 
+-    String groupDNPatterns = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPDNPATTERN);
+-    String groupFilterVal  = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER);
+-    String userDNPatterns  = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN);
+-    String userFilterVal   = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER);
+-    groupMembership_attr   = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPMEMBERSHIP_KEY);
+-    groupClass_attr        = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPCLASS_KEY);
++  private static final List<FilterFactory> FILTER_FACTORIES = ImmutableList.<FilterFactory>of(
++      new CustomQueryFilterFactory(),
++      new ChainFilterFactory(new UserSearchFilterFactory(), new UserFilterFactory(),
++          new GroupFilterFactory())
++  );
+ 
+-    // parse COLON delimited root DNs for users/groups that may or may not be under BaseDN.
+-    // Expect the root DNs be fully qualified including the baseDN
+-    if (groupDNPatterns != null && groupDNPatterns.trim().length() > 0) {
+-      String[] groupTokens = groupDNPatterns.split(":");
+-      for (int i = 0; i < groupTokens.length; i++) {
+-        if (groupTokens[i].contains(",") && groupTokens[i].contains("=")) {
+-          groupBases.add(groupTokens[i]);
+-        } else {
+-          LOG.warn("Unexpected format for " + HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPDNPATTERN
+-                       + "..ignoring " + groupTokens[i]);
+-        }
+-      }
+-    } else if (baseDN != null) {
+-      groupBases.add(guid_attr + "=%s," + baseDN);
+-    }
+-
+-    if (groupFilterVal != null && groupFilterVal.trim().length() > 0) {
+-      String[] groups = groupFilterVal.split(",");
+-      for (int i = 0; i < groups.length; i++) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Filtered group: " + groups[i]);
+-        }
+-        groupFilter.add(groups[i]);
+-      }
+-    }
++  private final HiveConf conf;
++  private final Filter filter;
++  private final DirSearchFactory searchFactory;
+ 
+-    if (userDNPatterns != null && userDNPatterns.trim().length() > 0) {
+-      String[] userTokens = userDNPatterns.split(":");
+-      for (int i = 0; i < userTokens.length; i++) {
+-        if (userTokens[i].contains(",") && userTokens[i].contains("=")) {
+-          userBases.add(userTokens[i]);
+-        } else {
+-          LOG.warn("Unexpected format for " + HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN
+-                       + "..ignoring " + userTokens[i]);
+-        }
+-      }
+-    } else if (baseDN != null) {
+-      userBases.add(guid_attr + "=%s," + baseDN);
+-    }
++  public LdapAuthenticationProviderImpl(HiveConf conf) {
++    this(conf, new LdapSearchFactory());
++  }
+ 
+-    if (userFilterVal != null && userFilterVal.trim().length() > 0) {
+-      String[] users = userFilterVal.split(",");
+-      for (int i = 0; i < users.length; i++) {
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Filtered user: " + users[i]);
+-        }
+-        userFilter.add(users[i]);
+-      }
+-    }
++  @VisibleForTesting
++  LdapAuthenticationProviderImpl(HiveConf conf, DirSearchFactory searchFactory) {
++    this.conf = conf;
++    this.searchFactory = searchFactory;
++    filter = resolveFilter(conf);
+   }
+ 
+   @Override
+   public void Authenticate(String user, String password) throws AuthenticationException {
+-
+-    Hashtable<String, Object> env = new Hashtable<String, Object>();
+-    env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.ldap.LdapCtxFactory");
+-    env.put(Context.PROVIDER_URL, ldapURL);
+-
+-    // If the domain is available in the config, then append it unless domain is
+-    // already part of the username. LDAP providers like Active Directory use a
+-    // fully qualified user name like foo@bar.com.
+-    if (!hasDomain(user) && ldapDomain != null) {
+-      user  = user + "@" + ldapDomain;
+-    }
+-
+-    if (password == null || password.isEmpty() || password.getBytes()[0] == 0) {
+-      throw new AuthenticationException("Error validating LDAP user:" +
+-          " a null or blank password has been provided");
+-    }
+-
+-    env.put(Context.SECURITY_AUTHENTICATION, "simple");
+-    env.put(Context.SECURITY_CREDENTIALS, password);
+-
+-    // setup the security principal
+-    String bindDN   = null;
+-    DirContext ctx  = null;
+-    String userDN   = null;
+-    String userName = null;
+-    Exception ex    = null;
+-
+-    if (!isDN(user) && !hasDomain(user) && userBases.size() > 0) {
+-      ListIterator<String> listIter = userBases.listIterator();
+-      while (listIter.hasNext()) {
+-        try {
+-          bindDN = listIter.next().replaceAll("%s", user);
+-          env.put(Context.SECURITY_PRINCIPAL, bindDN);
+-          LOG.debug("Connecting using DN " + bindDN + " at url " + ldapURL);
+-          ctx = new InitialDirContext(env);
+-          break;
+-        } catch (NamingException e) {
+-          ex = e;
+-        }
+-      }
+-    } else {
+-      env.put(Context.SECURITY_PRINCIPAL, user);
+-      LOG.debug("Connecting using principal " + user + " at url " + ldapURL);
+-      try {
+-        ctx = new InitialDirContext(env);
+-      } catch (NamingException e) {
+-        ex = e;
+-      }
+-    }
+-
+-    if (ctx == null) {
+-      LOG.debug("Could not connect to the LDAP Server:Authentication failed for " + user);
+-      throw new AuthenticationException("LDAP Authentication failed for user", ex);
+-    }
+-
+-    LOG.debug("Connected using principal=" + user + " at url=" + ldapURL);
++    DirSearch search = null;
+     try {
+-      if (isDN(user) || hasDomain(user)) {
+-        userName = extractName(user);
+-      } else {
+-        userName = user;
+-      }
+-
+-      // if a custom LDAP query is specified, it takes precedence over other configuration properties.
+-      // if the user being authenticated is part of the resultset from the custom query, it succeeds.
+-      if (customQuery != null) {
+-        List<String> resultList = executeLDAPQuery(ctx, customQuery, baseDN);
+-        if (resultList != null) {
+-          for (String matchedDN : resultList) {
+-            LOG.info("<queried user=" + matchedDN.split(",",2)[0].split("=",2)[1] + ",user=" + user + ">");
+-            if (matchedDN.split(",",2)[0].split("=",2)[1].equalsIgnoreCase(user) ||
+-                matchedDN.equalsIgnoreCase(user)) {
+-              LOG.info("Authentication succeeded based on result set from LDAP query");
+-              return;
+-            }
+-          }
+-        }
+-        LOG.info("Authentication failed based on result set from custom LDAP query");
+-        throw new AuthenticationException("Authentication failed: LDAP query " +
+-            "from property returned no data");
+-      } else if (userBases.size() > 0) {
+-        if (isDN(user)) {
+-          userDN = findUserDNByDN(ctx, user);
+-        } else {
+-          if (userDN == null) {
+-            userDN = findUserDNByPattern(ctx, userName);
+-          }
+-
+-          if (userDN == null) {
+-            userDN = findUserDNByName(ctx, userName);
+-          }
+-        }
+-
+-        // This should not be null because we were allowed to bind with this username
+-        // safe check in case we were able to bind anonymously.
+-        if (userDN == null) {
+-          throw new AuthenticationException("Authentication failed: User search failed");
+-        }
+-
+-        // This section checks if the user satisfies the specified user filter.
+-        if (userFilter.size() > 0) {
+-          LOG.info("Authenticating user " + user + " using user filter");
+-
+-          if (userDN != null) {
+-            LOG.info("User filter partially satisfied");
+-          }
+-
+-          boolean success = false;
+-          for (String filteredUser : userFilter) {
+-            if (filteredUser.equalsIgnoreCase(userName)) {
+-              LOG.debug("User filter entirely satisfied");
+-              success = true;
+-              break;
+-            }
+-          }
+-
+-          if (!success) {
+-            LOG.info("Authentication failed based on user membership");
+-            throw new AuthenticationException("Authentication failed: User not a member " +
+-                "of specified list");
+-          }
+-        }
+-
+-        // This section checks if the user satisfies the specified user filter.
+-        if (groupFilter.size() > 0) {
+-          LOG.debug("Authenticating user " + user + " using group membership");
+-          List<String> userGroups = getGroupsForUser(ctx, userDN);
+-          if (LOG.isDebugEnabled()) {
+-            LOG.debug("User member of :");
+-            prettyPrint(userGroups);
+-          }
+-
+-          if (userGroups != null) {
+-            for (String elem : userGroups) {
+-              String shortName = ((elem.split(","))[0].split("="))[1];
+-              if (groupFilter.contains(shortName)) {
+-                LOG.info("Authentication succeeded based on group membership");
+-                return;
+-              }
+-            }
+-          }
+-
+-          LOG.debug("Authentication failed: User is not a member of configured groups");
+-          throw new AuthenticationException("Authentication failed: User not a member of " +
+-              "listed groups");
+-        }
+-        LOG.info("Authentication succeeded using ldap user search");
+-        return;
+-      }
+-      // Ideally we should not be here. Indicates partially configured LDAP Service.
+-      // We allow it for now for backward compatibility.
+-      LOG.info("Simple password authentication succeeded");
+-    } catch (NamingException e) {
+-      throw new AuthenticationException("LDAP Authentication failed for user", e);
++      search = createDirSearch(user, password);
++      applyFilter(search, user);
+     } finally {
+-      try {
+-        if (ctx != null) {
+-          ctx.close();
+-        }
+-      } catch(Exception e) {
+-        LOG.warn("Exception when closing LDAP context:" + e.getMessage());
+-      }
++      ServiceUtils.cleanup(LOG, search);
+     }
+   }
+ 
+-  private boolean hasDomain(String userName) {
+-    return (ServiceUtils.indexOfDomainMatch(userName) > 0);
+-  }
+-
+-  private static void prettyPrint(List<String> list) {
+-    for (String elem : list) {
+-      LOG.debug("    " + elem);
++  private DirSearch createDirSearch(String user, String password) throws AuthenticationException {
++    if (StringUtils.isBlank(user)) {
++      throw new AuthenticationException("Error validating LDAP user:"
++          + " a null or blank user name has been provided");
+     }
+-  }
+-
+-  private static void prettyPrint(Attributes attrs) {
+-    NamingEnumeration<? extends Attribute> set = attrs.getAll();
+-    try {
+-      NamingEnumeration<?> list = null;
+-      while (set.hasMore()) {
+-        Attribute attr = set.next();
+-        list = attr.getAll();
+-        String attrVals = "";
+-        while (list.hasMore()) {
+-          attrVals += list.next() + "+";
+-        }
+-        LOG.debug(attr.getID() + ":::" + attrVals);
+-      }
+-    } catch (Exception e) {
+-      System.out.println("Error occurred when reading ldap data:" + e.getMessage());
++    if (StringUtils.isBlank(password) || password.getBytes()[0] == 0) {
++      throw new AuthenticationException("Error validating LDAP user:"
++          + " a null or blank password has been provided");
+     }
+-  }
+-
+-  /**
+-   * This helper method attempts to find a DN given a unique groupname.
+-   * Various LDAP implementations have different keys/properties that store this unique ID.
+-   * So the first attempt is to find an entity with objectClass=group && CN=groupName
+-   * @param ctx DirContext for the LDAP Connection.
+-   * @param baseDN BaseDN for this LDAP directory where the search is to be performed.
+-   * @param groupName A unique groupname that is to be located in the LDAP.
+-   * @return LDAP DN if the group is found in LDAP, null otherwise.
+-   */
+-  public static String findGroupDNByName(DirContext ctx, String baseDN, String groupName)
+-    throws NamingException {
+-    String searchFilter  = "(&(objectClass=" + groupClass_attr + ")(" + guid_attr + "=" + groupName + "))";
+-    List<String> results = null;
+-
+-    results = findDNByName(ctx, baseDN, searchFilter, 2);
+-
+-    if (results == null) {
+-      return null;
+-    } else if (results.size() > 1) {
+-      //make sure there is not another item available, there should be only 1 match
+-      LOG.info("Matched multiple groups for the group: " + groupName + ",returning null");
+-      return null;
+-    }
+-    return results.get(0);
+-  }
+-
+-  /**
+-   * This helper method attempts to find an LDAP group entity given a unique name using a
+-   * user-defined pattern for GROUPBASE.The list of group bases is defined by the user via property
+-   * "hive.server2.authentication.ldap.groupDNPattern" in the hive-site.xml.
+-   * Users can use %s where the actual groupname is to be substituted in the LDAP Query.
+-   * @param ctx DirContext for the LDAP Connection.
+-   * @param groupName A unique groupname that is to be located in the LDAP.
+-   * @return LDAP DN of given group if found in the directory, null otherwise.
+-   */
+-  public static String findGroupDNByPattern(DirContext ctx, String groupName)
+-      throws NamingException {
+-    return findDNByPattern(ctx, groupName, groupBases);
+-  }
+-
+-  public static String findDNByPattern(DirContext ctx, String name, List<String> nodes)
+-      throws NamingException {
+-    String searchFilter;
+-    String searchBase;
+-    SearchResult searchResult = null;
+-    NamingEnumeration<SearchResult> results;
+-
+-    String[] returnAttributes     = new String[0]; // empty set
+-    SearchControls searchControls = new SearchControls();
+-
+-    searchControls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+-    searchControls.setReturningAttributes(returnAttributes);
+-
+-    for (String node : nodes) {
+-      searchFilter = "(" + (node.substring(0,node.indexOf(","))).replaceAll("%s", name) + ")";
+-      searchBase   = node.split(",",2)[1];
+-      results      = ctx.search(searchBase, searchFilter, searchControls);
+-
+-      if(results.hasMoreElements()) {
+-        searchResult = results.nextElement();
+-        //make sure there is not another item available, there should be only 1 match
+-        if(results.hasMoreElements()) {
+-          LOG.warn("Matched multiple entities for the name: " + name);
+-          return null;
++    List<String> principals = LdapUtils.createCandidatePrincipals(conf, user);
++    for (Iterator<String> iterator = principals.iterator(); iterator.hasNext();) {
++      String principal = iterator.next();
++      try {
++        return searchFactory.getInstance(conf, principal, password);
++      } catch (AuthenticationException ex) {
++        if (!iterator.hasNext()) {
++          throw ex;
+         }
+-        return searchResult.getNameInNamespace();
+       }
+     }
+-    return null;
++    throw new AuthenticationException(
++        String.format("No candidate principals for %s was found.", user));
+   }
+ 
+-  /**
+-   * This helper method attempts to find a DN given a unique username.
+-   * Various LDAP implementations have different keys/properties that store this unique userID.
+-   * Active Directory has a "sAMAccountName" that appears reliable,openLDAP uses "uid"
+-   * So the first attempt is to find an entity with objectClass=person||user where
+-   * (uid||sAMAccountName) matches the given username.
+-   * The second attempt is to use CN attribute for wild card matching and then match the
+-   * username in the DN.
+-   * @param ctx DirContext for the LDAP Connection.
+-   * @param baseDN BaseDN for this LDAP directory where the search is to be performed.
+-   * @param userName A unique userid that is to be located in the LDAP.
+-   * @return LDAP DN if the user is found in LDAP, null otherwise.
+-   */
+-  public static String findUserDNByName(DirContext ctx, String userName)
+-      throws NamingException {
+-    if (userBases.size() == 0) {
+-      return null;
+-    }
+-
+-    String baseFilter    = "(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))";
+-    String suffix[]      = new String[] {
+-                             "(|(uid=" + userName + ")(sAMAccountName=" + userName + ")))",
+-                             "(|(cn=*" + userName + "*)))"
+-                           };
+-
+-    String searchFilter           = null;
+-    List<String> results          = null;
+-    ListIterator<String> listIter = userBases.listIterator();
+-
+-    for (int i = 0; i < suffix.length; i++) {
+-      searchFilter = baseFilter + suffix[i];
+-
+-      while (listIter.hasNext()) {
+-        results = findDNByName(ctx, listIter.next().split(",",2)[1], searchFilter, 2);
+-
+-        if(results == null) {
+-          continue;
+-        }
+-
+-        if(results != null && results.size() > 1) {
+-          //make sure there is not another item available, there should be only 1 match
+-          LOG.info("Matched multiple users for the user: " + userName + ",returning null");
+-          return null;
+-        }
+-        return results.get(0);
++  private static Filter resolveFilter(HiveConf conf) {
++    for (FilterFactory filterProvider : FILTER_FACTORIES) {
++      Filter filter = filterProvider.getInstance(conf);
++      if (filter != null) {
++        return filter;
+       }
+     }
+     return null;
+   }
+ 
+-  /**
+-   * This helper method attempts to find a username given a DN.
+-   * Various LDAP implementations have different keys/properties that store this unique userID.
+-   * Active Directory has a "sAMAccountName" that appears reliable,openLDAP uses "uid"
+-   * So the first attempt is to find an entity with objectClass=person||user where
+-   * (uid||sAMAccountName) matches the given username.
+-   * The second attempt is to use CN attribute for wild card matching and then match the
+-   * username in the DN.
+-   * @param ctx DirContext for the LDAP Connection.
+-   * @param baseDN BaseDN for this LDAP directory where the search is to be performed.
+-   * @param userName A unique userid that is to be located in the LDAP.
+-   * @return LDAP DN if the user is found in LDAP, null otherwise.
+-   */
+-  public static String findUserDNByDN(DirContext ctx, String userDN)
+-      throws NamingException {
+-    if (!isDN(userDN)) {
+-      return null;
+-    }
+-
+-    String baseDN        = extractBaseDN(userDN);
+-    List<String> results = null;
+-    // we are using the first part of the userDN in the search criteria.
+-    // We know the DN is legal as we are able to bind with it, this is to confirm that its a user.
+-    String searchFilter  = "(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))("
+-                             +  userDN.substring(0,userDN.indexOf(",")) + "))";
+-
+-    results = findDNByName(ctx, baseDN, searchFilter, 2);
+-
+-    if (results == null) {
+-      return null;
+-    }
+-
+-    if(results.size() > 1) {
+-      //make sure there is not another item available, there should be only 1 match
+-      LOG.info("Matched multiple users for the user: " + userDN + ",returning null");
+-      return null;
+-    }
+-    return results.get(0);
+-  }
+-
+-  public static List<String> findDNByName(DirContext ctx, String baseDN,
+-      String searchString, int limit) throws NamingException {
+-    SearchResult searchResult     = null;
+-    List<String> retValues        = null;
+-    String matchedDN              = null;
+-    SearchControls searchControls = new SearchControls();
+-    String[] returnAttributes     = new String[0]; //empty set
+-
+-    searchControls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+-    searchControls.setReturningAttributes(returnAttributes);
+-    if (limit > 0) {
+-      searchControls.setCountLimit(limit); // limit the result set to limit the size of resultset
+-    }
+-
+-    NamingEnumeration<SearchResult> results = ctx.search(baseDN, searchString, searchControls);
+-    while(results.hasMoreElements()) {
+-      searchResult = results.nextElement();
+-      matchedDN    = searchResult.getNameInNamespace();
+-
+-      if (retValues == null) {
+-        retValues = new ArrayList<String>();
+-      }
+-      retValues.add(matchedDN);
+-    }
+-    return retValues;
+-  }
+-
+-  /**
+-   * This helper method attempts to find a UserDN given a unique username from a
+-   * user-defined pattern for USERBASE. The list of user bases is defined by the user
+-   * via property "hive.server2.authentication.ldap.userDNPattern" in the hive-site.xml.
+-   * Users can use %s where the actual username is to be subsituted in the LDAP Query.
+-   * @param ctx DirContext for the LDAP Connection.
+-   * @param userName A unique userid that is to be located in the LDAP.
+-   * @return LDAP DN of given user if found in the directory, null otherwise.
+-   */
+-  public static String findUserDNByPattern(DirContext ctx, String userName)
+-      throws NamingException {
+-    return findDNByPattern(ctx, userName, userBases);
+-  }
+-
+-  /**
+-   * This helper method finds all the groups a given user belongs to.
+-   * This method relies on the attribute,configurable via HIVE_SERVER2_PLAIN_LDAP_GROUPMEMBERSHIP_KEY,
+-   * being set on the user entry that references the group. The returned list ONLY includes direct
+-   * groups the user belongs to. Parent groups of these direct groups are NOT included.
+-   * @param ctx DirContext for the LDAP Connection.
+-   * @param userDN A unique userDN that is to be located in the LDAP.
+-   * @return List of Group DNs the user belongs to, emptylist otherwise.
+-   */
+-  public static List<String> getGroupsForUser(DirContext ctx, String userDN)
+-      throws NamingException {
+-    List<String> groupList        = new ArrayList<String>();
+-    String user                   = extractName(userDN);
+-    String searchFilter           = "(&(objectClass=" + groupClass_attr + ")(|(" +
+-                                      groupMembership_attr + "=" + userDN + ")(" +
+-                                      groupMembership_attr + "=" + user + ")))";
+-    SearchControls searchControls = new SearchControls();
+-    NamingEnumeration<SearchResult> results = null;
+-    SearchResult result = null;
+-    String groupBase = null;
+-
+-    LOG.debug("getGroupsForUser:searchFilter=" + searchFilter);
+-    String[] attrIDs = new String[0];
+-    searchControls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+-    searchControls.setReturningAttributes(attrIDs);
+-
+-    ListIterator<String> listIter = groupBases.listIterator();
+-    while (listIter.hasNext()) {
+-      try {
+-        groupBase = listIter.next().split(",", 2)[1];
+-        LOG.debug("Searching for groups under " + groupBase);
+-        results   = ctx.search(groupBase, searchFilter, searchControls);
+-
+-        while(results.hasMoreElements()) {
+-          result = results.nextElement();
+-          LOG.debug("Found Group:" + result.getNameInNamespace());
+-          groupList.add(result.getNameInNamespace());
+-        }
+-      } catch (NamingException e) {
+-        LOG.warn("Exception searching for user groups", e);
+-      }
+-    }
+-
+-    return groupList;
+-  }
+-
+-  /**
+-   * This method helps execute a LDAP query defined by the user via property
+-   * "hive.server2.authentication.ldap.customLDAPQuery"
+-   * A full LDAP query that LDAP Atn provider uses to execute against LDAP Server.
+-   * If this query return a null resultset, the LDAP Provider fails the authentication request.
+-   * If the LDAP query returns a list of DNs, a check is performed to confirm one
+-   * of the entries is for the user being authenticated.
+-   * For example: (&(objectClass=group)(objectClass=top)(instanceType=4)(cn=Domain*))
+-   * (&(objectClass=person)(|(sAMAccountName=admin)
+-   *                       (|(memberOf=CN=Domain Admins,CN=Users,DC=domain,DC=com)
+-   *                         (memberOf=CN=Administrators,CN=Builtin,DC=domain,DC=com))))
+-   * @param ctx DirContext to execute this query within.
+-   * @param query User-defined LDAP Query string to be used to authenticate users.
+-   * @param rootDN BaseDN at which to execute the LDAP query, typically rootDN for the LDAP.
+-   * @return List of LDAP DNs returned from executing the LDAP Query.
+-   */
+-  public static List<String> executeLDAPQuery(DirContext ctx, String query, String rootDN)
+-      throws NamingException {
+-    if (rootDN == null) {
+-      return null;
+-    }
+-
+-    SearchControls searchControls = new SearchControls();
+-    List<String> list             = new ArrayList<String>();
+-    String[] returnAttributes;
+-    if (groupMembership_attr != null) {
+-      // retrieve the attributes that are meant to desginate user DNs
+-      returnAttributes = new String[] { groupMembership_attr };
+-    } else {
+-      returnAttributes = new String[0]; //empty set
+-    }
+-
+-    searchControls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+-    searchControls.setReturningAttributes(returnAttributes);
+-
+-    LOG.info("Using a user specified LDAP query for adjudication:" + query + ",baseDN=" + rootDN);
+-    NamingEnumeration<SearchResult> results = ctx.search(rootDN, query, searchControls);
+-    SearchResult searchResult = null;
+-    while(results.hasMoreElements()) {
+-      searchResult = results.nextElement();
+-      if (groupMembership_attr != null) {
+-        Attribute userAttribute = searchResult.getAttributes().get(groupMembership_attr);
+-        if (userAttribute != null) {
+-          list.add((String)userAttribute.get());
+-          continue;
+-        }
++  private void applyFilter(DirSearch client, String user) throws AuthenticationException {
++    if (filter != null) {
++      if (LdapUtils.hasDomain(user)) {
++        filter.apply(client, LdapUtils.extractUserName(user));
++      } else {
++        filter.apply(client, user);
+       }
+-
+-      list.add(searchResult.getNameInNamespace());
+-      LOG.debug("LDAPAtn:executeLDAPQuery()::Return set size " + list.get(list.size() - 1));
+     }
+-    return list;
+-  }
+-
+-  public static boolean isDN(String name) {
+-    return (name.indexOf("=") > -1);
+-  }
+-
+-  public static String extractName(String dn) {
+-    int domainIdx = ServiceUtils.indexOfDomainMatch(dn);
+-    if (domainIdx > 0) {
+-      return dn.substring(0, domainIdx);
+-    }
+-
+-    if (dn.indexOf("=") > -1) {
+-      return dn.substring(dn.indexOf("=") + 1, dn.indexOf(","));
+-    }
+-    return dn;
+-  }
+-
+-  public static String extractBaseDN(String dn) {
+-    if (dn.indexOf(",") > -1) {
+-      return dn.substring(dn.indexOf(",") + 1);
+-    }
+-    return null;
+   }
+ }
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/ChainFilterFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/ChainFilterFactory.java
+new file mode 100644
+index 0000000..e6255e8
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/ChainFilterFactory.java
+@@ -0,0 +1,78 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import com.google.common.collect.ImmutableList;
++import java.util.ArrayList;
++import java.util.List;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++
++/**
++ * A factory that produces a {@link Filter} that is implemented as a chain of other filters.
++ * The chain of filters are created as a result of
++ * {@link #getInstance(org.apache.hadoop.hive.conf.HiveConf) }
++ * method call. The resulting object filters out all users that don't pass <b>all</b>
++ * chained filters. The filters will be applied in the order they are mentioned in the factory
++ * constructor.
++ */
++public class ChainFilterFactory  implements FilterFactory {
++
++  private final List<FilterFactory> chainedFactories;
++
++  /**
++   * Constructs a factory for a chain of filters.
++   *
++   * @param factories The array of factories that will be used to construct a chain of filters.
++   */
++  public ChainFilterFactory(FilterFactory... factories) {
++    this.chainedFactories = ImmutableList.copyOf(factories);
++  }
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public Filter getInstance(HiveConf conf) {
++    List<Filter> filters = new ArrayList<>();
++    for (FilterFactory factory : chainedFactories) {
++      Filter filter = factory.getInstance(conf);
++      if (filter != null) {
++        filters.add(filter);
++      }
++    }
++
++    return filters.isEmpty() ? null : new ChainFilter(ImmutableList.copyOf(filters));
++  }
++
++  private static final class ChainFilter implements Filter {
++
++    private final List<Filter> chainedFilters;
++
++    public ChainFilter(List<Filter> chainedFilters) {
++      this.chainedFilters = chainedFilters;
++    }
++
++    @Override
++    public void apply(DirSearch client, String user) throws AuthenticationException {
++      for (Filter filter : chainedFilters) {
++        filter.apply(client, user);
++      }
++    }
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/CustomQueryFilterFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/CustomQueryFilterFactory.java
+new file mode 100644
+index 0000000..a0708c3
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/CustomQueryFilterFactory.java
+@@ -0,0 +1,84 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import com.google.common.base.Strings;
++import java.util.List;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * A factory for a {@link Filter} based on a custom query.
++ * <br>
++ * The produced filter object filters out all users that are not found in the search result
++ * of the query provided in Hive configuration.
++ * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY
++ */
++public class CustomQueryFilterFactory implements FilterFactory {
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public Filter getInstance(HiveConf conf) {
++    String customQuery = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY);
++
++    if (Strings.isNullOrEmpty(customQuery)) {
++      return null;
++    }
++
++    return new CustomQueryFilter(customQuery);
++  }
++
++  private static final class CustomQueryFilter implements Filter {
++
++    private static final Logger LOG = LoggerFactory.getLogger(CustomQueryFilter.class);
++
++    private final String query;
++
++    public CustomQueryFilter(String query) {
++      this.query = query;
++    }
++
++    @Override
++    public void apply(DirSearch client, String user) throws AuthenticationException {
++      List<String> resultList;
++      try {
++        resultList = client.executeCustomQuery(query);
++      } catch (NamingException e) {
++        throw new AuthenticationException("LDAP Authentication failed for user", e);
++      }
++      if (resultList != null) {
++        for (String matchedDn : resultList) {
++          String shortUserName = LdapUtils.getShortName(matchedDn);
++          LOG.info("<queried user=" + shortUserName + ",user=" + user + ">");
++          if (shortUserName.equalsIgnoreCase(user) || matchedDn.equalsIgnoreCase(user)) {
++            LOG.info("Authentication succeeded based on result set from LDAP query");
++            return;
++          }
++        }
++      }
++      LOG.info("Authentication failed based on result set from custom LDAP query");
++      throw new AuthenticationException("Authentication failed: LDAP query "
++          + "from property returned no data");
++    }
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/DirSearch.java b/service/src/java/org/apache/hive/service/auth/ldap/DirSearch.java
+new file mode 100644
+index 0000000..33b6088
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/DirSearch.java
+@@ -0,0 +1,52 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.io.Closeable;
++import java.util.List;
++import javax.naming.NamingException;
++
++/**
++ * The object used for executing queries on the Directory Service.
++ */
++public interface DirSearch extends Closeable {
++
++  /**
++   * Finds user's distinguished name.
++   * @param user username
++   * @return DN for the specified username
++   * @throws NamingException
++   */
++  String findUserDn(String user) throws NamingException;
++
++  /**
++   * Finds groups that contain the specified user.
++   * @param userDn user's distinguished name
++   * @return list of groups
++   * @throws NamingException
++   */
++  List<String> findGroupsForUser(String userDn) throws NamingException;
++
++  /**
++   * Executes an arbitrary query.
++   * @param query any query
++   * @return list of names in the namespace
++   * @throws NamingException
++   */
++  List<String> executeCustomQuery(String query) throws NamingException;
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/DirSearchFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/DirSearchFactory.java
+new file mode 100644
+index 0000000..e6d9ff9
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/DirSearchFactory.java
+@@ -0,0 +1,37 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++
++/**
++ * A factory for {@code DirSearch}.
++ */
++public interface DirSearchFactory {
++
++  /**
++   * Returns an instance of {@code DirSearch}.
++   * @param conf Hive configuration
++   * @param user username
++   * @param password user password
++   * @return instance of {@code DirSearch}
++   * @throws AuthenticationException
++   */
++  DirSearch getInstance(HiveConf conf, String user, String password) throws AuthenticationException;
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/Filter.java b/service/src/java/org/apache/hive/service/auth/ldap/Filter.java
+new file mode 100644
+index 0000000..fa72ced
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/Filter.java
+@@ -0,0 +1,36 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import javax.security.sasl.AuthenticationException;
++
++/**
++ * The object that filters LDAP users.
++ * <br>
++ * The assumption is that this user was already authenticated by a previous bind operation.
++ */
++public interface Filter {
++
++  /**
++   * Applies this filter to the authenticated user.
++   * @param client LDAP client that will be used for execution of LDAP queries.
++   * @param user username
++   * @throws AuthenticationException
++   */
++  void apply(DirSearch client, String user) throws AuthenticationException;
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/FilterFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/FilterFactory.java
+new file mode 100644
+index 0000000..0708ccd
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/FilterFactory.java
+@@ -0,0 +1,33 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++
++/**
++ * Factory for the filter.
++ */
++public interface FilterFactory {
++
++  /**
++   * Returns an instance of the corresponding filter.
++   * @param conf Hive properties used to configure the filter.
++   * @return the filter or {@code null} if this filter doesn't support provided set of properties
++   */
++  Filter getInstance(HiveConf conf);
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/GroupFilterFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/GroupFilterFactory.java
+new file mode 100644
+index 0000000..152c4b2
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/GroupFilterFactory.java
+@@ -0,0 +1,90 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * A factory for a {@link Filter} based on a list of allowed groups.
++ * <br>
++ * The produced filter object filters out all users that are not members of at least one of
++ * the groups provided in Hive configuration.
++ * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER
++ */
++public final class GroupFilterFactory implements FilterFactory {
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public Filter getInstance(HiveConf conf) {
++    Collection<String> groupFilter = conf.getStringCollection(
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER.varname);
++
++    if (groupFilter.isEmpty()) {
++      return null;
++    }
++
++    return new GroupFilter(groupFilter);
++  }
++
++  private static final class GroupFilter implements Filter {
++
++    private static final Logger LOG = LoggerFactory.getLogger(GroupFilter.class);
++
++    private final Set<String> groupFilter = new HashSet<>();
++
++    GroupFilter(Collection<String> groupFilter) {
++      this.groupFilter.addAll(groupFilter);
++    }
++
++    @Override
++    public void apply(DirSearch ldap, String user) throws AuthenticationException {
++      LOG.info("Authenticating user '{}' using group membership", user);
++
++      List<String> memberOf = null;
++
++      try {
++        String userDn = ldap.findUserDn(user);
++        memberOf = ldap.findGroupsForUser(userDn);
++        LOG.debug("User {} member of : {}", userDn, memberOf);
++      } catch (NamingException e) {
++        throw new AuthenticationException("LDAP Authentication failed for user", e);
++      }
++
++      for (String groupDn : memberOf) {
++        String shortName = LdapUtils.getShortName(groupDn);
++        if (groupFilter.contains(shortName)) {
++          LOG.info("Authentication succeeded based on group membership");
++          return;
++        }
++      }
++      LOG.info("Authentication failed based on user membership");
++      throw new AuthenticationException("Authentication failed: "
++          + "User not a member of specified list");
++    }
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/LdapSearch.java b/service/src/java/org/apache/hive/service/auth/ldap/LdapSearch.java
+new file mode 100644
+index 0000000..65076ea
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/LdapSearch.java
+@@ -0,0 +1,155 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
++import javax.naming.directory.DirContext;
++import javax.naming.directory.SearchResult;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Implements search for LDAP.
++ */
++public final class LdapSearch implements DirSearch {
++
++  private static final Logger LOG = LoggerFactory.getLogger(LdapSearch.class);
++
++  private final String baseDn;
++  private final List<String> groupBases;
++  private final List<String> userBases;
++  private final List<String> userPatterns;
++
++  private final QueryFactory queries;
++
++  private final DirContext ctx;
++
++  /**
++   * Construct an instance of {@code LdapSearch}.
++   * @param conf Hive configuration
++   * @param ctx Directory service that will be used for the queries.
++   * @throws NamingException
++   */
++  public LdapSearch(HiveConf conf, DirContext ctx) throws NamingException {
++    baseDn = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN);
++    userPatterns = LdapUtils.parseDnPatterns(conf,
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN);
++    groupBases = LdapUtils.patternsToBaseDns(LdapUtils.parseDnPatterns(conf,
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPDNPATTERN));
++    userBases = LdapUtils.patternsToBaseDns(userPatterns);
++    this.ctx = ctx;
++    queries = new QueryFactory(conf);
++  }
++
++  /**
++   * Closes this search object and releases any system resources associated
++   * with it. If the search object is already closed then invoking this
++   * method has no effect.
++   */
++  @Override
++  public void close() {
++    try {
++      ctx.close();
++    } catch (NamingException e) {
++      LOG.warn("Exception when closing LDAP context:", e);
++    }
++  }
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public String findUserDn(String user) throws NamingException {
++    List<String> allLdapNames;
++    if (LdapUtils.isDn(user)) {
++      String userBaseDn = LdapUtils.extractBaseDn(user);
++      String userRdn = LdapUtils.extractFirstRdn(user);
++      allLdapNames = execute(Collections.singletonList(userBaseDn),
++          queries.findUserDnByRdn(userRdn)).getAllLdapNames();
++    } else {
++      allLdapNames = findDnByPattern(userPatterns, user);
++      if (allLdapNames.isEmpty()) {
++        allLdapNames = execute(userBases, queries.findUserDnByName(user)).getAllLdapNames();
++      }
++    }
++
++    if (allLdapNames.size() == 1) {
++      return allLdapNames.get(0);
++    } else {
++      LOG.info("Expected exactly one user result for the user: {}, but got {}. Returning null",
++          user, allLdapNames.size());
++      LOG.debug("Matched users: {}", allLdapNames);
++      return null;
++    }
++  }
++
++  private List<String> findDnByPattern(List<String> patterns, String name) throws NamingException {
++    for (String pattern : patterns) {
++      String baseDnFromPattern = LdapUtils.extractBaseDn(pattern);
++      String rdn = LdapUtils.extractFirstRdn(pattern).replaceAll("%s", name);
++      List<String> list = execute(Collections.singletonList(baseDnFromPattern),
++          queries.findDnByPattern(rdn)).getAllLdapNames();
++      if (!list.isEmpty()) {
++        return list;
++      }
++    }
++    return Collections.emptyList();
++  }
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public List<String> findGroupsForUser(String userDn) throws NamingException {
++    String userName = LdapUtils.extractUserName(userDn);
++    return execute(groupBases, queries.findGroupsForUser(userName, userDn)).getAllLdapNames();
++  }
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public List<String> executeCustomQuery(String query) throws NamingException {
++    return execute(Collections.singletonList(baseDn), queries.customQuery(query))
++        .getAllLdapNamesAndAttributes();
++  }
++
++  private SearchResultHandler execute(Collection<String> baseDns, Query query) {
++    List<NamingEnumeration<SearchResult>> searchResults = new ArrayList<>();
++    LOG.debug("Executing a query: '{}' with base DNs {}.", query.getFilter(), baseDns);
++    for (String aBaseDn : baseDns) {
++      try {
++        NamingEnumeration<SearchResult> searchResult = ctx.search(aBaseDn, query.getFilter(),
++            query.getControls());
++        if (searchResult != null) {
++          searchResults.add(searchResult);
++        }
++      } catch (NamingException ex) {
++        LOG.debug("Exception happened for query '" + query.getFilter() +
++            "' with base DN '" + aBaseDn + "'", ex);
++      }
++    }
++    return new SearchResultHandler(searchResults);
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/LdapSearchFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/LdapSearchFactory.java
+new file mode 100644
+index 0000000..71c3bfe
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/LdapSearchFactory.java
+@@ -0,0 +1,64 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.Hashtable;
++import javax.naming.Context;
++import javax.naming.NamingException;
++import javax.naming.directory.DirContext;
++import javax.naming.directory.InitialDirContext;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * A factory for LDAP search objects.
++ */
++public final class LdapSearchFactory implements DirSearchFactory {
++
++  private static final Logger LOG = LoggerFactory.getLogger(LdapSearchFactory.class);
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public DirSearch getInstance(HiveConf conf, String principal, String password)
++      throws AuthenticationException {
++    try {
++      DirContext ctx = createDirContext(conf, principal, password);
++      return new LdapSearch(conf, ctx);
++    } catch (NamingException e) {
++      LOG.debug("Could not connect to the LDAP Server:Authentication failed for {}", principal);
++      throw new AuthenticationException("Error validating LDAP user", e);
++    }
++  }
++
++  private static DirContext createDirContext(HiveConf conf, String principal, String password)
++      throws NamingException {
++    Hashtable<String, Object> env = new Hashtable<String, Object>();
++    String ldapUrl = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_URL);
++    env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.ldap.LdapCtxFactory");
++    env.put(Context.PROVIDER_URL, ldapUrl);
++    env.put(Context.SECURITY_AUTHENTICATION, "simple");
++    env.put(Context.SECURITY_CREDENTIALS, password);
++    env.put(Context.SECURITY_PRINCIPAL, principal);
++    LOG.debug("Connecting using principal {} to ldap url {}", principal, ldapUrl);
++    return new InitialDirContext(env);
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/LdapUtils.java b/service/src/java/org/apache/hive/service/auth/ldap/LdapUtils.java
+new file mode 100644
+index 0000000..df2ba6b
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/LdapUtils.java
+@@ -0,0 +1,228 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hive.service.ServiceUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Static utility methods related to LDAP authentication module.
++ */
++public final class LdapUtils {
++
++  private static final Logger LOG = LoggerFactory.getLogger(LdapUtils.class);
++
++  /**
++   * Extracts a base DN from the provided distinguished name.
++   * <br>
++   * <b>Example:</b>
++   * <br>
++   * "ou=CORP,dc=mycompany,dc=com" is the base DN for "cn=user1,ou=CORP,dc=mycompany,dc=com"
++   *
++   * @param dn distinguished name
++   * @return base DN
++   */
++  public static String extractBaseDn(String dn) {
++    final int indexOfFirstDelimiter = dn.indexOf(",");
++    if (indexOfFirstDelimiter > -1) {
++      return dn.substring(indexOfFirstDelimiter + 1);
++    }
++    return null;
++  }
++
++  /**
++   * Extracts the first Relative Distinguished Name (RDN).
++   * <br>
++   * <b>Example:</b>
++   * <br>
++   * For DN "cn=user1,ou=CORP,dc=mycompany,dc=com" this method will return "cn=user1"
++   * @param dn distinguished name
++   * @return first RDN
++   */
++  public static String extractFirstRdn(String dn) {
++    return dn.substring(0, dn.indexOf(","));
++  }
++
++  /**
++   * Extracts username from user DN.
++   * <br>
++   * <b>Examples:</b>
++   * <pre>
++   * LdapUtils.extractUserName("UserName")                        = "UserName"
++   * LdapUtils.extractUserName("UserName@mycorp.com")             = "UserName"
++   * LdapUtils.extractUserName("cn=UserName,dc=mycompany,dc=com") = "UserName"
++   * </pre>
++   * @param userDn
++   * @return
++   */
++  public static String extractUserName(String userDn) {
++    if (!isDn(userDn) && !hasDomain(userDn)) {
++      return userDn;
++    }
++
++    int domainIdx = ServiceUtils.indexOfDomainMatch(userDn);
++    if (domainIdx > 0) {
++      return userDn.substring(0, domainIdx);
++    }
++
++    if (userDn.contains("=")) {
++      return userDn.substring(userDn.indexOf("=") + 1, userDn.indexOf(","));
++    }
++    return userDn;
++  }
++
++  /**
++   * Gets value part of the first attribute in the provided RDN.
++   * <br>
++   * <b>Example:</b>
++   * <br>
++   * For RDN "cn=user1,ou=CORP" this method will return "user1"
++   * @param rdn Relative Distinguished Name
++   * @return value part of the first attribute
++   */
++  public static String getShortName(String rdn) {
++    return ((rdn.split(","))[0].split("="))[1];
++  }
++
++  /**
++   * Check for a domain part in the provided username.
++   * <br>
++   * <b>Example:</b>
++   * <br>
++   * <pre>
++   * LdapUtils.hasDomain("user1@mycorp.com") = true
++   * LdapUtils.hasDomain("user1")            = false
++   * </pre>
++   * @param userName username
++   * @return true if {@code userName} contains {@code @<domain>} part
++   */
++  public static boolean hasDomain(String userName) {
++    return (ServiceUtils.indexOfDomainMatch(userName) > 0);
++  }
++
++  /**
++   * Detects DN names.
++   * <br>
++   * <b>Example:</b>
++   * <br>
++   * <pre>
++   * LdapUtils.isDn("cn=UserName,dc=mycompany,dc=com") = true
++   * LdapUtils.isDn("user1")                           = false
++   * </pre>
++   * @param name name to be checked
++   * @return true if the provided name is a distinguished name
++   */
++  public static boolean isDn(String name) {
++    return name.contains("=");
++  }
++
++  /**
++   * Reads and parses DN patterns from Hive configuration.
++   * <br>
++   * If no patterns are provided in the configuration, then the base DN will be used.
++   * @param conf Hive configuration
++   * @param var variable to be read
++   * @return a list of DN patterns
++   * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN
++   * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GUIDKEY
++   * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPDNPATTERN
++   * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN
++   */
++  public static List<String> parseDnPatterns(HiveConf conf, HiveConf.ConfVars var) {
++    String patternsString = conf.getVar(var);
++    List<String> result = new ArrayList<>();
++    if (StringUtils.isBlank(patternsString)) {
++      String defaultBaseDn = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN);
++      String guidAttr = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GUIDKEY);
++      if (StringUtils.isNotBlank(defaultBaseDn)) {
++        result.add(guidAttr + "=%s," + defaultBaseDn);
++      }
++    } else {
++      String[] patterns = patternsString.split(":");
++      for (String pattern : patterns) {
++        if (pattern.contains(",") && pattern.contains("=")) {
++          result.add(pattern);
++        } else {
++          LOG.warn("Unexpected format for " + var + "..ignoring " + pattern);
++        }
++      }
++    }
++    return result;
++  }
++
++  private static String patternToBaseDn(String pattern) {
++    if (pattern.contains("=%s")) {
++      return pattern.split(",", 2)[1];
++    }
++    return pattern;
++  }
++
++  /**
++   * Converts a collection of Distinguished Name patterns to a collection of base DNs.
++   * @param patterns Distinguished Name patterns
++   * @return a list of base DNs
++   * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPDNPATTERN
++   * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN
++   */
++  public static List<String> patternsToBaseDns(Collection<String> patterns) {
++    List<String> result = new ArrayList<>();
++    for (String pattern : patterns) {
++      result.add(patternToBaseDn(pattern));
++    }
++    return result;
++  }
++
++  /**
++   * Creates a list of principals to be used for user authentication.
++   * @param conf Hive configuration
++   * @param user username
++   * @return a list of user's principals
++   */
++  public static List<String> createCandidatePrincipals(HiveConf conf, String user) {
++    if (hasDomain(user) || isDn(user)) {
++      return Collections.singletonList(user);
++    }
++
++    String ldapDomain = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_DOMAIN);
++    if (StringUtils.isNotBlank(ldapDomain)) {
++      return Collections.singletonList(user + "@" + ldapDomain);
++    }
++
++    List<String> userPatterns = parseDnPatterns(conf,
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN);
++    if (userPatterns.isEmpty()) {
++      return Collections.singletonList(user);
++    }
++
++    List<String> candidatePrincipals = new ArrayList<>();
++    for (String userPattern : userPatterns) {
++      candidatePrincipals.add(userPattern.replaceAll("%s", user));
++    }
++    return candidatePrincipals;
++  }
++
++  private LdapUtils() {
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/Query.java b/service/src/java/org/apache/hive/service/auth/ldap/Query.java
+new file mode 100644
+index 0000000..b8bf938
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/Query.java
+@@ -0,0 +1,154 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import com.google.common.base.Preconditions;
++import java.util.ArrayList;
++import java.util.List;
++import javax.naming.directory.SearchControls;
++import org.stringtemplate.v4.ST;
++
++/**
++ * The object that encompasses all components of a Directory Service search query.
++ * <br>
++ * @see LdapSearch
++ */
++public final class Query {
++
++  private final String filter;
++  private final SearchControls controls;
++
++  /**
++   * Constructs an instance of Directory Service search query.
++   * @param filter search filter
++   * @param controls search controls
++   */
++  public Query(String filter, SearchControls controls) {
++    this.filter = filter;
++    this.controls = controls;
++  }
++
++  /**
++   * Returns search filter.
++   * @return search filter
++   */
++  public String getFilter() {
++    return filter;
++  }
++
++  /**
++   * Returns search controls.
++   * @return search controls
++   */
++  public SearchControls getControls() {
++    return controls;
++  }
++
++  /**
++   * Creates Query Builder.
++   * @return query builder.
++   */
++  public static QueryBuilder builder() {
++    return new QueryBuilder();
++  }
++
++  /**
++   * A builder of the {@link Query}.
++   */
++  public static final class QueryBuilder {
++
++    private ST filterTemplate;
++    private final SearchControls controls = new SearchControls();
++    private final List<String> returningAttributes = new ArrayList<>();
++
++    private QueryBuilder() {
++      controls.setSearchScope(SearchControls.SUBTREE_SCOPE);
++      controls.setReturningAttributes(new String[0]);
++    }
++
++    /**
++     * Sets search filter template.
++     * @param filterTemplate search filter template
++     * @return the current instance of the builder
++     */
++    public QueryBuilder filter(String filterTemplate) {
++      this.filterTemplate = new ST(filterTemplate);
++      return this;
++    }
++
++    /**
++     * Sets mapping between names in the search filter template and actual values.
++     * @param key marker in the search filter template.
++     * @param value actual value
++     * @return the current instance of the builder
++     */
++    public QueryBuilder map(String key, String value) {
++      filterTemplate.add(key, value);
++      return this;
++    }
++
++    /**
++     * Sets attribute that should be returned in results for the query.
++     * @param attributeName attribute name
++     * @return the current instance of the builder
++     */
++    public QueryBuilder returnAttribute(String attributeName) {
++      returningAttributes.add(attributeName);
++      return this;
++    }
++
++    /**
++     * Sets the maximum number of entries to be returned as a result of the search.
++     * <br>
++     * 0 indicates no limit: all entries will be returned.
++     * @param limit The maximum number of entries that will be returned.
++     * @return the current instance of the builder
++     */
++    public QueryBuilder limit(int limit) {
++      controls.setCountLimit(limit);
++      return this;
++    }
++
++    private void validate() {
++      Preconditions.checkArgument(filterTemplate != null,
++          "filter is required for LDAP search query");
++    }
++
++    private String createFilter() {
++      return filterTemplate.render();
++    }
++
++    private void updateControls() {
++      if (!returningAttributes.isEmpty()) {
++        controls.setReturningAttributes(returningAttributes
++            .toArray(new String[returningAttributes.size()]));
++      }
++    }
++
++    /**
++     * Builds an instance of {@link Query}.
++     * @return configured directory service query
++     */
++    public Query build() {
++      validate();
++      String filter = createFilter();
++      updateControls();
++      return new Query(filter, controls);
++    }
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/QueryFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/QueryFactory.java
+new file mode 100644
+index 0000000..e9172d3
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/QueryFactory.java
+@@ -0,0 +1,135 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import com.google.common.base.Strings;
++import org.apache.hadoop.hive.conf.HiveConf;
++
++/**
++ * A factory for common types of directory service search queries.
++ */
++public final class QueryFactory {
++
++  private final String guidAttr;
++  private final String groupClassAttr;
++  private final String groupMembershipAttr;
++
++  /**
++   * Constructs the factory based on provided Hive configuration.
++   * @param conf Hive configuration
++   */
++  public QueryFactory(HiveConf conf) {
++    guidAttr = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GUIDKEY);
++    groupClassAttr = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPCLASS_KEY);
++    groupMembershipAttr = conf.getVar(
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPMEMBERSHIP_KEY);
++  }
++
++  /**
++   * Returns a query for finding Group DN based on group unique ID.
++   * @param groupId group unique identifier
++   * @return an instance of {@link Query}
++   */
++  public Query findGroupDnById(String groupId) {
++    return Query.builder()
++        .filter("(&(objectClass=<groupClassAttr>)(<guidAttr>=<groupID>))")
++        .map("guidAttr", guidAttr)
++        .map("groupClassAttr", groupClassAttr)
++        .map("groupID", groupId)
++        .limit(2)
++        .build();
++  }
++
++  /**
++   * Returns a query for finding user DN based on user RDN.
++   * @param userRdn user RDN
++   * @return an instance of {@link Query}
++   */
++  public Query findUserDnByRdn(String userRdn) {
++    return Query.builder()
++        .filter("(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))"
++            + "(<userRdn>))")
++        .limit(2)
++        .map("userRdn", userRdn)
++        .build();
++  }
++
++  /**
++   * Returns a query for finding user DN based on DN pattern.
++   * <br>
++   * Name of this method was derived from the original implementation of LDAP authentication.
++   * This method should be replaced by {@link QueryFactory#findUserDnByRdn(java.lang.String).
++   *
++   * @param rdn user RDN
++   * @return an instance of {@link Query}
++   */
++  public Query findDnByPattern(String rdn) {
++    return Query.builder()
++        .filter("(<rdn>)")
++        .map("rdn", rdn)
++        .limit(2)
++        .build();
++  }
++
++  /**
++   * Returns a query for finding user DN based on user unique name.
++   * @param userName user unique name (uid or sAMAccountName)
++   * @return an instance of {@link Query}
++   */
++  public Query findUserDnByName(String userName) {
++    return Query.builder()
++        .filter("(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))"
++            + "(|(uid=<userName>)(sAMAccountName=<userName>)))")
++        .map("userName", userName)
++        .limit(2)
++        .build();
++  }
++
++  /**
++   * Returns a query for finding groups to which the user belongs.
++   * @param userName username
++   * @param userDn user DN
++   * @return an instance of {@link Query}
++   */
++  public Query findGroupsForUser(String userName, String userDn) {
++    return Query.builder()
++        .filter("(&(objectClass=<groupClassAttr>)(|(<groupMembershipAttr>=<userDn>)"
++            + "(<groupMembershipAttr>=<userName>)))")
++        .map("groupClassAttr", groupClassAttr)
++        .map("groupMembershipAttr", groupMembershipAttr)
++        .map("userName", userName)
++        .map("userDn", userDn)
++        .build();
++  }
++
++  /**
++   * Returns a query object created for the custom filter.
++   * <br>
++   * This query is configured to return a group membership attribute as part of the search result.
++   * @param searchFilter custom search filter
++   * @return an instance of {@link Query}
++   */
++  public Query customQuery(String searchFilter) {
++    Query.QueryBuilder builder = Query.builder();
++    builder.filter(searchFilter);
++    if (!Strings.isNullOrEmpty(groupMembershipAttr)) {
++      builder.returnAttribute(groupMembershipAttr);
++    }
++    return builder.build();
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/SearchResultHandler.java b/service/src/java/org/apache/hive/service/auth/ldap/SearchResultHandler.java
+new file mode 100644
+index 0000000..1b391f8
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/SearchResultHandler.java
+@@ -0,0 +1,163 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
++import javax.naming.directory.Attribute;
++import javax.naming.directory.SearchResult;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * The object that handles Directory Service search results.
++ * In most cases it converts search results into a list of names in the namespace.
++ */
++public final class SearchResultHandler {
++
++  private static final Logger LOG = LoggerFactory.getLogger(SearchResultHandler.class);
++
++  private final Collection<NamingEnumeration<SearchResult>> searchResults;
++
++  /**
++   * Constructs a search result handler object for the provided search results.
++   * @param searchResults directory service search results
++   */
++  public SearchResultHandler(Collection<NamingEnumeration<SearchResult>> searchResults) {
++    this.searchResults = searchResults;
++  }
++
++  /**
++   * Returns all entries from the search result.
++   * @return a list of names in the namespace
++   * @throws NamingException
++   */
++  public List<String> getAllLdapNames() throws NamingException {
++    final List<String> result = new ArrayList<>();
++    handle(new RecordProcessor() {
++      @Override
++      public boolean process(SearchResult record) throws NamingException {
++        result.add(record.getNameInNamespace());
++        return true;
++      }
++    });
++    return result;
++  }
++
++  /**
++   * Checks whether search result contains exactly one entry.
++   * @return true if the search result contains a single entry.
++   * @throws NamingException
++   */
++  public boolean hasSingleResult() throws NamingException {
++    List<String> allResults = getAllLdapNames();
++    return allResults != null && allResults.size() == 1;
++  }
++
++  /**
++   * Returns a single entry from the search result.
++   * Throws {@code NamingException} if the search result doesn't contain exactly one entry.
++   * @return name in the namespace
++   * @throws NamingException
++   */
++  public String getSingleLdapName() throws NamingException {
++    List<String> allLdapNames = getAllLdapNames();
++    if (allLdapNames.size() == 1) {
++      return allLdapNames.get(0);
++    }
++    throw new NamingException("Single result was expected");
++  }
++
++  /**
++   * Returns all entries and all attributes for these entries.
++   * @return a list that includes all entries and all attributes from these entries.
++   * @throws NamingException
++   */
++  public List<String> getAllLdapNamesAndAttributes() throws NamingException {
++    final List<String> result = new ArrayList<>();
++    handle(new RecordProcessor() {
++      @Override
++      public boolean process(SearchResult record) throws NamingException {
++        result.add(record.getNameInNamespace());
++        NamingEnumeration<? extends Attribute> allAttributes = record.getAttributes().getAll();
++        while(allAttributes.hasMore()) {
++          Attribute attribute = allAttributes.next();
++          addAllAttributeValuesToResult(attribute.getAll());
++        }
++        return true;
++      }
++
++      private void addAllAttributeValuesToResult(NamingEnumeration values) throws NamingException {
++        while(values.hasMore()) {
++          result.add(String.valueOf(values.next()));
++        }
++      }
++
++    });
++    return result;
++  }
++
++  /**
++   * Allows for custom processing of the search results.
++   * @param processor {@link RecordProcessor} implementation
++   * @throws NamingException
++   */
++  public void handle(RecordProcessor processor) throws NamingException {
++    try {
++      for (NamingEnumeration<SearchResult> searchResult : searchResults) {
++        while (searchResult.hasMore()) {
++          if (!processor.process(searchResult.next())) {
++            return;
++          }
++        }
++      }
++    } finally {
++      for (NamingEnumeration<SearchResult> searchResult : searchResults) {
++        try {
++          searchResult.close();
++        } catch (NamingException ex) {
++          LOG.warn("Failed to close LDAP search result", ex);
++        }
++      }
++    }
++  }
++
++  /**
++   * An interface used by {@link SearchResultHandler} for processing records of
++   * a {@link SearchResult} on a per-record basis.
++   * <br>
++   * Implementations of this interface perform the actual work of processing each record,
++   * but don't need to worry about exception handling, closing underlying data structures,
++   * and combining results from several search requests.
++   * {@see SearchResultHandler}
++   */
++  public interface RecordProcessor {
++
++    /**
++     * Implementations must implement this method to process each record in {@link SearchResult}.
++     * @param record the {@code SearchResult} to precess
++     * @return {@code true} to continue processing, {@code false} to stop iterating
++     * over search results
++     * @throws NamingException
++     */
++    boolean process(SearchResult record) throws NamingException;
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/UserFilterFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/UserFilterFactory.java
+new file mode 100644
+index 0000000..c8a6c88
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/UserFilterFactory.java
+@@ -0,0 +1,75 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.Set;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * A factory for a {@link Filter} based on a list of allowed users.
++ * <br>
++ * The produced filter object filters out all users that are not on the provided in
++ * Hive configuration list.
++ * @see HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER
++ */
++public final class UserFilterFactory implements FilterFactory {
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public Filter getInstance(HiveConf conf) {
++    Collection<String> userFilter = conf.getStringCollection(
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER.varname);
++
++    if (userFilter.isEmpty()) {
++      return null;
++    }
++
++    return new UserFilter(userFilter);
++  }
++
++  private static final class UserFilter implements Filter {
++
++    private static final Logger LOG = LoggerFactory.getLogger(UserFilter.class);
++
++    private final Set<String> userFilter = new HashSet<>();
++
++    UserFilter(Collection<String> userFilter) {
++      for (String userFilterItem : userFilter) {
++        this.userFilter.add(userFilterItem.toLowerCase());
++      }
++    }
++
++    @Override
++    public void apply(DirSearch ldap, String user) throws AuthenticationException {
++      LOG.info("Authenticating user '{}' using user filter", user);
++      String userName = LdapUtils.extractUserName(user).toLowerCase();
++      if (!userFilter.contains(userName)) {
++        LOG.info("Authentication failed based on user membership");
++        throw new AuthenticationException("Authentication failed: "
++            + "User not a member of specified list");
++      }
++    }
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/auth/ldap/UserSearchFilterFactory.java b/service/src/java/org/apache/hive/service/auth/ldap/UserSearchFilterFactory.java
+new file mode 100644
+index 0000000..3218875
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/auth/ldap/UserSearchFilterFactory.java
+@@ -0,0 +1,65 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.Collection;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++
++/**
++ * A factory for a {@link Filter} that check whether provided user could be found in the directory.
++ * <br>
++ * The produced filter object filters out all users that are not found in the directory.
++ */
++public final class UserSearchFilterFactory implements FilterFactory {
++
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public Filter getInstance(HiveConf conf) {
++    Collection<String> groupFilter = conf.getStringCollection(
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER.varname);
++    Collection<String> userFilter = conf.getStringCollection(
++        HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER.varname);
++
++    if (groupFilter.isEmpty() && userFilter.isEmpty()) {
++      return null;
++    }
++
++    return new UserSearchFilter();
++  }
++
++  private static final class UserSearchFilter implements Filter {
++    @Override
++    public void apply(DirSearch client, String user) throws AuthenticationException {
++      try {
++        String userDn = client.findUserDn(user);
++
++        // This should not be null because we were allowed to bind with this username
++        // safe check in case we were able to bind anonymously.
++        if (userDn == null) {
++          throw new AuthenticationException("Authentication failed: User search failed");
++        }
++      } catch (NamingException e) {
++        throw new AuthenticationException("LDAP Authentication failed for user", e);
++      }
++    }
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java b/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java
+index 089a059..23a048a 100644
+--- a/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java
++++ b/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java
+@@ -225,7 +225,6 @@ public static void init() throws Exception {
+     hiveConf = new HiveConf();
+ 
+     ldapProvider = new LdapAuthenticationProviderImpl(hiveConf);
+-    ldapProvider.init(hiveConf);
+   }
+ 
+   @AfterClass
+@@ -259,7 +258,7 @@ private static void initLdapAtn(Map<String, String> hiveProperties)
+       }
+     }
+ 
+-    ldapProvider.init(hiveConf);
++    ldapProvider = new LdapAuthenticationProviderImpl(hiveConf);
+   }
+ 
+   @Test
+diff --git a/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java b/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java
+index 7e80e1d..d1f0b0e 100644
+--- a/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java
++++ b/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java
+@@ -1,47 +1,276 @@
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
+ package org.apache.hive.service.auth;
+ 
++import java.io.IOException;
++import java.util.Arrays;
++import javax.naming.NamingException;
+ import javax.security.sasl.AuthenticationException;
+-import java.io.ByteArrayOutputStream;
+-import java.io.File;
+-import java.io.FileOutputStream;
+-
+-import junit.framework.TestCase;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hive.service.auth.ldap.DirSearch;
++import org.apache.hive.service.auth.ldap.DirSearchFactory;
++import org.apache.hive.service.auth.ldap.LdapSearchFactory;
++import org.junit.Test;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.rules.ExpectedException;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestLdapAuthenticationProviderImpl {
+ 
+-public class TestLdapAuthenticationProviderImpl extends TestCase {
++  @Rule
++  public ExpectedException thrown = ExpectedException.none();
+ 
+-  private static HiveConf hiveConf;
+-  private static byte[] hiveConfBackup;
++  public HiveConf conf;
++  public LdapAuthenticationProviderImpl auth;
+ 
+-  @Override
+-  public void setUp() throws Exception {
+-      hiveConf = new HiveConf();
+-      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+-      hiveConf.writeXml(baos);
+-      baos.close();
+-      hiveConfBackup = baos.toByteArray();
+-      hiveConf.set("hive.server2.authentication.ldap.url", "localhost");
+-      FileOutputStream fos = new FileOutputStream(new File(hiveConf.getHiveSiteLocation().toURI()));
+-      hiveConf.writeXml(fos);
+-      fos.close();
++  @Mock
++  public DirSearchFactory factory;
++
++  @Mock
++  public DirSearch search;
++
++  @Before
++  public void setup() throws AuthenticationException {
++    conf = new HiveConf();
++    conf.set("hive.root.logger", "DEBUG,console");
++    conf.set("hive.server2.authentication.ldap.url", "localhost");
++    when(factory.getInstance(any(HiveConf.class), anyString(), anyString())).thenReturn(search);
+   }
+ 
+-  public void testLdapEmptyPassword() {
+-    LdapAuthenticationProviderImpl ldapImpl = new LdapAuthenticationProviderImpl(hiveConf);
+-    try {
+-      ldapImpl.Authenticate("user", "");
+-      assertFalse(true);
+-    } catch (AuthenticationException e) {
+-      assertTrue(e.getMessage(), e.getMessage().contains("a null or blank password has been provided"));
+-    }
++  @Test
++  public void authenticateGivenBlankPassword() throws Exception {
++    auth = new LdapAuthenticationProviderImpl(conf, new LdapSearchFactory());
++    expectAuthenticationExceptionForInvalidPassword();
++    auth.Authenticate("user", "");
++  }
++
++  @Test
++  public void authenticateGivenStringWithNullCharacterForPassword() throws Exception {
++    auth = new LdapAuthenticationProviderImpl(conf, new LdapSearchFactory());
++    expectAuthenticationExceptionForInvalidPassword();
++    auth.Authenticate("user", "\0");
++  }
++
++  @Test
++  public void authenticateGivenNullForPassword() throws Exception {
++    auth = new LdapAuthenticationProviderImpl(conf, new LdapSearchFactory());
++    expectAuthenticationExceptionForInvalidPassword();
++    auth.Authenticate("user", null);
++  }
++
++  @Test
++  public void testAuthenticateNoUserOrGroupFilter() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "cn=%s,ou=Users,dc=mycorp,dc=com:cn=%s,ou=PowerUsers,dc=mycorp,dc=com");
++
++    DirSearchFactory factory = mock(DirSearchFactory.class);
++
++    when(search.findUserDn("user1")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++
++    when(factory.getInstance(conf, "cn=user1,ou=PowerUsers,dc=mycorp,dc=com", "Blah")).thenReturn(search);
++    when(factory.getInstance(conf, "cn=user1,ou=Users,dc=mycorp,dc=com", "Blah")).thenThrow(AuthenticationException.class);
++
++    auth = new LdapAuthenticationProviderImpl(conf, factory);
++    auth.Authenticate("user1", "Blah");
++
++    verify(factory, times(2)).getInstance(isA(HiveConf.class), anyString(), eq("Blah"));
++    verify(search, atLeastOnce()).close();
++  }
++
++  @Test
++  public void testAuthenticateWhenUserFilterPasses() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER,
++        "user1,user2");
++
++    when(search.findUserDn("user1")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++    when(search.findUserDn("user2")).thenReturn("cn=user2,ou=PowerUsers,dc=mycorp,dc=com");
++
++    authenticateUserAndCheckSearchIsClosed("user1");
++    authenticateUserAndCheckSearchIsClosed("user2");
++  }
++
++  @Test
++  public void testAuthenticateWhenLoginWithDomainAndUserFilterPasses() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER,
++        "user1");
++
++    when(search.findUserDn("user1")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++
++    authenticateUserAndCheckSearchIsClosed("user1@mydomain.com");
++  }
++
++  @Test
++  public void testAuthenticateWhenLoginWithDnAndUserFilterPasses() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER,
++        "user1");
++
++    when(search.findUserDn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++
++    authenticateUserAndCheckSearchIsClosed("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++  }
++
++  @Test
++  public void testAuthenticateWhenUserSearchFails() throws NamingException, AuthenticationException, IOException {
++    thrown.expect(AuthenticationException.class);
++
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "user1,user2");
++
++    when(search.findUserDn("user1")).thenReturn(null);
++
++    authenticateUserAndCheckSearchIsClosed("user1");
+   }
+ 
+-  @Override
+-  public void tearDown() throws Exception {
+-    if(hiveConf != null && hiveConfBackup != null) {
+-      FileOutputStream fos = new FileOutputStream(new File(hiveConf.getHiveSiteLocation().toURI()));
+-      fos.write(hiveConfBackup);
+-      fos.close();
++  @Test
++  public void testAuthenticateWhenUserFilterFails() throws NamingException, AuthenticationException, IOException {
++    thrown.expect(AuthenticationException.class);
++
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "user1,user2");
++
++    when(search.findUserDn("user3")).thenReturn("cn=user3,ou=PowerUsers,dc=mycorp,dc=com");
++
++    authenticateUserAndCheckSearchIsClosed("user3");
++  }
++
++  @Test
++  public void testAuthenticateWhenGroupFilterPasses() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "group1,group2");
++
++    when(search.findUserDn("user1")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++    when(search.findUserDn("user2")).thenReturn("cn=user2,ou=PowerUsers,dc=mycorp,dc=com");
++
++    when(search.findGroupsForUser("cn=user1,ou=PowerUsers,dc=mycorp,dc=com"))
++        .thenReturn(Arrays.asList(
++            "cn=testGroup,ou=Groups,dc=mycorp,dc=com",
++            "cn=group1,ou=Groups,dc=mycorp,dc=com"));
++    when(search.findGroupsForUser("cn=user2,ou=PowerUsers,dc=mycorp,dc=com"))
++        .thenReturn(Arrays.asList(
++            "cn=testGroup,ou=Groups,dc=mycorp,dc=com",
++            "cn=group2,ou=Groups,dc=mycorp,dc=com"));
++
++    authenticateUserAndCheckSearchIsClosed("user1");
++    authenticateUserAndCheckSearchIsClosed("user2");
++  }
++
++  @Test
++  public void testAuthenticateWhenUserAndGroupFiltersPass() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "group1,group2");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "user1,user2");
++
++    when(search.findUserDn("user1")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++    when(search.findUserDn("user2")).thenReturn("cn=user2,ou=PowerUsers,dc=mycorp,dc=com");
++
++    when(search.findGroupsForUser("cn=user1,ou=PowerUsers,dc=mycorp,dc=com"))
++        .thenReturn(Arrays.asList(
++            "cn=testGroup,ou=Groups,dc=mycorp,dc=com",
++            "cn=group1,ou=Groups,dc=mycorp,dc=com"));
++    when(search.findGroupsForUser("cn=user2,ou=PowerUsers,dc=mycorp,dc=com"))
++        .thenReturn(Arrays.asList(
++            "cn=testGroup,ou=Groups,dc=mycorp,dc=com",
++            "cn=group2,ou=Groups,dc=mycorp,dc=com"));
++
++    authenticateUserAndCheckSearchIsClosed("user1");
++    authenticateUserAndCheckSearchIsClosed("user2");
++  }
++
++  @Test
++  public void testAuthenticateWhenUserFilterPassesAndGroupFilterFails()
++      throws NamingException, AuthenticationException, IOException {
++    thrown.expect(AuthenticationException.class);
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "group1,group2");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "user1,user2");
++
++    when(search.findUserDn("user1")).thenReturn("cn=user1,ou=PowerUsers,dc=mycorp,dc=com");
++
++    when(search.findGroupsForUser("cn=user1,ou=PowerUsers,dc=mycorp,dc=com"))
++        .thenReturn(Arrays.asList(
++            "cn=testGroup,ou=Groups,dc=mycorp,dc=com",
++            "cn=OtherGroup,ou=Groups,dc=mycorp,dc=com"));
++
++    authenticateUserAndCheckSearchIsClosed("user1");
++  }
++
++  @Test
++  public void testAuthenticateWhenUserFilterFailsAndGroupFilterPasses()
++      throws NamingException, AuthenticationException, IOException {
++    thrown.expect(AuthenticationException.class);
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "group3");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "user1,user2");
++
++    when(search.findUserDn("user3")).thenReturn("cn=user3,ou=PowerUsers,dc=mycorp,dc=com");
++
++    when(search.findGroupsForUser("cn=user3,ou=PowerUsers,dc=mycorp,dc=com"))
++        .thenReturn(Arrays.asList(
++            "cn=testGroup,ou=Groups,dc=mycorp,dc=com",
++            "cn=group3,ou=Groups,dc=mycorp,dc=com"));
++
++    authenticateUserAndCheckSearchIsClosed("user3");
++  }
++
++  @Test
++  public void testAuthenticateWhenCustomQueryFilterPasses() throws NamingException, AuthenticationException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN, "dc=mycorp,dc=com");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY,
++        "(&(objectClass=person)(|(memberOf=CN=Domain Admins,CN=Users,DC=apache,DC=org)(memberOf=CN=Administrators,CN=Builtin,DC=apache,DC=org)))");
++
++    when(search.executeCustomQuery(anyString())).thenReturn(Arrays.asList(
++        "cn=user1,ou=PowerUsers,dc=mycorp,dc=com",
++        "cn=user2,ou=PowerUsers,dc=mycorp,dc=com"));
++
++    authenticateUserAndCheckSearchIsClosed("user1");
++  }
++
++  @Test
++  public void testAuthenticateWhenCustomQueryFilterFailsAndUserFilterPasses() throws NamingException, AuthenticationException, IOException {
++    thrown.expect(AuthenticationException.class);
++
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN, "dc=mycorp,dc=com");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY,
++        "(&(objectClass=person)(|(memberOf=CN=Domain Admins,CN=Users,DC=apache,DC=org)(memberOf=CN=Administrators,CN=Builtin,DC=apache,DC=org)))");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "user3");
++
++    when(search.findUserDn("user3")).thenReturn("cn=user3,ou=PowerUsers,dc=mycorp,dc=com");
++    when(search.executeCustomQuery(anyString())).thenReturn(Arrays.asList(
++        "cn=user1,ou=PowerUsers,dc=mycorp,dc=com",
++        "cn=user2,ou=PowerUsers,dc=mycorp,dc=com"));
++
++    authenticateUserAndCheckSearchIsClosed("user3");
++  }
++
++  private void expectAuthenticationExceptionForInvalidPassword() {
++    thrown.expect(AuthenticationException.class);
++    thrown.expectMessage("a null or blank password has been provided");
++  }
++
++  private void authenticateUserAndCheckSearchIsClosed(String user) throws IOException {
++    auth = new LdapAuthenticationProviderImpl(conf, factory);
++    try {
++      auth.Authenticate(user, "password doesn't matter");
++    } finally {
++      verify(search, atLeastOnce()).close();
+     }
+   }
+ }
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/Credentials.java b/service/src/test/org/apache/hive/service/auth/ldap/Credentials.java
+new file mode 100644
+index 0000000..ce22b8e
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/Credentials.java
+@@ -0,0 +1,41 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++public final class Credentials {
++
++  private final String user;
++  private final String password;
++
++  private Credentials(String user, String password) {
++    this.user = user;
++    this.password = password;
++  }
++
++  public static Credentials of(String user, String password) {
++    return new Credentials(user, password);
++  }
++
++  public String getUser() {
++    return user;
++  }
++
++  public String getPassword() {
++    return password;
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/LdapTestUtils.java b/service/src/test/org/apache/hive/service/auth/ldap/LdapTestUtils.java
+new file mode 100644
+index 0000000..d4e034f
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/LdapTestUtils.java
+@@ -0,0 +1,126 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
++import javax.naming.directory.Attribute;
++import javax.naming.directory.Attributes;
++import javax.naming.directory.BasicAttribute;
++import javax.naming.directory.BasicAttributes;
++import javax.naming.directory.SearchResult;
++
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++import org.mockito.stubbing.OngoingStubbing;
++
++public final class LdapTestUtils {
++
++  private LdapTestUtils() {
++  }
++
++  public static NamingEnumeration<SearchResult> mockEmptyNamingEnumeration() throws NamingException {
++    return mockNamingEnumeration(new SearchResult[0]);
++  }
++
++  public static NamingEnumeration<SearchResult> mockNamingEnumeration(String... dns) throws NamingException {
++    return mockNamingEnumeration(mockSearchResults(dns).toArray(new SearchResult[0]));
++  }
++
++  public static NamingEnumeration<SearchResult> mockNamingEnumeration(SearchResult... searchResults) throws NamingException {
++    NamingEnumeration<SearchResult> ne =
++        (NamingEnumeration<SearchResult>) mock(NamingEnumeration.class);
++    mockHasMoreMethod(ne, searchResults.length);
++    if (searchResults.length > 0) {
++      List<SearchResult> mockedResults = Arrays.asList(searchResults);
++      mockNextMethod(ne, mockedResults);
++    }
++    return ne;
++  }
++
++  public static void mockHasMoreMethod(NamingEnumeration<SearchResult> ne, int length) throws NamingException {
++    OngoingStubbing<Boolean> hasMoreStub = when(ne.hasMore());
++    for (int i = 0; i < length; i++) {
++      hasMoreStub = hasMoreStub.thenReturn(true);
++    }
++    hasMoreStub.thenReturn(false);
++  }
++
++  public static void mockNextMethod(NamingEnumeration<SearchResult> ne, List<SearchResult> searchResults) throws NamingException {
++    OngoingStubbing<SearchResult> nextStub = when(ne.next());
++    for (SearchResult searchResult : searchResults) {
++      nextStub = nextStub.thenReturn(searchResult);
++    }
++  }
++
++  public static List<SearchResult> mockSearchResults(String[] dns) {
++    List<SearchResult> list = new ArrayList<>();
++    for (String dn : dns) {
++      list.add(mockSearchResult(dn, null));
++    }
++    return list;
++  }
++
++  public static SearchResult mockSearchResult(String dn, Attributes attributes) {
++    SearchResult searchResult = mock(SearchResult.class);
++    when(searchResult.getNameInNamespace()).thenReturn(dn);
++    when(searchResult.getAttributes()).thenReturn(attributes);
++    return searchResult;
++  }
++
++  public static Attributes mockEmptyAttributes() throws NamingException {
++    return mockAttributes();
++  }
++
++  public static Attributes mockAttributes(String name, String value) throws NamingException {
++    return mockAttributes(new NameValues(name, value));
++  }
++
++  public static Attributes mockAttributes(String name1, String value1, String name2, String value2) throws NamingException {
++    if (name1.equals(name2)) {
++      return mockAttributes(new NameValues(name1, value1, value2));
++    } else {
++      return mockAttributes(new NameValues(name1, value1), new NameValues(name2, value2));
++    }
++  }
++
++  private static Attributes mockAttributes(NameValues... namedValues) throws NamingException {
++    Attributes attributes =  new BasicAttributes();
++    for (NameValues namedValue : namedValues) {
++      Attribute attr = new BasicAttribute(namedValue.name);
++      for (String value : namedValue.values) {
++        attr.add(value);
++      }
++      attributes.put(attr);
++    }
++    return attributes;
++  }
++
++  private static final class NameValues {
++    final String name;
++    final String[] values;
++
++    public NameValues(String name, String... values) {
++      this.name = name;
++      this.values = values;
++    }
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestChainFilter.java b/service/src/test/org/apache/hive/service/auth/ldap/TestChainFilter.java
+new file mode 100644
+index 0000000..9caa233
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestChainFilter.java
+@@ -0,0 +1,103 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.io.IOException;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import org.junit.Before;
++import org.mockito.Mock;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestChainFilter {
++
++  private FilterFactory factory;
++  private HiveConf conf;
++
++  @Mock
++  public Filter filter1;
++
++  @Mock
++  public Filter filter2;
++
++  @Mock
++  public Filter filter3;
++
++  @Mock
++  public FilterFactory factory1;
++
++  @Mock
++  public FilterFactory factory2;
++
++  @Mock
++  public FilterFactory factory3;
++
++  @Mock
++  private DirSearch search;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++    factory = new ChainFilterFactory(factory1, factory2, factory3);
++  }
++
++  @Test
++  public void testFactoryAllNull() {
++    assertNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testFactoryAllEmpty() {
++    FilterFactory emptyFactory = new ChainFilterFactory();
++    assertNull(emptyFactory.getInstance(conf));
++  }
++
++  @Test
++  public void testFactory() throws AuthenticationException {
++    when(factory1.getInstance(any(HiveConf.class))).thenReturn(filter1);
++    when(factory2.getInstance(any(HiveConf.class))).thenReturn(filter2);
++    when(factory3.getInstance(any(HiveConf.class))).thenReturn(filter3);
++
++    Filter filter = factory.getInstance(conf);
++
++    filter.apply(search, "User");
++    verify(filter1, times(1)).apply(search, "User");
++    verify(filter2, times(1)).apply(search, "User");
++    verify(filter3, times(1)).apply(search, "User");
++  }
++
++  @Test(expected = AuthenticationException.class)
++  public void testApplyNegative() throws AuthenticationException, NamingException, IOException {
++    doThrow(AuthenticationException.class).when(filter3).apply((DirSearch) anyObject(), anyString());
++
++    when(factory1.getInstance(any(HiveConf.class))).thenReturn(filter1);
++    when(factory3.getInstance(any(HiveConf.class))).thenReturn(filter3);
++
++    Filter filter = factory.getInstance(conf);
++
++    filter.apply(search, "User");
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestCustomQueryFilter.java b/service/src/test/org/apache/hive/service/auth/ldap/TestCustomQueryFilter.java
+new file mode 100644
+index 0000000..fd4b898
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestCustomQueryFilter.java
+@@ -0,0 +1,85 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.io.IOException;
++import java.util.Arrays;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import org.junit.Before;
++import org.mockito.Mock;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestCustomQueryFilter {
++
++  private static final String USER2_DN = "uid=user2,ou=People,dc=example,dc=com";
++  private static final String USER1_DN = "uid=user1,ou=People,dc=example,dc=com";
++  private static final String CUSTOM_QUERY = "(&(objectClass=person)(|(uid=user1)(uid=user2)))";
++
++  private FilterFactory factory;
++  private HiveConf conf;
++
++  @Mock
++  private DirSearch search;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++    conf.set("hive.root.logger", "DEBUG,console");
++    factory = new CustomQueryFilterFactory();
++  }
++
++  @Test
++  public void testFactory() {
++    conf.unset(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY.varname);
++    assertNull(factory.getInstance(conf));
++
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY, CUSTOM_QUERY);
++    assertNotNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testApplyPositive() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY, CUSTOM_QUERY);
++
++    when(search.executeCustomQuery(eq(CUSTOM_QUERY))).thenReturn(Arrays.asList(USER1_DN, USER2_DN));
++
++    Filter filter = factory.getInstance(conf);
++    filter.apply(search, "user1");
++    filter.apply(search, "user2");
++  }
++
++
++  @Test(expected = AuthenticationException.class)
++  public void testApplyNegative() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_CUSTOMLDAPQUERY, CUSTOM_QUERY);
++
++    when(search.executeCustomQuery(eq(CUSTOM_QUERY))).thenReturn(Arrays.asList(USER1_DN, USER2_DN));
++
++    Filter filter = factory.getInstance(conf);
++    filter.apply(search, "user3");
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestGroupFilter.java b/service/src/test/org/apache/hive/service/auth/ldap/TestGroupFilter.java
+new file mode 100644
+index 0000000..0cc2ead
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestGroupFilter.java
+@@ -0,0 +1,101 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.io.IOException;
++import java.util.Arrays;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import org.junit.Before;
++import org.mockito.Mock;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestGroupFilter {
++
++  private FilterFactory factory;
++  private HiveConf conf;
++
++  @Mock
++  private DirSearch search;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++    conf.set("hive.root.logger", "DEBUG,console");
++    factory = new GroupFilterFactory();
++  }
++
++  @Test
++  public void testFactory() {
++    conf.unset(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER.varname);
++    assertNull(factory.getInstance(conf));
++
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "G1");
++    assertNotNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testApplyPositive() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "HiveUsers");
++
++    when(search.findUserDn(eq("user1")))
++        .thenReturn("cn=user1,ou=People,dc=example,dc=com");
++    when(search.findUserDn(eq("cn=user2,dc=example,dc=com")))
++        .thenReturn("cn=user2,ou=People,dc=example,dc=com");
++    when(search.findUserDn(eq("user3@mydomain.com")))
++        .thenReturn("cn=user3,ou=People,dc=example,dc=com");
++
++    when(search.findGroupsForUser(eq("cn=user1,ou=People,dc=example,dc=com")))
++        .thenReturn(Arrays.asList(
++            "cn=SuperUsers,ou=Groups,dc=example,dc=com",
++            "cn=Office1,ou=Groups,dc=example,dc=com",
++            "cn=HiveUsers,ou=Groups,dc=example,dc=com",
++            "cn=G1,ou=Groups,dc=example,dc=com"));
++    when(search.findGroupsForUser(eq("cn=user2,ou=People,dc=example,dc=com")))
++        .thenReturn(Arrays.asList(
++            "cn=HiveUsers,ou=Groups,dc=example,dc=com"));
++    when(search.findGroupsForUser(eq("cn=user3,ou=People,dc=example,dc=com")))
++        .thenReturn(Arrays.asList(
++            "cn=HiveUsers,ou=Groups,dc=example,dc=com",
++            "cn=G1,ou=Groups,dc=example,dc=com",
++            "cn=G2,ou=Groups,dc=example,dc=com"));
++
++    Filter filter = factory.getInstance(conf);
++    filter.apply(search, "user1");
++    filter.apply(search, "cn=user2,dc=example,dc=com");
++    filter.apply(search, "user3@mydomain.com");
++  }
++
++  @Test(expected = AuthenticationException.class)
++  public void testApplyNegative() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "HiveUsers");
++
++    when(search.findGroupsForUser(eq("user1"))).thenReturn(Arrays.asList("SuperUsers", "Office1", "G1", "G2"));
++
++    Filter filter = factory.getInstance(conf);
++    filter.apply(search, "user1");
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestLdapSearch.java b/service/src/test/org/apache/hive/service/auth/ldap/TestLdapSearch.java
+new file mode 100644
+index 0000000..499b624
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestLdapSearch.java
+@@ -0,0 +1,209 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
++import javax.naming.directory.DirContext;
++import javax.naming.directory.SearchControls;
++import javax.naming.directory.SearchResult;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++import static org.apache.hive.service.auth.ldap.LdapTestUtils.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestLdapSearch {
++
++  @Mock
++  private DirContext ctx;
++
++  private HiveConf conf;
++  private LdapSearch search;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++  }
++
++  @Test
++  public void testClose() throws NamingException {
++    search = new LdapSearch(conf, ctx);
++    search.close();
++    verify(ctx, atLeastOnce()).close();
++  }
++
++  @Test
++  public void testFindUserDnWhenUserDnPositive() throws NamingException {
++    NamingEnumeration<SearchResult> searchResult = mockNamingEnumeration("CN=User1,OU=org1,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class)))
++        .thenReturn(searchResult)
++        .thenThrow(NamingException.class);
++    search = new LdapSearch(conf, ctx);
++    String expected = "CN=User1,OU=org1,DC=foo,DC=bar";
++    String actual = search.findUserDn("CN=User1,OU=org1");
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testFindUserDnWhenUserDnNegativeDuplicates() throws NamingException {
++    NamingEnumeration<SearchResult> searchResult = mockNamingEnumeration(
++            "CN=User1,OU=org1,DC=foo,DC=bar",
++            "CN=User1,OU=org2,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class))).thenReturn(searchResult);
++    search = new LdapSearch(conf, ctx);
++    assertNull(search.findUserDn("CN=User1,DC=foo,DC=bar"));
++  }
++
++  @Test
++  public void testFindUserDnWhenUserDnNegativeNone() throws NamingException {
++    NamingEnumeration<SearchResult> searchResult = mockEmptyNamingEnumeration();
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class))).thenReturn(searchResult);
++    search = new LdapSearch(conf, ctx);
++    assertNull(search.findUserDn("CN=User1,DC=foo,DC=bar"));
++  }
++
++  @Test
++  public void testFindUserDnWhenUserPatternFoundBySecondPattern() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "CN=%s,OU=org1,DC=foo,DC=bar:CN=%s,OU=org2,DC=foo,DC=bar");
++    NamingEnumeration<SearchResult> emptyResult = mockEmptyNamingEnumeration();
++    NamingEnumeration<SearchResult> validResult = mockNamingEnumeration("CN=User1,OU=org2,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class)))
++        .thenReturn(emptyResult)
++        .thenReturn(validResult);
++    search = new LdapSearch(conf, ctx);
++    String expected = "CN=User1,OU=org2,DC=foo,DC=bar";
++    String actual = search.findUserDn("User1");
++    assertEquals(expected, actual);
++    verify(ctx).search(eq("OU=org1,DC=foo,DC=bar"), contains("CN=User1"), any(SearchControls.class));
++    verify(ctx).search(eq("OU=org2,DC=foo,DC=bar"), contains("CN=User1"), any(SearchControls.class));
++  }
++
++  @Test
++  public void testFindUserDnWhenUserPatternFoundByFirstPattern() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "CN=%s,OU=org1,DC=foo,DC=bar:CN=%s,OU=org2,DC=foo,DC=bar");
++    NamingEnumeration<SearchResult> emptyResult = mockEmptyNamingEnumeration();
++    NamingEnumeration<SearchResult> validResult = mockNamingEnumeration("CN=User1,OU=org2,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class)))
++        .thenReturn(validResult)
++        .thenReturn(emptyResult);
++    search = new LdapSearch(conf, ctx);
++    String expected = "CN=User1,OU=org2,DC=foo,DC=bar";
++    String actual = search.findUserDn("User1");
++    assertEquals(expected, actual);
++    verify(ctx).search(eq("OU=org1,DC=foo,DC=bar"), contains("CN=User1"), any(SearchControls.class));
++  }
++
++  @Test
++  public void testFindUserDnWhenUserPatternFoundByUniqueIdentifier() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "CN=%s,OU=org1,DC=foo,DC=bar");
++    NamingEnumeration<SearchResult> validResult = mockNamingEnumeration("CN=User1,OU=org1,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class)))
++        .thenReturn(null)
++        .thenReturn(validResult);
++    search = new LdapSearch(conf, ctx);
++    String expected = "CN=User1,OU=org1,DC=foo,DC=bar";
++    String actual = search.findUserDn("User1");
++    assertEquals(expected, actual);
++    verify(ctx).search(eq("OU=org1,DC=foo,DC=bar"), contains("CN=User1"), any(SearchControls.class));
++    verify(ctx).search(eq("OU=org1,DC=foo,DC=bar"), contains("uid=User1"), any(SearchControls.class));
++  }
++
++  @Test
++  public void testFindUserDnWhenUserPatternFoundByUniqueIdentifierNegativeNone() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "CN=%s,OU=org1,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class)))
++        .thenReturn(null)
++        .thenReturn(null);
++    search = new LdapSearch(conf, ctx);
++    assertNull(search.findUserDn("User1"));
++  }
++
++  @Test
++  public void testFindUserDnWhenUserPatternFoundByUniqueIdentifierNegativeMany() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "CN=%s,OU=org1,DC=foo,DC=bar");
++    NamingEnumeration<SearchResult> manyResult = mockNamingEnumeration(
++        "CN=User1,OU=org1,DC=foo,DC=bar",
++        "CN=User12,OU=org1,DC=foo,DC=bar");
++    when(ctx.search(anyString(), anyString(), any(SearchControls.class)))
++        .thenReturn(null)
++        .thenReturn(manyResult);
++    search = new LdapSearch(conf, ctx);
++    assertNull(search.findUserDn("User1"));
++  }
++
++  @Test
++  public void testFindGroupsForUser() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPDNPATTERN,
++        "CN=%s,OU=org1,DC=foo,DC=bar");
++
++    NamingEnumeration<SearchResult> groupsResult = mockNamingEnumeration("CN=Group1,OU=org1,DC=foo,DC=bar");
++    when(ctx.search(eq("OU=org1,DC=foo,DC=bar"), contains("User1"), any(SearchControls.class)))
++        .thenReturn(groupsResult);
++
++    search = new LdapSearch(conf, ctx);
++
++    List<String> expected = Arrays.asList("CN=Group1,OU=org1,DC=foo,DC=bar");
++    List<String> actual = search.findGroupsForUser("CN=User1,OU=org1,DC=foo,DC=bar");
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testExecuteCustomQuery() throws NamingException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN, "dc=example,dc=com");
++
++    NamingEnumeration<SearchResult> customQueryResult = mockNamingEnumeration(
++        mockSearchResult(
++            "uid=group1,ou=Groups,dc=example,dc=com",
++            mockAttributes("member", "uid=user1,ou=People,dc=example,dc=com")),
++        mockSearchResult(
++            "uid=group2,ou=Groups,dc=example,dc=com",
++            mockAttributes("member", "uid=user2,ou=People,dc=example,dc=com"))
++        );
++
++    when(ctx.search(eq("dc=example,dc=com"), anyString(), any(SearchControls.class)))
++        .thenReturn(customQueryResult);
++
++    search = new LdapSearch(conf, ctx);
++
++    List<String> expected = Arrays.asList(
++        "uid=group1,ou=Groups,dc=example,dc=com",
++        "uid=user1,ou=People,dc=example,dc=com",
++        "uid=group2,ou=Groups,dc=example,dc=com",
++        "uid=user2,ou=People,dc=example,dc=com");
++    List<String> actual = search.executeCustomQuery("(&(objectClass=groupOfNames)(|(cn=group1)(cn=group2)))");
++    Collections.sort(expected);
++    Collections.sort(actual);
++    assertEquals(expected, actual);
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestLdapUtils.java b/service/src/test/org/apache/hive/service/auth/ldap/TestLdapUtils.java
+new file mode 100644
+index 0000000..661aff4
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestLdapUtils.java
+@@ -0,0 +1,103 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class TestLdapUtils {
++
++  @Test
++  public void testCreateCandidatePrincipalsForUserDn() {
++    HiveConf conf = new HiveConf();
++    String userDn = "cn=user1,ou=CORP,dc=mycompany,dc=com";
++    List<String> expected = Arrays.asList(userDn);
++    List<String> actual = LdapUtils.createCandidatePrincipals(conf, userDn);
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testCreateCandidatePrincipalsForUserWithDomain() {
++    HiveConf conf = new HiveConf();
++    String userWithDomain = "user1@mycompany.com";
++    List<String> expected = Arrays.asList(userWithDomain);
++    List<String> actual = LdapUtils.createCandidatePrincipals(conf, userWithDomain);
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testCreateCandidatePrincipalsLdapDomain() {
++    HiveConf conf = new HiveConf();
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_DOMAIN, "mycompany.com");
++    List<String> expected = Arrays.asList("user1@mycompany.com");
++    List<String> actual = LdapUtils.createCandidatePrincipals(conf, "user1");
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testCreateCandidatePrincipalsUserPatternsDefaultBaseDn() {
++    HiveConf conf = new HiveConf();
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GUIDKEY, "sAMAccountName");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN, "dc=mycompany,dc=com");
++    List<String> expected = Arrays.asList("sAMAccountName=user1,dc=mycompany,dc=com");
++    List<String> actual = LdapUtils.createCandidatePrincipals(conf, "user1");
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testCreateCandidatePrincipals() {
++    HiveConf conf = new HiveConf();
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BASEDN, "dc=mycompany,dc=com");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERDNPATTERN,
++        "cn=%s,ou=CORP1,dc=mycompany,dc=com:cn=%s,ou=CORP2,dc=mycompany,dc=com");
++    List<String> expected = Arrays.asList(
++        "cn=user1,ou=CORP1,dc=mycompany,dc=com",
++        "cn=user1,ou=CORP2,dc=mycompany,dc=com");
++    List<String> actual = LdapUtils.createCandidatePrincipals(conf, "user1");
++    Collections.sort(expected);
++    Collections.sort(actual);
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testExtractFirstRdn() {
++    String dn = "cn=user1,ou=CORP1,dc=mycompany,dc=com";
++    String expected = "cn=user1";
++    String actual = LdapUtils.extractFirstRdn(dn);
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testExtractBaseDn() {
++    String dn = "cn=user1,ou=CORP1,dc=mycompany,dc=com";
++    String expected = "ou=CORP1,dc=mycompany,dc=com";
++    String actual = LdapUtils.extractBaseDn(dn);
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testExtractBaseDnNegative() {
++    String dn = "cn=user1";
++    assertNull(LdapUtils.extractBaseDn(dn));
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestQuery.java b/service/src/test/org/apache/hive/service/auth/ldap/TestQuery.java
+new file mode 100644
+index 0000000..1f4bb1a
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestQuery.java
+@@ -0,0 +1,59 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class TestQuery {
++
++  @Test
++  public void testQueryBuilderFilter() {
++    Query q = Query.builder()
++        .filter("test <uid_attr>=<value> query")
++        .map("uid_attr", "uid")
++        .map("value", "Hello!")
++        .build();
++    assertEquals("test uid=Hello! query", q.getFilter());
++    assertEquals(0, q.getControls().getCountLimit());
++  }
++
++  @Test
++  public void testQueryBuilderLimit() {
++    Query q = Query.builder()
++        .filter("<key1>,<key2>")
++        .map("key1", "value1")
++        .map("key2", "value2")
++        .limit(8)
++        .build();
++    assertEquals("value1,value2", q.getFilter());
++    assertEquals(8, q.getControls().getCountLimit());
++  }
++
++  @Test
++  public void testQueryBuilderReturningAttributes() {
++    Query q = Query.builder()
++        .filter("(query)")
++        .returnAttribute("attr1")
++        .returnAttribute("attr2")
++        .build();
++    assertEquals("(query)", q.getFilter());
++    assertArrayEquals(new String[] {"attr1", "attr2"}, q.getControls().getReturningAttributes());
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestQueryFactory.java b/service/src/test/org/apache/hive/service/auth/ldap/TestQueryFactory.java
+new file mode 100644
+index 0000000..3054e33
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestQueryFactory.java
+@@ -0,0 +1,79 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class TestQueryFactory {
++
++  private QueryFactory queries;
++  private HiveConf conf;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GUIDKEY, "guid");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPCLASS_KEY, "superGroups");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPMEMBERSHIP_KEY, "member");
++    queries = new QueryFactory(conf);
++  }
++
++  @Test
++  public void testFindGroupDnById() {
++    Query q = queries.findGroupDnById("unique_group_id");
++    String expected = "(&(objectClass=superGroups)(guid=unique_group_id))";
++    String actual = q.getFilter();
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testFindUserDnByRdn() {
++    Query q = queries.findUserDnByRdn("cn=User1");
++    String expected = "(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))(cn=User1))";
++    String actual = q.getFilter();
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testFindDnByPattern() {
++    Query q = queries.findDnByPattern("cn=User1");
++    String expected = "(cn=User1)";
++    String actual = q.getFilter();
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testFindUserDnByName() {
++    Query q = queries.findUserDnByName("unique_user_id");
++    String expected = "(&(|(objectClass=person)(objectClass=user)(objectClass=inetOrgPerson))(|(uid=unique_user_id)(sAMAccountName=unique_user_id)))";
++    String actual = q.getFilter();
++    assertEquals(expected, actual);
++  }
++
++  @Test
++  public void testFindGroupsForUser() {
++    Query q = queries.findGroupsForUser("user_name", "user_Dn");
++    String expected = "(&(objectClass=superGroups)(|(member=user_Dn)(member=user_name)))";
++    String actual = q.getFilter();
++    assertEquals(expected, actual);
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestSearchResultHandler.java b/service/src/test/org/apache/hive/service/auth/ldap/TestSearchResultHandler.java
+new file mode 100644
+index 0000000..2615680
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestSearchResultHandler.java
+@@ -0,0 +1,222 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.util.AbstractCollection;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Iterator;
++import java.util.List;
++import javax.naming.NamingEnumeration;
++import javax.naming.NamingException;
++import javax.naming.directory.SearchResult;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++import static org.apache.hive.service.auth.ldap.LdapTestUtils.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestSearchResultHandler {
++
++  SearchResultHandler handler;
++
++  @Test
++  public void testHandle() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addSearchResultWithDns("1")
++        .addSearchResultWithDns("2", "3");
++    handler = new SearchResultHandler(resultCollection);
++    List<String> expected = Arrays.asList("1", "2");
++    final List<String> actual = new ArrayList<>();
++    handler.handle(new SearchResultHandler.RecordProcessor() {
++      @Override
++      public boolean process(SearchResult record) throws NamingException {
++        actual.add(record.getNameInNamespace());
++        return actual.size() < 2;
++      }
++    });
++    assertEquals(expected, actual);
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testGetAllLdapNamesNoRecords() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addEmptySearchResult();
++    handler = new SearchResultHandler(resultCollection);
++    List<String> actual = handler.getAllLdapNames();
++    assertEquals("Resultset size", 0, actual.size());
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testGetAllLdapNamesWithExceptionInNamingEnumerationClose() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addSearchResultWithDns("1")
++        .addSearchResultWithDns("2");
++    doThrow(NamingException.class).when(resultCollection.iterator().next()).close();
++    handler = new SearchResultHandler(resultCollection);
++    List<String> actual = handler.getAllLdapNames();
++    assertEquals("Resultset size", 2, actual.size());
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testGetAllLdapNames() throws NamingException {
++    String objectDn1 = "cn=a1,dc=b,dc=c";
++    String objectDn2 = "cn=a2,dc=b,dc=c";
++    String objectDn3 = "cn=a3,dc=b,dc=c";
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addSearchResultWithDns(objectDn1)
++        .addSearchResultWithDns(objectDn2, objectDn3);
++    handler = new SearchResultHandler(resultCollection);
++    List<String> expected = Arrays.asList(objectDn1, objectDn2, objectDn3);
++    Collections.sort(expected);
++    List<String> actual = handler.getAllLdapNames();
++    Collections.sort(actual);
++    assertEquals(expected, actual);
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testGetAllLdapNamesAndAttributes() throws NamingException {
++    SearchResult searchResult1 = mockSearchResult("cn=a1,dc=b,dc=c",
++        mockAttributes("attr1", "attr1value1"));
++    SearchResult searchResult2 = mockSearchResult("cn=a2,dc=b,dc=c",
++        mockAttributes("attr1", "attr1value2", "attr2", "attr2value1"));
++    SearchResult searchResult3 = mockSearchResult("cn=a3,dc=b,dc=c",
++        mockAttributes("attr1", "attr1value3", "attr1", "attr1value4"));
++    SearchResult searchResult4 = mockSearchResult("cn=a4,dc=b,dc=c",
++        mockEmptyAttributes());
++
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addSearchResults(searchResult1)
++        .addSearchResults(searchResult2, searchResult3)
++        .addSearchResults(searchResult4);
++
++    handler = new SearchResultHandler(resultCollection);
++    List<String> expected = Arrays.asList(
++        "cn=a1,dc=b,dc=c", "attr1value1",
++        "cn=a2,dc=b,dc=c", "attr1value2", "attr2value1",
++        "cn=a3,dc=b,dc=c", "attr1value3", "attr1value4",
++        "cn=a4,dc=b,dc=c");
++    Collections.sort(expected);
++    List<String> actual = handler.getAllLdapNamesAndAttributes();
++    Collections.sort(actual);
++    assertEquals(expected, actual);
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testHasSingleResultNoRecords() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addEmptySearchResult();
++    handler = new SearchResultHandler(resultCollection);
++    assertFalse(handler.hasSingleResult());
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testHasSingleResult() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addSearchResultWithDns("1");
++    handler = new SearchResultHandler(resultCollection);
++    assertTrue(handler.hasSingleResult());
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test
++  public void testHasSingleResultManyRecords() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addSearchResultWithDns("1")
++        .addSearchResultWithDns("2");
++    handler = new SearchResultHandler(resultCollection);
++    assertFalse(handler.hasSingleResult());
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  @Test(expected = NamingException.class)
++  public void testGetSingleLdapNameNoRecords() throws NamingException {
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addEmptySearchResult();
++    handler = new SearchResultHandler(resultCollection);
++    try {
++      handler.getSingleLdapName();
++    } finally {
++      assertAllNamingEnumerationsClosed(resultCollection);
++    }
++  }
++
++  @Test
++  public void testGetSingleLdapName() throws NamingException {
++    String objectDn = "cn=a,dc=b,dc=c";
++    MockResultCollection resultCollection = MockResultCollection.create()
++        .addEmptySearchResult()
++        .addSearchResultWithDns(objectDn);
++
++    handler = new SearchResultHandler(resultCollection);
++    String expected = objectDn;
++    String actual = handler.getSingleLdapName();
++    assertEquals(expected, actual);
++    assertAllNamingEnumerationsClosed(resultCollection);
++  }
++
++  private void assertAllNamingEnumerationsClosed(MockResultCollection resultCollection) throws NamingException {
++    for (NamingEnumeration<SearchResult> namingEnumeration : resultCollection) {
++      verify(namingEnumeration, atLeastOnce()).close();
++    }
++  }
++
++  private static final class MockResultCollection extends AbstractCollection<NamingEnumeration<SearchResult>> {
++
++    List<NamingEnumeration<SearchResult>> results = new ArrayList<>();
++
++    static MockResultCollection create() {
++      return new MockResultCollection();
++    }
++
++    MockResultCollection addSearchResultWithDns(String... dns) throws NamingException {
++      results.add(mockNamingEnumeration(dns));
++      return this;
++    }
++
++    MockResultCollection addSearchResults(SearchResult... dns) throws NamingException {
++      results.add(mockNamingEnumeration(dns));
++      return this;
++    }
++
++    MockResultCollection addEmptySearchResult() throws NamingException {
++      addSearchResults();
++      return this;
++    }
++
++    @Override
++    public Iterator<NamingEnumeration<SearchResult>> iterator() {
++      return results.iterator();
++    }
++
++    @Override
++    public int size() {
++      return results.size();
++    }
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestUserFilter.java b/service/src/test/org/apache/hive/service/auth/ldap/TestUserFilter.java
+new file mode 100644
+index 0000000..f941c9c
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestUserFilter.java
+@@ -0,0 +1,75 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.io.IOException;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import org.junit.Before;
++import org.mockito.Mock;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestUserFilter {
++
++  private FilterFactory factory;
++  private HiveConf conf;
++
++  @Mock
++  private DirSearch search;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++    factory = new UserFilterFactory();
++  }
++
++  @Test
++  public void testFactory() {
++    conf.unset(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER.varname);
++    assertNull(factory.getInstance(conf));
++
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1");
++    assertNotNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testApplyPositive() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1,User2,uSeR3");
++
++    Filter filter = factory.getInstance(conf);
++    filter.apply(search, "User1");
++    filter.apply(search, "uid=user2,ou=People,dc=example,dc=com");
++    filter.apply(search, "User3@mydomain.com");
++  }
++
++  @Test(expected = AuthenticationException.class)
++  public void testApplyNegative() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1,User2");
++
++    Filter filter = factory.getInstance(conf);
++    filter.apply(search, "User3");
++  }
++}
+diff --git a/service/src/test/org/apache/hive/service/auth/ldap/TestUserSearchFilter.java b/service/src/test/org/apache/hive/service/auth/ldap/TestUserSearchFilter.java
+new file mode 100644
+index 0000000..0f2b509
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/auth/ldap/TestUserSearchFilter.java
+@@ -0,0 +1,94 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.auth.ldap;
++
++import java.io.IOException;
++import javax.naming.NamingException;
++import javax.security.sasl.AuthenticationException;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.mockito.runners.MockitoJUnitRunner;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++
++@RunWith(MockitoJUnitRunner.class)
++public class TestUserSearchFilter {
++
++  private FilterFactory factory;
++  private HiveConf conf;
++
++  @Mock
++  private DirSearch search;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf();
++    factory = new UserSearchFilterFactory();
++  }
++
++  @Test
++  public void testFactoryWhenNoGroupOrUserFilters() {
++    assertNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testFactoryWhenGroupFilter() {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_GROUPFILTER, "Grp1,Grp2");
++    assertNotNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testFactoryWhenUserFilter() {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1,User2");
++    assertNotNull(factory.getInstance(conf));
++  }
++
++  @Test
++  public void testApplyPositive() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1");
++    Filter filter = factory.getInstance(conf);
++
++    when(search.findUserDn(anyString())).thenReturn("cn=User1,ou=People,dc=example,dc=com");
++
++    filter.apply(search, "User1");
++  }
++
++  @Test(expected = AuthenticationException.class)
++  public void testApplyWhenNamingException() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1");
++    Filter filter = factory.getInstance(conf);
++
++    when(search.findUserDn(anyString())).thenThrow(NamingException.class);
++
++    filter.apply(search, "User3");
++  }
++
++  @Test(expected = AuthenticationException.class)
++  public void testApplyWhenNotFound() throws AuthenticationException, NamingException, IOException {
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_USERFILTER, "User1");
++    Filter filter = factory.getInstance(conf);
++
++    when(search.findUserDn(anyString())).thenReturn(null);
++
++    filter.apply(search, "User3");
++  }
++}
+-- 
+1.7.9.5
+

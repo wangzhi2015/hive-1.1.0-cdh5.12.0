@@ -1,0 +1,101 @@
+From ae6d2569bb53db172fd5713a04ea91a03ff8fff5 Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@hortonworks.com>
+Date: Mon, 21 Sep 2015 10:59:21 -0700
+Subject: [PATCH 0884/1164] CDH-48208 HIVE-11849: NPE in
+ HiveHBaseTableShapshotInputFormat in query with
+ just count(*) (Enis Soztutar via Jason Dere)
+
+(cherry picked from commit 2a65989a48e043404b7060296be8da9d3494911e)
+
+Change-Id: Icb78e4a79cf687232a82bbd6e4848e08e645c365
+---
+ .../hbase/HiveHBaseTableSnapshotInputFormat.java   |   21 ++++++++++++-------
+ .../test/queries/positive/hbase_handler_snapshot.q |    4 ++++
+ .../results/positive/hbase_handler_snapshot.q.out  |   22 ++++++++++++++++++++
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableSnapshotInputFormat.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableSnapshotInputFormat.java
+index 45e4de9..aa3a02f 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableSnapshotInputFormat.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableSnapshotInputFormat.java
+@@ -24,6 +24,9 @@
+ import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+ import org.apache.hadoop.hbase.mapred.TableInputFormat;
+ import org.apache.hadoop.hbase.mapred.TableSnapshotInputFormat;
++import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
++import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
++import org.apache.hadoop.hbase.util.Base64;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.mapred.FileInputFormat;
+ import org.apache.hadoop.mapred.InputFormat;
+@@ -41,15 +44,17 @@
+   TableSnapshotInputFormat delegate = new TableSnapshotInputFormat();
+ 
+   private static void setColumns(JobConf job) throws IOException {
+-    // hbase mapred API doesn't support scan at the moment.
+     Scan scan = HiveHBaseInputFormatUtil.getScan(job);
+-    byte[][] families = scan.getFamilies();
+-    StringBuilder sb = new StringBuilder();
+-    for (int i = 0; i < families.length; i++) {
+-      if (i > 0) sb.append(" ");
+-      sb.append(Bytes.toString(families[i]));
+-    }
+-    job.set(TableInputFormat.COLUMN_LIST, sb.toString());
++    job.set(org.apache.hadoop.hbase.mapreduce.TableInputFormat.SCAN,
++      convertScanToString(scan));
++  }
++
++  // TODO: Once HBASE-11163 is completed, use that API, or switch to
++  // using mapreduce version of the APIs. rather than mapred
++  // Copied from HBase's TableMapreduceUtil since it is not public API
++  static String convertScanToString(Scan scan) throws IOException {
++    ClientProtos.Scan proto = ProtobufUtil.toScan(scan);
++    return Base64.encodeBytes(proto.toByteArray());
+   }
+ 
+   @Override
+diff --git a/hbase-handler/src/test/queries/positive/hbase_handler_snapshot.q b/hbase-handler/src/test/queries/positive/hbase_handler_snapshot.q
+index 11d52fd..ebdc63c 100644
+--- a/hbase-handler/src/test/queries/positive/hbase_handler_snapshot.q
++++ b/hbase-handler/src/test/queries/positive/hbase_handler_snapshot.q
+@@ -2,3 +2,7 @@ SET hive.hbase.snapshot.name=src_hbase_snapshot;
+ SET hive.hbase.snapshot.restoredir=/tmp;
+ 
+ SELECT * FROM src_hbase LIMIT 5;
++
++SELECT value FROM src_hbase LIMIT 5;
++
++select count(*) from src_hbase;
+diff --git a/hbase-handler/src/test/results/positive/hbase_handler_snapshot.q.out b/hbase-handler/src/test/results/positive/hbase_handler_snapshot.q.out
+index 1cb18b2..731646c 100644
+--- a/hbase-handler/src/test/results/positive/hbase_handler_snapshot.q.out
++++ b/hbase-handler/src/test/results/positive/hbase_handler_snapshot.q.out
+@@ -11,3 +11,25 @@ POSTHOOK: Input: default@src_hbase
+ 100	val_100
+ 103	val_103
+ 104	val_104
++PREHOOK: query: SELECT value FROM src_hbase LIMIT 5
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_hbase
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT value FROM src_hbase LIMIT 5
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_hbase
++#### A masked pattern was here ####
++val_0
++val_10
++val_100
++val_103
++val_104
++PREHOOK: query: select count(*) from src_hbase
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_hbase
++#### A masked pattern was here ####
++POSTHOOK: query: select count(*) from src_hbase
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_hbase
++#### A masked pattern was here ####
++309
+-- 
+1.7.9.5
+

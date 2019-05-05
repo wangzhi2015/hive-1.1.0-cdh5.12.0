@@ -1,0 +1,75 @@
+From 10a6c101764ef5b9bc4b916811641f266f4ecc87 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Tue, 9 May 2017 10:23:15 -0400
+Subject: [PATCH 1103/1164] CDH-52465 HIVE-16451: Race condition between
+ HiveStatement.getQueryLog and
+ HiveStatement.runAsyncOnServer (Peter Vary,
+ reviewed by Anishek and Yongzhi Chen)
+
+(cherry picked from commit 691acd5a3a0948c7c8fb956b6a72c9afb780e270)
+
+Change-Id: I3752c4fef02a95f7815ba9b1343665ee70bc9fd6
+---
+ .../java/org/apache/hive/jdbc/HiveStatement.java   |   21 ++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java b/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
+index be04b4a..5997961 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
+@@ -181,18 +181,27 @@ public void clearWarnings() throws SQLException {
+     warningChain = null;
+   }
+ 
+-  void closeClientOperation() throws SQLException {
++  /**
++   * Closes the statement if there is one running. Do not change the the flags.
++   * @throws SQLException If there is an error closing the statement
++   */
++  private void closeStatementIfNeeded() throws SQLException {
+     try {
+       if (stmtHandle != null) {
+         TCloseOperationReq closeReq = new TCloseOperationReq(stmtHandle);
+         TCloseOperationResp closeResp = client.CloseOperation(closeReq);
+         Utils.verifySuccessWithInfo(closeResp.getStatus());
++        stmtHandle = null;
+       }
+     } catch (SQLException e) {
+       throw e;
+     } catch (Exception e) {
+       throw new SQLException(e.toString(), "08S01", e);
+     }
++  }
++
++  void closeClientOperation() throws SQLException {
++    closeStatementIfNeeded();
+     isQueryClosed = true;
+     isExecuteStatementFailed = false;
+     stmtHandle = null;
+@@ -229,8 +238,7 @@ public void closeOnCompletion() throws SQLException {
+   public boolean execute(String sql) throws SQLException {
+     checkConnection("execute");
+ 
+-    closeClientOperation();
+-    initFlags();
++    reInitState();
+ 
+     TExecuteStatementReq execReq = new TExecuteStatementReq(sessHandle, sql);
+     /**
+@@ -318,7 +326,12 @@ private void checkConnection(String action) throws SQLException {
+     }
+   }
+ 
+-  private void initFlags() {
++  /**
++   * Close statement if needed, and reset the flags.
++   * @throws SQLException
++   */
++  private void reInitState() throws SQLException {
++    closeStatementIfNeeded();
+     isCancelled = false;
+     isQueryClosed = false;
+     isLogBeingGenerated = true;
+-- 
+1.7.9.5
+

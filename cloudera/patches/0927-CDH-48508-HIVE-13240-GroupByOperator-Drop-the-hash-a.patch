@@ -1,0 +1,88 @@
+From 674dea7cce827e4a449d9a3bec89e05a5b822cbe Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Fri, 22 Apr 2016 10:55:53 -0700
+Subject: [PATCH 0927/1164] CDH-48508: HIVE-13240 : GroupByOperator: Drop the
+ hash aggregates when closing operator (Gopal V,
+ reviewed by Sergey Shelukhin)
+
+(cherry picked from commit 145e253df9c05e4e725c6aeab172ac0885bf5384)
+
+Change-Id: I8bf90bc6539edc9219097a626065dd1583ccf183
+---
+ .../hadoop/hive/ql/exec/GroupByOperator.java       |    1 +
+ .../hadoop/hive/ql/exec/ReduceSinkOperator.java    |   15 ++++++++++-----
+ 2 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/GroupByOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/GroupByOperator.java
+index 7918194..481b453 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/GroupByOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/GroupByOperator.java
+@@ -1084,6 +1084,7 @@ public void closeOp(boolean abort) throws HiveException {
+         throw new HiveException(e);
+       }
+     }
++    hashAggregations = null;
+   }
+ 
+   // Group by contains the columns needed - no need to aggregate from children
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java
+index 507f1e0..984c806 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java
+@@ -116,7 +116,7 @@
+   protected transient String[] inputAliases;  // input aliases of this RS for join (used for PPD)
+   protected transient boolean useUniformHash = false;
+   // picks topN K:V pairs from input.
+-  protected transient TopNHash reducerHash = new TopNHash();
++  protected transient TopNHash reducerHash;
+   protected transient HiveKey keyWritable = new HiveKey();
+   protected transient ObjectInspector keyObjectInspector;
+   protected transient ObjectInspector valueObjectInspector;
+@@ -225,7 +225,7 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+       float memUsage = conf.getTopNMemoryUsage();
+ 
+       if (limit >= 0 && memUsage > 0) {
+-        reducerHash = conf.isPTFReduceSink() ? new PTFTopNHash() : reducerHash;
++        reducerHash = conf.isPTFReduceSink() ? new PTFTopNHash() : new TopNHash();
+         reducerHash.initialize(limit, memUsage, conf.isMapGroupBy(), this);
+       }
+ 
+@@ -374,8 +374,11 @@ public void processOp(Object row, int tag) throws HiveException {
+        */
+       boolean partKeyNull = conf.isPTFReduceSink() && partitionKeysAreNull(row);
+ 
+-      // Try to store the first key. If it's not excluded, we will proceed.
+-      int firstIndex = reducerHash.tryStoreKey(firstKey, partKeyNull);
++      // Try to store the first key.
++      // if TopNHashes aren't active, always forward
++      // if TopNHashes are active, proceed if not already excluded (i.e order by limit)
++      final int firstIndex =
++          (reducerHash != null) ? reducerHash.tryStoreKey(firstKey, partKeyNull) : TopNHash.FORWARD;
+       if (firstIndex == TopNHash.EXCLUDE) return; // Nothing to do.
+       // Compute value and hashcode - we'd either store or forward them.
+       BytesWritable value = makeValueWritable(row);
+@@ -383,6 +386,7 @@ public void processOp(Object row, int tag) throws HiveException {
+       if (firstIndex == TopNHash.FORWARD) {
+         collect(firstKey, value);
+       } else {
++        // invariant: reducerHash != null
+         assert firstIndex >= 0;
+         reducerHash.storeValue(firstIndex, firstKey.hashCode(), value, false);
+       }
+@@ -553,11 +557,12 @@ private BytesWritable makeValueWritable(Object row) throws Exception {
+ 
+   @Override
+   protected void closeOp(boolean abort) throws HiveException {
+-    if (!abort) {
++    if (!abort && reducerHash != null) {
+       reducerHash.flush();
+     }
+     super.closeOp(abort);
+     out = null;
++    reducerHash = null;
+     if (isLogInfoEnabled) {
+       LOG.info(toString() + ": records written - " + numRows);
+     }
+-- 
+1.7.9.5
+

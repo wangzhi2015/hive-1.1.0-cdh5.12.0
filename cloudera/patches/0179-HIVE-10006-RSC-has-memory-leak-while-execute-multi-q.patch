@@ -1,0 +1,64 @@
+From 235049b30b8fa2c560be65650bac74c35cf9c990 Mon Sep 17 00:00:00 2001
+From: lirui <lirui@unknown>
+Date: Mon, 23 Mar 2015 06:46:44 +0000
+Subject: [PATCH 0179/1164] HIVE-10006: RSC has memory leak while execute
+ multi queries.[Spark Branch] (Chengxiang via Rui,
+ reviewed by Xuefu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/branches/spark@1668521 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hive/ql/exec/spark/SparkPlanGenerator.java     |   22 +++++++++++++-------
+ .../hadoop/hive/ql/io/CombineHiveInputFormat.java  |    4 ++++
+ 2 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
+index abe5a60..491f9c0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
+@@ -98,14 +98,20 @@ public SparkPlan generate(SparkWork sparkWork) throws Exception {
+     workToTranMap.clear();
+     workToParentWorkTranMap.clear();
+ 
+-    for (BaseWork work : sparkWork.getAllWork()) {
+-      perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.SPARK_CREATE_TRAN + work.getName());
+-      SparkTran tran = generate(work);
+-      SparkTran parentTran = generateParentTran(sparkPlan, sparkWork, work);
+-      sparkPlan.addTran(tran);
+-      sparkPlan.connect(parentTran, tran);
+-      workToTranMap.put(work, tran);
+-      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.SPARK_CREATE_TRAN + work.getName());
++    try {
++      for (BaseWork work : sparkWork.getAllWork()) {
++        perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.SPARK_CREATE_TRAN + work.getName());
++        SparkTran tran = generate(work);
++        SparkTran parentTran = generateParentTran(sparkPlan, sparkWork, work);
++        sparkPlan.addTran(tran);
++        sparkPlan.connect(parentTran, tran);
++        workToTranMap.put(work, tran);
++        perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.SPARK_CREATE_TRAN + work.getName());
++      }
++    } finally {
++      // clear all ThreadLocal cached MapWork/ReduceWork after plan generation
++      // as this may executed in a pool thread.
++      Utilities.clearWorkMap();
+     }
+ 
+     perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.SPARK_BUILD_PLAN);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+index 6710c14..1de7e40 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+@@ -580,6 +580,10 @@ public int hashCode() {
+     if (oldPaths != null) {
+       job.set(HiveConf.ConfVars.HADOOPMAPREDINPUTDIR.varname, oldPaths);
+     }
++
++    // clear work from ThreadLocal after splits generated in case of thread is reused in pool.
++    Utilities.clearWorkMapForConf(job);
++
+     LOG.info("Number of all splits " + result.size());
+     perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.GET_SPLITS);
+     return result.toArray(new InputSplit[result.size()]);
+-- 
+1.7.9.5
+

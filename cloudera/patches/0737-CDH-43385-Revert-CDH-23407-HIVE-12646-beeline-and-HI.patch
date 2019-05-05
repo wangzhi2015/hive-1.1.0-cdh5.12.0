@@ -1,0 +1,172 @@
+From a4943219532963563d25f93168cc72c6eb628fb5 Mon Sep 17 00:00:00 2001
+From: stakiar <stakiar@cloudera.com>
+Date: Mon, 22 Aug 2016 19:26:42 -0700
+Subject: [PATCH 0737/1164] CDH-43385: Revert "CDH-23407: HIVE-12646: beeline
+ and HIVE CLI do not parse ; in quote properly
+ (Sahil Takiar, reviewed by Sergio Pena)"
+
+This reverts commit 63722ce0ecfcd5495d3117e2c256373e24d448aa.
+
+Change-Id: I8c647f2c1c7b8c0746a900b3398ee8d027b7038b
+---
+ .../src/java/org/apache/hive/beeline/Commands.java |   90 ++++----------------
+ .../apache/hive/beeline/TestBeeLineWithArgs.java   |   21 -----
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    2 +-
+ 3 files changed, 17 insertions(+), 96 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 9063418..aa36c07 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -1112,89 +1112,31 @@ private boolean execute(String line, boolean call, boolean entireLineAsCommand)
+     }
+ 
+     line = line.trim();
+-    List<String> cmdList = getCmdList(line, entireLineAsCommand);
+-    for (int i = 0; i < cmdList.size(); i++) {
+-      String sql = cmdList.get(i).trim();
+-      if (sql.length() != 0) {
+-        if (!executeInternal(sql, call)) {
+-          return false;
+-        }
+-      }
+-    }
+-    return true;
+-  }
+-
+-  /**
+-   * Helper method to parse input from Beeline and convert it to a {@link List} of commands that
+-   * can be executed. This method contains logic for handling semicolons that are placed within
+-   * quotations. It iterates through each character in the line and checks to see if it is a ;, ',
+-   * or "
+-   */
+-  private List<String> getCmdList(String line, boolean entireLineAsCommand) {
+     List<String> cmdList = new ArrayList<String>();
+     if (entireLineAsCommand) {
+       cmdList.add(line);
+     } else {
+       StringBuffer command = new StringBuffer();
+-
+-      boolean hasUnterminatedDoubleQuote = false;
+-      boolean hasUntermindatedSingleQuote = false;
+-
+-      int lastSemiColonIndex = 0;
+-      char[] lineChars = line.toCharArray();
+-
+-      boolean wasPrevEscape = false;
+-      int index = 0;
+-      for (; index < lineChars.length; index++) {
+-        switch (lineChars[index]) {
+-          case '\'':
+-            if (!hasUnterminatedDoubleQuote && !wasPrevEscape) {
+-              hasUntermindatedSingleQuote = !hasUntermindatedSingleQuote;
+-            }
+-            wasPrevEscape = false;
+-            break;
+-          case '\"':
+-            if (!hasUntermindatedSingleQuote && !wasPrevEscape) {
+-              hasUnterminatedDoubleQuote = !hasUnterminatedDoubleQuote;
+-            }
+-            wasPrevEscape = false;
+-            break;
+-          case ';':
+-            if (!hasUnterminatedDoubleQuote && !hasUntermindatedSingleQuote) {
+-              addCmdPart(cmdList, command, line.substring(lastSemiColonIndex, index));
+-              lastSemiColonIndex = index + 1;
+-            }
+-            wasPrevEscape = false;
+-            break;
+-          case '\\':
+-            wasPrevEscape = true;
+-            break;
+-          default:
+-            wasPrevEscape = false;
+-            break;
++      for (String cmdpart: line.split(";")) {
++        if (cmdpart.endsWith("\\")) {
++          command.append(cmdpart.substring(0, cmdpart.length() -1)).append(";");
++          continue;
++        } else {
++          command.append(cmdpart);
+         }
+-      }
+-      // if the line doesn't end with a ; or if the line is empty, add the cmd part
+-      if (lastSemiColonIndex != index || lineChars.length == 0) {
+-        addCmdPart(cmdList, command, line.substring(lastSemiColonIndex, index));
++        cmdList.add(command.toString());
++        command.setLength(0);
+       }
+     }
+-    return cmdList;
+-  }
+-
+-  /**
+-   * Given a cmdpart (e.g. if a command spans multiple lines), add to the current command, and if
+-   * applicable add that command to the {@link List} of commands
+-   */
+-  private void addCmdPart(List<String> cmdList, StringBuffer command, String cmdpart) {
+-    if (cmdpart.endsWith("\\")) {
+-      command.append(cmdpart.substring(0, cmdpart.length() - 1)).append(";");
+-      return;
+-    } else {
+-      command.append(cmdpart);
++    for (int i = 0; i < cmdList.size(); i++) {
++      String sql = cmdList.get(i).trim();
++      if (sql.length() != 0) {
++        if (!executeInternal(sql, call)) {
++          return false;
++        }
++      }
+     }
+-    cmdList.add(command.toString());
+-    command.setLength(0);
++    return true;
+   }
+ 
+   private Runnable createLogRunnable(Statement statement) {
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+index 6e4e6ba..126dbbb 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+@@ -789,25 +789,4 @@ public void testConnectionWithURLParams() throws Throwable {
+ 
+     testScriptFile( SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+-
+-  /**
+-   * Test that Beeline queries don't treat semicolons inside quotations as query-ending characters.
+-   */
+-  @Test
+-  public void testQueryNonEscapedSemiColon() throws Throwable {
+-    String SCRIPT_TEXT = "drop table if exists nonEscapedSemiColon;create table nonEscapedSemiColon "
+-            + "(key int) ROW FORMAT DELIMITED FIELDS TERMINATED BY ';';show tables;";
+-    final String EXPECTED_PATTERN = " nonEscapedSemiColon ";
+-    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+-  }
+-
+-  @Test
+-  public void testSelectQueryWithNonEscapedSemiColon() throws Throwable {
+-    String SCRIPT_TEXT = "select ';', \"';'\", '\";\"', '\\';', ';\\'', '\\\";', ';\\\"' from " + tableName + ";";
+-    final String EXPECTED_PATTERN = ";\t';'\t\";\"\t';\t;'\t\";\t;\"";
+-    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+-    argList.add("--outputformat=tsv2");
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+-  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 0133e2c..b9c7351 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -4447,7 +4447,7 @@ private String escapeHiveCommand(String str) {
+     StringBuilder sb = new StringBuilder();
+     for (int i = 0; i < str.length(); i ++) {
+       char c = str.charAt(i);
+-      if (c == '\'') {
++      if (c == '\'' || c == ';') {
+         sb.append('\\');
+       }
+       sb.append(c);
+-- 
+1.7.9.5
+

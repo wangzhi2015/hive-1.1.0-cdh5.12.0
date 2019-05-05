@@ -1,0 +1,2377 @@
+From 13720019732b5e21178a2a1e1a208fe190d615ef Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Mon, 27 Jun 2016 10:18:45 -0500
+Subject: [PATCH 0646/1164] Revert "CDH-41331: HIVE-12661:
+ StatsSetupConst.COLUMN_STATS_ACCURATE is not used
+ correctly (Pengcheng Xiong, reviewed by Ashutosh
+ Chauhan)"
+
+This reverts commit 4a713fb78b11f23aa005422a846e3798195ec8ac.
+---
+ common/pom.xml                                     |    5 -
+ .../apache/hadoop/hive/common/StatsSetupConst.java |  211 +----
+ .../listener/TestDbNotificationListener.java       |   26 +-
+ .../hadoop/hive/metastore/MetaStoreUtils.java      |   14 +-
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |   24 +-
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    7 +-
+ .../org/apache/hadoop/hive/ql/exec/StatsTask.java  |   12 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   30 +-
+ .../org/apache/hadoop/hive/ql/metadata/Table.java  |    2 +-
+ .../hadoop/hive/ql/optimizer/StatsOptimizer.java   |   66 +-
+ .../org/apache/hadoop/hive/ql/plan/StatsWork.java  |    4 -
+ .../columnStatsUpdateForStatsOptimizer_1.q         |  102 ---
+ .../columnStatsUpdateForStatsOptimizer_2.q         |   58 --
+ .../columnStatsUpdateForStatsOptimizer_1.q.out     |  945 --------------------
+ .../columnStatsUpdateForStatsOptimizer_2.q.out     |  447 ---------
+ 15 files changed, 66 insertions(+), 1887 deletions(-)
+ delete mode 100644 ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_1.q
+ delete mode 100644 ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_2.q
+ delete mode 100644 ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_1.q.out
+ delete mode 100644 ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_2.q.out
+
+diff --git a/common/pom.xml b/common/pom.xml
+index 9264332..7b4b275 100644
+--- a/common/pom.xml
++++ b/common/pom.xml
+@@ -85,11 +85,6 @@
+       <artifactId>ant</artifactId>
+       <version>${ant.version}</version>
+     </dependency>
+-    <dependency>
+-      <groupId>org.json</groupId>
+-      <artifactId>json</artifactId>
+-      <version>${json.version}</version>
+-    </dependency>
+     <!-- test inter-project -->
+     <dependency>
+       <groupId>com.google.code.tempus-fugit</groupId>
+diff --git a/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java b/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java
+index 88869ac..c70cdfb 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java
++++ b/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java
+@@ -19,15 +19,9 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.conf.HiveConf;
+-import org.json.JSONException;
+-import org.json.JSONObject;
+ 
+-import java.util.LinkedHashMap;
+-import java.util.List;
+ import java.util.Map;
+ 
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ 
+ 
+ /**
+@@ -36,8 +30,6 @@
+ 
+ public class StatsSetupConst {
+ 
+-  protected final static Logger LOG = LoggerFactory.getLogger(StatsSetupConst.class.getName());
+-
+   public enum StatDB {
+     hbase {
+       @Override
+@@ -148,211 +140,16 @@ public String getAggregator(Configuration conf) {
+   // update should take place, such as with replication.
+   public static final String DO_NOT_UPDATE_STATS = "DO_NOT_UPDATE_STATS";
+ 
+-  //This string constant will be persisted in metastore to indicate whether corresponding
+-  //table or partition's statistics and table or partition's column statistics are accurate or not.
++  // This string constant will be persisted in metastore to indicate whether corresponding
++  // table or partition's statistics are accurate or not.
+   public static final String COLUMN_STATS_ACCURATE = "COLUMN_STATS_ACCURATE";
+ 
+-  public static final String COLUMN_STATS = "COLUMN_STATS";
+-
+-  public static final String BASIC_STATS = "BASIC_STATS";
+-
+   public static final String TRUE = "true";
+ 
+   public static final String FALSE = "false";
+ 
+-  public static boolean areBasicStatsUptoDate(Map<String, String> params) {
+-    String statsAcc = params.get(COLUMN_STATS_ACCURATE);
+-    if (statsAcc == null) {
+-      return false;
+-    } else {
+-      JSONObject jsonObj;
+-      try {
+-        jsonObj = new JSONObject(statsAcc);
+-        if (jsonObj != null && jsonObj.has(BASIC_STATS)) {
+-          return true;
+-        } else {
+-          return false;
+-        }
+-      } catch (JSONException e) {
+-        // For backward compatibility, if previous value can not be parsed to a
+-        // json object, it will come here.
+-        LOG.debug("In StatsSetupConst, JsonParser can not parse " + BASIC_STATS + ".");
+-        // We try to parse it as TRUE or FALSE
+-        if (statsAcc.equals(TRUE)) {
+-          setBasicStatsState(params, TRUE);
+-          return true;
+-        } else {
+-          setBasicStatsState(params, FALSE);
+-          return false;
+-        }
+-      }
+-    }
+-  }
+-
+-  public static boolean areColumnStatsUptoDate(Map<String, String> params, String colName) {
+-    String statsAcc = params.get(COLUMN_STATS_ACCURATE);
+-    if (statsAcc == null) {
+-      return false;
+-    } else {
+-      JSONObject jsonObj;
+-      try {
+-        jsonObj = new JSONObject(statsAcc);
+-        if (jsonObj == null || !jsonObj.has(COLUMN_STATS)) {
+-          return false;
+-        } else {
+-          JSONObject columns = jsonObj.getJSONObject(COLUMN_STATS);
+-          if (columns != null && columns.has(colName)) {
+-            return true;
+-          } else {
+-            return false;
+-          }
+-        }
+-      } catch (JSONException e) {
+-        // For backward compatibility, if previous value can not be parsed to a
+-        // json object, it will come here.
+-        LOG.debug("In StatsSetupConst, JsonParser can not parse COLUMN_STATS.");
+-        return false;
+-      }
+-    }
+-  }
+-
+-  // It will only throw JSONException when stats.put(BASIC_STATS, TRUE)
+-  // has duplicate key, which is not possible
+-  // note that set basic stats false will wipe out column stats too.
+-  public static void setBasicStatsState(Map<String, String> params, String setting) {
+-    if (setting.equals(FALSE)) {
+-      if (params.containsKey(COLUMN_STATS_ACCURATE)) {
+-        params.remove(COLUMN_STATS_ACCURATE);
+-      }
+-    } else {
+-      String statsAcc = params.get(COLUMN_STATS_ACCURATE);
+-      if (statsAcc == null) {
+-        JSONObject stats = new JSONObject(new LinkedHashMap());
+-        // duplicate key is not possible
+-        try {
+-          stats.put(BASIC_STATS, TRUE);
+-        } catch (JSONException e) {
+-          // impossible to throw any json exceptions.
+-          LOG.trace(e.getMessage());
+-        }
+-        params.put(COLUMN_STATS_ACCURATE, stats.toString());
+-      } else {
+-        // statsAcc may not be jason format, which will throw exception
+-        JSONObject stats;
+-        try {
+-          stats = new JSONObject(statsAcc);
+-        } catch (JSONException e) {
+-          // old format of statsAcc, e.g., TRUE or FALSE
+-          LOG.debug("In StatsSetupConst, JsonParser can not parse statsAcc.");
+-          stats = new JSONObject(new LinkedHashMap());
+-          try {
+-            if (statsAcc.equals(TRUE)) {
+-              stats.put(BASIC_STATS, TRUE);
+-            } else {
+-              stats.put(BASIC_STATS, FALSE);
+-            }
+-          } catch (JSONException e1) {
+-            // impossible to throw any json exceptions.
+-            LOG.trace(e1.getMessage());
+-          }
+-        }
+-        if (!stats.has(BASIC_STATS)) {
+-          // duplicate key is not possible
+-          try {
+-            stats.put(BASIC_STATS, TRUE);
+-          } catch (JSONException e) {
+-            // impossible to throw any json exceptions.
+-            LOG.trace(e.getMessage());
+-          }
+-        }
+-        params.put(COLUMN_STATS_ACCURATE, stats.toString());
+-      }
+-    }
+-  }
+-
+-  public static void setColumnStatsState(Map<String, String> params, List<String> colNames) {
+-    try {
+-      String statsAcc = params.get(COLUMN_STATS_ACCURATE);
+-      JSONObject colStats = new JSONObject(new LinkedHashMap());
+-      // duplicate key is not possible
+-      for (String colName : colNames) {
+-        colStats.put(colName.toLowerCase(), TRUE);
+-      }
+-      if (statsAcc == null) {
+-        JSONObject stats = new JSONObject(new LinkedHashMap());
+-        // duplicate key is not possible
+-        stats.put(COLUMN_STATS, colStats);
+-        params.put(COLUMN_STATS_ACCURATE, stats.toString());
+-      } else {
+-        // statsAcc may not be jason format, which will throw exception
+-        JSONObject stats;
+-        try {
+-          stats = new JSONObject(statsAcc);
+-        } catch (JSONException e) {
+-          // old format of statsAcc, e.g., TRUE or FALSE
+-          LOG.debug("In StatsSetupConst, JsonParser can not parse statsAcc.");
+-          stats = new JSONObject(new LinkedHashMap());
+-          try {
+-            if (statsAcc.equals(TRUE)) {
+-              stats.put(BASIC_STATS, TRUE);
+-            } else {
+-              stats.put(BASIC_STATS, FALSE);
+-            }
+-          } catch (JSONException e1) {
+-            // impossible to throw any json exceptions.
+-            LOG.trace(e1.getMessage());
+-          }
+-        }
+-        if (!stats.has(COLUMN_STATS)) {
+-          // duplicate key is not possible
+-          stats.put(COLUMN_STATS, colStats);
+-        } else {
+-          // getJSONObject(COLUMN_STATS) should be found.
+-          JSONObject allColumnStats = stats.getJSONObject(COLUMN_STATS);
+-          for (String colName : colNames) {
+-            if (!allColumnStats.has(colName)) {
+-              // duplicate key is not possible
+-              allColumnStats.put(colName, TRUE);
+-            }
+-          }
+-          stats.remove(COLUMN_STATS);
+-          // duplicate key is not possible
+-          stats.put(COLUMN_STATS, allColumnStats);
+-        }
+-        params.put(COLUMN_STATS_ACCURATE, stats.toString());
+-      }
+-    } catch (JSONException e) {
+-      //impossible to throw any json exceptions.
+-      LOG.trace(e.getMessage());
+-    }
+-  }
+-
+-  public static void clearColumnStatsState(Map<String, String> params) {
++  public static boolean areStatsUptoDate(Map<String, String> params) {
+     String statsAcc = params.get(COLUMN_STATS_ACCURATE);
+-    if (statsAcc != null) {
+-      // statsAcc may not be jason format, which will throw exception
+-      JSONObject stats;
+-      try {
+-        stats = new JSONObject(statsAcc);
+-      } catch (JSONException e) {
+-        // old format of statsAcc, e.g., TRUE or FALSE
+-        LOG.debug("In StatsSetupConst, JsonParser can not parse statsAcc.");
+-        stats = new JSONObject(new LinkedHashMap());
+-        try {
+-          if (statsAcc.equals(TRUE)) {
+-            stats.put(BASIC_STATS, TRUE);
+-          } else {
+-            stats.put(BASIC_STATS, FALSE);
+-          }
+-        } catch (JSONException e1) {
+-          // impossible to throw any json exceptions.
+-          LOG.trace(e1.getMessage());
+-        }
+-      }
+-      if (stats.has(COLUMN_STATS)) {
+-        stats.remove(COLUMN_STATS);
+-      }
+-      params.put(COLUMN_STATS_ACCURATE, stats.toString());
+-    }
++    return statsAcc == null ? false : statsAcc.equals(TRUE);
+   }
+ }
+diff --git a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+index f17e768..d7a71a2 100644
+--- a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
++++ b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+@@ -536,35 +536,35 @@ public void sqlInsertPartition() throws Exception {
+     for (NotificationEvent ne : rsp.getEvents()) LOG.debug("EVENT: " + ne.getMessage());
+     // For reasons not clear to me there's one or more alter partitions after add partition and
+     // insert.
+-    assertEquals(25, rsp.getEventsSize());
++    assertEquals(19, rsp.getEventsSize());
+     NotificationEvent event = rsp.getEvents().get(1);
+     assertEquals(firstEventId + 2, event.getEventId());
+     assertEquals(HCatConstants.HCAT_ADD_PARTITION_EVENT, event.getEventType());
+-    event = rsp.getEvents().get(5);
+-    assertEquals(firstEventId + 6, event.getEventId());
++    event = rsp.getEvents().get(4);
++    assertEquals(firstEventId + 5, event.getEventId());
+     assertEquals(HCatConstants.HCAT_INSERT_EVENT, event.getEventType());
+     // Make sure the files are listed in the insert
+     assertTrue(event.getMessage().matches(".*\"files\":\\[\"pfile.*"));
++    event = rsp.getEvents().get(7);
++    assertEquals(firstEventId + 8, event.getEventId());
++    assertEquals(HCatConstants.HCAT_INSERT_EVENT, event.getEventType());
++    assertTrue(event.getMessage().matches(".*\"files\":\\[\"pfile.*"));
+     event = rsp.getEvents().get(9);
+     assertEquals(firstEventId + 10, event.getEventId());
++    assertEquals(HCatConstants.HCAT_ADD_PARTITION_EVENT, event.getEventType());
++    event = rsp.getEvents().get(11);
++    assertEquals(firstEventId + 12, event.getEventId());
+     assertEquals(HCatConstants.HCAT_INSERT_EVENT, event.getEventType());
+     assertTrue(event.getMessage().matches(".*\"files\":\\[\"pfile.*"));
+-    event = rsp.getEvents().get(12);
+-    assertEquals(firstEventId + 13, event.getEventId());
+-    assertEquals(HCatConstants.HCAT_ADD_PARTITION_EVENT, event.getEventType());
+     event = rsp.getEvents().get(14);
+     assertEquals(firstEventId + 15, event.getEventId());
+     assertEquals(HCatConstants.HCAT_INSERT_EVENT, event.getEventType());
+     assertTrue(event.getMessage().matches(".*\"files\":\\[\"pfile.*"));
++    event = rsp.getEvents().get(16);
++    assertEquals(firstEventId + 17, event.getEventId());
++    assertEquals(HCatConstants.HCAT_ADD_PARTITION_EVENT, event.getEventType());
+     event = rsp.getEvents().get(18);
+     assertEquals(firstEventId + 19, event.getEventId());
+-    assertEquals(HCatConstants.HCAT_INSERT_EVENT, event.getEventType());
+-    assertTrue(event.getMessage().matches(".*\"files\":\\[\"pfile.*"));
+-    event = rsp.getEvents().get(21);
+-    assertEquals(firstEventId + 22, event.getEventId());
+-    assertEquals(HCatConstants.HCAT_ADD_PARTITION_EVENT, event.getEventType());
+-    event = rsp.getEvents().get(24);
+-    assertEquals(firstEventId + 25, event.getEventId());
+     assertEquals(HCatConstants.HCAT_DROP_PARTITION_EVENT, event.getEventType());
+   }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+index 9276e8f..eadc61c 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+@@ -220,10 +220,13 @@ public static boolean updateUnpartitionedTableStatsFast(Table tbl,
+         LOG.info("Updated size of table " + tbl.getTableName() +" to "+ params.get(StatsSetupConst.TOTAL_SIZE));
+         if(!params.containsKey(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK)) {
+           // invalidate stats requiring scan since this is a regular ddl alter case
+-          StatsSetupConst.setBasicStatsState(params, StatsSetupConst.FALSE);
++          for (String stat : StatsSetupConst.statsRequireCompute) {
++            params.put(stat, "-1");
++          }
++          params.put(StatsSetupConst.COLUMN_STATS_ACCURATE, StatsSetupConst.FALSE);
+         } else {
+           params.remove(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK);
+-          StatsSetupConst.setBasicStatsState(params, StatsSetupConst.TRUE);
++          params.put(StatsSetupConst.COLUMN_STATS_ACCURATE, StatsSetupConst.TRUE);
+         }
+       }
+       tbl.setParameters(params);
+@@ -338,10 +341,13 @@ public static boolean updatePartitionStatsFast(PartitionSpecProxy.PartitionItera
+         LOG.warn("Updated size to " + params.get(StatsSetupConst.TOTAL_SIZE));
+         if(!params.containsKey(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK)) {
+           // invalidate stats requiring scan since this is a regular ddl alter case
+-          StatsSetupConst.setBasicStatsState(params, StatsSetupConst.FALSE);
++          for (String stat : StatsSetupConst.statsRequireCompute) {
++            params.put(stat, "-1");
++          }
++          params.put(StatsSetupConst.COLUMN_STATS_ACCURATE, StatsSetupConst.FALSE);
+         } else {
+           params.remove(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK);
+-          StatsSetupConst.setBasicStatsState(params, StatsSetupConst.TRUE);
++          params.put(StatsSetupConst.COLUMN_STATS_ACCURATE, StatsSetupConst.TRUE);
+         }
+       }
+       part.setParameters(params);
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index b73c63b..f4bc58f 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -65,7 +65,6 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.ObjectPair;
+-import org.apache.hadoop.hive.common.StatsSetupConst;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
+ import org.apache.hadoop.hive.common.classification.InterfaceStability;
+ import org.apache.hadoop.hive.common.metrics.common.Metrics;
+@@ -6329,24 +6328,12 @@ public boolean updateTableColumnStatistics(ColumnStatistics colStats)
+       // DataNucleus objects get detached all over the place for no (real) reason.
+       // So let's not use them anywhere unless absolutely necessary.
+       Table table = ensureGetTable(statsDesc.getDbName(), statsDesc.getTableName());
+-      List<String> colNames = new ArrayList<>();
+       for (ColumnStatisticsObj statsObj:statsObjs) {
+         // We have to get mtable again because DataNucleus.
+         MTableColumnStatistics mStatsObj = StatObjectConverter.convertToMTableColumnStatistics(
+             ensureGetMTable(statsDesc.getDbName(), statsDesc.getTableName()), statsDesc, statsObj);
+         writeMTableColumnStatistics(table, mStatsObj);
+-        colNames.add(statsObj.getColName());
+       }
+-
+-      // Set the table properties
+-      // No need to check again if it exists.
+-      String dbname = table.getDbName();
+-      String name = table.getTableName();
+-      MTable oldt = getMTable(dbname, name);
+-      Map<String, String> parameters = table.getParameters();
+-      StatsSetupConst.setColumnStatsState(parameters, colNames);
+-      oldt.setParameters(parameters);
+-
+       committed = commitTransaction();
+       return committed;
+     } finally {
+@@ -6368,7 +6355,6 @@ public boolean updatePartitionColumnStatistics(ColumnStatistics colStats, List<S
+     Table table = ensureGetTable(statsDesc.getDbName(), statsDesc.getTableName());
+     Partition partition = convertToPart(getMPartition(
+         statsDesc.getDbName(), statsDesc.getTableName(), partVals));
+-    List<String> colNames = new ArrayList<>();
+     for (ColumnStatisticsObj statsObj:statsObjs) {
+       // We have to get partition again because DataNucleus
+       MPartition mPartition = getMPartition(
+@@ -6379,15 +6365,7 @@ public boolean updatePartitionColumnStatistics(ColumnStatistics colStats, List<S
+       MPartitionColumnStatistics mStatsObj =
+           StatObjectConverter.convertToMPartitionColumnStatistics(mPartition, statsDesc, statsObj);
+       writeMPartitionColumnStatistics(table, partition, mStatsObj);
+-      colNames.add(statsObj.getColName());
+-    }
+-    // Set the partition properties
+-    // No need to check again if it exists.
+-    MPartition mPartition = getMPartition(
+-        statsDesc.getDbName(), statsDesc.getTableName(), partVals);
+-    Map<String, String> parameters = mPartition.getParameters();
+-    StatsSetupConst.setColumnStatsState(parameters, colNames);
+-    mPartition.setParameters(parameters);
++    }
+     committed = commitTransaction();
+     return committed;
+     } finally {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index f98900c..b04be9a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -4388,15 +4388,10 @@ private boolean needToUpdateStats(Map<String,String> props) {
+       String statVal = props.get(stat);
+       if (statVal != null && Long.parseLong(statVal) > 0) {
+         statsPresent = true;
+-        //In the case of truncate table, we set the stats to be 0.
+         props.put(stat, "0");
++        props.put(StatsSetupConst.COLUMN_STATS_ACCURATE, "false");
+       }
+     }
+-    //first set basic stats to true
+-    StatsSetupConst.setBasicStatsState(props, StatsSetupConst.TRUE);
+-    props.put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, StatsSetupConst.TRUE);
+-    //then invalidate column stats
+-    StatsSetupConst.clearColumnStatsState(props);
+     return statsPresent;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsTask.java
+index dd8eb97..6922f89 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsTask.java
+@@ -179,9 +179,7 @@ private int aggregateStats() {
+         updateQuickStats(wh, parameters, tTable.getSd());
+ 
+         // write table stats to metastore
+-        if (!getWork().getNoStatsAggregator()) {
+-          parameters.put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, StatsSetupConst.TRUE);
+-        }
++        parameters.put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, StatsSetupConst.TRUE);
+ 
+         db.alterTable(tableFullName, new Table(tTable));
+ 
+@@ -214,9 +212,7 @@ private int aggregateStats() {
+ 
+           updateQuickStats(wh, parameters, tPart.getSd());
+ 
+-          if (!getWork().getNoStatsAggregator()) {
+-            parameters.put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, StatsSetupConst.TRUE);
+-          }
++          parameters.put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, StatsSetupConst.TRUE);
+           updates.add(new Partition(table, tPart));
+ 
+           console.printInfo("Partition " + tableFullName + partn.getSpec() +
+@@ -311,7 +307,7 @@ private void updateStats(StatsAggregator statsAggregator,
+         if (work.getLoadTableDesc() != null &&
+             !work.getLoadTableDesc().getReplace()) {
+           String originalValue = parameters.get(statType);
+-          if (originalValue != null) {
++          if (originalValue != null && !originalValue.equals("-1")) {
+             longValue += Long.parseLong(originalValue); // todo: invalid + valid = invalid
+           }
+         }
+@@ -337,7 +333,7 @@ private void updateQuickStats(Warehouse wh, Map<String, String> parameters,
+   private void clearStats(Map<String, String> parameters) {
+     for (String statType : StatsSetupConst.supportedStats) {
+       if (parameters.containsKey(statType)) {
+-        parameters.remove(statType);
++        parameters.put(statType, "0");
+       }
+     }
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index d681061..cca6187 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -507,7 +507,7 @@ public void createTable(String tableName, List<String> columns, List<String> par
+     tbl.setNumBuckets(bucketCount);
+     tbl.setBucketCols(bucketCols);
+     if (parameters != null) {
+-      tbl.setParameters(parameters);
++      tbl.setParamters(parameters);
+     }
+     createTable(tbl);
+   }
+@@ -1390,7 +1390,6 @@ public void loadPartition(Path loadPath, String tableName,
+    * @param isSrcLocal
+    *          If the source directory is LOCAL
+    * @param isAcid true if this is an ACID operation
+-   * @throws JSONException
+    */
+   public Partition loadPartition(Path loadPath, Table tbl,
+       Map<String, String> partSpec, boolean replace, boolean holdDDLTime,
+@@ -1451,33 +1450,23 @@ public Partition loadPartition(Path loadPath, Table tbl,
+       boolean forceCreate = (!holdDDLTime) ? true : false;
+       newTPart = getPartition(tbl, partSpec, forceCreate, newPartPath.toString(),
+           inheritTableSpecs, newFiles);
+-      //column stats will be inaccurate
+-      StatsSetupConst.clearColumnStatsState(newTPart.getParameters());
+-
+       // recreate the partition if it existed before
+       if (!holdDDLTime) {
+         if (isSkewedStoreAsSubdir) {
+           org.apache.hadoop.hive.metastore.api.Partition newCreatedTpart = newTPart.getTPartition();
+           SkewedInfo skewedInfo = newCreatedTpart.getSd().getSkewedInfo();
+-        /* Construct list bucketing location mappings from sub-directory name. */
++          /* Construct list bucketing location mappings from sub-directory name. */
+           Map<List<String>, String> skewedColValueLocationMaps = constructListBucketingLocationMap(
+-                  newPartPath, skewedInfo);
+-        /* Add list bucketing location mappings. */
++              newPartPath, skewedInfo);
++          /* Add list bucketing location mappings. */
+           skewedInfo.setSkewedColValueLocationMaps(skewedColValueLocationMaps);
+           newCreatedTpart.getSd().setSkewedInfo(skewedInfo);
+-          if (!this.getConf().getBoolVar(HiveConf.ConfVars.HIVESTATSAUTOGATHER)) {
+-            newTPart.getParameters().put(StatsSetupConst.COLUMN_STATS_ACCURATE, "false");
+-          }
+           alterPartition(tbl.getDbName(), tbl.getTableName(), new Partition(tbl, newCreatedTpart));
+           newTPart = getPartition(tbl, partSpec, true, newPartPath.toString(), inheritTableSpecs,
+-                  newFiles);
++              newFiles);
+           return new Partition(tbl, newCreatedTpart);
+         }
+       }
+-      if (!this.getConf().getBoolVar(HiveConf.ConfVars.HIVESTATSAUTOGATHER)) {
+-        newTPart.getParameters().put(StatsSetupConst.COLUMN_STATS_ACCURATE, "false");
+-        alterPartition(tbl.getDbName(), tbl.getTableName(), new Partition(tbl, newTPart.getTPartition()));
+-      }
+     } catch (IOException e) {
+       LOG.error(StringUtils.stringifyException(e));
+       throw new HiveException(e);
+@@ -1588,7 +1577,6 @@ private void constructOneLBLocationMap(FileStatus fSta,
+    * @param isAcid true if this is an ACID operation
+    * @return partition map details (PartitionSpec and Partition)
+    * @throws HiveException
+-   * @throws JSONException
+    */
+   public Map<Map<String, String>, Partition> loadDynamicPartitions(Path loadPath,
+       String tableName, Map<String, String> partSpec, boolean replace,
+@@ -1692,16 +1680,9 @@ public void loadTable(Path loadPath, String tableName, boolean replace,
+       } catch (IOException e) {
+         throw new HiveException("addFiles: filesystem error in check phase", e);
+       }
+-    }
+-    if(!this.getConf().getBoolVar(HiveConf.ConfVars.HIVESTATSAUTOGATHER)) {
+-      StatsSetupConst.setBasicStatsState(tbl.getParameters(), StatsSetupConst.FALSE);
+-    }  else {
+       tbl.getParameters().put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, "true");
+     }
+ 
+-    //column stats will be inaccurate
+-    StatsSetupConst.clearColumnStatsState(tbl.getParameters());
+-
+     try {
+       if (isSkewedStoreAsSubdir) {
+         SkewedInfo skewedInfo = tbl.getSkewedInfo();
+@@ -1960,6 +1941,7 @@ private void alterPartitionSpec(Table tbl,
+       throw new HiveException("new partition path should not be null or empty.");
+     }
+     tpart.getSd().setLocation(partPath);
++    tpart.getParameters().put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK,"true");
+     String fullName = tbl.getTableName();
+     if (!org.apache.commons.lang.StringUtils.isEmpty(tbl.getDbName())) {
+       fullName = tbl.getDbName() + "." + tbl.getTableName();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+index 5d8dd9b..806854f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+@@ -377,7 +377,7 @@ public void setProperty(String name, String value) {
+     tTable.getParameters().put(name, value);
+   }
+ 
+-  public void setParameters(Map<String, String> params) {
++  public void setParamters(Map<String, String> params) {
+     tTable.setParameters(params);
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/StatsOptimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/StatsOptimizer.java
+index f8a5c81..257750b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/StatsOptimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/StatsOptimizer.java
+@@ -238,7 +238,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+                   gbyOp.getConf().getAggregators().size())) {
+             // all select columns must be aggregations
+             return null;
+-
++  
+           }
+           for(ExprNodeDesc desc : selOp.getConf().getColList()) {
+             if (!(desc instanceof ExprNodeColumnDesc)) {
+@@ -301,18 +301,13 @@ else if (udaf instanceof GenericUDAFCount) {
+               String colName = desc.getColumn();
+               StatType type = getType(desc.getTypeString());
+               if(!tbl.isPartitioned()) {
+-                if (!StatsSetupConst.areBasicStatsUptoDate(tbl.getParameters())) {
+-                  Log.debug("Stats for table : " + tbl.getTableName() + " are not up to date.");
++                if (!StatsSetupConst.areStatsUptoDate(tbl.getParameters())) {
++                  Log.debug("Stats for table : " + tbl.getTableName() + " are not upto date.");
+                   return null;
+                 }
+                 rowCnt = Long.parseLong(tbl.getProperty(StatsSetupConst.ROW_COUNT));
+-                if (rowCnt == null) {
+-                  Log.debug("Table doesn't have up to date stats " + tbl.getTableName());
+-                  return null;
+-                }
+-                if (!StatsSetupConst.areColumnStatsUptoDate(tbl.getParameters(), colName)) {
+-                  Log.debug("Stats for table : " + tbl.getTableName() + " column " + colName
+-                      + " are not up to date.");
++                if (rowCnt < 1) {
++                  Log.debug("Table doesn't have upto date stats " + tbl.getTableName());
+                   return null;
+                 }
+                 List<ColumnStatisticsObj> stats = hive.getMSC().getTableColumnStatistics(
+@@ -333,20 +328,20 @@ else if (udaf instanceof GenericUDAFCount) {
+                 Set<Partition> parts = pctx.getPrunedPartitions(
+                     tsOp.getConf().getAlias(), tsOp).getPartitions();
+                 for (Partition part : parts) {
+-                  if (!StatsSetupConst.areBasicStatsUptoDate(part.getParameters())) {
+-                    Log.debug("Stats for part : " + part.getSpec() + " are not up to date.");
++                  if (!StatsSetupConst.areStatsUptoDate(part.getParameters())) {
++                    Log.debug("Stats for part : " + part.getSpec() + " are not upto date.");
+                     return null;
+                   }
+                   Long partRowCnt = Long.parseLong(part.getParameters()
+                       .get(StatsSetupConst.ROW_COUNT));
+-                  if (partRowCnt == null) {
+-                    Log.debug("Partition doesn't have up to date stats " + part.getSpec());
++                  if (partRowCnt < 1) {
++                    Log.debug("Partition doesn't have upto date stats " + part.getSpec());
+                     return null;
+                   }
+                   rowCnt += partRowCnt;
+                 }
+                 Collection<List<ColumnStatisticsObj>> result =
+-                    verifyAndGetPartColumnStats(hive, tbl, colName, parts);
++                    verifyAndGetPartStats(hive, tbl, colName, parts);
+                 if (result == null) {
+                   return null; // logging inside
+                 }
+@@ -372,9 +367,8 @@ else if (udaf instanceof GenericUDAFCount) {
+             String colName = colDesc.getColumn();
+             StatType type = getType(colDesc.getTypeString());
+             if(!tbl.isPartitioned()) {
+-              if (!StatsSetupConst.areColumnStatsUptoDate(tbl.getParameters(), colName)) {
+-                Log.debug("Stats for table : " + tbl.getTableName() + " column " + colName
+-                    + " are not up to date.");
++              if (!StatsSetupConst.areStatsUptoDate(tbl.getParameters())) {
++                Log.debug("Stats for table : " + tbl.getTableName() + " are not upto date.");
+                 return null;
+               }
+               List<ColumnStatisticsObj> stats = hive.getMSC().getTableColumnStatistics(
+@@ -410,7 +404,7 @@ else if (udaf instanceof GenericUDAFCount) {
+                 case Integeral: {
+                   Long maxVal = null;
+                   Collection<List<ColumnStatisticsObj>> result =
+-                      verifyAndGetPartColumnStats(hive, tbl, colName, parts);
++                      verifyAndGetPartStats(hive, tbl, colName, parts);
+                   if (result == null) {
+                     return null; // logging inside
+                   }
+@@ -432,7 +426,7 @@ else if (udaf instanceof GenericUDAFCount) {
+                 case Double: {
+                   Double maxVal = null;
+                   Collection<List<ColumnStatisticsObj>> result =
+-                      verifyAndGetPartColumnStats(hive, tbl, colName, parts);
++                      verifyAndGetPartStats(hive, tbl, colName, parts);
+                   if (result == null) {
+                     return null; // logging inside
+                   }
+@@ -462,9 +456,8 @@ else if (udaf instanceof GenericUDAFCount) {
+             String colName = colDesc.getColumn();
+             StatType type = getType(colDesc.getTypeString());
+             if (!tbl.isPartitioned()) {
+-              if (!StatsSetupConst.areColumnStatsUptoDate(tbl.getParameters(), colName)) {
+-                Log.debug("Stats for table : " + tbl.getTableName() + " column " + colName
+-                    + " are not up to date.");
++              if (!StatsSetupConst.areStatsUptoDate(tbl.getParameters())) {
++                Log.debug("Stats for table : " + tbl.getTableName() + " are not upto date.");
+                 return null;
+               }
+               ColumnStatisticsData statData = hive.getMSC().getTableColumnStatistics(
+@@ -494,7 +487,7 @@ else if (udaf instanceof GenericUDAFCount) {
+                 case Integeral: {
+                   Long minVal = null;
+                   Collection<List<ColumnStatisticsObj>> result =
+-                      verifyAndGetPartColumnStats(hive, tbl, colName, parts);
++                      verifyAndGetPartStats(hive, tbl, colName, parts);
+                   if (result == null) {
+                     return null; // logging inside
+                   }
+@@ -516,7 +509,7 @@ else if (udaf instanceof GenericUDAFCount) {
+                 case Double: {
+                   Double minVal = null;
+                   Collection<List<ColumnStatisticsObj>> result =
+-                      verifyAndGetPartColumnStats(hive, tbl, colName, parts);
++                      verifyAndGetPartStats(hive, tbl, colName, parts);
+                   if (result == null) {
+                     return null; // logging inside
+                   }
+@@ -597,13 +590,12 @@ private ColumnStatisticsData validateSingleColStat(List<ColumnStatisticsObj> sta
+       return statObj.get(0).getStatsData();
+     }
+ 
+-    private Collection<List<ColumnStatisticsObj>> verifyAndGetPartColumnStats(
++    private Collection<List<ColumnStatisticsObj>> verifyAndGetPartStats(
+         Hive hive, Table tbl, String colName, Set<Partition> parts) throws TException {
+       List<String> partNames = new ArrayList<String>(parts.size());
+       for (Partition part : parts) {
+-        if (!StatsSetupConst.areColumnStatsUptoDate(part.getParameters(), colName)) {
+-          Log.debug("Stats for part : " + part.getSpec() + " column " + colName
+-              + " are not up to date.");
++        if (!StatsSetupConst.areStatsUptoDate(part.getParameters())) {
++          Log.debug("Stats for part : " + part.getSpec() + " are not upto date.");
+           return null;
+         }
+         partNames.add(part.getName());
+@@ -623,25 +615,19 @@ private Long getRowCnt(
+       if (tbl.isPartitioned()) {
+         for (Partition part : pctx.getPrunedPartitions(
+             tsOp.getConf().getAlias(), tsOp).getPartitions()) {
+-          if (!StatsSetupConst.areBasicStatsUptoDate(part.getParameters())) {
+-            return null;
+-          }
+-          Long partRowCnt = Long.parseLong(part.getParameters().get(StatsSetupConst.ROW_COUNT));
+-          if (partRowCnt == null) {
+-            Log.debug("Partition doesn't have up to date stats " + part.getSpec());
++          long partRowCnt = Long.parseLong(part.getParameters().get(StatsSetupConst.ROW_COUNT));
++          if (partRowCnt < 1) {
++            Log.debug("Partition doesn't have upto date stats " + part.getSpec());
+             return null;
+           }
+           rowCnt += partRowCnt;
+         }
+       } else { // unpartitioned table
+-        if (!StatsSetupConst.areBasicStatsUptoDate(tbl.getParameters())) {
+-          return null;
+-        }
+         rowCnt = Long.parseLong(tbl.getProperty(StatsSetupConst.ROW_COUNT));
+-        if (rowCnt == null) {
++        if (rowCnt < 1) {
+           // if rowCnt < 1 than its either empty table or table on which stats are not
+           //  computed We assume the worse and don't attempt to optimize.
+-          Log.debug("Table doesn't have up to date stats " + tbl.getTableName());
++          Log.debug("Table doesn't have upto date stats " + tbl.getTableName());
+           rowCnt = null;
+         }
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/StatsWork.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/StatsWork.java
+index bafd7d4..66d4d4a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/StatsWork.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/StatsWork.java
+@@ -42,10 +42,6 @@
+   // are still valid. However, if a load file is being performed, the old stats collected by
+   // aggregator are not valid. It might be a good idea to clear them instead of leaving wrong
+   // and old stats.
+-  // Since HIVE-12661, we maintain the old stats (although may be wrong) for CBO
+-  // purpose. We use a flag COLUMN_STATS_ACCURATE to
+-  // show the accuracy of the stats.
+-
+   private boolean clearAggregatorStats = false;
+ 
+   private boolean noStatsAggregator = false;
+diff --git a/ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_1.q b/ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_1.q
+deleted file mode 100644
+index 199c74c..0000000
+--- a/ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_1.q
++++ /dev/null
+@@ -1,102 +0,0 @@
+-set hive.stats.fetch.column.stats=true; 
+-set hive.stats.fetch.partition.stats=true; 
+-set hive.compute.query.using.stats=true; 
+-set hive.mapred.mode=nonstrict;
+-
+-drop table calendar;
+-
+-CREATE TABLE calendar (year int, month int);
+-
+-insert into calendar values (2010, 10), (2011, 11), (2012, 12); 
+-
+-desc formatted calendar;
+-
+-analyze table calendar compute statistics;
+-
+-desc formatted calendar;
+-
+-explain select count(1) from calendar; 
+-
+-explain select max(year) from calendar; 
+-
+-select max(year) from calendar; 
+-
+-select max(month) from calendar;
+-
+-analyze table calendar compute statistics for columns;
+-
+-desc formatted calendar;
+-
+-explain select max(year) from calendar; 
+-
+-select max(year) from calendar;
+-
+-insert into calendar values (2015, 15);
+-
+-desc formatted calendar;
+-
+-explain select max(year) from calendar; 
+-
+-select max(year) from calendar;
+-
+-explain select max(month) from calendar; 
+-
+-select max(month) from calendar;
+-
+-analyze table calendar compute statistics for columns year;
+-
+-desc formatted calendar;
+-
+-explain select max(year) from calendar; 
+-
+-select max(year) from calendar;
+-
+-explain select max(month) from calendar; 
+-
+-select max(month) from calendar;
+-
+-analyze table calendar compute statistics for columns month;
+-
+-desc formatted calendar;
+-
+-explain select max(month) from calendar; 
+-
+-select max(month) from calendar;
+-
+-CREATE TABLE calendarp (`year` int)  partitioned by (p int);
+-
+-insert into table calendarp partition (p=1) values (2010), (2011), (2012); 
+-
+-desc formatted calendarp partition (p=1);
+-
+-explain select max(year) from calendarp where p=1; 
+-
+-select max(year) from calendarp where p=1; 
+-
+-analyze table calendarp partition (p=1) compute statistics for columns;
+-
+-desc formatted calendarp partition (p=1);
+-
+-explain select max(year) from calendarp where p=1; 
+-
+-insert into table calendarp partition (p=1) values (2015);
+-
+-desc formatted calendarp partition (p=1);
+-
+-explain select max(year) from calendarp where p=1; 
+-
+-select max(year) from calendarp where p=1;
+-
+-create table t (key string, value string);
+-
+-load data local inpath '../../data/files/kv1.txt' into table t;
+-
+-desc formatted t;
+-
+-analyze table t compute statistics;
+-
+-desc formatted t;
+-
+-
+-
+-
+diff --git a/ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_2.q b/ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_2.q
+deleted file mode 100644
+index 222d85f..0000000
+--- a/ql/src/test/queries/clientpositive/columnStatsUpdateForStatsOptimizer_2.q
++++ /dev/null
+@@ -1,58 +0,0 @@
+-set hive.stats.fetch.column.stats=true;
+-set hive.stats.fetch.partition.stats=true;
+-set hive.compute.query.using.stats=true; 
+-
+-
+-drop table calendar;
+-
+-CREATE TABLE calendar (year int, month int) clustered by (month) into 2 buckets stored as orc;
+-
+-insert into calendar values (2010, 10), (2011, 11), (2012, 12);
+-
+-desc formatted calendar;
+-
+-analyze table calendar compute statistics for columns year;
+-
+-desc formatted calendar;
+-
+-explain select max(year) from calendar;
+-
+-select max(year) from calendar;
+-
+-explain select count(1) from calendar;
+-
+-select count(1) from calendar;
+-
+-ALTER TABLE calendar CHANGE year year1 INT;
+-
+---after patch, should be old stats rather than -1
+-
+-desc formatted calendar;
+-
+---but basic/column stats can not be used by optimizer
+-
+-explain select max(month) from calendar;
+-
+-select max(month) from calendar;
+-
+-explain select count(1) from calendar;
+-
+-select count(1) from calendar;
+-
+-truncate table calendar;
+-
+---after patch, should be 0 
+-
+-desc formatted calendar;
+-
+---but column stats can not be used by optimizer
+-
+-explain select max(month) from calendar;
+-
+-select max(month) from calendar;
+-
+---basic stats can be used by optimizer
+-
+-explain select count(1) from calendar;
+-
+-select count(1) from calendar;
+diff --git a/ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_1.q.out b/ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_1.q.out
+deleted file mode 100644
+index 4a136ff..0000000
+--- a/ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_1.q.out
++++ /dev/null
+@@ -1,945 +0,0 @@
+-PREHOOK: query: drop table calendar
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: drop table calendar
+-POSTHOOK: type: DROPTABLE
+-PREHOOK: query: CREATE TABLE calendar (year int, month int)
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: CREATE TABLE calendar (year int, month int)
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@calendar
+-PREHOOK: query: insert into calendar values (2010, 10), (2011, 11), (2012, 12)
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@values__tmp__table__1
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: insert into calendar values (2010, 10), (2011, 11), (2012, 12)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@values__tmp__table__1
+-POSTHOOK: Output: default@calendar
+-POSTHOOK: Lineage: calendar.month EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
+-POSTHOOK: Lineage: calendar.year EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	21                  
+-	totalSize           	24                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: analyze table calendar compute statistics
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: analyze table calendar compute statistics
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-POSTHOOK: Output: default@calendar
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	21                  
+-	totalSize           	24                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select count(1) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select count(1) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: explain select max(year) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 3 Data size: 21 Basic stats: COMPLETE Column stats: NONE
+-            Select Operator
+-              expressions: year (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 3 Data size: 21 Basic stats: COMPLETE Column stats: NONE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-2012
+-PREHOOK: query: select max(month) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(month) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-12
+-PREHOOK: query: analyze table calendar compute statistics for columns
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: analyze table calendar compute statistics for columns
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"COLUMN_STATS\":{\"year\":\"true\",\"month\":\"true\"},\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	21                  
+-	totalSize           	24                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-2012
+-PREHOOK: query: insert into calendar values (2015, 15)
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@values__tmp__table__2
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: insert into calendar values (2015, 15)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@values__tmp__table__2
+-POSTHOOK: Output: default@calendar
+-POSTHOOK: Lineage: calendar.month EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
+-POSTHOOK: Lineage: calendar.year EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-	numFiles            	2                   
+-	numRows             	4                   
+-	rawDataSize         	28                  
+-	totalSize           	32                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 4 Data size: 28 Basic stats: COMPLETE Column stats: COMPLETE
+-            Select Operator
+-              expressions: year (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 4 Data size: 28 Basic stats: COMPLETE Column stats: COMPLETE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-2015
+-PREHOOK: query: explain select max(month) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(month) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 4 Data size: 28 Basic stats: COMPLETE Column stats: COMPLETE
+-            Select Operator
+-              expressions: month (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 4 Data size: 28 Basic stats: COMPLETE Column stats: COMPLETE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(month) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(month) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-15
+-PREHOOK: query: analyze table calendar compute statistics for columns year
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: analyze table calendar compute statistics for columns year
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"COLUMN_STATS\":{\"year\":\"true\"},\"BASIC_STATS\":\"true\"}
+-	numFiles            	2                   
+-	numRows             	4                   
+-	rawDataSize         	28                  
+-	totalSize           	32                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-2015
+-PREHOOK: query: explain select max(month) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(month) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 4 Data size: 28 Basic stats: COMPLETE Column stats: COMPLETE
+-            Select Operator
+-              expressions: month (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 4 Data size: 28 Basic stats: COMPLETE Column stats: COMPLETE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: COMPLETE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(month) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(month) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-15
+-PREHOOK: query: analyze table calendar compute statistics for columns month
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: analyze table calendar compute statistics for columns month
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"COLUMN_STATS\":{\"month\":\"true\",\"year\":\"true\"},\"BASIC_STATS\":\"true\"}
+-	numFiles            	2                   
+-	numRows             	4                   
+-	rawDataSize         	28                  
+-	totalSize           	32                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(month) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(month) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(month) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(month) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-15
+-PREHOOK: query: CREATE TABLE calendarp (`year` int)  partitioned by (p int)
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@calendarp
+-POSTHOOK: query: CREATE TABLE calendarp (`year` int)  partitioned by (p int)
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@calendarp
+-PREHOOK: query: insert into table calendarp partition (p=1) values (2010), (2011), (2012)
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@values__tmp__table__3
+-PREHOOK: Output: default@calendarp@p=1
+-POSTHOOK: query: insert into table calendarp partition (p=1) values (2010), (2011), (2012)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@values__tmp__table__3
+-POSTHOOK: Output: default@calendarp@p=1
+-POSTHOOK: Lineage: calendarp PARTITION(p=1).year EXPRESSION [(values__tmp__table__3)values__tmp__table__3.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+-PREHOOK: query: desc formatted calendarp partition (p=1)
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendarp
+-POSTHOOK: query: desc formatted calendarp partition (p=1)
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendarp
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-	 	 
+-# Partition Information	 	 
+-# col_name            	data_type           	comment             
+-	 	 
+-p                   	int                 	                    
+-	 	 
+-# Detailed Partition Information	 	 
+-Partition Value:    	[1]                 	 
+-Database:           	default             	 
+-Table:              	calendarp           	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-#### A masked pattern was here ####
+-Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	12                  
+-	totalSize           	15                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendarp where p=1
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendarp where p=1
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendarp
+-            Statistics: Num rows: 3 Data size: 12 Basic stats: COMPLETE Column stats: NONE
+-            Select Operator
+-              expressions: year (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 3 Data size: 12 Basic stats: COMPLETE Column stats: NONE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendarp where p=1
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendarp
+-PREHOOK: Input: default@calendarp@p=1
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendarp where p=1
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendarp
+-POSTHOOK: Input: default@calendarp@p=1
+-#### A masked pattern was here ####
+-2012
+-PREHOOK: query: analyze table calendarp partition (p=1) compute statistics for columns
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendarp
+-PREHOOK: Input: default@calendarp@p=1
+-#### A masked pattern was here ####
+-POSTHOOK: query: analyze table calendarp partition (p=1) compute statistics for columns
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendarp
+-POSTHOOK: Input: default@calendarp@p=1
+-#### A masked pattern was here ####
+-PREHOOK: query: desc formatted calendarp partition (p=1)
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendarp
+-POSTHOOK: query: desc formatted calendarp partition (p=1)
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendarp
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-	 	 
+-# Partition Information	 	 
+-# col_name            	data_type           	comment             
+-	 	 
+-p                   	int                 	                    
+-	 	 
+-# Detailed Partition Information	 	 
+-Partition Value:    	[1]                 	 
+-Database:           	default             	 
+-Table:              	calendarp           	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-#### A masked pattern was here ####
+-Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"COLUMN_STATS\":{\"year\":\"true\"},\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	12                  
+-	totalSize           	15                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendarp where p=1
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendarp where p=1
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: insert into table calendarp partition (p=1) values (2015)
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@values__tmp__table__4
+-PREHOOK: Output: default@calendarp@p=1
+-POSTHOOK: query: insert into table calendarp partition (p=1) values (2015)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@values__tmp__table__4
+-POSTHOOK: Output: default@calendarp@p=1
+-POSTHOOK: Lineage: calendarp PARTITION(p=1).year EXPRESSION [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+-PREHOOK: query: desc formatted calendarp partition (p=1)
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendarp
+-POSTHOOK: query: desc formatted calendarp partition (p=1)
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendarp
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-	 	 
+-# Partition Information	 	 
+-# col_name            	data_type           	comment             
+-	 	 
+-p                   	int                 	                    
+-	 	 
+-# Detailed Partition Information	 	 
+-Partition Value:    	[1]                 	 
+-Database:           	default             	 
+-Table:              	calendarp           	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-#### A masked pattern was here ####
+-Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\",\"COLUMN_STATS\":{\"year\":\"true\"}}
+-	numFiles            	2                   
+-	numRows             	4                   
+-	rawDataSize         	16                  
+-	totalSize           	20                  
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendarp where p=1
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendarp where p=1
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendarp where p=1
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendarp
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendarp where p=1
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendarp
+-#### A masked pattern was here ####
+-2012
+-PREHOOK: query: create table t (key string, value string)
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@t
+-POSTHOOK: query: create table t (key string, value string)
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@t
+-PREHOOK: query: load data local inpath '../../data/files/kv1.txt' into table t
+-PREHOOK: type: LOAD
+-#### A masked pattern was here ####
+-PREHOOK: Output: default@t
+-POSTHOOK: query: load data local inpath '../../data/files/kv1.txt' into table t
+-POSTHOOK: type: LOAD
+-#### A masked pattern was here ####
+-POSTHOOK: Output: default@t
+-PREHOOK: query: desc formatted t
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@t
+-POSTHOOK: query: desc formatted t
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@t
+-# col_name            	data_type           	comment             
+-	 	 
+-key                 	string              	                    
+-value               	string              	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	numFiles            	1                   
+-	totalSize           	5812                
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: analyze table t compute statistics
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@t
+-PREHOOK: Output: default@t
+-POSTHOOK: query: analyze table t compute statistics
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@t
+-POSTHOOK: Output: default@t
+-PREHOOK: query: desc formatted t
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@t
+-POSTHOOK: query: desc formatted t
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@t
+-# col_name            	data_type           	comment             
+-	 	 
+-key                 	string              	                    
+-value               	string              	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	500                 
+-	rawDataSize         	5312                
+-	totalSize           	5812                
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
+-InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	-1                  	 
+-Bucket Columns:     	[]                  	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+diff --git a/ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_2.q.out b/ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_2.q.out
+deleted file mode 100644
+index 183f02b..0000000
+--- a/ql/src/test/results/clientpositive/columnStatsUpdateForStatsOptimizer_2.q.out
++++ /dev/null
+@@ -1,447 +0,0 @@
+-PREHOOK: query: drop table calendar
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: drop table calendar
+-POSTHOOK: type: DROPTABLE
+-PREHOOK: query: CREATE TABLE calendar (year int, month int) clustered by (month) into 2 buckets stored as orc
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: CREATE TABLE calendar (year int, month int) clustered by (month) into 2 buckets stored as orc
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@calendar
+-PREHOOK: query: insert into calendar values (2010, 10), (2011, 11), (2012, 12)
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@values__tmp__table__1
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: insert into calendar values (2010, 10), (2011, 11), (2012, 12)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@values__tmp__table__1
+-POSTHOOK: Output: default@calendar
+-POSTHOOK: Lineage: calendar.month EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
+-POSTHOOK: Lineage: calendar.year EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	24                  
+-	totalSize           	275                 
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.ql.io.orc.OrcSerde	 
+-InputFormat:        	org.apache.hadoop.hive.ql.io.orc.OrcInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	2                   	 
+-Bucket Columns:     	[month]             	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: analyze table calendar compute statistics for columns year
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: analyze table calendar compute statistics for columns year
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-PREHOOK: query: desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year                	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"COLUMN_STATS\":{\"year\":\"true\"},\"BASIC_STATS\":\"true\"}
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	24                  
+-	totalSize           	275                 
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.ql.io.orc.OrcSerde	 
+-InputFormat:        	org.apache.hadoop.hive.ql.io.orc.OrcInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	2                   	 
+-Bucket Columns:     	[month]             	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: explain select max(year) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select max(year) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(year) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(year) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-2012
+-PREHOOK: query: explain select count(1) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select count(1) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select count(1) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select count(1) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-3
+-PREHOOK: query: ALTER TABLE calendar CHANGE year year1 INT
+-PREHOOK: type: ALTERTABLE_RENAMECOL
+-PREHOOK: Input: default@calendar
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: ALTER TABLE calendar CHANGE year year1 INT
+-POSTHOOK: type: ALTERTABLE_RENAMECOL
+-POSTHOOK: Input: default@calendar
+-POSTHOOK: Output: default@calendar
+-PREHOOK: query: --after patch, should be old stats rather than -1
+-
+-desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: --after patch, should be old stats rather than -1
+-
+-desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year1               	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-#### A masked pattern was here ####
+-	numFiles            	1                   
+-	numRows             	3                   
+-	rawDataSize         	24                  
+-	totalSize           	275                 
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.ql.io.orc.OrcSerde	 
+-InputFormat:        	org.apache.hadoop.hive.ql.io.orc.OrcInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	2                   	 
+-Bucket Columns:     	[month]             	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: --but basic/column stats can not be used by optimizer
+-
+-explain select max(month) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: --but basic/column stats can not be used by optimizer
+-
+-explain select max(month) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 3 Data size: 24 Basic stats: COMPLETE Column stats: NONE
+-            Select Operator
+-              expressions: month (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 3 Data size: 24 Basic stats: COMPLETE Column stats: NONE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(month) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(month) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-12
+-PREHOOK: query: explain select count(1) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: explain select count(1) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 3 Data size: 24 Basic stats: COMPLETE Column stats: COMPLETE
+-            Select Operator
+-              Statistics: Num rows: 3 Data size: 24 Basic stats: COMPLETE Column stats: COMPLETE
+-              Group By Operator
+-                aggregations: count(1)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: COMPLETE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: COMPLETE
+-                  value expressions: _col0 (type: bigint)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: count(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: COMPLETE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: COMPLETE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select count(1) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select count(1) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-3
+-PREHOOK: query: truncate table calendar
+-PREHOOK: type: TRUNCATETABLE
+-PREHOOK: Output: default@calendar
+-POSTHOOK: query: truncate table calendar
+-POSTHOOK: type: TRUNCATETABLE
+-POSTHOOK: Output: default@calendar
+-PREHOOK: query: --after patch, should be 0 
+-
+-desc formatted calendar
+-PREHOOK: type: DESCTABLE
+-PREHOOK: Input: default@calendar
+-POSTHOOK: query: --after patch, should be 0 
+-
+-desc formatted calendar
+-POSTHOOK: type: DESCTABLE
+-POSTHOOK: Input: default@calendar
+-# col_name            	data_type           	comment             
+-	 	 
+-year1               	int                 	                    
+-month               	int                 	                    
+-	 	 
+-# Detailed Table Information	 	 
+-Database:           	default             	 
+-#### A masked pattern was here ####
+-Protect Mode:       	None                	 
+-Retention:          	0                   	 
+-#### A masked pattern was here ####
+-Table Type:         	MANAGED_TABLE       	 
+-Table Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	{\"BASIC_STATS\":\"true\"}
+-#### A masked pattern was here ####
+-	numFiles            	1                   
+-	numRows             	0                   
+-	rawDataSize         	0                   
+-	totalSize           	275                 
+-#### A masked pattern was here ####
+-	 	 
+-# Storage Information	 	 
+-SerDe Library:      	org.apache.hadoop.hive.ql.io.orc.OrcSerde	 
+-InputFormat:        	org.apache.hadoop.hive.ql.io.orc.OrcInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat	 
+-Compressed:         	No                  	 
+-Num Buckets:        	2                   	 
+-Bucket Columns:     	[month]             	 
+-Sort Columns:       	[]                  	 
+-Storage Desc Params:	 	 
+-	serialization.format	1                   
+-PREHOOK: query: --but column stats can not be used by optimizer
+-
+-explain select max(month) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: --but column stats can not be used by optimizer
+-
+-explain select max(month) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-0 depends on stages: Stage-1
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: calendar
+-            Statistics: Num rows: 68 Data size: 275 Basic stats: COMPLETE Column stats: NONE
+-            Select Operator
+-              expressions: month (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 68 Data size: 275 Basic stats: COMPLETE Column stats: NONE
+-              Group By Operator
+-                aggregations: max(_col0)
+-                mode: hash
+-                outputColumnNames: _col0
+-                Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                Reduce Output Operator
+-                  sort order: 
+-                  Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-                  value expressions: _col0 (type: int)
+-      Reduce Operator Tree:
+-        Group By Operator
+-          aggregations: max(VALUE._col0)
+-          mode: mergepartial
+-          outputColumnNames: _col0
+-          Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-          File Output Operator
+-            compressed: false
+-            Statistics: Num rows: 1 Data size: 4 Basic stats: COMPLETE Column stats: NONE
+-            table:
+-                input format: org.apache.hadoop.mapred.TextInputFormat
+-                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: -1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select max(month) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select max(month) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-NULL
+-PREHOOK: query: --basic stats can be used by optimizer
+-
+-explain select count(1) from calendar
+-PREHOOK: type: QUERY
+-POSTHOOK: query: --basic stats can be used by optimizer
+-
+-explain select count(1) from calendar
+-POSTHOOK: type: QUERY
+-STAGE DEPENDENCIES:
+-  Stage-0 is a root stage
+-
+-STAGE PLANS:
+-  Stage: Stage-0
+-    Fetch Operator
+-      limit: 1
+-      Processor Tree:
+-        ListSink
+-
+-PREHOOK: query: select count(1) from calendar
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-POSTHOOK: query: select count(1) from calendar
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@calendar
+-#### A masked pattern was here ####
+-0
+-- 
+1.7.9.5
+

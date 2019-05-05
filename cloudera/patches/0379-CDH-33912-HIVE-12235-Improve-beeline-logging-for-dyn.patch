@@ -1,0 +1,77 @@
+From ebef3314700dff67d05bac8a5ca3cdc6a6a11cc9 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Mon, 2 Nov 2015 17:16:42 -0800
+Subject: [PATCH 0379/1164] CDH-33912 : HIVE-12235 - Improve beeline logging
+ for dynamic service discovery
+
+Change-Id: I0cb2798c436f0595fde31783a67841a0ec370318
+---
+ .../src/main/resources/beeline-log4j.properties    |    2 ++
+ .../java/org/apache/hive/jdbc/HiveConnection.java  |   22 ++++++++++++++------
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/beeline/src/main/resources/beeline-log4j.properties b/beeline/src/main/resources/beeline-log4j.properties
+index fe47d94..23cd337 100644
+--- a/beeline/src/main/resources/beeline-log4j.properties
++++ b/beeline/src/main/resources/beeline-log4j.properties
+@@ -22,3 +22,5 @@ log4j.appender.console.target=System.err
+ log4j.appender.console.layout=org.apache.log4j.PatternLayout
+ log4j.appender.console.layout.ConversionPattern=%d{yy/MM/dd HH:mm:ss} [%t]: %p %c{2}: %m%n
+ log4j.appender.console.encoding=UTF-8
++
++log4j.category.org.apache.hive.jdbc.HiveConnection=INFO
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+index 6201771..7486c28 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+@@ -192,16 +192,15 @@ private void openTransport() throws SQLException {
+                 .get(JdbcConnectionParams.AUTH_KERBEROS_AUTH_TYPE));
+         transport = isHttpTransportMode() ? createHttpTransport() : createBinaryTransport();
+         if (!transport.isOpen()) {
+-          LOG.info("Will try to open client transport with JDBC Uri: " + jdbcUriString);
+           transport.open();
++          logZkDiscoveryMessage("Connected to " + connParams.getHost() + ":" + connParams.getPort());
+         }
+         break;
+       } catch (TTransportException e) {
+-        LOG.info("Could not open client transport with JDBC Uri: " + jdbcUriString);
+         // We'll retry till we exhaust all HiveServer2 nodes from ZooKeeper
+-        if ((sessConfMap.get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE) != null)
+-            && (JdbcConnectionParams.SERVICE_DISCOVERY_MODE_ZOOKEEPER.equalsIgnoreCase(sessConfMap
+-                .get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE)))) {
++        if (isZkDynamicDiscoveryMode()) {
++          // We'll retry till we exhaust all HiveServer2 uris from ZooKeeper
++          LOG.info("Failed to connect to " + connParams.getHost() + ":" + connParams.getPort());
+           try {
+             // Update jdbcUriString, host & port variables in connParams
+             // Throw an exception if all HiveServer2 nodes have been exhausted,
+@@ -216,7 +215,6 @@ private void openTransport() throws SQLException {
+           jdbcUriString = connParams.getJdbcUriString();
+           host = connParams.getHost();
+           port = connParams.getPort();
+-          LOG.info("Will retry opening client transport");
+         } else {
+           throw new SQLException("Could not open client transport with JDBC Uri: " + jdbcUriString
+               + ": " + e.getMessage(), " 08S01", e);
+@@ -522,6 +520,18 @@ private boolean isHttpTransportMode() {
+     return false;
+   }
+ 
++  private boolean isZkDynamicDiscoveryMode() {
++    return (sessConfMap.get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE) != null)
++      && (JdbcConnectionParams.SERVICE_DISCOVERY_MODE_ZOOKEEPER.equalsIgnoreCase(sessConfMap
++      .get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE)));
++  }
++
++  private void logZkDiscoveryMessage(String message) {
++    if (isZkDynamicDiscoveryMode()) {
++      LOG.info(message);
++    }
++  }
++
+   /**
+    * Lookup varName in sessConfMap, if its null or empty return the default
+    * value varDefault
+-- 
+1.7.9.5
+

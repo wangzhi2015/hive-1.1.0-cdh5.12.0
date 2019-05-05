@@ -1,0 +1,206 @@
+From 2b3cf856722fd17e9cf0c53b857007e754033dbb Mon Sep 17 00:00:00 2001
+From: Vaibhav Gumashta <vgumashta@apache.org>
+Date: Thu, 8 Oct 2015 13:07:20 -0700
+Subject: [PATCH 0569/1164] CDH-32685: HIVE-11408: HiveServer2 is leaking
+ ClassLoaders when add jar / temporary functions
+ are used due to constructor caching in Hadoop
+ ReflectionUtils (Vaibhav Gumashta reviewed by
+ Thejas Nair)
+
+This issue is fixed on branch-1.2 through HIVE-10329, but HIVE-10329 is part of LLAP changes; so we backport HIVE-11408 for now.
+
+Change-Id: Ib8ea8cc9e4cca492a009e07d51cf4376e78cb418
+---
+ data/files/identity_udf.jar                        |  Bin 0 -> 710 bytes
+ .../org/apache/hive/jdbc/TestJdbcWithMiniHS2.java  |   73 ++++++++++++++++++--
+ .../hadoop/hive/ql/session/SessionState.java       |   20 ++++++
+ 3 files changed, 87 insertions(+), 6 deletions(-)
+ create mode 100644 data/files/identity_udf.jar
+
+diff --git a/data/files/identity_udf.jar b/data/files/identity_udf.jar
+new file mode 100644
+index 0000000000000000000000000000000000000000..8170995435403dc4067e0e5f920ecd2328bd845a
+GIT binary patch
+literal 710
+zcmWIWW@Zs#;Nak3unlu_XFvj+3@i-3t|5-Po_=on|4uP5Ff#;rvvYt{FhP|C;M6Pv
+zQ~}rQ>*(j{<{BKL=j-;__snS@Z(Y5MyxzK6=gyqp9At3C_`%a6JuhD!Pv48Bt5`T^
+zyp}vNTUsmQhq$WR^Cemq&&5Tbh^tOxn40~m=wlHh*b&?dBkni@t#AQigd-e6QGFl|
+zl=VzW%`3?)sSGYD%FIg-b#c>6&PgmTPW3nRJM17ZXREOF42LOgOr1<zQyPwlPH{1D
+znK(gd7Q^48aW~t~SVp9C*RhHUvGP9%?AYtzx^2eIxpQSR_wTc}W1N#bLBYlTm|st<
+zlZoNA9o|kBQul?e!b6X>9J~{;FH>%M%>7rXnqK|Uv1YeCt8Hf4zX)3$bUQ{jCO4<f
+z@ZJ=TlZ&!mO-Vn-{w6j(XKtbX{@1%-zBx1h%SFfO26t`<^{uiBuUdM!DRklHRZ%Ms
+zZCNwV>*)D8T80k=8fzYFGyK#z=&_7BQRv;gJ<a!)C?09L7{$X{edE{WciilD559bz
+ze?ECr-@Si~pa=`PH}TGMU`W_8g2IZCNrVA4zG0CGif>c^k3dlDqiaQu0#IxtfGv;-
+p*NPPP$R>cI3fW<xs6v24Kqiie3-D%T11V$%LXfg|KwmL1001)X&sYEe
+
+literal 0
+HcmV?d00001
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+index 7594496..9aa453c 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+@@ -24,6 +24,7 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import java.lang.reflect.Method;
+ import java.sql.Connection;
+ import java.sql.DriverManager;
+ import java.sql.ResultSet;
+@@ -51,16 +52,20 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hive.jdbc.miniHS2.MiniHS2;
+ import org.junit.After;
+ import org.junit.AfterClass;
++import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+ public class TestJdbcWithMiniHS2 {
+   private static MiniHS2 miniHS2 = null;
+-  private static Path dataFilePath;
++  private static String dataFileDir;
++  private static Path kvDataFilePath;
+   private static final String tmpDir = System.getProperty("test.tmp.dir");
+ 
+   private Connection hs2Conn = null;
+@@ -71,9 +76,8 @@ public static void beforeTest() throws Exception {
+     HiveConf conf = new HiveConf();
+     conf.setBoolVar(ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+     miniHS2 = new MiniHS2(conf);
+-    String dataFileDir = conf.get("test.data.files").replace('\\', '/')
+-        .replace("c:", "");
+-    dataFilePath = new Path(dataFileDir, "kv1.txt");
++    dataFileDir = conf.get("test.data.files").replace('\\', '/').replace("c:", "");
++    kvDataFilePath = new Path(dataFileDir, "kv1.txt");
+     Map<String, String> confOverlay = new HashMap<String, String>();
+     miniHS2.start(confOverlay);
+   }
+@@ -113,7 +117,7 @@ public void testConnection() throws Exception {
+ 
+     // load data
+     stmt.execute("load data local inpath '"
+-        + dataFilePath.toString() + "' into table " + tableName);
++        + kvDataFilePath.toString() + "' into table " + tableName);
+ 
+     ResultSet res = stmt.executeQuery("SELECT * FROM " + tableName);
+     assertTrue(res.next());
+@@ -134,7 +138,7 @@ public void testConcurrentStatements() throws Exception {
+ 
+     // load data
+     stmt.execute("load data local inpath '"
+-        + dataFilePath.toString() + "' into table " + tableName);
++        + kvDataFilePath.toString() + "' into table " + tableName);
+ 
+     ResultSet res = stmt.executeQuery("SELECT * FROM " + tableName);
+     assertTrue(res.next());
+@@ -668,4 +672,61 @@ private void verifyScratchDir(HiveConf conf, FileSystem fs, Path scratchDirPath,
+           fs.getFileStatus(scratchDirPath).getPermission());
+     }
+   }
++
++  /**
++   * Tests that Hadoop's ReflectionUtils.CONSTRUCTOR_CACHE clears cached class objects (& hence
++   * doesn't leak classloaders) on closing any session
++   *
++   * @throws Exception
++   */
++  @Test
++  public void testAddJarConstructorUnCaching() throws Exception {
++    Path jarFilePath = new Path(dataFileDir, "identity_udf.jar");
++    Connection conn = getConnection(miniHS2.getJdbcURL(), "foo", "bar");
++    String tableName = "testAddJar";
++    Statement stmt = conn.createStatement();
++    stmt.execute("SET hive.support.concurrency = false");
++    // Create table
++    stmt.execute("DROP TABLE IF EXISTS " + tableName);
++    stmt.execute("CREATE TABLE " + tableName + " (key INT, value STRING)");
++    // Load data
++    stmt.execute("LOAD DATA LOCAL INPATH '" + kvDataFilePath.toString() + "' INTO TABLE "
++        + tableName);
++    ResultSet res = stmt.executeQuery("SELECT * FROM " + tableName);
++    // Ensure table is populated
++    assertTrue(res.next());
++
++    int cacheBeforeClose;
++    int cacheAfterClose;
++    // Add the jar file
++    stmt.execute("ADD JAR " + jarFilePath.toString());
++    // Create a temporary function using the jar
++    stmt.execute("CREATE TEMPORARY FUNCTION func AS 'IdentityStringUDF'");
++    // Execute the UDF
++    stmt.execute("SELECT func(value) from " + tableName);
++    cacheBeforeClose = getReflectionUtilsCacheSize();
++    System.out.println("Cache before connection close: " + cacheBeforeClose);
++    // Cache size should be > 0 now
++    Assert.assertTrue(cacheBeforeClose > 0);
++    conn.close();
++    cacheAfterClose = getReflectionUtilsCacheSize();
++    System.out.println("Cache after connection close: " + cacheAfterClose);
++    // Cache size should be 0 now
++    Assert.assertTrue("Failed: " + cacheAfterClose, cacheAfterClose == 0);
++  }
++
++  // Call ReflectionUtils#getCacheSize (which is private)
++  private int getReflectionUtilsCacheSize() {
++    Method getCacheSizeMethod;
++    try {
++      getCacheSizeMethod = ReflectionUtils.class.getDeclaredMethod("getCacheSize");
++      if (getCacheSizeMethod != null) {
++        getCacheSizeMethod.setAccessible(true);
++        return (Integer) getCacheSizeMethod.invoke(null);
++      }
++    } catch (Exception e) {
++      System.out.println(e);
++    }
++    return -1;
++  }
+ }
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index 2987a7d..79d815b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -23,6 +23,7 @@
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.PrintStream;
++import java.lang.reflect.Method;
+ import java.net.URI;
+ import java.net.URLClassLoader;
+ import java.sql.Timestamp;
+@@ -1386,6 +1387,25 @@ public void closeSparkSession() {
+         sparkSession = null;
+       }
+     }
++
++    // Hadoop's ReflectionUtils caches constructors for the classes it instantiated.
++    // In UDFs, this can result in classloaders not getting GCed for a temporary function,
++    // resulting in a PermGen leak when used extensively from HiveServer2
++    clearReflectionUtilsCache();
++  }
++
++  private void clearReflectionUtilsCache() {
++    Method clearCacheMethod;
++    try {
++      clearCacheMethod = ReflectionUtils.class.getDeclaredMethod("clearCache");
++      if (clearCacheMethod != null) {
++        clearCacheMethod.setAccessible(true);
++        clearCacheMethod.invoke(null);
++        LOG.debug("Cleared Hadoop ReflectionUtils CONSTRUCTOR_CACHE");
++      }
++    } catch (Exception e) {
++      LOG.info(e);
++    }
+   }
+ 
+   public AuthorizationMode getAuthorizationMode(){
+-- 
+1.7.9.5
+

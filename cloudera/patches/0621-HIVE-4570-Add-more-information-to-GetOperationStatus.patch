@@ -1,0 +1,1936 @@
+From 82b36d0bcfe10d00e5b41c1f34b1881abd60fdb9 Mon Sep 17 00:00:00 2001
+From: Rajat Khandelwal <prongs@apache.org>
+Date: Mon, 14 Mar 2016 12:31:34 +0530
+Subject: [PATCH 0621/1164] HIVE-4570 : Add more information to
+ GetOperationStatus in Hive Server2 when query is
+ still executing (Rajat Khandelwal, reviwed by
+ Amareshwari)
+
+Also, adds changes to TCLIService.thrift for the new fields required in TGetOperationStatusResp class to make sure that backport from upstream works as expected. Regenerated the thrift source files in service/src/gen directory based on the new definition of TGetOperationStatusResp in TCLIService.thrift
+
+Change-Id: I9e568b295493b6880c7563fd6987a520c0fae9ad
+---
+ .../cli/TestEmbeddedThriftBinaryCLIService.java    |    4 +-
+ .../hive/service/cli/session/TestQueryDisplay.java |    7 +-
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    9 +-
+ .../org/apache/hadoop/hive/ql/QueryDisplay.java    |  133 ++++---
+ .../java/org/apache/hadoop/hive/ql/QueryPlan.java  |   17 +-
+ .../java/org/apache/hadoop/hive/ql/exec/Task.java  |   73 ++--
+ .../apache/hadoop/hive/ql/exec/mr/ExecDriver.java  |    6 +
+ .../apache/hadoop/hive/ql/exec/mr/MapRedTask.java  |    8 +-
+ .../apache/hadoop/hive/ql/history/HiveHistory.java |    2 +-
+ service/if/TCLIService.thrift                      |   13 +
+ .../src/gen/thrift/gen-cpp/TCLIService_types.cpp   |   60 ++-
+ service/src/gen/thrift/gen-cpp/TCLIService_types.h |   52 ++-
+ .../cli/thrift/TGetOperationStatusResp.java        |  411 +++++++++++++++++++-
+ .../src/gen/thrift/gen-py/TCLIService/ttypes.py    |   50 ++-
+ .../src/gen/thrift/gen-rb/t_c_l_i_service_types.rb |   10 +-
+ .../org/apache/hive/tmpl/QueryProfileTmpl.jamon    |   18 +-
+ .../apache/hive/service/cli/OperationStatus.java   |   20 +-
+ .../hive/service/cli/operation/Operation.java      |   41 +-
+ .../hive/service/cli/operation/SQLOperation.java   |   49 ++-
+ .../hive/service/cli/thrift/ThriftCLIService.java  |    3 +
+ .../service/cli/thrift/ThriftCLIServiceClient.java |    3 +-
+ .../apache/hive/service/cli/CLIServiceTest.java    |  104 ++++-
+ 22 files changed, 964 insertions(+), 129 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/TestEmbeddedThriftBinaryCLIService.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/TestEmbeddedThriftBinaryCLIService.java
+index e7be18a..66ca386 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/TestEmbeddedThriftBinaryCLIService.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/TestEmbeddedThriftBinaryCLIService.java
+@@ -36,7 +36,9 @@
+   @BeforeClass
+   public static void setUpBeforeClass() throws Exception {
+     service = new EmbeddedThriftBinaryCLIService();
+-    service.init(new HiveConf());
++    HiveConf conf = new HiveConf();
++    conf.setBoolean("datanucleus.schema.autoCreateTables", true);
++    service.init(conf);
+     client = new ThriftCLIServiceClient(service);
+   }
+ 
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
+index e8d7bb8..4cda428 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
+@@ -24,15 +24,12 @@
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hive.service.cli.OperationHandle;
+ import org.apache.hive.service.cli.SessionHandle;
+-import org.apache.hive.service.cli.operation.ExecuteStatementOperation;
+ import org.apache.hive.service.cli.operation.SQLOperationDisplay;
+ import org.apache.hive.service.cli.thrift.TProtocolVersion;
+ import org.apache.hive.service.server.HiveServer2;
+-import org.apache.hive.service.servlet.QueryProfileServlet;
+ import org.apache.hive.tmpl.QueryProfileTmpl;
+ import org.junit.Assert;
+ import org.junit.Before;
+-import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+ import java.io.StringWriter;
+@@ -173,8 +170,8 @@ private void verifyDDL(SQLOperationDisplay display, String stmt, String handle,
+     Assert.assertTrue(qDisplay1.getPerfLogStarts(QueryDisplay.Phase.COMPILATION).size() > 0);
+     Assert.assertTrue(qDisplay1.getPerfLogEnds(QueryDisplay.Phase.COMPILATION).size() > 0);
+ 
+-    Assert.assertEquals(qDisplay1.getTaskInfos().size(), 1);
+-    QueryDisplay.TaskInfo tInfo1 = qDisplay1.getTaskInfos().get(0);
++    Assert.assertEquals(qDisplay1.getTaskDisplays().size(), 2);
++    QueryDisplay.TaskDisplay tInfo1 = qDisplay1.getTaskDisplays().get(1);
+     Assert.assertEquals(tInfo1.getTaskId(), "Stage-0");
+     Assert.assertEquals(tInfo1.getTaskType(), StageType.DDL);
+     Assert.assertTrue(tInfo1.getBeginTime() > 0 && tInfo1.getBeginTime() <= System.currentTimeMillis());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index fcbba5e..433024c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -465,7 +465,7 @@ public int compile(String command, boolean resetTaskIds) {
+       schema = getSchema(sem, conf);
+ 
+       plan = new QueryPlan(queryStr, sem, perfLogger.getStartTime(PerfLogger.DRIVER_RUN), queryId,
+-        SessionState.get().getCommandType(), schema);
++        SessionState.get().getHiveOperation(), schema, queryDisplay);
+ 
+       conf.setVar(HiveConf.ConfVars.HIVEQUERYSTRING, queryStr);
+ 
+@@ -1232,8 +1232,8 @@ private int compileInternal(String command) {
+    */
+   private ReentrantLock tryAcquireCompileLock(String command) {
+     long maxCompileLockWaitTime = HiveConf.getTimeVar(
+-          this.conf, ConfVars.HIVE_SERVER2_COMPILE_LOCK_TIMEOUT,
+-          TimeUnit.SECONDS);
++      this.conf, ConfVars.HIVE_SERVER2_COMPILE_LOCK_TIMEOUT,
++      TimeUnit.SECONDS);
+     if (maxCompileLockWaitTime > 0) {
+       try {
+         if (LOG.isDebugEnabled()) {
+@@ -1535,7 +1535,6 @@ public int execute() throws CommandNeedRetryException {
+         // Launch upto maxthreads tasks
+         Task<? extends Serializable> task;
+         while ((task = driverCxt.getRunnable(maxthreads)) != null) {
+-          queryDisplay.addTask(task);
+           TaskRunner runner = launchTask(task, queryId, noName, jobname, jobs, driverCxt);
+           if (!runner.isRunning()) {
+             break;
+@@ -1548,7 +1547,7 @@ public int execute() throws CommandNeedRetryException {
+           continue;
+         }
+         hookContext.addCompleteTask(tskRun);
+-        queryDisplay.setTaskCompleted(tskRun.getTask().getId(), tskRun.getTaskResult());
++        queryDisplay.setTaskResult(tskRun.getTask().getId(), tskRun.getTaskResult());
+ 
+         Task<? extends Serializable> tsk = tskRun.getTask();
+         TaskResult result = tskRun.getTaskResult();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/QueryDisplay.java b/ql/src/java/org/apache/hadoop/hive/ql/QueryDisplay.java
+index c87c825..467dab6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/QueryDisplay.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/QueryDisplay.java
+@@ -22,11 +22,12 @@
+ import org.apache.hadoop.hive.ql.exec.TaskResult;
+ import org.apache.hadoop.hive.ql.plan.api.StageType;
+ 
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.Map;
++import java.io.Serializable;
++import java.util.*;
++
++import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import org.codehaus.jackson.annotate.JsonWriteNullProperties;
++import org.codehaus.jackson.annotate.JsonIgnore;
+ 
+ /**
+  * Some limited query information to save for WebUI.
+@@ -41,39 +42,56 @@
+   private String errorMessage;
+   private String queryId;
+ 
+-  private final Map<Phase, Map<String, Long>> hmsTimingMap = new HashMap();
+-  private final Map<Phase, Map<String, Long>> perfLogStartMap = new HashMap();
+-  private final Map<Phase, Map<String, Long>> perfLogEndMap = new HashMap();
++  private final Map<Phase, Map<String, Long>> hmsTimingMap = new HashMap<Phase, Map<String, Long>>();
++  private final Map<Phase, Map<String, Long>> perfLogStartMap = new HashMap<Phase, Map<String, Long>>();
++  private final Map<Phase, Map<String, Long>> perfLogEndMap = new HashMap<Phase, Map<String, Long>>();
++
++  private final LinkedHashMap<String, TaskDisplay> tasks = new LinkedHashMap<String, TaskDisplay>();
+ 
+-  private final LinkedHashMap<String, TaskInfo> tasks = new LinkedHashMap<String, TaskInfo>();
++  public synchronized <T extends Serializable> void updateTaskStatus(Task<T> tTask) {
++    if (!tasks.containsKey(tTask.getId())) {
++      tasks.put(tTask.getId(), new TaskDisplay(tTask));
++    }
++    tasks.get(tTask.getId()).updateStatus(tTask);
++  }
+ 
+   //Inner classes
+-  public static enum Phase {
++  public enum Phase {
+     COMPILATION,
+     EXECUTION,
+   }
+ 
+-  public static class TaskInfo {
++  @JsonWriteNullProperties(false)
++  @JsonIgnoreProperties(ignoreUnknown = true)
++  public static class TaskDisplay {
++
+     private Integer returnVal;  //if set, determines that task is complete.
+     private String errorMsg;
+-    private long endTime;
+ 
+-    final long beginTime;
+-    final String taskId;
+-    final StageType taskType;
+-    final String name;
+-    final boolean requireLock;
+-    final boolean retryIfFail;
++    private Long beginTime;
++    private Long endTime;
++
++    private String taskId;
++    private String taskExternalHandle;
++
++    public Task.TaskState taskState;
++    private StageType taskType;
++    private String name;
++    private boolean requireLock;
++    private boolean retryIfFail;
++    // required for jackson
++    public TaskDisplay() {
+ 
+-    public TaskInfo (Task task) {
+-      beginTime = System.currentTimeMillis();
++    }
++    public TaskDisplay(Task task) {
+       taskId = task.getId();
++      taskExternalHandle = task.getExternalHandle();
+       taskType = task.getType();
+       name = task.getName();
+       requireLock = task.requireLock();
+       retryIfFail = task.ifRetryCmdWhenFail();
+     }
+-
++    @JsonIgnore
+     public synchronized String getStatus() {
+       if (returnVal == null) {
+         return "Running";
+@@ -84,67 +102,82 @@ public synchronized String getStatus() {
+       }
+     }
+ 
+-    public synchronized long getElapsedTime() {
+-      if (endTime == 0) {
++    public synchronized Long getElapsedTime() {
++      if (endTime == null) {
++        if (beginTime == null) {
++          return null;
++        }
+         return System.currentTimeMillis() - beginTime;
+       } else {
+         return endTime - beginTime;
+       }
+     }
+ 
++    public synchronized Integer getReturnValue() {
++      return returnVal;
++    }
++
+     public synchronized String getErrorMsg() {
+       return errorMsg;
+     }
+ 
+-    public synchronized long getEndTime() {
+-      return endTime;
++    public synchronized Long getBeginTime() {
++      return beginTime;
+     }
+ 
+-    //Following methods do not need to be synchronized, because they are final fields.
+-    public long getBeginTime() {
+-      return beginTime;
++    public synchronized Long getEndTime() {
++      return endTime;
+     }
+ 
+-    public String getTaskId() {
++    public synchronized String getTaskId() {
+       return taskId;
+     }
+ 
+-    public StageType getTaskType() {
++    public synchronized StageType getTaskType() {
+       return taskType;
+     }
+ 
+-    public String getName() {
++    public synchronized String getName() {
+       return name;
+     }
+-
+-    public boolean isRequireLock() {
++    @JsonIgnore
++    public synchronized boolean isRequireLock() {
+       return requireLock;
+     }
+-
+-    public boolean isRetryIfFail() {
++    @JsonIgnore
++    public synchronized boolean isRetryIfFail() {
+       return retryIfFail;
+     }
+-  }
+ 
+-  public synchronized void addTask(Task task) {
+-    tasks.put(task.getId(), new TaskInfo(task));
+-  }
++    public synchronized String getExternalHandle() {
++      return taskExternalHandle;
++    }
+ 
+-  public synchronized void setTaskCompleted(String taskId, TaskResult result) {
+-    TaskInfo taskInfo = tasks.get(taskId);
+-    if (taskInfo != null) {
+-      taskInfo.returnVal = result.getExitVal();
++    public synchronized <T extends Serializable> void updateStatus(Task<T> tTask) {
++      this.taskState = tTask.getTaskState();
++      switch(taskState) {
++        case RUNNING:
++          beginTime = System.currentTimeMillis();
++          break;
++        case FINISHED:
++          endTime = System.currentTimeMillis();
++          break;
++      }
++    }
++  }
++  public synchronized void setTaskResult(String taskId, TaskResult result) {
++    TaskDisplay taskDisplay = tasks.get(taskId);
++    if (taskDisplay != null) {
++      taskDisplay.returnVal = result.getExitVal();
+       if (result.getTaskError() != null) {
+-        taskInfo.errorMsg = result.getTaskError().toString();
++        taskDisplay.errorMsg = result.getTaskError().toString();
+       }
+-      taskInfo.endTime = System.currentTimeMillis();
+     }
+   }
+-
+-  public synchronized List<TaskInfo> getTaskInfos() {
+-    List<TaskInfo> taskInfos = new ArrayList<TaskInfo>();
+-    taskInfos.addAll(tasks.values());
+-    return taskInfos;
++  public synchronized List<TaskDisplay> getTaskDisplays() {
++    List<TaskDisplay> taskDisplays = new ArrayList<TaskDisplay>();
++    taskDisplays.addAll(tasks.values());
++    return taskDisplays;
+   }
+ 
+   public synchronized void setQueryStr(String queryStr) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/QueryPlan.java b/ql/src/java/org/apache/hadoop/hive/ql/QueryPlan.java
+index 75bbe98..f1fd890 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/QueryPlan.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/QueryPlan.java
+@@ -50,6 +50,7 @@
+ import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
+ import org.apache.hadoop.hive.ql.parse.ColumnAccessInfo;
+ import org.apache.hadoop.hive.ql.parse.TableAccessInfo;
++import org.apache.hadoop.hive.ql.plan.HiveOperation;
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ import org.apache.hadoop.hive.ql.plan.ReducerTimeStatsPerJob;
+ import org.apache.hadoop.hive.ql.plan.api.AdjacencyType;
+@@ -113,13 +114,27 @@ public QueryPlan() {
+   }
+ 
+   public QueryPlan(String queryString, BaseSemanticAnalyzer sem, Long startTime, String queryId,
+-      String operationName, Schema resultSchema) {
++                   HiveOperation operation, Schema resultSchema) {
++    this(queryString, sem, startTime, queryId, operation, resultSchema, null);
++  }
++  public QueryPlan(String queryString, BaseSemanticAnalyzer sem, Long startTime, String queryId,
++                  HiveOperation operation, Schema resultSchema, QueryDisplay queryDisplay) {
+     this.queryString = queryString;
+ 
+     rootTasks = new ArrayList<Task<? extends Serializable>>();
+     this.reducerTimeStatsPerJobList = new ArrayList<ReducerTimeStatsPerJob>();
+     rootTasks.addAll(sem.getRootTasks());
+     fetchTask = sem.getFetchTask();
++    if (queryDisplay != null) {
++      if (fetchTask != null) {
++        fetchTask.setQueryDisplay(queryDisplay);
++      }
++      if (rootTasks!= null) {
++        for (Task t : rootTasks) {
++          t.setQueryDisplay(queryDisplay);
++        }
++      }
++    }
+     // Note that inputs and outputs can be changed when the query gets executed
+     inputs = sem.getInputs();
+     outputs = sem.getOutputs();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
+index 8a7aacd..8d60fcd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
+@@ -31,6 +31,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.DriverContext;
++import org.apache.hadoop.hive.ql.QueryDisplay;
+ import org.apache.hadoop.hive.ql.QueryPlan;
+ import org.apache.hadoop.hive.ql.lib.Node;
+ import org.apache.hadoop.hive.ql.metadata.Hive;
+@@ -55,10 +56,6 @@
+   private static final long serialVersionUID = 1L;
+   public transient HashMap<String, Long> taskCounters;
+   public transient TaskHandle taskHandle;
+-  protected transient boolean started;
+-  protected transient boolean initialized;
+-  protected transient boolean isdone;
+-  protected transient boolean queued;
+   protected transient HiveConf conf;
+   protected transient Hive db;
+   protected transient LogHelper console;
+@@ -85,18 +82,32 @@
+   // created in case the mapjoin failed.
+   public static final int MAPJOIN_ONLY_NOBACKUP = 7;
+   public static final int CONVERTED_SORTMERGEJOIN = 8;
+-
++  public QueryDisplay queryDisplay = null;
+   // Descendants tasks who subscribe feeds from this task
+   protected transient List<Task<? extends Serializable>> feedSubscribers;
+ 
+   protected String id;
+   protected T work;
+-
++  private TaskState taskState = TaskState.CREATED;
+   private transient boolean fetchSource;
+ 
+-  public static enum FeedType {
++  public enum FeedType {
+     DYNAMIC_PARTITIONS, // list of dynamic partitions
+   }
++  public enum TaskState {
++    // Task data structures have been initialized
++    INITIALIZED,
++    // Task has been queued for execution by the driver
++    QUEUED,
++    // Task is currently running
++    RUNNING,
++    // Task has completed
++    FINISHED,
++    // Task is just created
++    CREATED,
++    // Task state is unkown
++    UNKNOWN
++  }
+ 
+   // Bean methods
+ 
+@@ -112,10 +123,6 @@
+   private Throwable exception;
+ 
+   public Task() {
+-    isdone = false;
+-    started = false;
+-    initialized = false;
+-    queued = false;
+     this.taskCounters = new HashMap<String, Long>();
+     taskTag = Task.NO_TAG;
+   }
+@@ -126,11 +133,8 @@ public TaskHandle getTaskHandle() {
+ 
+   public void initialize(HiveConf conf, QueryPlan queryPlan, DriverContext driverContext) {
+     this.queryPlan = queryPlan;
+-    isdone = false;
+-    started = false;
+     setInitialized();
+     this.conf = conf;
+-
+     try {
+       db = Hive.get(conf);
+     } catch (HiveException e) {
+@@ -144,6 +148,20 @@ public void initialize(HiveConf conf, QueryPlan queryPlan, DriverContext driverC
+     console = new LogHelper(LOG);
+   }
+ 
++  public void setQueryDisplay(QueryDisplay queryDisplay) {
++    this.queryDisplay = queryDisplay;
++  }
++
++  private void updateStatusInQueryDisplay() {
++    if (queryDisplay != null) {
++      queryDisplay.updateTaskStatus(this);
++    }
++  }
++
++  private void setState(TaskState state) {
++    this.taskState = state;
++    updateStatusInQueryDisplay();
++  }
+   /**
+    * This method is called in the Driver on every task. It updates counters and calls execute(),
+    * which is overridden in each task
+@@ -310,37 +328,36 @@ public void removeDependentTask(Task<? extends Serializable> dependent) {
+       }
+     }
+   }
+-
+   public void setStarted() {
+-    this.started = true;
++    setState(TaskState.RUNNING);
+   }
+ 
+   public boolean started() {
+-    return started;
++    return taskState == TaskState.RUNNING;
+   }
+ 
+   public boolean done() {
+-    return isdone;
++    return taskState == TaskState.FINISHED;
+   }
+ 
+   public void setDone() {
+-    isdone = true;
++    setState(TaskState.FINISHED);
+   }
+ 
+   public void setQueued() {
+-    queued = true;
++    setState(TaskState.QUEUED);
+   }
+ 
+   public boolean getQueued() {
+-    return queued;
++    return taskState == TaskState.QUEUED;
+   }
+ 
+   public void setInitialized() {
+-    initialized = true;
++    setState(TaskState.INITIALIZED);
+   }
+ 
+   public boolean getInitialized() {
+-    return initialized;
++    return taskState == TaskState.INITIALIZED;
+   }
+ 
+   public boolean isRunnable() {
+@@ -378,6 +395,14 @@ public String getId() {
+     return id;
+   }
+ 
++  public String getExternalHandle() {
++    return null;
++  }
++
++  public TaskState getTaskState() {
++    return taskState;
++  }
++
+   public boolean isMapRedTask() {
+     return false;
+   }
+@@ -557,4 +582,6 @@ public int hashCode() {
+   public boolean equals(Object obj) {
+     return toString().equals(String.valueOf(obj));
+   }
++
++
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+index 51b5941..72de9f9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+@@ -432,6 +432,7 @@ public int execute(DriverContext driverContext) {
+       if (pwd != null) {
+         HiveConf.setVar(job, HiveConf.ConfVars.METASTOREPWD, pwd);
+       }
++      this.jobID = rj.getJobID();
+ 
+       returnVal = jobExecHelper.progress(rj, jc, ctx.getHiveTxnManager());
+       success = (returnVal == 0);
+@@ -845,5 +846,10 @@ public void shutdown() {
+       rj = null;
+     }
+   }
++
++  @Override
++  public String getExternalHandle() {
++    return this.jobID;
++  }
+ }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+index 6ba8663..326ca93 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+@@ -362,25 +362,25 @@ static void configureDebugVariablesForChildJVM(Map<String, String> environmentVa
+   @Override
+   public boolean mapStarted() {
+     boolean b = super.mapStarted();
+-    return runningViaChild ? isdone : b;
++    return runningViaChild ? done() : b;
+   }
+ 
+   @Override
+   public boolean reduceStarted() {
+     boolean b = super.reduceStarted();
+-    return runningViaChild ? isdone : b;
++    return runningViaChild ? done() : b;
+   }
+ 
+   @Override
+   public boolean mapDone() {
+     boolean b = super.mapDone();
+-    return runningViaChild ? isdone : b;
++    return runningViaChild ? done() : b;
+   }
+ 
+   @Override
+   public boolean reduceDone() {
+     boolean b = super.reduceDone();
+-    return runningViaChild ? isdone : b;
++    return runningViaChild ? done() : b;
+   }
+ 
+   /**
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistory.java b/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistory.java
+index 45cd533..687f551 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistory.java
+@@ -109,7 +109,7 @@
+   };
+ 
+   /**
+-   * TaskInfo.
++   * TaskDisplay.
+    *
+    */
+   public static class TaskInfo extends Info {
+diff --git a/service/if/TCLIService.thrift b/service/if/TCLIService.thrift
+index 6f1a4ca..485aa30 100644
+--- a/service/if/TCLIService.thrift
++++ b/service/if/TCLIService.thrift
+@@ -968,6 +968,19 @@ struct TGetOperationStatusResp {
+ 
+   // Error message
+   5: optional string errorMessage
++
++  // List of statuses of sub tasks
++  6: optional string taskStatus
++
++  // When was the operation started
++  7: optional i64 operationStarted
++
++  // When was the operation completed
++  8: optional i64 operationCompleted
++
++  // If the operation has the result
++  9: optional bool hasResultSet
++
+ }
+ 
+ 
+diff --git a/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp b/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp
+index 326d25b..9e80eaf 100644
+--- a/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp
++++ b/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp
+@@ -5615,8 +5615,8 @@ void swap(TGetOperationStatusReq &a, TGetOperationStatusReq &b) {
+   swap(a.operationHandle, b.operationHandle);
+ }
+ 
+-const char* TGetOperationStatusResp::ascii_fingerprint = "BD124DB87A5A2E7D11945BD1B17F013D";
+-const uint8_t TGetOperationStatusResp::binary_fingerprint[16] = {0xBD,0x12,0x4D,0xB8,0x7A,0x5A,0x2E,0x7D,0x11,0x94,0x5B,0xD1,0xB1,0x7F,0x01,0x3D};
++const char* TGetOperationStatusResp::ascii_fingerprint = "F236074CA75B2BE6D27F380B505DA5D2";
++const uint8_t TGetOperationStatusResp::binary_fingerprint[16] = {0xF2,0x36,0x07,0x4C,0xA7,0x5B,0x2B,0xE6,0xD2,0x7F,0x38,0x0B,0x50,0x5D,0xA5,0xD2};
+ 
+ uint32_t TGetOperationStatusResp::read(::apache::thrift::protocol::TProtocol* iprot) {
+ 
+@@ -5681,6 +5681,38 @@ uint32_t TGetOperationStatusResp::read(::apache::thrift::protocol::TProtocol* ip
+           xfer += iprot->skip(ftype);
+         }
+         break;
++      case 6:
++        if (ftype == ::apache::thrift::protocol::T_STRING) {
++          xfer += iprot->readString(this->taskStatus);
++          this->__isset.taskStatus = true;
++        } else {
++          xfer += iprot->skip(ftype);
++        }
++        break;
++      case 7:
++        if (ftype == ::apache::thrift::protocol::T_I64) {
++          xfer += iprot->readI64(this->operationStarted);
++          this->__isset.operationStarted = true;
++        } else {
++          xfer += iprot->skip(ftype);
++        }
++        break;
++      case 8:
++        if (ftype == ::apache::thrift::protocol::T_I64) {
++          xfer += iprot->readI64(this->operationCompleted);
++          this->__isset.operationCompleted = true;
++        } else {
++          xfer += iprot->skip(ftype);
++        }
++        break;
++      case 9:
++        if (ftype == ::apache::thrift::protocol::T_BOOL) {
++          xfer += iprot->readBool(this->hasResultSet);
++          this->__isset.hasResultSet = true;
++        } else {
++          xfer += iprot->skip(ftype);
++        }
++        break;
+       default:
+         xfer += iprot->skip(ftype);
+         break;
+@@ -5723,6 +5755,26 @@ uint32_t TGetOperationStatusResp::write(::apache::thrift::protocol::TProtocol* o
+     xfer += oprot->writeString(this->errorMessage);
+     xfer += oprot->writeFieldEnd();
+   }
++  if (this->__isset.taskStatus) {
++    xfer += oprot->writeFieldBegin("taskStatus", ::apache::thrift::protocol::T_STRING, 6);
++    xfer += oprot->writeString(this->taskStatus);
++    xfer += oprot->writeFieldEnd();
++  }
++  if (this->__isset.operationStarted) {
++    xfer += oprot->writeFieldBegin("operationStarted", ::apache::thrift::protocol::T_I64, 7);
++    xfer += oprot->writeI64(this->operationStarted);
++    xfer += oprot->writeFieldEnd();
++  }
++  if (this->__isset.operationCompleted) {
++    xfer += oprot->writeFieldBegin("operationCompleted", ::apache::thrift::protocol::T_I64, 8);
++    xfer += oprot->writeI64(this->operationCompleted);
++    xfer += oprot->writeFieldEnd();
++  }
++  if (this->__isset.hasResultSet) {
++    xfer += oprot->writeFieldBegin("hasResultSet", ::apache::thrift::protocol::T_BOOL, 9);
++    xfer += oprot->writeBool(this->hasResultSet);
++    xfer += oprot->writeFieldEnd();
++  }
+   xfer += oprot->writeFieldStop();
+   xfer += oprot->writeStructEnd();
+   return xfer;
+@@ -5735,6 +5787,10 @@ void swap(TGetOperationStatusResp &a, TGetOperationStatusResp &b) {
+   swap(a.sqlState, b.sqlState);
+   swap(a.errorCode, b.errorCode);
+   swap(a.errorMessage, b.errorMessage);
++  swap(a.taskStatus, b.taskStatus);
++  swap(a.operationStarted, b.operationStarted);
++  swap(a.operationCompleted, b.operationCompleted);
++  swap(a.hasResultSet, b.hasResultSet);
+   swap(a.__isset, b.__isset);
+ }
+ 
+diff --git a/service/src/gen/thrift/gen-cpp/TCLIService_types.h b/service/src/gen/thrift/gen-cpp/TCLIService_types.h
+index d2942ab..dbbd3e9 100644
+--- a/service/src/gen/thrift/gen-cpp/TCLIService_types.h
++++ b/service/src/gen/thrift/gen-cpp/TCLIService_types.h
+@@ -3279,20 +3279,24 @@ class TGetOperationStatusReq {
+ void swap(TGetOperationStatusReq &a, TGetOperationStatusReq &b);
+ 
+ typedef struct _TGetOperationStatusResp__isset {
+-  _TGetOperationStatusResp__isset() : operationState(false), sqlState(false), errorCode(false), errorMessage(false) {}
++  _TGetOperationStatusResp__isset() : operationState(false), sqlState(false), errorCode(false), errorMessage(false), taskStatus(false), operationStarted(false), operationCompleted(false), hasResultSet(false) {}
+   bool operationState;
+   bool sqlState;
+   bool errorCode;
+   bool errorMessage;
++  bool taskStatus;
++  bool operationStarted;
++  bool operationCompleted;
++  bool hasResultSet;
+ } _TGetOperationStatusResp__isset;
+ 
+ class TGetOperationStatusResp {
+  public:
+ 
+-  static const char* ascii_fingerprint; // = "BD124DB87A5A2E7D11945BD1B17F013D";
+-  static const uint8_t binary_fingerprint[16]; // = {0xBD,0x12,0x4D,0xB8,0x7A,0x5A,0x2E,0x7D,0x11,0x94,0x5B,0xD1,0xB1,0x7F,0x01,0x3D};
++  static const char* ascii_fingerprint; // = "F236074CA75B2BE6D27F380B505DA5D2";
++  static const uint8_t binary_fingerprint[16]; // = {0xF2,0x36,0x07,0x4C,0xA7,0x5B,0x2B,0xE6,0xD2,0x7F,0x38,0x0B,0x50,0x5D,0xA5,0xD2};
+ 
+-  TGetOperationStatusResp() : operationState((TOperationState::type)0), sqlState(), errorCode(0), errorMessage() {
++  TGetOperationStatusResp() : operationState((TOperationState::type)0), sqlState(), errorCode(0), errorMessage(), taskStatus(), operationStarted(0), operationCompleted(0), hasResultSet(0) {
+   }
+ 
+   virtual ~TGetOperationStatusResp() throw() {}
+@@ -3302,6 +3306,10 @@ class TGetOperationStatusResp {
+   std::string sqlState;
+   int32_t errorCode;
+   std::string errorMessage;
++  std::string taskStatus;
++  int64_t operationStarted;
++  int64_t operationCompleted;
++  bool hasResultSet;
+ 
+   _TGetOperationStatusResp__isset __isset;
+ 
+@@ -3329,6 +3337,26 @@ class TGetOperationStatusResp {
+     __isset.errorMessage = true;
+   }
+ 
++  void __set_taskStatus(const std::string& val) {
++    taskStatus = val;
++    __isset.taskStatus = true;
++  }
++
++  void __set_operationStarted(const int64_t val) {
++    operationStarted = val;
++    __isset.operationStarted = true;
++  }
++
++  void __set_operationCompleted(const int64_t val) {
++    operationCompleted = val;
++    __isset.operationCompleted = true;
++  }
++
++  void __set_hasResultSet(const bool val) {
++    hasResultSet = val;
++    __isset.hasResultSet = true;
++  }
++
+   bool operator == (const TGetOperationStatusResp & rhs) const
+   {
+     if (!(status == rhs.status))
+@@ -3349,6 +3377,22 @@ class TGetOperationStatusResp {
+       return false;
+     else if (__isset.errorMessage && !(errorMessage == rhs.errorMessage))
+       return false;
++    if (__isset.taskStatus != rhs.__isset.taskStatus)
++      return false;
++    else if (__isset.taskStatus && !(taskStatus == rhs.taskStatus))
++      return false;
++    if (__isset.operationStarted != rhs.__isset.operationStarted)
++      return false;
++    else if (__isset.operationStarted && !(operationStarted == rhs.operationStarted))
++      return false;
++    if (__isset.operationCompleted != rhs.__isset.operationCompleted)
++      return false;
++    else if (__isset.operationCompleted && !(operationCompleted == rhs.operationCompleted))
++      return false;
++    if (__isset.hasResultSet != rhs.__isset.hasResultSet)
++      return false;
++    else if (__isset.hasResultSet && !(hasResultSet == rhs.hasResultSet))
++      return false;
+     return true;
+   }
+   bool operator != (const TGetOperationStatusResp &rhs) const {
+diff --git a/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TGetOperationStatusResp.java b/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TGetOperationStatusResp.java
+index 94ba6bb..d27927a 100644
+--- a/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TGetOperationStatusResp.java
++++ b/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TGetOperationStatusResp.java
+@@ -39,6 +39,10 @@
+   private static final org.apache.thrift.protocol.TField SQL_STATE_FIELD_DESC = new org.apache.thrift.protocol.TField("sqlState", org.apache.thrift.protocol.TType.STRING, (short)3);
+   private static final org.apache.thrift.protocol.TField ERROR_CODE_FIELD_DESC = new org.apache.thrift.protocol.TField("errorCode", org.apache.thrift.protocol.TType.I32, (short)4);
+   private static final org.apache.thrift.protocol.TField ERROR_MESSAGE_FIELD_DESC = new org.apache.thrift.protocol.TField("errorMessage", org.apache.thrift.protocol.TType.STRING, (short)5);
++  private static final org.apache.thrift.protocol.TField TASK_STATUS_FIELD_DESC = new org.apache.thrift.protocol.TField("taskStatus", org.apache.thrift.protocol.TType.STRING, (short)6);
++  private static final org.apache.thrift.protocol.TField OPERATION_STARTED_FIELD_DESC = new org.apache.thrift.protocol.TField("operationStarted", org.apache.thrift.protocol.TType.I64, (short)7);
++  private static final org.apache.thrift.protocol.TField OPERATION_COMPLETED_FIELD_DESC = new org.apache.thrift.protocol.TField("operationCompleted", org.apache.thrift.protocol.TType.I64, (short)8);
++  private static final org.apache.thrift.protocol.TField HAS_RESULT_SET_FIELD_DESC = new org.apache.thrift.protocol.TField("hasResultSet", org.apache.thrift.protocol.TType.BOOL, (short)9);
+ 
+   private static final Map<Class<? extends IScheme>, SchemeFactory> schemes = new HashMap<Class<? extends IScheme>, SchemeFactory>();
+   static {
+@@ -51,6 +55,10 @@
+   private String sqlState; // optional
+   private int errorCode; // optional
+   private String errorMessage; // optional
++  private String taskStatus; // optional
++  private long operationStarted; // optional
++  private long operationCompleted; // optional
++  private boolean hasResultSet; // optional
+ 
+   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+@@ -62,7 +70,11 @@
+     OPERATION_STATE((short)2, "operationState"),
+     SQL_STATE((short)3, "sqlState"),
+     ERROR_CODE((short)4, "errorCode"),
+-    ERROR_MESSAGE((short)5, "errorMessage");
++    ERROR_MESSAGE((short)5, "errorMessage"),
++    TASK_STATUS((short)6, "taskStatus"),
++    OPERATION_STARTED((short)7, "operationStarted"),
++    OPERATION_COMPLETED((short)8, "operationCompleted"),
++    HAS_RESULT_SET((short)9, "hasResultSet");
+ 
+     private static final Map<String, _Fields> byName = new HashMap<String, _Fields>();
+ 
+@@ -87,6 +99,14 @@ public static _Fields findByThriftId(int fieldId) {
+           return ERROR_CODE;
+         case 5: // ERROR_MESSAGE
+           return ERROR_MESSAGE;
++        case 6: // TASK_STATUS
++          return TASK_STATUS;
++        case 7: // OPERATION_STARTED
++          return OPERATION_STARTED;
++        case 8: // OPERATION_COMPLETED
++          return OPERATION_COMPLETED;
++        case 9: // HAS_RESULT_SET
++          return HAS_RESULT_SET;
+         default:
+           return null;
+       }
+@@ -128,8 +148,11 @@ public String getFieldName() {
+ 
+   // isset id assignments
+   private static final int __ERRORCODE_ISSET_ID = 0;
++  private static final int __OPERATIONSTARTED_ISSET_ID = 1;
++  private static final int __OPERATIONCOMPLETED_ISSET_ID = 2;
++  private static final int __HASRESULTSET_ISSET_ID = 3;
+   private byte __isset_bitfield = 0;
+-  private _Fields optionals[] = {_Fields.OPERATION_STATE,_Fields.SQL_STATE,_Fields.ERROR_CODE,_Fields.ERROR_MESSAGE};
++  private _Fields optionals[] = {_Fields.OPERATION_STATE,_Fields.SQL_STATE,_Fields.ERROR_CODE,_Fields.ERROR_MESSAGE,_Fields.TASK_STATUS,_Fields.OPERATION_STARTED,_Fields.OPERATION_COMPLETED,_Fields.HAS_RESULT_SET};
+   public static final Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+   static {
+     Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+@@ -143,6 +166,14 @@ public String getFieldName() {
+         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
+     tmpMap.put(_Fields.ERROR_MESSAGE, new org.apache.thrift.meta_data.FieldMetaData("errorMessage", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
++    tmpMap.put(_Fields.TASK_STATUS, new org.apache.thrift.meta_data.FieldMetaData("taskStatus", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
++        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
++    tmpMap.put(_Fields.OPERATION_STARTED, new org.apache.thrift.meta_data.FieldMetaData("operationStarted", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
++        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
++    tmpMap.put(_Fields.OPERATION_COMPLETED, new org.apache.thrift.meta_data.FieldMetaData("operationCompleted", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
++        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
++    tmpMap.put(_Fields.HAS_RESULT_SET, new org.apache.thrift.meta_data.FieldMetaData("hasResultSet", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
++        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
+     metaDataMap = Collections.unmodifiableMap(tmpMap);
+     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(TGetOperationStatusResp.class, metaDataMap);
+   }
+@@ -175,6 +206,12 @@ public TGetOperationStatusResp(TGetOperationStatusResp other) {
+     if (other.isSetErrorMessage()) {
+       this.errorMessage = other.errorMessage;
+     }
++    if (other.isSetTaskStatus()) {
++      this.taskStatus = other.taskStatus;
++    }
++    this.operationStarted = other.operationStarted;
++    this.operationCompleted = other.operationCompleted;
++    this.hasResultSet = other.hasResultSet;
+   }
+ 
+   public TGetOperationStatusResp deepCopy() {
+@@ -189,6 +226,13 @@ public void clear() {
+     setErrorCodeIsSet(false);
+     this.errorCode = 0;
+     this.errorMessage = null;
++    this.taskStatus = null;
++    setOperationStartedIsSet(false);
++    this.operationStarted = 0;
++    setOperationCompletedIsSet(false);
++    this.operationCompleted = 0;
++    setHasResultSetIsSet(false);
++    this.hasResultSet = false;
+   }
+ 
+   public TStatus getStatus() {
+@@ -313,6 +357,95 @@ public void setErrorMessageIsSet(boolean value) {
+     }
+   }
+ 
++  public String getTaskStatus() {
++    return this.taskStatus;
++  }
++
++  public void setTaskStatus(String taskStatus) {
++    this.taskStatus = taskStatus;
++  }
++
++  public void unsetTaskStatus() {
++    this.taskStatus = null;
++  }
++
++  /** Returns true if field taskStatus is set (has been assigned a value) and false otherwise */
++  public boolean isSetTaskStatus() {
++    return this.taskStatus != null;
++  }
++
++  public void setTaskStatusIsSet(boolean value) {
++    if (!value) {
++      this.taskStatus = null;
++    }
++  }
++
++  public long getOperationStarted() {
++    return this.operationStarted;
++  }
++
++  public void setOperationStarted(long operationStarted) {
++    this.operationStarted = operationStarted;
++    setOperationStartedIsSet(true);
++  }
++
++  public void unsetOperationStarted() {
++    __isset_bitfield = EncodingUtils.clearBit(__isset_bitfield, __OPERATIONSTARTED_ISSET_ID);
++  }
++
++  /** Returns true if field operationStarted is set (has been assigned a value) and false otherwise */
++  public boolean isSetOperationStarted() {
++    return EncodingUtils.testBit(__isset_bitfield, __OPERATIONSTARTED_ISSET_ID);
++  }
++
++  public void setOperationStartedIsSet(boolean value) {
++    __isset_bitfield = EncodingUtils.setBit(__isset_bitfield, __OPERATIONSTARTED_ISSET_ID, value);
++  }
++
++  public long getOperationCompleted() {
++    return this.operationCompleted;
++  }
++
++  public void setOperationCompleted(long operationCompleted) {
++    this.operationCompleted = operationCompleted;
++    setOperationCompletedIsSet(true);
++  }
++
++  public void unsetOperationCompleted() {
++    __isset_bitfield = EncodingUtils.clearBit(__isset_bitfield, __OPERATIONCOMPLETED_ISSET_ID);
++  }
++
++  /** Returns true if field operationCompleted is set (has been assigned a value) and false otherwise */
++  public boolean isSetOperationCompleted() {
++    return EncodingUtils.testBit(__isset_bitfield, __OPERATIONCOMPLETED_ISSET_ID);
++  }
++
++  public void setOperationCompletedIsSet(boolean value) {
++    __isset_bitfield = EncodingUtils.setBit(__isset_bitfield, __OPERATIONCOMPLETED_ISSET_ID, value);
++  }
++
++  public boolean isHasResultSet() {
++    return this.hasResultSet;
++  }
++
++  public void setHasResultSet(boolean hasResultSet) {
++    this.hasResultSet = hasResultSet;
++    setHasResultSetIsSet(true);
++  }
++
++  public void unsetHasResultSet() {
++    __isset_bitfield = EncodingUtils.clearBit(__isset_bitfield, __HASRESULTSET_ISSET_ID);
++  }
++
++  /** Returns true if field hasResultSet is set (has been assigned a value) and false otherwise */
++  public boolean isSetHasResultSet() {
++    return EncodingUtils.testBit(__isset_bitfield, __HASRESULTSET_ISSET_ID);
++  }
++
++  public void setHasResultSetIsSet(boolean value) {
++    __isset_bitfield = EncodingUtils.setBit(__isset_bitfield, __HASRESULTSET_ISSET_ID, value);
++  }
++
+   public void setFieldValue(_Fields field, Object value) {
+     switch (field) {
+     case STATUS:
+@@ -355,6 +488,38 @@ public void setFieldValue(_Fields field, Object value) {
+       }
+       break;
+ 
++    case TASK_STATUS:
++      if (value == null) {
++        unsetTaskStatus();
++      } else {
++        setTaskStatus((String)value);
++      }
++      break;
++
++    case OPERATION_STARTED:
++      if (value == null) {
++        unsetOperationStarted();
++      } else {
++        setOperationStarted((Long)value);
++      }
++      break;
++
++    case OPERATION_COMPLETED:
++      if (value == null) {
++        unsetOperationCompleted();
++      } else {
++        setOperationCompleted((Long)value);
++      }
++      break;
++
++    case HAS_RESULT_SET:
++      if (value == null) {
++        unsetHasResultSet();
++      } else {
++        setHasResultSet((Boolean)value);
++      }
++      break;
++
+     }
+   }
+ 
+@@ -375,6 +540,18 @@ public Object getFieldValue(_Fields field) {
+     case ERROR_MESSAGE:
+       return getErrorMessage();
+ 
++    case TASK_STATUS:
++      return getTaskStatus();
++
++    case OPERATION_STARTED:
++      return Long.valueOf(getOperationStarted());
++
++    case OPERATION_COMPLETED:
++      return Long.valueOf(getOperationCompleted());
++
++    case HAS_RESULT_SET:
++      return Boolean.valueOf(isHasResultSet());
++
+     }
+     throw new IllegalStateException();
+   }
+@@ -396,6 +573,14 @@ public boolean isSet(_Fields field) {
+       return isSetErrorCode();
+     case ERROR_MESSAGE:
+       return isSetErrorMessage();
++    case TASK_STATUS:
++      return isSetTaskStatus();
++    case OPERATION_STARTED:
++      return isSetOperationStarted();
++    case OPERATION_COMPLETED:
++      return isSetOperationCompleted();
++    case HAS_RESULT_SET:
++      return isSetHasResultSet();
+     }
+     throw new IllegalStateException();
+   }
+@@ -458,6 +643,42 @@ public boolean equals(TGetOperationStatusResp that) {
+         return false;
+     }
+ 
++    boolean this_present_taskStatus = true && this.isSetTaskStatus();
++    boolean that_present_taskStatus = true && that.isSetTaskStatus();
++    if (this_present_taskStatus || that_present_taskStatus) {
++      if (!(this_present_taskStatus && that_present_taskStatus))
++        return false;
++      if (!this.taskStatus.equals(that.taskStatus))
++        return false;
++    }
++
++    boolean this_present_operationStarted = true && this.isSetOperationStarted();
++    boolean that_present_operationStarted = true && that.isSetOperationStarted();
++    if (this_present_operationStarted || that_present_operationStarted) {
++      if (!(this_present_operationStarted && that_present_operationStarted))
++        return false;
++      if (this.operationStarted != that.operationStarted)
++        return false;
++    }
++
++    boolean this_present_operationCompleted = true && this.isSetOperationCompleted();
++    boolean that_present_operationCompleted = true && that.isSetOperationCompleted();
++    if (this_present_operationCompleted || that_present_operationCompleted) {
++      if (!(this_present_operationCompleted && that_present_operationCompleted))
++        return false;
++      if (this.operationCompleted != that.operationCompleted)
++        return false;
++    }
++
++    boolean this_present_hasResultSet = true && this.isSetHasResultSet();
++    boolean that_present_hasResultSet = true && that.isSetHasResultSet();
++    if (this_present_hasResultSet || that_present_hasResultSet) {
++      if (!(this_present_hasResultSet && that_present_hasResultSet))
++        return false;
++      if (this.hasResultSet != that.hasResultSet)
++        return false;
++    }
++
+     return true;
+   }
+ 
+@@ -490,6 +711,26 @@ public int hashCode() {
+     if (present_errorMessage)
+       builder.append(errorMessage);
+ 
++    boolean present_taskStatus = true && (isSetTaskStatus());
++    builder.append(present_taskStatus);
++    if (present_taskStatus)
++      builder.append(taskStatus);
++
++    boolean present_operationStarted = true && (isSetOperationStarted());
++    builder.append(present_operationStarted);
++    if (present_operationStarted)
++      builder.append(operationStarted);
++
++    boolean present_operationCompleted = true && (isSetOperationCompleted());
++    builder.append(present_operationCompleted);
++    if (present_operationCompleted)
++      builder.append(operationCompleted);
++
++    boolean present_hasResultSet = true && (isSetHasResultSet());
++    builder.append(present_hasResultSet);
++    if (present_hasResultSet)
++      builder.append(hasResultSet);
++
+     return builder.toHashCode();
+   }
+ 
+@@ -551,6 +792,46 @@ public int compareTo(TGetOperationStatusResp other) {
+         return lastComparison;
+       }
+     }
++    lastComparison = Boolean.valueOf(isSetTaskStatus()).compareTo(typedOther.isSetTaskStatus());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetTaskStatus()) {
++      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.taskStatus, typedOther.taskStatus);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
++    lastComparison = Boolean.valueOf(isSetOperationStarted()).compareTo(typedOther.isSetOperationStarted());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetOperationStarted()) {
++      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.operationStarted, typedOther.operationStarted);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
++    lastComparison = Boolean.valueOf(isSetOperationCompleted()).compareTo(typedOther.isSetOperationCompleted());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetOperationCompleted()) {
++      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.operationCompleted, typedOther.operationCompleted);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
++    lastComparison = Boolean.valueOf(isSetHasResultSet()).compareTo(typedOther.isSetHasResultSet());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetHasResultSet()) {
++      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.hasResultSet, typedOther.hasResultSet);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
+     return 0;
+   }
+ 
+@@ -614,6 +895,34 @@ public String toString() {
+       }
+       first = false;
+     }
++    if (isSetTaskStatus()) {
++      if (!first) sb.append(", ");
++      sb.append("taskStatus:");
++      if (this.taskStatus == null) {
++        sb.append("null");
++      } else {
++        sb.append(this.taskStatus);
++      }
++      first = false;
++    }
++    if (isSetOperationStarted()) {
++      if (!first) sb.append(", ");
++      sb.append("operationStarted:");
++      sb.append(this.operationStarted);
++      first = false;
++    }
++    if (isSetOperationCompleted()) {
++      if (!first) sb.append(", ");
++      sb.append("operationCompleted:");
++      sb.append(this.operationCompleted);
++      first = false;
++    }
++    if (isSetHasResultSet()) {
++      if (!first) sb.append(", ");
++      sb.append("hasResultSet:");
++      sb.append(this.hasResultSet);
++      first = false;
++    }
+     sb.append(")");
+     return sb.toString();
+   }
+@@ -707,6 +1016,38 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, TGetOperationStatus
+               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+             }
+             break;
++          case 6: // TASK_STATUS
++            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
++              struct.taskStatus = iprot.readString();
++              struct.setTaskStatusIsSet(true);
++            } else { 
++              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
++            }
++            break;
++          case 7: // OPERATION_STARTED
++            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
++              struct.operationStarted = iprot.readI64();
++              struct.setOperationStartedIsSet(true);
++            } else { 
++              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
++            }
++            break;
++          case 8: // OPERATION_COMPLETED
++            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
++              struct.operationCompleted = iprot.readI64();
++              struct.setOperationCompletedIsSet(true);
++            } else { 
++              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
++            }
++            break;
++          case 9: // HAS_RESULT_SET
++            if (schemeField.type == org.apache.thrift.protocol.TType.BOOL) {
++              struct.hasResultSet = iprot.readBool();
++              struct.setHasResultSetIsSet(true);
++            } else { 
++              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
++            }
++            break;
+           default:
+             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+         }
+@@ -751,6 +1092,28 @@ public void write(org.apache.thrift.protocol.TProtocol oprot, TGetOperationStatu
+           oprot.writeFieldEnd();
+         }
+       }
++      if (struct.taskStatus != null) {
++        if (struct.isSetTaskStatus()) {
++          oprot.writeFieldBegin(TASK_STATUS_FIELD_DESC);
++          oprot.writeString(struct.taskStatus);
++          oprot.writeFieldEnd();
++        }
++      }
++      if (struct.isSetOperationStarted()) {
++        oprot.writeFieldBegin(OPERATION_STARTED_FIELD_DESC);
++        oprot.writeI64(struct.operationStarted);
++        oprot.writeFieldEnd();
++      }
++      if (struct.isSetOperationCompleted()) {
++        oprot.writeFieldBegin(OPERATION_COMPLETED_FIELD_DESC);
++        oprot.writeI64(struct.operationCompleted);
++        oprot.writeFieldEnd();
++      }
++      if (struct.isSetHasResultSet()) {
++        oprot.writeFieldBegin(HAS_RESULT_SET_FIELD_DESC);
++        oprot.writeBool(struct.hasResultSet);
++        oprot.writeFieldEnd();
++      }
+       oprot.writeFieldStop();
+       oprot.writeStructEnd();
+     }
+@@ -782,7 +1145,19 @@ public void write(org.apache.thrift.protocol.TProtocol prot, TGetOperationStatus
+       if (struct.isSetErrorMessage()) {
+         optionals.set(3);
+       }
+-      oprot.writeBitSet(optionals, 4);
++      if (struct.isSetTaskStatus()) {
++        optionals.set(4);
++      }
++      if (struct.isSetOperationStarted()) {
++        optionals.set(5);
++      }
++      if (struct.isSetOperationCompleted()) {
++        optionals.set(6);
++      }
++      if (struct.isSetHasResultSet()) {
++        optionals.set(7);
++      }
++      oprot.writeBitSet(optionals, 8);
+       if (struct.isSetOperationState()) {
+         oprot.writeI32(struct.operationState.getValue());
+       }
+@@ -795,6 +1170,18 @@ public void write(org.apache.thrift.protocol.TProtocol prot, TGetOperationStatus
+       if (struct.isSetErrorMessage()) {
+         oprot.writeString(struct.errorMessage);
+       }
++      if (struct.isSetTaskStatus()) {
++        oprot.writeString(struct.taskStatus);
++      }
++      if (struct.isSetOperationStarted()) {
++        oprot.writeI64(struct.operationStarted);
++      }
++      if (struct.isSetOperationCompleted()) {
++        oprot.writeI64(struct.operationCompleted);
++      }
++      if (struct.isSetHasResultSet()) {
++        oprot.writeBool(struct.hasResultSet);
++      }
+     }
+ 
+     @Override
+@@ -803,7 +1190,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, TGetOperationStatusR
+       struct.status = new TStatus();
+       struct.status.read(iprot);
+       struct.setStatusIsSet(true);
+-      BitSet incoming = iprot.readBitSet(4);
++      BitSet incoming = iprot.readBitSet(8);
+       if (incoming.get(0)) {
+         struct.operationState = TOperationState.findByValue(iprot.readI32());
+         struct.setOperationStateIsSet(true);
+@@ -820,6 +1207,22 @@ public void read(org.apache.thrift.protocol.TProtocol prot, TGetOperationStatusR
+         struct.errorMessage = iprot.readString();
+         struct.setErrorMessageIsSet(true);
+       }
++      if (incoming.get(4)) {
++        struct.taskStatus = iprot.readString();
++        struct.setTaskStatusIsSet(true);
++      }
++      if (incoming.get(5)) {
++        struct.operationStarted = iprot.readI64();
++        struct.setOperationStartedIsSet(true);
++      }
++      if (incoming.get(6)) {
++        struct.operationCompleted = iprot.readI64();
++        struct.setOperationCompletedIsSet(true);
++      }
++      if (incoming.get(7)) {
++        struct.hasResultSet = iprot.readBool();
++        struct.setHasResultSetIsSet(true);
++      }
+     }
+   }
+ 
+diff --git a/service/src/gen/thrift/gen-py/TCLIService/ttypes.py b/service/src/gen/thrift/gen-py/TCLIService/ttypes.py
+index 0957c12..c6d0094 100644
+--- a/service/src/gen/thrift/gen-py/TCLIService/ttypes.py
++++ b/service/src/gen/thrift/gen-py/TCLIService/ttypes.py
+@@ -5252,6 +5252,10 @@ class TGetOperationStatusResp:
+    - sqlState
+    - errorCode
+    - errorMessage
++   - taskStatus
++   - operationStarted
++   - operationCompleted
++   - hasResultSet
+   """
+ 
+   thrift_spec = (
+@@ -5261,14 +5265,22 @@ class TGetOperationStatusResp:
+     (3, TType.STRING, 'sqlState', None, None, ), # 3
+     (4, TType.I32, 'errorCode', None, None, ), # 4
+     (5, TType.STRING, 'errorMessage', None, None, ), # 5
++    (6, TType.STRING, 'taskStatus', None, None, ), # 6
++    (7, TType.I64, 'operationStarted', None, None, ), # 7
++    (8, TType.I64, 'operationCompleted', None, None, ), # 8
++    (9, TType.BOOL, 'hasResultSet', None, None, ), # 9
+   )
+ 
+-  def __init__(self, status=None, operationState=None, sqlState=None, errorCode=None, errorMessage=None,):
++  def __init__(self, status=None, operationState=None, sqlState=None, errorCode=None, errorMessage=None, taskStatus=None, operationStarted=None, operationCompleted=None, hasResultSet=None,):
+     self.status = status
+     self.operationState = operationState
+     self.sqlState = sqlState
+     self.errorCode = errorCode
+     self.errorMessage = errorMessage
++    self.taskStatus = taskStatus
++    self.operationStarted = operationStarted
++    self.operationCompleted = operationCompleted
++    self.hasResultSet = hasResultSet
+ 
+   def read(self, iprot):
+     if iprot.__class__ == TBinaryProtocol.TBinaryProtocolAccelerated and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None and fastbinary is not None:
+@@ -5305,6 +5317,26 @@ def read(self, iprot):
+           self.errorMessage = iprot.readString();
+         else:
+           iprot.skip(ftype)
++      elif fid == 6:
++        if ftype == TType.STRING:
++          self.taskStatus = iprot.readString();
++        else:
++          iprot.skip(ftype)
++      elif fid == 7:
++        if ftype == TType.I64:
++          self.operationStarted = iprot.readI64();
++        else:
++          iprot.skip(ftype)
++      elif fid == 8:
++        if ftype == TType.I64:
++          self.operationCompleted = iprot.readI64();
++        else:
++          iprot.skip(ftype)
++      elif fid == 9:
++        if ftype == TType.BOOL:
++          self.hasResultSet = iprot.readBool();
++        else:
++          iprot.skip(ftype)
+       else:
+         iprot.skip(ftype)
+       iprot.readFieldEnd()
+@@ -5335,6 +5367,22 @@ def write(self, oprot):
+       oprot.writeFieldBegin('errorMessage', TType.STRING, 5)
+       oprot.writeString(self.errorMessage)
+       oprot.writeFieldEnd()
++    if self.taskStatus is not None:
++      oprot.writeFieldBegin('taskStatus', TType.STRING, 6)
++      oprot.writeString(self.taskStatus)
++      oprot.writeFieldEnd()
++    if self.operationStarted is not None:
++      oprot.writeFieldBegin('operationStarted', TType.I64, 7)
++      oprot.writeI64(self.operationStarted)
++      oprot.writeFieldEnd()
++    if self.operationCompleted is not None:
++      oprot.writeFieldBegin('operationCompleted', TType.I64, 8)
++      oprot.writeI64(self.operationCompleted)
++      oprot.writeFieldEnd()
++    if self.hasResultSet is not None:
++      oprot.writeFieldBegin('hasResultSet', TType.BOOL, 9)
++      oprot.writeBool(self.hasResultSet)
++      oprot.writeFieldEnd()
+     oprot.writeFieldStop()
+     oprot.writeStructEnd()
+ 
+diff --git a/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb b/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
+index 220434e..9dd1266 100644
+--- a/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
++++ b/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
+@@ -1468,13 +1468,21 @@ class TGetOperationStatusResp
+   SQLSTATE = 3
+   ERRORCODE = 4
+   ERRORMESSAGE = 5
++  TASKSTATUS = 6
++  OPERATIONSTARTED = 7
++  OPERATIONCOMPLETED = 8
++  HASRESULTSET = 9
+ 
+   FIELDS = {
+     STATUS => {:type => ::Thrift::Types::STRUCT, :name => 'status', :class => ::TStatus},
+     OPERATIONSTATE => {:type => ::Thrift::Types::I32, :name => 'operationState', :optional => true, :enum_class => ::TOperationState},
+     SQLSTATE => {:type => ::Thrift::Types::STRING, :name => 'sqlState', :optional => true},
+     ERRORCODE => {:type => ::Thrift::Types::I32, :name => 'errorCode', :optional => true},
+-    ERRORMESSAGE => {:type => ::Thrift::Types::STRING, :name => 'errorMessage', :optional => true}
++    ERRORMESSAGE => {:type => ::Thrift::Types::STRING, :name => 'errorMessage', :optional => true},
++    TASKSTATUS => {:type => ::Thrift::Types::STRING, :name => 'taskStatus', :optional => true},
++    OPERATIONSTARTED => {:type => ::Thrift::Types::I64, :name => 'operationStarted', :optional => true},
++    OPERATIONCOMPLETED => {:type => ::Thrift::Types::I64, :name => 'operationCompleted', :optional => true},
++    HASRESULTSET => {:type => ::Thrift::Types::BOOL, :name => 'hasResultSet', :optional => true}
+   }
+ 
+   def struct_fields; FIELDS; end
+diff --git a/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon b/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon
+index 9ba4f95..1831d9f 100644
+--- a/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon
++++ b/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon
+@@ -176,16 +176,16 @@ org.apache.hive.service.cli.operation.SQLOperationDisplay;
+            <th>Retry If Fail</th>
+         </tr>
+ 
+-       <%if sod.getQueryDisplay() != null && sod.getQueryDisplay().getTaskInfos() != null %>
+-           <%for QueryDisplay.TaskInfo taskInfo : sod.getQueryDisplay().getTaskInfos() %>
++       <%if sod.getQueryDisplay() != null && sod.getQueryDisplay().getTaskDisplays() != null %>
++           <%for QueryDisplay.TaskDisplay taskDisplay : sod.getQueryDisplay().getTaskDisplays() %>
+                <tr>
+-                   <td><% taskInfo.getTaskId() + ":" + taskInfo.getTaskType() %></td>
+-                   <td><% taskInfo.getStatus() %></td>
+-                   <td><% new Date(taskInfo.getBeginTime()) %>
+-                   <td><% taskInfo.getEndTime() == 0 ? "" : new Date(taskInfo.getEndTime()) %></td>
+-                   <td><% taskInfo.getElapsedTime()/1000 %> (s) </td>
+-                   <td><% taskInfo.isRequireLock() %></td>
+-                   <td><% taskInfo.isRetryIfFail() %></td>
++                   <td><% taskDisplay.getTaskId() + ":" + taskDisplay.getTaskType() %></td>
++                   <td><% taskDisplay.getStatus() %></td>
++                   <td><% taskDisplay.getBeginTime() == null ? "" : new Date(taskDisplay.getBeginTime()) %></td>
++                   <td><% taskDisplay.getEndTime() == null ? "" : new Date(taskDisplay.getEndTime()) %></td>
++                   <td><% taskDisplay.getElapsedTime() == null ? "" : taskDisplay.getElapsedTime()/1000 %> (s) </td>
++                   <td><% taskDisplay.isRequireLock() %></td>
++                   <td><% taskDisplay.isRetryIfFail() %></td>
+                </tr>
+            </%for>
+        </%if>
+diff --git a/service/src/java/org/apache/hive/service/cli/OperationStatus.java b/service/src/java/org/apache/hive/service/cli/OperationStatus.java
+index e45b828..5e24d38 100644
+--- a/service/src/java/org/apache/hive/service/cli/OperationStatus.java
++++ b/service/src/java/org/apache/hive/service/cli/OperationStatus.java
+@@ -25,10 +25,16 @@
+ public class OperationStatus {
+ 
+   private final OperationState state;
++  private final String taskStatus;
++  private final long operationStarted;
++  private final long operationCompleted;
+   private final HiveSQLException operationException;
+ 
+-  public OperationStatus(OperationState state, HiveSQLException operationException) {
++  public OperationStatus(OperationState state, String taskStatus, long operationStarted, long operationCompleted, HiveSQLException operationException) {
+     this.state = state;
++    this.taskStatus = taskStatus;
++    this.operationStarted = operationStarted;
++    this.operationCompleted = operationCompleted;
+     this.operationException = operationException;
+   }
+ 
+@@ -36,6 +42,18 @@ public OperationState getState() {
+     return state;
+   }
+ 
++  public String getTaskStatus() {
++    return taskStatus;
++  }
++
++  public long getOperationStarted() {
++    return operationStarted;
++  }
++
++  public long getOperationCompleted() {
++    return operationCompleted;
++  }
++
+   public HiveSQLException getOperationException() {
+     return operationException;
+   }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index 7a6f3eb..c5afa22 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -74,6 +74,9 @@
+   private volatile long lastAccessTime;
+   private final long beginTime;
+ 
++  protected long operationStart;
++  protected long operationComplete;
++
+   protected static final EnumSet<FetchOrientation> DEFAULT_FETCH_ORIENTATION_SET =
+       EnumSet.of(FetchOrientation.FETCH_NEXT,FetchOrientation.FETCH_FIRST);
+ 
+@@ -132,7 +135,13 @@ public OperationType getType() {
+   }
+ 
+   public OperationStatus getStatus() {
+-    return new OperationStatus(state, operationException);
++    String taskStatus = null;
++    try {
++      taskStatus = getTaskStatus();
++    } catch (HiveSQLException sqlException) {
++      LOG.error("Error getting task status for " + opHandle.toString(), sqlException);
++    }
++    return new OperationStatus(state, taskStatus, operationStart, operationComplete, operationException);
+   }
+ 
+   public boolean hasResultSet() {
+@@ -347,6 +356,10 @@ public RowSet getNextRowSet() throws HiveSQLException {
+     return getNextRowSet(FetchOrientation.FETCH_NEXT, DEFAULT_FETCH_MAX_ROWS);
+   }
+ 
++  public String getTaskStatus() throws HiveSQLException {
++    return null;
++  }
++
+   /**
+    * Verify if the given fetch orientation is part of the default orientation types.
+    * @param orientation
+@@ -432,5 +445,31 @@ protected OperationState getState() {
+   }
+ 
+   protected void onNewState(OperationState state, OperationState prevState) {
++    switch(state) {
++      case RUNNING:
++      markOperationStartTime();
++        break;
++      case ERROR:
++      case FINISHED:
++      case CANCELED:
++        markOperationCompletedTime();
++        break;
++    }
++  }
++
++  public long getOperationComplete() {
++    return operationComplete;
++  }
++
++  public long getOperationStart() {
++    return operationStart;
++  }
++
++  protected void markOperationStartTime() {
++    operationStart = System.currentTimeMillis();
++  }
++
++  protected void markOperationCompletedTime() {
++    operationComplete = System.currentTimeMillis();
+   }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index 4649d92..1ec1fe0 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -18,17 +18,10 @@
+ 
+ package org.apache.hive.service.cli.operation;
+ 
+-import java.io.IOException;
+-import java.io.PrintStream;
+-import java.io.Serializable;
+-import java.io.UnsupportedEncodingException;
++import java.io.*;
+ import java.security.PrivilegedExceptionAction;
+ import java.sql.SQLException;
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Properties;
++import java.util.*;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -45,6 +38,7 @@
+ import org.apache.hadoop.hive.metastore.api.Schema;
+ import org.apache.hadoop.hive.ql.CommandNeedRetryException;
+ import org.apache.hadoop.hive.ql.Driver;
++import org.apache.hadoop.hive.ql.QueryDisplay;
+ import org.apache.hadoop.hive.ql.exec.ExplainTask;
+ import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.metadata.Hive;
+@@ -70,6 +64,9 @@
+ import org.apache.hive.service.cli.TableSchema;
+ import org.apache.hive.service.cli.session.HiveSession;
+ import org.apache.hive.service.server.ThreadWithGarbageCleanup;
++import org.codehaus.jackson.JsonGenerationException;
++import org.codehaus.jackson.map.JsonMappingException;
++import org.codehaus.jackson.map.ObjectMapper;
+ 
+ /**
+  * SQLOperation.
+@@ -129,7 +126,6 @@ private void setupSessionIO(SessionState sessionState) {
+    */
+   public void prepare(HiveConf sqlOperationConf) throws HiveSQLException {
+     setState(OperationState.RUNNING);
+-
+     try {
+       driver = new Driver(sqlOperationConf, getParentSession().getUserName());
+       sqlOpDisplay.setQueryDisplay(driver.getQueryDisplay());
+@@ -386,6 +382,38 @@ public RowSet getNextRowSet(FetchOrientation orientation, long maxRows) throws H
+     }
+   }
+ 
++  @Override
++  public String getTaskStatus() throws HiveSQLException {
++    if (driver != null) {
++      List<QueryDisplay.TaskDisplay> statuses = driver.getQueryDisplay().getTaskDisplays();
++      if (statuses != null) {
++        ByteArrayOutputStream out = null;
++        try {
++          ObjectMapper mapper = new ObjectMapper();
++          out = new ByteArrayOutputStream();
++          mapper.writeValue(out, statuses);
++          return out.toString("UTF-8");
++        } catch (JsonGenerationException e) {
++          throw new HiveSQLException(e);
++        } catch (JsonMappingException e) {
++          throw new HiveSQLException(e);
++        } catch (IOException e) {
++          throw new HiveSQLException(e);
++        } finally {
++          if (out != null) {
++            try {
++              out.close();
++            } catch (IOException e) {
++              throw new HiveSQLException(e);
++            }
++          }
++        }
++      }
++    }
++    // Driver not initialized
++    return null;
++  }
++
+   private RowSet decode(List<Object> rows, RowSet rowSet) throws Exception {
+     if (driver.isFetchingTable()) {
+       return prepareFromRow(rows, rowSet);
+@@ -507,6 +535,7 @@ public SQLOperationDisplay getSQLOperationDisplay() {
+ 
+   @Override
+   protected void onNewState(OperationState state, OperationState prevState) {
++    super.onNewState(state, prevState);
+     currentSQLStateScope = setMetrics(currentSQLStateScope, MetricsConstant.SQL_OPERATION_PREFIX,
+       MetricsConstant.COMPLETED_SQL_OPERATION_PREFIX, state);
+ 
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+index 7539402..d4eabe8 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+@@ -628,6 +628,9 @@ public TGetOperationStatusResp GetOperationStatus(TGetOperationStatusReq req) th
+           new OperationHandle(req.getOperationHandle()));
+       resp.setOperationState(operationStatus.getState().toTOperationState());
+       HiveSQLException opException = operationStatus.getOperationException();
++      resp.setTaskStatus(operationStatus.getTaskStatus());
++      resp.setOperationStarted(operationStatus.getOperationStarted());
++      resp.setOperationCompleted(operationStatus.getOperationCompleted());
+       if (opException != null) {
+         resp.setSqlState(opException.getSQLState());
+         resp.setErrorCode(opException.getErrorCode());
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java
+index 1af4539..7c4ca05 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java
+@@ -307,7 +307,8 @@ public OperationStatus getOperationStatus(OperationHandle opHandle) throws HiveS
+       if (opState == OperationState.ERROR) {
+         opException = new HiveSQLException(resp.getErrorMessage(), resp.getSqlState(), resp.getErrorCode());
+       }
+-      return new OperationStatus(opState, opException);
++      return new OperationStatus(opState, resp.getTaskStatus(), resp.getOperationStarted(),
++        resp.getOperationCompleted(), opException);
+     } catch (HiveSQLException e) {
+       throw e;
+     } catch (Exception e) {
+diff --git a/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java b/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
+index 0643a6e..cd59828 100644
+--- a/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
++++ b/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
+@@ -18,11 +18,9 @@
+ 
+ package org.apache.hive.service.cli;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertNotNull;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
++import static org.junit.Assert.*;
+ 
++import java.io.ByteArrayInputStream;
+ import java.io.Serializable;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -35,14 +33,18 @@
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
++import org.apache.hadoop.hive.ql.QueryDisplay;
+ import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.parse.ASTNode;
+ import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHook;
+ import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHookContext;
+ import org.apache.hadoop.hive.ql.parse.SemanticException;
++import org.codehaus.jackson.map.ObjectMapper;
++import org.codehaus.jackson.type.TypeReference;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.hadoop.hive.ql.session.SessionState;
++
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+@@ -167,6 +169,9 @@ public void testExecuteStatement() throws Exception {
+     // Blocking execute
+     queryString = "SELECT ID+1 FROM TEST_EXEC";
+     opHandle = client.executeStatement(sessionHandle, queryString, confOverlay);
++
++    OperationStatus opStatus = client.getOperationStatus(opHandle);
++    checkOperationTimes(opHandle, opStatus);
+     // Expect query to be completed now
+     assertEquals("Query should be finished",
+         OperationState.FINISHED, client.getOperationStatus(opHandle).getState());
+@@ -264,6 +269,10 @@ public void testExecuteStatementAsync() throws Exception {
+     opHandle = client.executeStatementAsync(sessionHandle, queryString, confOverlay);
+     System.out.println("Cancelling " + opHandle);
+     client.cancelOperation(opHandle);
++
++    OperationStatus operationStatus = client.getOperationStatus(opHandle);
++    checkOperationTimes(opHandle, operationStatus);
++
+     state = client.getOperationStatus(opHandle).getState();
+     System.out.println(opHandle + " after cancelling, state= " + state);
+     assertEquals("Query should be cancelled", OperationState.CANCELED, state);
+@@ -422,7 +431,7 @@ private SessionHandle setupTestData(String tableName, String columnDefinitions,
+     assertNotNull(sessionHandle);
+ 
+     String queryString = "SET " + HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname
+-        + " = false";
++      + " = false";
+     client.executeStatement(sessionHandle, queryString, confOverlay);
+ 
+     // Drop the table if it exists
+@@ -561,4 +570,89 @@ public void testConfOverlay() throws Exception {
+     client.closeOperation(opHandle);
+     client.closeSession(sessionHandle);
+   }
++
++  @Test
++  public void testTaskStatus() throws Exception {
++    HashMap<String, String> confOverlay = new HashMap<String, String>();
++    String tableName = "TEST_EXEC_ASYNC";
++    String columnDefinitions = "(ID STRING)";
++
++    // Open a session and set up the test data
++    SessionHandle sessionHandle = setupTestData(tableName, columnDefinitions, confOverlay);
++    assertNotNull(sessionHandle);
++    // nonblocking execute
++    String select = "SELECT ID + ' ' FROM TEST_EXEC_ASYNC";
++    OperationHandle ophandle =
++      client.executeStatementAsync(sessionHandle, select, confOverlay);
++
++    OperationStatus status = null;
++    int count = 0;
++    while (true) {
++      status = client.getOperationStatus(ophandle);
++      checkOperationTimes(ophandle, status);
++      OperationState state = status.getState();
++      System.out.println("Polling: " + ophandle + " count=" + (++count)
++        + " state=" + state);
++
++      String jsonTaskStatus = status.getTaskStatus();
++      assertNotNull(jsonTaskStatus);
++      ObjectMapper mapper = new ObjectMapper();
++      ByteArrayInputStream in = new ByteArrayInputStream(jsonTaskStatus.getBytes("UTF-8"));
++      List<QueryDisplay.TaskDisplay> taskStatuses =
++        mapper.readValue(in, new TypeReference<List<QueryDisplay.TaskDisplay>>(){});
++      checkTaskStatuses(taskStatuses);
++      System.out.println("task statuses: " + jsonTaskStatus); // TaskDisplay doesn't have a toString, using json
++      if (OperationState.CANCELED == state || state == OperationState.CLOSED
++        || state == OperationState.FINISHED
++        || state == OperationState.ERROR) {
++        break;
++      }
++      Thread.sleep(1000);
++    }
++  }
++
++  private void checkTaskStatuses(List<QueryDisplay.TaskDisplay> taskDisplays) {
++    assertNotNull(taskDisplays);
++    for (QueryDisplay.TaskDisplay taskDisplay: taskDisplays) {
++      switch (taskDisplay.taskState) {
++        case INITIALIZED:
++        case QUEUED:
++          assertNull(taskDisplay.getBeginTime());
++          assertNull(taskDisplay.getEndTime());
++          assertNull(taskDisplay.getElapsedTime());
++          assertNull(taskDisplay.getErrorMsg());
++          assertNull(taskDisplay.getReturnValue());
++          break;
++        case RUNNING:
++          assertNotNull(taskDisplay.getBeginTime());
++          assertNull(taskDisplay.getEndTime());
++          assertNotNull(taskDisplay.getElapsedTime());
++          assertNull(taskDisplay.getErrorMsg());
++          assertNull(taskDisplay.getReturnValue());
++          break;
++        case FINISHED:
++          assertNotNull(taskDisplay.getBeginTime());
++          assertNotNull(taskDisplay.getEndTime());
++          assertNotNull(taskDisplay.getElapsedTime());
++          break;
++        case UNKNOWN:
++        default:
++          fail("unknown task status: " + taskDisplay);
++      }
++    }
++  }
++
++
++  private void checkOperationTimes(OperationHandle operationHandle, OperationStatus status) {
++    OperationState state = status.getState();
++    assertFalse(status.getOperationStarted() ==  0);
++    if (OperationState.CANCELED == state || state == OperationState.CLOSED
++      || state == OperationState.FINISHED || state == OperationState.ERROR) {
++      System.out.println("##OP " + operationHandle.getHandleIdentifier() + " STATE:" + status.getState()
++        +" START:" + status.getOperationStarted()
++        + " END:" + status.getOperationCompleted());
++      assertFalse(status.getOperationCompleted() ==  0);
++      assertTrue(status.getOperationCompleted() - status.getOperationStarted() >= 0);
++    }
++  }
+ }
+-- 
+1.7.9.5
+

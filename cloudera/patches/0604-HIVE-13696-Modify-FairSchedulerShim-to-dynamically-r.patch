@@ -1,0 +1,614 @@
+From 104eb08d2bca7fa6751f71105b585b2afc165f4a Mon Sep 17 00:00:00 2001
+From: Reuben Kuhnert <reuben.kuhnert@cloudera.com>
+Date: Sat, 14 May 2016 12:22:26 -0500
+Subject: [PATCH 0604/1164] HIVE-13696: Modify FairSchedulerShim to
+ dynamically reload changes to fair-scheduler.xml.
+
+This patch dynamically reloads changes to fair-scheduler.xml by attaching a FileSystemWatcher
+object onto the file. When the file changes the YARN queue routing will be automatically updated
+and jobs will be reconfigured to send to the correct location based on the fair-scheduler config.
+
+Conflicts:
+	service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+	shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerShim.java
+
+Change-Id: I668a53d4afd5869a10fa940ceea1d52aae15b546
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   11 ++
+ .../hadoop/hive/ql/session/YarnFairScheduling.java |   70 ++++++++++++
+ .../hive/service/cli/session/HiveSessionImpl.java  |    8 +-
+ .../apache/hadoop/hive/shims/SchedulerShim.java    |    2 +
+ shims/scheduler/pom.xml                            |    7 +-
+ .../hive/schshim/FairSchedulerQueueAllocator.java  |   93 +++++++++++++++
+ .../hadoop/hive/schshim/FairSchedulerShim.java     |  108 ++++++++++++------
+ .../apache/hadoop/hive/schshim/QueueAllocator.java |   37 ++++++
+ .../schshim/TestFairSchedulerQueueAllocator.java   |  120 ++++++++++++++++++++
+ 9 files changed, 415 insertions(+), 41 deletions(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/session/YarnFairScheduling.java
+ create mode 100644 shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerQueueAllocator.java
+ create mode 100644 shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/QueueAllocator.java
+ create mode 100644 shims/scheduler/src/test/java/org/apache/hadoop/hive/schshim/TestFairSchedulerQueueAllocator.java
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index ff900be..73e4d40 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -117,6 +117,7 @@
+ import org.apache.hadoop.hive.ql.session.OperationLog;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
++import org.apache.hadoop.hive.ql.session.YarnFairScheduling;
+ import org.apache.hadoop.hive.serde2.ByteStream;
+ import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hadoop.mapred.ClusterStatus;
+@@ -476,6 +477,8 @@ public int compile(String command, boolean resetTaskIds) {
+         plan.getFetchTask().initialize(conf, plan, null);
+       }
+ 
++      configureScheduling(conf, userName);
++
+       //do the authorization check
+       if (!sem.skipAuthorization() &&
+           HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_AUTHORIZATION_ENABLED)) {
+@@ -537,6 +540,14 @@ public int compile(String command, boolean resetTaskIds) {
+     }
+   }
+ 
++  private HiveConf configureScheduling(HiveConf configuration, String forUser) throws IOException, HiveException {
++    if (YarnFairScheduling.usingNonImpersonationModeWithFairScheduling(configuration)) {
++        YarnFairScheduling.validateYarnQueue(configuration, forUser);
++    }
++
++    return configuration;
++  }
++
+   private ImmutableMap<String, Long> dumpMetaCallTimingWithoutEx(String phase) {
+     try {
+       return Hive.get().dumpAndClearMetaCallTiming(phase);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/YarnFairScheduling.java b/ql/src/java/org/apache/hadoop/hive/ql/session/YarnFairScheduling.java
+new file mode 100644
+index 0000000..e3ba47c
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/YarnFairScheduling.java
+@@ -0,0 +1,70 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.session;
++
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.shims.ShimLoader;
++
++import java.io.IOException;
++
++/**
++ * A front handle for managing job submission to Yarn-FairScheduler.
++ */
++public class YarnFairScheduling {
++  /**
++   * Determine if jobs can be configured for YARN fair scheduling.
++   * @param conf - the current HiveConf configuration.
++   * @return Returns true when impersonation mode is disabled and fair-scheduling is enabled.
++   */
++  public static boolean usingNonImpersonationModeWithFairScheduling(HiveConf conf) {
++    return (conf != null)
++      && (!conf.getBoolVar(HiveConf.ConfVars.HIVE_SERVER2_ENABLE_DOAS)
++      && (conf.getBoolVar(HiveConf.ConfVars.HIVE_SERVER2_MAP_FAIR_SCHEDULER_QUEUE)));
++  }
++
++  /**
++   * Configure the default YARN queue for the user.
++   * @param conf - The current HiveConf configuration.
++   * @param forUser - The user to configure scheduling for.
++   * @throws IOException
++   * @throws HiveException
++   */
++  public static void setDefaultJobQueue(HiveConf conf, String forUser) throws IOException, HiveException {
++    Preconditions.checkState(usingNonImpersonationModeWithFairScheduling(conf),
++      "Unable to map job to fair-scheduler because either impersonation is on or fair-scheduling is disabled.");
++
++    ShimLoader.getSchedulerShims().refreshDefaultQueue(conf, forUser);
++  }
++
++  /**
++   * Validate the current YARN queue for the current user.
++   * @param conf - The current HiveConf configuration.
++   * @param forUser - The user to configure scheduling for.
++   * @throws IOException
++   * @throws HiveException
++   */
++  public static void validateYarnQueue(HiveConf conf, String forUser) throws IOException, HiveException {
++    Preconditions.checkState(usingNonImpersonationModeWithFairScheduling(conf),
++      "Unable to map job to fair-scheduler because either impersonation is on or fair-scheduling is disabled.");
++
++    ShimLoader.getSchedulerShims().validateQueueConfiguration(conf, forUser);
++  }
++}
+\ No newline at end of file
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+index 37c053a..f83a994 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+@@ -49,6 +49,7 @@
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.processors.SetProcessor;
+ import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.session.YarnFairScheduling;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hive.common.util.HiveVersionInfo;
+ import org.apache.hive.service.auth.HiveAuthFactory;
+@@ -121,11 +122,10 @@ public HiveSessionImpl(TProtocolVersion protocol, String username, String passwo
+     try {
+       // In non-impersonation mode, map scheduler queue to current user
+       // if fair scheduler is configured.
+-      if (! hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_ENABLE_DOAS) &&
+-        hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_MAP_FAIR_SCHEDULER_QUEUE)) {
+-        ShimLoader.getHadoopShims().refreshDefaultQueue(hiveConf, username);
++      if (YarnFairScheduling.usingNonImpersonationModeWithFairScheduling(hiveConf)) {
++        YarnFairScheduling.setDefaultJobQueue(hiveConf, username);
+       }
+-    } catch (IOException e) {
++    } catch (Exception e) {
+       LOG.warn("Error setting scheduler queue: " + e, e);
+     }
+     // Set an explicit session name to control the download directory name
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/SchedulerShim.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/SchedulerShim.java
+index 63803b8..f88e192 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/SchedulerShim.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/SchedulerShim.java
+@@ -34,4 +34,6 @@
+    */
+   public void refreshDefaultQueue(Configuration conf, String userName)
+       throws IOException;
++
++  public void validateQueueConfiguration(Configuration configuration, String forUser) throws IOException;
+ }
+diff --git a/shims/scheduler/pom.xml b/shims/scheduler/pom.xml
+index 7ae1aa5..82fdfa7 100644
+--- a/shims/scheduler/pom.xml
++++ b/shims/scheduler/pom.xml
+@@ -82,7 +82,12 @@
+      <version>${hadoop-23.version}</version>
+      <optional>true</optional>
+    </dependency>
+-   <dependency>
++    <dependency>
++      <groupId>org.mockito</groupId>
++      <artifactId>mockito-all</artifactId>
++      <version>${mockito-all.version}</version>
++    </dependency>
++    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-yarn-server-tests</artifactId>
+      <version>${hadoop-23.version}</version>
+diff --git a/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerQueueAllocator.java b/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerQueueAllocator.java
+new file mode 100644
+index 0000000..0e32ff0
+--- /dev/null
++++ b/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerQueueAllocator.java
+@@ -0,0 +1,93 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.schshim;
++
++import com.google.common.annotations.VisibleForTesting;
++import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationConfiguration;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++import java.util.concurrent.atomic.AtomicReference;
++
++public class FairSchedulerQueueAllocator implements QueueAllocator {
++  private static final Logger LOG = LoggerFactory.getLogger(FairSchedulerQueueAllocator.class);
++  private static final String YARN_SCHEDULER_FILE_PROPERTY = "yarn.scheduler.fair.allocation.file";
++
++  private String currentlyWatching;
++  private AllocationFileLoaderService loaderService;
++  private final AtomicReference<AllocationConfiguration> allocationConfiguration
++    = new AtomicReference<AllocationConfiguration>();
++
++  /**
++   * Generates a Yarn FairScheduler queue resolver based on 'fair-scheduler.xml'.
++   * @param config The HiveConf configuration.
++   * @param username      The user to configure the job for.
++   * @return Returns a configured allocation resolver.
++   * @throws IOException
++   */
++  public synchronized AtomicReference<AllocationConfiguration> makeConfigurationFor(Configuration config, String username) throws IOException {
++    updateWatcher(config);
++
++    return allocationConfiguration;
++  }
++
++  public synchronized void refresh(Configuration config) {
++    updateWatcher(config);
++  }
++
++  @VisibleForTesting
++  public String getCurrentlyWatchingFile() {
++    return this.currentlyWatching;
++  }
++
++  private void updateWatcher(Configuration config) {
++    if (this.loaderService != null && StringUtils.equals(currentlyWatching, config.get(YARN_SCHEDULER_FILE_PROPERTY))) return;
++
++    this.currentlyWatching = config.get(YARN_SCHEDULER_FILE_PROPERTY);
++
++    if (this.loaderService != null) {
++      this.loaderService.stop();
++    }
++
++    this.loaderService = new AllocationFileLoaderService();
++    this.loaderService.init(config);
++    this.loaderService.setReloadListener(new AllocationFileLoaderService.Listener() {
++      @Override
++      public void onReload(AllocationConfiguration allocs) {
++        allocationConfiguration.set(allocs);
++      }
++    });
++
++    try {
++      this.loaderService.reloadAllocations();
++    } catch (Exception ex) {
++      LOG.error("Failed to load queue allocations", ex);
++    }
++
++    if (allocationConfiguration.get() == null) {
++      allocationConfiguration.set(new AllocationConfiguration(config));
++    }
++
++    this.loaderService.start();
++  }
++}
+diff --git a/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerShim.java b/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerShim.java
+index 41c34aa..741d992 100644
+--- a/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerShim.java
++++ b/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/FairSchedulerShim.java
+@@ -6,9 +6,9 @@
+  * to you under the Apache License, Version 2.0 (the
+  * "License"); you may not use this file except in compliance
+  * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
++ * <p>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p>
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+@@ -17,54 +17,90 @@
+  */
+ package org.apache.hadoop.hive.schshim;
+ 
+-import java.io.IOException;
+-import java.util.concurrent.atomic.AtomicReference;
+-
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.lang.StringUtils;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.shims.SchedulerShim;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationConfiguration;
+-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
+ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.QueuePlacementPolicy;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++
++/*
++ * FairSchedulerShim monitors changes in fair-scheduler.xml (if it exists) to allow for dynamic
++ * reloading and queue resolution. When changes to the fair-scheduler.xml file are detected, the
++ * cached queue resolution policies for each user are cleared, and then re-cached/validated on job-submit.
++ */
+ 
+ public class FairSchedulerShim implements SchedulerShim {
+-  private static final Log LOG = LogFactory.getLog(FairSchedulerShim.class);
++  private static final Logger LOG = LoggerFactory.getLogger(FairSchedulerShim.class);
+   private static final String MR2_JOB_QUEUE_PROPERTY = "mapreduce.job.queuename";
+ 
++  private final QueueAllocator queueAllocator;
++
++  @VisibleForTesting
++  public FairSchedulerShim(QueueAllocator queueAllocator) {
++    this.queueAllocator = queueAllocator;
++  }
++
++  public FairSchedulerShim() {
++    this(new FairSchedulerQueueAllocator());
++  }
++
++  /**
++   * Applies the default YARN fair scheduler queue for a user.
++   * @param conf - the current HiveConf configuration.
++   * @param forUser - the user to configure the default queue for.
++   * @throws IOException
++   */
+   @Override
+-  public void refreshDefaultQueue(Configuration conf, String userName)
+-      throws IOException {
+-    String requestedQueue = YarnConfiguration.DEFAULT_QUEUE_NAME;
+-    final AtomicReference<AllocationConfiguration> allocConf = new AtomicReference<AllocationConfiguration>();
++  public synchronized void refreshDefaultQueue(Configuration conf, String forUser)
++    throws IOException {
++    setJobQueueForUserInternal(conf, YarnConfiguration.DEFAULT_QUEUE_NAME, forUser);
++  }
+ 
+-    AllocationFileLoaderService allocsLoader = new AllocationFileLoaderService();
+-    allocsLoader.init(conf);
+-    allocsLoader.setReloadListener(new AllocationFileLoaderService.Listener() {
+-      @Override
+-      public void onReload(AllocationConfiguration allocs) {
+-        allocConf.set(allocs);
+-      }
+-    });
+-    try {
+-      allocsLoader.reloadAllocations();
+-    } catch (Exception ex) {
+-      throw new IOException("Failed to load queue allocations", ex);
+-    }
+-    if (allocConf.get() == null) {
+-      allocConf.set(new AllocationConfiguration(conf));
++  /**
++   * Validates the YARN fair scheduler queue configuration.
++   * @param conf - the current HiveConf configuration.
++   * @param forUser - the user to configure the default queue for.
++   * @throws IOException
++   */
++  @Override
++  public synchronized void validateQueueConfiguration(Configuration conf, String forUser) throws IOException {
++    // Currently, "validation" is just to ensure that the client can still set the same queue that they
++    // could previously. In almost all situations, this should be essentially a no-op (unless the fair-scheduler.xml
++    // file changes in such a way as this is disallowed). Currently this implementation is just inteded to allow us
++    // to validate that the user's configuration is at least reasonable on a per-request basis beyond from the already-
++    // occurring per session setup.
++
++    // TODO: Build out ACL enforcement.
++
++    String currentJobQueue = conf.get(MR2_JOB_QUEUE_PROPERTY);
++    if (currentJobQueue != null && !currentJobQueue.isEmpty()) {
++      setJobQueueForUserInternal(conf, currentJobQueue, forUser);
++    } else {
++      refreshDefaultQueue(conf, forUser);
+     }
+-    QueuePlacementPolicy queuePolicy = allocConf.get().getPlacementPolicy();
++  }
++
++  public QueueAllocator getQueueAllocator() {
++    return this.queueAllocator;
++  }
++
++  private void setJobQueueForUserInternal(Configuration conf, String queueName, String forUser) throws IOException {
++    QueuePlacementPolicy queuePolicy = queueAllocator.makeConfigurationFor(conf, forUser).get().getPlacementPolicy();
++
+     if (queuePolicy != null) {
+-      requestedQueue = queuePolicy.assignAppToQueue(requestedQueue, userName);
++      String requestedQueue = queuePolicy.assignAppToQueue(queueName, forUser);
+       if (StringUtils.isNotBlank(requestedQueue)) {
+-        LOG.debug("Setting queue name to " + requestedQueue + " for user "
+-            + userName);
++        LOG.info("Setting queue name to: '{}' for user '{}'", requestedQueue, forUser);
+         conf.set(MR2_JOB_QUEUE_PROPERTY, requestedQueue);
++      } else {
++        LOG.warn("Unable to set queue: {} for user: {}, resetting to user's default queue.", requestedQueue, forUser);
++        conf.set(MR2_JOB_QUEUE_PROPERTY, queuePolicy.assignAppToQueue(YarnConfiguration.DEFAULT_QUEUE_NAME, forUser));
+       }
+     }
+   }
+-
+-}
++}
+\ No newline at end of file
+diff --git a/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/QueueAllocator.java b/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/QueueAllocator.java
+new file mode 100644
+index 0000000..daf02da
+--- /dev/null
++++ b/shims/scheduler/src/main/java/org/apache/hadoop/hive/schshim/QueueAllocator.java
+@@ -0,0 +1,37 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.schshim;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationConfiguration;
++
++import java.io.IOException;
++import java.util.concurrent.atomic.AtomicReference;
++
++public interface QueueAllocator {
++  /**
++   * Generates a queue resolver for a given configuration and username.
++   * @param configuration The HiveConf configuration.
++   * @param username The user to configure the job for.
++   * @return Returns the queue allocation configuration.
++   * @throws IOException
++   */
++  AtomicReference<AllocationConfiguration> makeConfigurationFor(Configuration configuration, String username) throws IOException;
++  void refresh(Configuration configuration);
++}
+diff --git a/shims/scheduler/src/test/java/org/apache/hadoop/hive/schshim/TestFairSchedulerQueueAllocator.java b/shims/scheduler/src/test/java/org/apache/hadoop/hive/schshim/TestFairSchedulerQueueAllocator.java
+new file mode 100644
+index 0000000..58465e4
+--- /dev/null
++++ b/shims/scheduler/src/test/java/org/apache/hadoop/hive/schshim/TestFairSchedulerQueueAllocator.java
+@@ -0,0 +1,120 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.schshim;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationConfiguration;
++import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.QueuePlacementPolicy;
++import org.junit.Test;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.mockito.Matchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++public class TestFairSchedulerQueueAllocator {
++  private static final String EMPTY = "";
++  private static final int USERNAME_ARGUMENT_INDEX = 1;
++  private static final String YARN_SCHEDULER_FILE_PROPERTY = "yarn.scheduler.fair.allocation.file";
++  private static final String MR2_JOB_QUEUE_PROPERTY = "mapreduce.job.queuename";
++
++  @Test
++  public void testChangingLastUsedHiveConfigurationStringDirectly() throws Exception {
++    Configuration configuration = new Configuration();
++    FairSchedulerShim shim = new FairSchedulerShim();
++    FairSchedulerQueueAllocator allocator = (FairSchedulerQueueAllocator) shim.getQueueAllocator();
++
++    // On initialization should be uncached.
++    assertNull(allocator.getCurrentlyWatchingFile());
++
++    // Per job submission the location of fair-scheduler should be updated.
++    for (String location : new String[] { "/first", "/second", "third/fourth" }){
++      for (String user : new String[] { "firstUser", "secondUser", "thirdUser" }) {
++        configuration.set(YARN_SCHEDULER_FILE_PROPERTY, location);
++        shim.refreshDefaultQueue(configuration, user);
++        assertEquals(allocator.getCurrentlyWatchingFile(), location);
++      }
++    }
++  }
++
++  @Test
++  public void testNeverBeforeSeenUsersEffectOnLastUsedHiveConfigurationString() throws Exception {
++    final Configuration configuration = new Configuration();
++    FairSchedulerShim shim = new FairSchedulerShim();
++    FairSchedulerQueueAllocator allocator = (FairSchedulerQueueAllocator) shim.getQueueAllocator();
++
++    // Per job submission the location of fair-scheduler should be updated.
++    configuration.set(YARN_SCHEDULER_FILE_PROPERTY, "/some/unchanging/location");
++    for (String user : new String[] { "first", "second", "third", "fourth", "fifth" }) {
++      shim.refreshDefaultQueue(configuration, user);
++      assertEquals(allocator.getCurrentlyWatchingFile(), "/some/unchanging/location");
++    }
++  }
++
++  @Test
++  public void testQueueAllocation() throws Exception {
++    Configuration configuration = new Configuration();
++    QueueAllocator allocator = mock(QueueAllocator.class);
++
++    when(allocator.makeConfigurationFor(any(Configuration.class), any(String.class)))
++      .thenAnswer(new Answer<AtomicReference<AllocationConfiguration>>() {
++        @Override
++        public AtomicReference<AllocationConfiguration> answer(InvocationOnMock invocationOnMock) throws Throwable {
++          // Capture which user is causing the reset for verification purposes.
++          final String username = (String) invocationOnMock.getArguments()[USERNAME_ARGUMENT_INDEX];
++
++          AllocationConfiguration allocationConfiguration = mock(AllocationConfiguration.class);
++          when(allocationConfiguration.getPlacementPolicy())
++            .thenAnswer(new Answer<QueuePlacementPolicy>() {
++              @Override
++              public QueuePlacementPolicy answer(InvocationOnMock invocationOnMock) throws Throwable {
++                QueuePlacementPolicy placementPolicy = mock(QueuePlacementPolicy.class);
++                when(placementPolicy.assignAppToQueue(any(String.class), any(String.class)))
++                  .thenAnswer(new Answer<String>() {
++                    @Override
++                    public String answer(InvocationOnMock invocationOnMock) throws Throwable {
++                      return String.format("queue.for.%s", username);
++                    }
++                  });
++
++                return placementPolicy;
++              }
++            });
++
++          return new AtomicReference<>(allocationConfiguration);
++        }
++      });
++
++    FairSchedulerShim shim = new FairSchedulerShim(allocator);
++
++    // Per job submission the location of fair-scheduler should be updated.
++    configuration.set(YARN_SCHEDULER_FILE_PROPERTY, "/some/file/location");
++    for (String user : new String[] { "first", "second", "third", "fourth", "fifth" }) {
++      shim.refreshDefaultQueue(configuration, user);
++
++      String queueName = String.format("queue.for.%s", user);
++      assertEquals(configuration.get(MR2_JOB_QUEUE_PROPERTY), queueName);
++    }
++  }
++}
+\ No newline at end of file
+-- 
+1.7.9.5
+

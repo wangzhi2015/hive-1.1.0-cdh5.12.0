@@ -1,0 +1,113 @@
+From 5b26c6d842ee4eeb6cca92898c8e9977bb32e720 Mon Sep 17 00:00:00 2001
+From: Mohit Sabharwal <mohit@cloudera.com>
+Date: Fri, 12 Feb 2016 16:34:37 -0800
+Subject: [PATCH 0498/1164] CDH-37147 : HIVE-13047 Disabling Web UI leads to
+ NullPointerException
+
+Change-Id: I365511a0fba3536187b1684d7cfa59be57659b56
+---
+ .../service/cli/operation/OperationManager.java    |   19 +++++++++++++------
+ .../hive/service/servlet/QueryProfileServlet.java  |   10 +++++++++-
+ 2 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+index b1adadd..81ce9ca 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+@@ -22,13 +22,10 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.Iterator;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Queue;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.commons.logging.Log;
+@@ -186,7 +183,9 @@ private Operation removeTimedOutOperation(OperationHandle operationHandle) {
+       synchronized (webuiLock) {
+         String opKey = operationHandle.getHandleIdentifier().toString();
+         SQLOperationDisplay display = liveSqlOperations.remove(opKey);
+-        historicSqlOperations.put(opKey, display);
++        if (historicSqlOperations != null) {
++          historicSqlOperations.put(opKey, display);
++        }
+       }
+       return operation;
+     }
+@@ -208,7 +207,9 @@ private Operation removeOperation(OperationHandle opHandle) {
+     synchronized (webuiLock) {
+       String opKey = opHandle.getHandleIdentifier().toString();
+       SQLOperationDisplay display = liveSqlOperations.remove(opKey);
+-      historicSqlOperations.put(opKey, display);
++      if (historicSqlOperations != null) {
++        historicSqlOperations.put(opKey, display);
++      }
+     }
+     return result;
+   }
+@@ -347,7 +348,9 @@ public OperationLog getOperationLogByThread() {
+   public List<SQLOperationDisplay> getHistoricalSQLOperations() {
+     List<SQLOperationDisplay> result = new LinkedList<>();
+     synchronized (webuiLock) {
+-      result.addAll(historicSqlOperations.values());
++      if (historicSqlOperations != null) {
++        result.addAll(historicSqlOperations.values());
++      }
+     }
+     return result;
+   }
+@@ -369,6 +372,10 @@ public OperationLog getOperationLogByThread() {
+    */
+   public SQLOperationDisplay getSQLOperationDisplay(String handle) {
+     synchronized (webuiLock) {
++      if (historicSqlOperations == null) {
++        return null;
++      }
++
+       SQLOperationDisplay result = liveSqlOperations.get(handle);
+       if (result != null) {
+         return result;
+diff --git a/service/src/java/org/apache/hive/service/servlet/QueryProfileServlet.java b/service/src/java/org/apache/hive/service/servlet/QueryProfileServlet.java
+index 74a374d..8fa447a 100644
+--- a/service/src/java/org/apache/hive/service/servlet/QueryProfileServlet.java
++++ b/service/src/java/org/apache/hive/service/servlet/QueryProfileServlet.java
+@@ -21,6 +21,9 @@
+ import org.apache.hive.service.cli.operation.SQLOperationDisplay;
+ import org.apache.hive.service.cli.session.SessionManager;
+ import org.apache.hive.tmpl.QueryProfileTmpl;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ 
+ import javax.servlet.ServletContext;
+ import javax.servlet.ServletException;
+@@ -33,6 +36,8 @@
+  * Renders a query page
+  */
+ public class QueryProfileServlet extends HttpServlet {
++  private static final Logger LOG = LoggerFactory.getLogger(QueryProfileServlet.class);
++
+   @Override
+   public void doGet(HttpServletRequest request, HttpServletResponse response)
+     throws ServletException, IOException {
+@@ -42,8 +47,11 @@ public void doGet(HttpServletRequest request, HttpServletResponse response)
+       (SessionManager)ctx.getAttribute("hive.sm");
+     OperationManager opManager = sessionManager.getOperationManager();
+     SQLOperationDisplay sod = opManager.getSQLOperationDisplay(opId);
++    if (sod == null) {
++      LOG.debug("No display object found for operation {} ", opId);
++      return;
++    }
+ 
+     new QueryProfileTmpl().render(response.getWriter(), sod);
+   }
+-
+ }
+-- 
+1.7.9.5
+

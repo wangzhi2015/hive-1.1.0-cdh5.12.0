@@ -1,0 +1,192 @@
+From 7ae4960a3508f24bab9c9aab9da02cf3293534d9 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Thu, 7 Jan 2016 10:15:40 -0500
+Subject: [PATCH 0453/1164] CDH-36074 HIVE-12795: Vectorized execution causes
+ ClassCastException (Yongzhi Chen, reviewed by
+ Aihua Xu)
+
+Change-Id: If2dc181b6a51682bd0ec678092ead20d071e4bb5
+---
+ .../expressions/VectorExpressionWriterFactory.java |    3 +-
+ ql/src/test/queries/clientpositive/vector_join.q   |   43 ++++++++
+ .../test/results/clientpositive/vector_join.q.out  |  104 ++++++++++++++++++++
+ 3 files changed, 149 insertions(+), 1 deletion(-)
+ create mode 100644 ql/src/test/queries/clientpositive/vector_join.q
+ create mode 100644 ql/src/test/results/clientpositive/vector_join.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorExpressionWriterFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorExpressionWriterFactory.java
+index 94a47e0..aa7aee1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorExpressionWriterFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorExpressionWriterFactory.java
+@@ -1098,7 +1098,8 @@ public static void processVectorInspector(
+     ArrayList<String> columnNames = new ArrayList<String>();
+     int i = 0;
+     for(StructField field : fields) {
+-      ObjectInspector fieldObjInsp = field.getFieldObjectInspector();
++      ObjectInspector fieldObjInsp = TypeInfoUtils.getStandardWritableObjectInspectorFromTypeInfo(
++                TypeInfoUtils.getTypeInfoFromObjectInspector(field.getFieldObjectInspector()));
+       writers[i] = VectorExpressionWriterFactory.
+                 genVectorExpressionWritable(fieldObjInsp);
+       columnNames.add(field.getFieldName());
+diff --git a/ql/src/test/queries/clientpositive/vector_join.q b/ql/src/test/queries/clientpositive/vector_join.q
+new file mode 100644
+index 0000000..9238a6e
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/vector_join.q
+@@ -0,0 +1,43 @@
++DROP TABLE IF EXISTS test1_vc;
++DROP TABLE IF EXISTS test2_vc;
++CREATE TABLE test1_vc
++ (
++   id string)
++   PARTITIONED BY (
++  cr_year bigint,
++  cr_month bigint)
++ ROW FORMAT SERDE
++  'org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe'
++STORED AS INPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
++OUTPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat'
++TBLPROPERTIES (
++  'serialization.null.format'='' );
++CREATE TABLE test2_vc(
++    id string
++  )
++   PARTITIONED BY (
++  cr_year bigint,
++  cr_month bigint)
++ROW FORMAT SERDE
++  'org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe'
++STORED AS INPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
++OUTPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat'
++TBLPROPERTIES (
++  'serialization.null.format'=''
++ );
++set hive.auto.convert.join=false;
++set hive.vectorized.execution.enabled = true;
++set hive.mapred.mode=nonstrict;
++SELECT cr.id1 ,
++cr.id2
++FROM
++(SELECT t1.id id1,
++ t2.id id2
++ from
++ (select * from test1_vc ) t1
++ left outer join test2_vc  t2
++ on t1.id=t2.id) cr;
+diff --git a/ql/src/test/results/clientpositive/vector_join.q.out b/ql/src/test/results/clientpositive/vector_join.q.out
+new file mode 100644
+index 0000000..94c0290
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/vector_join.q.out
+@@ -0,0 +1,104 @@
++PREHOOK: query: DROP TABLE IF EXISTS test1_vc
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS test1_vc
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: DROP TABLE IF EXISTS test2_vc
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS test2_vc
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE test1_vc
++ (
++   id string)
++   PARTITIONED BY (
++  cr_year bigint,
++  cr_month bigint)
++ ROW FORMAT SERDE
++  'org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe'
++STORED AS INPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
++OUTPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat'
++TBLPROPERTIES (
++  'serialization.null.format'='' )
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@test1_vc
++POSTHOOK: query: CREATE TABLE test1_vc
++ (
++   id string)
++   PARTITIONED BY (
++  cr_year bigint,
++  cr_month bigint)
++ ROW FORMAT SERDE
++  'org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe'
++STORED AS INPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
++OUTPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat'
++TBLPROPERTIES (
++  'serialization.null.format'='' )
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@test1_vc
++PREHOOK: query: CREATE TABLE test2_vc(
++    id string
++  )
++   PARTITIONED BY (
++  cr_year bigint,
++  cr_month bigint)
++ROW FORMAT SERDE
++  'org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe'
++STORED AS INPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
++OUTPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat'
++TBLPROPERTIES (
++  'serialization.null.format'=''
++ )
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@test2_vc
++POSTHOOK: query: CREATE TABLE test2_vc(
++    id string
++  )
++   PARTITIONED BY (
++  cr_year bigint,
++  cr_month bigint)
++ROW FORMAT SERDE
++  'org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe'
++STORED AS INPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileInputFormat'
++OUTPUTFORMAT
++  'org.apache.hadoop.hive.ql.io.RCFileOutputFormat'
++TBLPROPERTIES (
++  'serialization.null.format'=''
++ )
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@test2_vc
++PREHOOK: query: SELECT cr.id1 ,
++cr.id2
++FROM
++(SELECT t1.id id1,
++ t2.id id2
++ from
++ (select * from test1_vc ) t1
++ left outer join test2_vc  t2
++ on t1.id=t2.id) cr
++PREHOOK: type: QUERY
++PREHOOK: Input: default@test1_vc
++PREHOOK: Input: default@test2_vc
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT cr.id1 ,
++cr.id2
++FROM
++(SELECT t1.id id1,
++ t2.id id2
++ from
++ (select * from test1_vc ) t1
++ left outer join test2_vc  t2
++ on t1.id=t2.id) cr
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@test1_vc
++POSTHOOK: Input: default@test2_vc
++#### A masked pattern was here ####
+-- 
+1.7.9.5
+

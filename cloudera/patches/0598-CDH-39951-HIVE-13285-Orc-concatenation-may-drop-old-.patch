@@ -1,0 +1,190 @@
+From 7bf6f986a6953662a7fdfbf97ca8d94054b80ae3 Mon Sep 17 00:00:00 2001
+From: Prasanth Jayachandran <j.prasanth.j@gmail.com>
+Date: Wed, 16 Mar 2016 14:01:52 -0700
+Subject: [PATCH 0598/1164] CDH-39951: HIVE-13285: Orc concatenation may drop
+ old files from moving to final path (Prasanth
+ Jayachandran reviewed by Gopal V)
+
+Remove ql/src/test/results/clientpositive/tez/orc_merge_incompat3.q.out as it fails with TestMiniTezCliDriver, and we
+don't upport TEZ for now.
+
+Change-Id: I5edfaaf96a6e6e3bcd4453b55c516f624e4e7e41
+---
+ .../hive/ql/exec/AbstractFileMergeOperator.java    |   23 ++++---
+ .../hadoop/hive/ql/exec/OrcFileMergeOperator.java  |   14 ++--
+ .../queries/clientpositive/orc_merge_incompat3.q   |   14 ++++
+ .../clientpositive/orc_merge_incompat3.q.out       |   70 ++++++++++++++++++++
+ 4 files changed, 105 insertions(+), 16 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/orc_merge_incompat3.q
+ create mode 100644 ql/src/test/results/clientpositive/orc_merge_incompat3.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java
+index 6c80a14..5eea5a0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java
+@@ -199,18 +199,23 @@ protected void fixTmpPath(Path path) throws IOException {
+   @Override
+   public void closeOp(boolean abort) throws HiveException {
+     try {
+-      if (!exception) {
+-        FileStatus fss = fs.getFileStatus(outPath);
+-        if (!fs.rename(outPath, finalPath)) {
+-          throw new IOException(
+-              "Unable to rename " + outPath + " to " + finalPath);
++      if (!abort) {
++        // if outPath does not exist, then it means all paths within combine split are skipped as
++        // they are incompatible for merge (for example: files without stripe stats).
++        // Those files will be added to incompatFileSet
++        if (fs.exists(outPath)) {
++          FileStatus fss = fs.getFileStatus(outPath);
++          if (!fs.rename(outPath, finalPath)) {
++            throw new IOException(
++                "Unable to rename " + outPath + " to " + finalPath);
++          }
++          LOG.info("renamed path " + outPath + " to " + finalPath + " . File" +
++              " size is "
++              + fss.getLen());
+         }
+-        LOG.info("renamed path " + outPath + " to " + finalPath + " . File" +
+-            " size is "
+-            + fss.getLen());
+ 
+         // move any incompatible files to final path
+-        if (!incompatFileSet.isEmpty()) {
++        if (incompatFileSet != null && !incompatFileSet.isEmpty()) {
+           for (Path incompatFile : incompatFileSet) {
+             Path destDir = finalPath.getParent();
+             try {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/OrcFileMergeOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/OrcFileMergeOperator.java
+index da044e4..a8887d3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/OrcFileMergeOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/OrcFileMergeOperator.java
+@@ -217,22 +217,22 @@ static public String getOperatorName() {
+ 
+   @Override
+   public void closeOp(boolean abort) throws HiveException {
+-    // close writer
+-    if (outWriter == null) {
+-      return;
+-    }
+-
+     try {
+       if (fdis != null) {
+         fdis.close();
+         fdis = null;
+       }
+ 
+-      outWriter.close();
+-      outWriter = null;
++      if (outWriter != null) {
++        outWriter.close();
++        outWriter = null;
++      }
+     } catch (Exception e) {
+       throw new HiveException("Unable to close OrcFileMergeOperator", e);
+     }
++
++    // When there are no exceptions, this has to be called always to make sure incompatible files
++    // are moved properly to the destination path
+     super.closeOp(abort);
+   }
+ }
+diff --git a/ql/src/test/queries/clientpositive/orc_merge_incompat3.q b/ql/src/test/queries/clientpositive/orc_merge_incompat3.q
+new file mode 100644
+index 0000000..d6be111
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/orc_merge_incompat3.q
+@@ -0,0 +1,14 @@
++create table concat_incompat like alltypesorc;
++
++load data local inpath '../../data/files/alltypesorc' into table concat_incompat;
++load data local inpath '../../data/files/alltypesorc' into table concat_incompat;
++load data local inpath '../../data/files/alltypesorc' into table concat_incompat;
++load data local inpath '../../data/files/alltypesorc' into table concat_incompat;
++
++dfs -ls ${hiveconf:hive.metastore.warehouse.dir}/concat_incompat/;
++select count(*) from concat_incompat;
++
++ALTER TABLE concat_incompat CONCATENATE;
++
++dfs -ls ${hiveconf:hive.metastore.warehouse.dir}/concat_incompat/;
++select count(*) from concat_incompat;
+diff --git a/ql/src/test/results/clientpositive/orc_merge_incompat3.q.out b/ql/src/test/results/clientpositive/orc_merge_incompat3.q.out
+new file mode 100644
+index 0000000..e34492b
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/orc_merge_incompat3.q.out
+@@ -0,0 +1,70 @@
++PREHOOK: query: create table concat_incompat like alltypesorc
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@concat_incompat
++POSTHOOK: query: create table concat_incompat like alltypesorc
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@concat_incompat
++PREHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@concat_incompat
++POSTHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@concat_incompat
++PREHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@concat_incompat
++POSTHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@concat_incompat
++PREHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@concat_incompat
++POSTHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@concat_incompat
++PREHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@concat_incompat
++POSTHOOK: query: load data local inpath '../../data/files/alltypesorc' into table concat_incompat
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@concat_incompat
++Found 4 items
++#### A masked pattern was here ####
++PREHOOK: query: select count(*) from concat_incompat
++PREHOOK: type: QUERY
++PREHOOK: Input: default@concat_incompat
++#### A masked pattern was here ####
++POSTHOOK: query: select count(*) from concat_incompat
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@concat_incompat
++#### A masked pattern was here ####
++49152
++PREHOOK: query: ALTER TABLE concat_incompat CONCATENATE
++PREHOOK: type: ALTER_TABLE_MERGE
++PREHOOK: Input: default@concat_incompat
++PREHOOK: Output: default@concat_incompat
++POSTHOOK: query: ALTER TABLE concat_incompat CONCATENATE
++POSTHOOK: type: ALTER_TABLE_MERGE
++POSTHOOK: Input: default@concat_incompat
++POSTHOOK: Output: default@concat_incompat
++Found 4 items
++#### A masked pattern was here ####
++PREHOOK: query: select count(*) from concat_incompat
++PREHOOK: type: QUERY
++PREHOOK: Input: default@concat_incompat
++#### A masked pattern was here ####
++POSTHOOK: query: select count(*) from concat_incompat
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@concat_incompat
++#### A masked pattern was here ####
++49152
+-- 
+1.7.9.5
+

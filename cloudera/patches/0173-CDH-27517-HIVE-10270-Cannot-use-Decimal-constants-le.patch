@@ -1,0 +1,535 @@
+From 101a9ef6a09655b2dda2c3b7ecf9f00a007d2311 Mon Sep 17 00:00:00 2001
+From: Reuben Kuhnert <reuben.kuhnert@cloudera.com>
+Date: Thu, 2 Jul 2015 13:49:06 -0500
+Subject: [PATCH 0173/1164] CDH-27517: HIVE-10270: Cannot use Decimal
+ constants less than 0.1BD (Jason Dere, reviewed
+ by Gunther Hagleitner)
+
+---
+ .../hadoop/hive/common/type/HiveDecimal.java       |   19 +-
+ .../queries/clientpositive/decimal_precision2.q    |   15 ++
+ .../clientpositive/decimal_precision2.q.out        |  163 +++++++++++++++++
+ .../serde2/binarysortable/BinarySortableSerDe.java |  187 ++++++++++++--------
+ .../binarysortable/TestBinarySortableSerDe.java    |    4 +-
+ 5 files changed, 314 insertions(+), 74 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/decimal_precision2.q
+ create mode 100644 ql/src/test/results/clientpositive/decimal_precision2.q.out
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/type/HiveDecimal.java b/common/src/java/org/apache/hadoop/hive/common/type/HiveDecimal.java
+index c2bf6d7..a8215f2 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/type/HiveDecimal.java
++++ b/common/src/java/org/apache/hadoop/hive/common/type/HiveDecimal.java
+@@ -128,8 +128,25 @@ public int scale() {
+     return bd.scale();
+   }
+ 
++  /**
++   * Returns the number of digits (integer and fractional) in the number, which is equivalent
++   * to SQL decimal precision. Note that this is different from BigDecimal.precision(),
++   * which returns the precision of the unscaled value (BigDecimal.valueOf(0.01).precision() = 1,
++   * whereas HiveDecimal.create("0.01").precision() = 2).
++   * If you want the BigDecimal precision, use HiveDecimal.bigDecimalValue().precision()
++   * @return
++   */
+   public int precision() {
+-    return bd.precision();
++    int bdPrecision = bd.precision();
++    int bdScale = bd.scale();
++
++    if (bdPrecision < bdScale) {
++      // This can happen for numbers less than 0.1
++      // For 0.001234: bdPrecision=4, bdScale=6
++      // In this case, we'll set the type to have the same precision as the scale.
++      return bdScale;
++    }
++    return bdPrecision;
+   }
+ 
+   public int intValue() {
+diff --git a/ql/src/test/queries/clientpositive/decimal_precision2.q b/ql/src/test/queries/clientpositive/decimal_precision2.q
+new file mode 100644
+index 0000000..b5f6f6b
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/decimal_precision2.q
+@@ -0,0 +1,15 @@
++
++explain select 100.001BD;
++
++explain select 100.000BD;
++
++explain select 0.000BD;
++
++explain select 0.100BD;
++
++explain select 0.010BD;
++
++explain select cast(0.010 as decimal(6,3));
++
++explain select 0.09765625BD * 0.09765625BD * 0.0125BD * 578992BD;
++select 0.09765625BD * 0.09765625BD * 0.0125BD * 578992BD;
+diff --git a/ql/src/test/results/clientpositive/decimal_precision2.q.out b/ql/src/test/results/clientpositive/decimal_precision2.q.out
+new file mode 100644
+index 0000000..16765db
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/decimal_precision2.q.out
+@@ -0,0 +1,163 @@
++PREHOOK: query: explain select 100.001BD
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select 100.001BD
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 100.001 (type: decimal(6,3))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: explain select 100.000BD
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select 100.000BD
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 100.000 (type: decimal(3,0))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: explain select 0.000BD
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select 0.000BD
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 0.000 (type: decimal(1,0))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: explain select 0.100BD
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select 0.100BD
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 0.100 (type: decimal(1,1))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: explain select 0.010BD
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select 0.010BD
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 0.010 (type: decimal(2,2))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: explain select cast(0.010 as decimal(6,3))
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cast(0.010 as decimal(6,3))
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 0.01 (type: decimal(6,3))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: explain select 0.09765625BD * 0.09765625BD * 0.0125BD * 578992BD
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select 0.09765625BD * 0.09765625BD * 0.0125BD * 578992BD
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 69.0212249755859375 (type: decimal(27,20))
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select 0.09765625BD * 0.09765625BD * 0.0125BD * 578992BD
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select 0.09765625BD * 0.09765625BD * 0.0125BD * 578992BD
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++69.0212249755859375
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/binarysortable/BinarySortableSerDe.java b/serde/src/java/org/apache/hadoop/hive/serde2/binarysortable/BinarySortableSerDe.java
+index 2b7fba6..25090bd 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/binarysortable/BinarySortableSerDe.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/binarysortable/BinarySortableSerDe.java
+@@ -126,7 +126,7 @@
+   boolean[] columnSortOrderIsDesc;
+ 
+   private static byte[] decimalBuffer = null;
+-  private static Charset decimalCharSet = Charset.forName("US-ASCII");
++  public static Charset decimalCharSet = Charset.forName("US-ASCII");
+ 
+   @Override
+   public void initialize(Configuration conf, Properties tbl)
+@@ -244,11 +244,7 @@ static Object deserialize(InputByteBuffer buffer, TypeInfo type,
+       case LONG: {
+         LongWritable r = reuse == null ? new LongWritable()
+             : (LongWritable) reuse;
+-        long v = buffer.read(invert) ^ 0x80;
+-        for (int i = 0; i < 7; i++) {
+-          v = (v << 8) + (buffer.read(invert) & 0xff);
+-        }
+-        r.set(v);
++        r.set(deserializeLong(buffer, invert));
+         return r;
+       }
+       case FLOAT: {
+@@ -542,11 +538,19 @@ private static int deserializeInt(InputByteBuffer buffer, boolean invert) throws
+     return v;
+   }
+ 
++  private static long deserializeLong(InputByteBuffer buffer, boolean invert) throws IOException {
++    long v = buffer.read(invert) ^ 0x80;
++    for (int i = 0; i < 7; i++) {
++      v = (v << 8) + (buffer.read(invert) & 0xff);
++    }
++    return v;
++  }
++
+   static int getCharacterMaxLength(TypeInfo type) {
+     return ((BaseCharTypeInfo)type).getLength();
+   }
+ 
+-  static Text deserializeText(InputByteBuffer buffer, boolean invert, Text r)
++  public static Text deserializeText(InputByteBuffer buffer, boolean invert, Text r)
+       throws IOException {
+     // Get the actual length first
+     int start = buffer.tell();
+@@ -610,7 +614,7 @@ public Writable serialize(Object obj, ObjectInspector objInspector) throws SerDe
+     return serializeBytesWritable;
+   }
+ 
+-  private static void writeByte(RandomAccessOutput buffer, byte b, boolean invert) {
++  public static void writeByte(RandomAccessOutput buffer, byte b, boolean invert) {
+     if (invert) {
+       b = (byte) (0xff ^ b);
+     }
+@@ -648,8 +652,7 @@ static void serialize(ByteStream.Output buffer, Object o, ObjectInspector oi,
+       case SHORT: {
+         ShortObjectInspector spoi = (ShortObjectInspector) poi;
+         short v = spoi.get(o);
+-        writeByte(buffer, (byte) ((v >> 8) ^ 0x80), invert);
+-        writeByte(buffer, (byte) v, invert);
++        serializeShort(buffer, v, invert);
+         return;
+       }
+       case INT: {
+@@ -661,50 +664,17 @@ static void serialize(ByteStream.Output buffer, Object o, ObjectInspector oi,
+       case LONG: {
+         LongObjectInspector loi = (LongObjectInspector) poi;
+         long v = loi.get(o);
+-        writeByte(buffer, (byte) ((v >> 56) ^ 0x80), invert);
+-        writeByte(buffer, (byte) (v >> 48), invert);
+-        writeByte(buffer, (byte) (v >> 40), invert);
+-        writeByte(buffer, (byte) (v >> 32), invert);
+-        writeByte(buffer, (byte) (v >> 24), invert);
+-        writeByte(buffer, (byte) (v >> 16), invert);
+-        writeByte(buffer, (byte) (v >> 8), invert);
+-        writeByte(buffer, (byte) v, invert);
++        serializeLong(buffer, v, invert);
+         return;
+       }
+       case FLOAT: {
+         FloatObjectInspector foi = (FloatObjectInspector) poi;
+-        int v = Float.floatToIntBits(foi.get(o));
+-        if ((v & (1 << 31)) != 0) {
+-          // negative number, flip all bits
+-          v = ~v;
+-        } else {
+-          // positive number, flip the first bit
+-          v = v ^ (1 << 31);
+-        }
+-        writeByte(buffer, (byte) (v >> 24), invert);
+-        writeByte(buffer, (byte) (v >> 16), invert);
+-        writeByte(buffer, (byte) (v >> 8), invert);
+-        writeByte(buffer, (byte) v, invert);
++        serializeFloat(buffer, foi.get(o), invert);
+         return;
+       }
+       case DOUBLE: {
+         DoubleObjectInspector doi = (DoubleObjectInspector) poi;
+-        long v = Double.doubleToLongBits(doi.get(o));
+-        if ((v & (1L << 63)) != 0) {
+-          // negative number, flip all bits
+-          v = ~v;
+-        } else {
+-          // positive number, flip the first bit
+-          v = v ^ (1L << 63);
+-        }
+-        writeByte(buffer, (byte) (v >> 56), invert);
+-        writeByte(buffer, (byte) (v >> 48), invert);
+-        writeByte(buffer, (byte) (v >> 40), invert);
+-        writeByte(buffer, (byte) (v >> 32), invert);
+-        writeByte(buffer, (byte) (v >> 24), invert);
+-        writeByte(buffer, (byte) (v >> 16), invert);
+-        writeByte(buffer, (byte) (v >> 8), invert);
+-        writeByte(buffer, (byte) v, invert);
++        serializeDouble(buffer, doi.get(o), invert);
+         return;
+       }
+       case STRING: {
+@@ -770,29 +740,7 @@ static void serialize(ByteStream.Output buffer, Object o, ObjectInspector oi,
+ 
+         HiveDecimalObjectInspector boi = (HiveDecimalObjectInspector) poi;
+         HiveDecimal dec = boi.getPrimitiveJavaObject(o);
+-
+-        // get the sign of the big decimal
+-        int sign = dec.compareTo(HiveDecimal.ZERO);
+-
+-        // we'll encode the absolute value (sign is separate)
+-        dec = dec.abs();
+-
+-        // get the scale factor to turn big decimal into a decimal < 1
+-        int factor = dec.precision() - dec.scale();
+-        factor = sign == 1 ? factor : -factor;
+-
+-        // convert the absolute big decimal to string
+-        dec.scaleByPowerOfTen(Math.abs(dec.scale()));
+-        String digits = dec.unscaledValue().toString();
+-
+-        // finally write out the pieces (sign, scale, digits)
+-        writeByte(buffer, (byte) ( sign + 1), invert);
+-        writeByte(buffer, (byte) ((factor >> 24) ^ 0x80), invert);
+-        writeByte(buffer, (byte) ( factor >> 16), invert);
+-        writeByte(buffer, (byte) ( factor >> 8), invert);
+-        writeByte(buffer, (byte)   factor, invert);
+-        serializeBytes(buffer, digits.getBytes(decimalCharSet),
+-            digits.length(), sign == -1 ? !invert : invert);
++        serializeHiveDecimal(buffer, dec, invert);
+         return;
+       }
+ 
+@@ -857,7 +805,7 @@ static void serialize(ByteStream.Output buffer, Object o, ObjectInspector oi,
+ 
+   }
+ 
+-  private static void serializeBytes(
++  public static void serializeBytes(
+       ByteStream.Output buffer, byte[] data, int length, boolean invert) {
+     for (int i = 0; i < length; i++) {
+       if (data[i] == 0 || data[i] == 1) {
+@@ -870,13 +818,110 @@ private static void serializeBytes(
+     writeByte(buffer, (byte) 0, invert);
+   }
+ 
+-  private static void serializeInt(ByteStream.Output buffer, int v, boolean invert) {
++  public static void serializeBytes(
++      ByteStream.Output buffer, byte[] data, int offset, int length, boolean invert) {
++    for (int i = offset; i < offset + length; i++) {
++      if (data[i] == 0 || data[i] == 1) {
++        writeByte(buffer, (byte) 1, invert);
++        writeByte(buffer, (byte) (data[i] + 1), invert);
++      } else {
++        writeByte(buffer, data[i], invert);
++      }
++    }
++    writeByte(buffer, (byte) 0, invert);
++  }
++
++  public static void serializeShort(ByteStream.Output buffer, short v, boolean invert) {
++    writeByte(buffer, (byte) ((v >> 8) ^ 0x80), invert);
++    writeByte(buffer, (byte) v, invert);
++  }
++
++  public static void serializeInt(ByteStream.Output buffer, int v, boolean invert) {
+     writeByte(buffer, (byte) ((v >> 24) ^ 0x80), invert);
+     writeByte(buffer, (byte) (v >> 16), invert);
+     writeByte(buffer, (byte) (v >> 8), invert);
+     writeByte(buffer, (byte) v, invert);
+   }
+ 
++  public static void serializeLong(ByteStream.Output buffer, long v, boolean invert) {
++    writeByte(buffer, (byte) ((v >> 56) ^ 0x80), invert);
++    writeByte(buffer, (byte) (v >> 48), invert);
++    writeByte(buffer, (byte) (v >> 40), invert);
++    writeByte(buffer, (byte) (v >> 32), invert);
++    writeByte(buffer, (byte) (v >> 24), invert);
++    writeByte(buffer, (byte) (v >> 16), invert);
++    writeByte(buffer, (byte) (v >> 8), invert);
++    writeByte(buffer, (byte) v, invert);
++  }
++
++  public static void serializeFloat(ByteStream.Output buffer, float vf, boolean invert) {
++    int v = Float.floatToIntBits(vf);
++    if ((v & (1 << 31)) != 0) {
++      // negative number, flip all bits
++      v = ~v;
++    } else {
++      // positive number, flip the first bit
++      v = v ^ (1 << 31);
++    }
++    writeByte(buffer, (byte) (v >> 24), invert);
++    writeByte(buffer, (byte) (v >> 16), invert);
++    writeByte(buffer, (byte) (v >> 8), invert);
++    writeByte(buffer, (byte) v, invert);
++  }
++
++  public static void serializeDouble(ByteStream.Output buffer, double vd, boolean invert) {
++    long v = Double.doubleToLongBits(vd);
++    if ((v & (1L << 63)) != 0) {
++      // negative number, flip all bits
++      v = ~v;
++    } else {
++      // positive number, flip the first bit
++      v = v ^ (1L << 63);
++    }
++    writeByte(buffer, (byte) (v >> 56), invert);
++    writeByte(buffer, (byte) (v >> 48), invert);
++    writeByte(buffer, (byte) (v >> 40), invert);
++    writeByte(buffer, (byte) (v >> 32), invert);
++    writeByte(buffer, (byte) (v >> 24), invert);
++    writeByte(buffer, (byte) (v >> 16), invert);
++    writeByte(buffer, (byte) (v >> 8), invert);
++    writeByte(buffer, (byte) v, invert);
++  }
++
++  public static void serializeTimestampWritable(ByteStream.Output buffer, TimestampWritable t, boolean invert) {
++    byte[] data = t.getBinarySortable();
++    for (int i = 0; i < data.length; i++) {
++      writeByte(buffer, data[i], invert);
++    }
++  }
++
++  public static void serializeHiveDecimal(ByteStream.Output buffer, HiveDecimal dec, boolean invert) {
++    // get the sign of the big decimal
++    int sign = dec.compareTo(HiveDecimal.ZERO);
++
++    // we'll encode the absolute value (sign is separate)
++    dec = dec.abs();
++
++    // get the scale factor to turn big decimal into a decimal < 1
++    // This relies on the BigDecimal precision value, which as of HIVE-10270
++    // is now different from HiveDecimal.precision()
++    int factor = dec.bigDecimalValue().precision() - dec.bigDecimalValue().scale();
++    factor = sign == 1 ? factor : -factor;
++
++    // convert the absolute big decimal to string
++    dec.scaleByPowerOfTen(Math.abs(dec.scale()));
++    String digits = dec.unscaledValue().toString();
++
++    // finally write out the pieces (sign, scale, digits)
++    writeByte(buffer, (byte) ( sign + 1), invert);
++    writeByte(buffer, (byte) ((factor >> 24) ^ 0x80), invert);
++    writeByte(buffer, (byte) ( factor >> 16), invert);
++    writeByte(buffer, (byte) ( factor >> 8), invert);
++    writeByte(buffer, (byte)   factor, invert);
++    serializeBytes(buffer, digits.getBytes(decimalCharSet),
++        digits.length(), sign == -1 ? !invert : invert);
++  }
++
+   @Override
+   public SerDeStats getSerDeStats() {
+     // no support for statistics
+diff --git a/serde/src/test/org/apache/hadoop/hive/serde2/binarysortable/TestBinarySortableSerDe.java b/serde/src/test/org/apache/hadoop/hive/serde2/binarysortable/TestBinarySortableSerDe.java
+index cefb72e..1f4f290 100644
+--- a/serde/src/test/org/apache/hadoop/hive/serde2/binarysortable/TestBinarySortableSerDe.java
++++ b/serde/src/test/org/apache/hadoop/hive/serde2/binarysortable/TestBinarySortableSerDe.java
+@@ -64,7 +64,7 @@ public static String hexString(BytesWritable bytes) {
+     return sb.toString();
+   }
+ 
+-  private SerDe getSerDe(String fieldNames, String fieldTypes, String order)
++  public static SerDe getSerDe(String fieldNames, String fieldTypes, String order)
+       throws Throwable {
+     Properties schema = new Properties();
+     schema.setProperty(serdeConstants.LIST_COLUMNS, fieldNames);
+@@ -124,7 +124,7 @@ private void testBinarySortableSerDe(Object[] rows, ObjectInspector rowOI,
+     }
+   }
+ 
+-  private void sort(Object[] structs, ObjectInspector oi) {
++  public static void sort(Object[] structs, ObjectInspector oi) {
+     for (int i = 0; i < structs.length; i++) {
+       for (int j = i + 1; j < structs.length; j++) {
+         if (ObjectInspectorUtils.compare(structs[i], oi, structs[j], oi) > 0) {
+-- 
+1.7.9.5
+

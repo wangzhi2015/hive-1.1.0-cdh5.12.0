@@ -1,0 +1,109 @@
+From 84f99fe135a3596ab75d05dccdf1dd00f8995e6c Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xzhang@Cloudera.com>
+Date: Mon, 3 Aug 2015 19:14:20 -0700
+Subject: [PATCH 0222/1164] HIVE-11434: Followup for HIVE-10166: reuse
+ existing configurations for prewarming Spark
+ executors (reviewed by Chao)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    9 ++-------
+ .../hive/ql/exec/spark/RemoteHiveSparkClient.java  |   13 ++++++-------
+ .../apache/hive/spark/client/SparkClientImpl.java  |    1 -
+ 3 files changed, 8 insertions(+), 15 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 3781796..7417f24 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1971,8 +1971,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_AM_SPLIT_GENERATION("hive.compute.splits.in.am", true,
+         "Whether to generate the splits locally or in the AM (tez only)"),
+ 
+-    HIVE_PREWARM_ENABLED("hive.prewarm.enabled", false, "Enables container prewarm for Tez (Hadoop 2 only)"),
+-    HIVE_PREWARM_NUM_CONTAINERS("hive.prewarm.numcontainers", 10, "Controls the number of containers to prewarm for Tez (Hadoop 2 only)"),
++    HIVE_PREWARM_ENABLED("hive.prewarm.enabled", false, "Enables container prewarm for Tez/Spark (Hadoop 2 only)"),
++    HIVE_PREWARM_NUM_CONTAINERS("hive.prewarm.numcontainers", 10, "Controls the number of containers to prewarm for Tez/Spark (Hadoop 2 only)"),
+ 
+     HIVESTAGEIDREARRANGE("hive.stageid.rearrange", "none", new StringSet("none", "idonly", "traverse", "execution"), ""),
+     HIVEEXPLAINDEPENDENCYAPPENDTASKTYPES("hive.explain.dependency.append.tasktype", false, ""),
+@@ -2073,11 +2073,6 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+       "Channel logging level for remote Spark driver.  One of {DEBUG, ERROR, INFO, TRACE, WARN}."),
+     SPARK_RPC_SASL_MECHANISM("hive.spark.client.rpc.sasl.mechanisms", "DIGEST-MD5",
+       "Name of the SASL mechanism to use for authentication."),
+-    SPARK_PREWARM_CONTAINERS("hive.spark.prewarm.containers", false, "Whether to prewarn containers for Spark." +
+-      "If enabled, Hive will spend no more than 60 seconds to wait for the containers to come up " +
+-      "before any query can be executed."),
+-    SPARK_PREWARM_NUM_CONTAINERS("hive.spark.prewarm.num.containers", 10, "The minimum number of containers to be prewarmed for Spark." +
+-      "Applicable only if hive.spark.prewarm.containers is set to true."),
+     SPARK_ENABLED("hive.enable.spark.execution.engine", false, "Whether Spark is allowed as an execution engine");
+ 
+     public final String varname;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+index d77dea8..d7c3703 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+@@ -71,9 +71,8 @@
+   private static final long serialVersionUID = 1L;
+ 
+   private static final String MR_JAR_PROPERTY = "tmpjars";
+-  protected static final transient Log LOG = LogFactory
+-    .getLog(RemoteHiveSparkClient.class);
+-
++  private static final transient Log LOG = LogFactory.getLog(RemoteHiveSparkClient.class);
++  private static final long MAX_PREWARM_TIME = 30000; // 30s
+   private static final transient Splitter CSV_SPLITTER = Splitter.on(",").omitEmptyStrings();
+ 
+   private transient SparkClient remoteClient;
+@@ -92,7 +91,7 @@
+     sparkConf = HiveSparkClientFactory.generateSparkConf(conf);
+     remoteClient = SparkClientFactory.createClient(conf, hiveConf);
+ 
+-    if (HiveConf.getBoolVar(hiveConf, ConfVars.SPARK_PREWARM_CONTAINERS) &&
++    if (HiveConf.getBoolVar(hiveConf, ConfVars.HIVE_PREWARM_ENABLED) &&
+         hiveConf.get("spark.master").startsWith("yarn-")) {
+       int minExecutors = getExecutorsToWarm();
+       if (minExecutors <= 0) {
+@@ -101,7 +100,7 @@
+ 
+       LOG.info("Prewarm Spark executors. The minimum number of executors to warm is " + minExecutors);
+ 
+-      // Spend at most 60s to wait for executors to come up.
++      // Spend at most MAX_PREWARM_TIME to wait for executors to come up.
+       int curExecutors = 0;
+       long ts = System.currentTimeMillis();
+       do {
+@@ -111,7 +110,7 @@
+           return;
+         }
+         Thread.sleep(1000); // sleep 1 second
+-      } while (System.currentTimeMillis() - ts < 60000);
++      } while (System.currentTimeMillis() - ts < MAX_PREWARM_TIME);
+ 
+       LOG.info("Timeout (60s) occurred while prewarming executors. The current number of executors is " + curExecutors);
+     }
+@@ -124,7 +123,7 @@
+    */
+   private int getExecutorsToWarm() {
+     int minExecutors =
+-        HiveConf.getIntVar(hiveConf, HiveConf.ConfVars.SPARK_PREWARM_NUM_CONTAINERS);
++        HiveConf.getIntVar(hiveConf, HiveConf.ConfVars.HIVE_PREWARM_NUM_CONTAINERS);
+     boolean dynamicAllocation = hiveConf.getBoolean("spark.dynamicAllocation.enabled", false);
+     if (dynamicAllocation) {
+       int min = sparkConf.getInt("spark.dynamicAllocation.minExecutors", 0);
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+index 60baa31..e1e64a7 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+@@ -53,7 +53,6 @@
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hadoop.security.SecurityUtil;
+-import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hive.spark.client.rpc.Rpc;
+ import org.apache.hive.spark.client.rpc.RpcConfiguration;
+ import org.apache.hive.spark.client.rpc.RpcServer;
+-- 
+1.7.9.5
+

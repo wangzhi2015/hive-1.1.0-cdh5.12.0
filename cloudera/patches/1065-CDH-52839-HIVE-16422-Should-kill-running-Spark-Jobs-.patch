@@ -1,0 +1,63 @@
+From 5becf6957146d048008818f3bedf4c4dd5103878 Mon Sep 17 00:00:00 2001
+From: Zhihai Xu <zhihaixu2012@gmail.com>
+Date: Thu, 13 Apr 2017 10:30:36 -0700
+Subject: [PATCH 1065/1164] CDH-52839: HIVE-16422: Should kill running Spark
+ Jobs when a query is cancelled (Zhihai Xu,
+ reviewed by Chao Sun)
+
+(cherry picked from commit cbab5b29f26ceb3d4633ade9647ce8bcb2f020a0)
+
+Change-Id: Ia0e78dfdf75f6b8f2ef3cc1089c1bc5e971d04fb
+---
+ .../hadoop/hive/ql/exec/spark/SparkTask.java       |   21 +++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+index a718057..4bdaa75 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+@@ -81,6 +81,8 @@
+   private final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private static final long serialVersionUID = 1L;
+   private SparkCounters sparkCounters;
++  private transient SparkJobRef jobRef = null;
++  private transient boolean isShutdown = false;
+ 
+   @Override
+   public void initialize(HiveConf conf, QueryPlan queryPlan, DriverContext driverContext) {
+@@ -102,7 +104,7 @@ public int execute(DriverContext driverContext) {
+       sparkWork.setRequiredCounterPrefix(getCounterPrefixes());
+ 
+       perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.SPARK_SUBMIT_JOB);
+-      SparkJobRef jobRef = sparkSession.submit(driverContext, sparkWork);
++      jobRef = sparkSession.submit(driverContext, sparkWork);
+       perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.SPARK_SUBMIT_JOB);
+ 
+       addToHistory(jobRef);
+@@ -332,6 +334,23 @@ private static StatsTask getStatsTaskInChildTasks(Task<? extends Serializable> r
+     return null;
+   }
+ 
++  public boolean isTaskShutdown() {
++    return isShutdown;
++  }
++
++  @Override
++  public void shutdown() {
++    super.shutdown();
++    if (jobRef != null && !isShutdown) {
++      try {
++        jobRef.cancelJob();
++      } catch (Exception e) {
++        LOG.warn("failed to kill job", e);
++      }
++    }
++    isShutdown = true;
++  }
++
+   private List<Map<String, String>> getPartitionSpecs(StatsWork work) throws HiveException {
+     if (work.getLoadFileDesc() != null) {
+       return null; //we are in CTAS, so we know there are no partitions
+-- 
+1.7.9.5
+

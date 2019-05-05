@@ -1,0 +1,154 @@
+From a54daec22821a78dcd42654728228a08079c3992 Mon Sep 17 00:00:00 2001
+From: Shinichi Yamashita <yamashitasni@oss.nttdata.co.jp>
+Date: Thu, 7 Jan 2016 04:52:00 -0800
+Subject: [PATCH 0901/1164] CDH-48445 HIVE-12780: Fix the output of the
+ history command in Beeline           HIVE-12789:
+ Fix output twice in the history command of
+ Beeline (Shinichi Yamashita via Ashutosh Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+(cherry picked from commit ef2db2122dfde3b284d6d9d395dcf654cdbaffb4)
+
+Change-Id: I264d29958c05609992bf83c3b7bd198c026558fd
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |    5 +-
+ .../src/java/org/apache/hive/beeline/Commands.java |    8 +-
+ .../apache/hive/beeline/TestBeeLineHistory.java    |   90 ++++++++++++++++++++
+ 3 files changed, 96 insertions(+), 7 deletions(-)
+ create mode 100644 beeline/src/test/org/apache/hive/beeline/TestBeeLineHistory.java
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index ab7dd1c..1cba000 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -1068,10 +1068,7 @@ public ConsoleReader getConsoleReader(InputStream inputStream) throws IOExceptio
+       // now load in the previous history
+       if (hist != null) {
+         History h = consoleReader.getHistory();
+-        if (h instanceof FileHistory) {
+-          ((FileHistory) consoleReader.getHistory()).load(new ByteArrayInputStream(hist
+-              .toByteArray()));
+-        } else {
++        if (!(h instanceof FileHistory)) {
+           consoleReader.getHistory().add(hist.toString());
+         }
+       }
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 0498bcb..530de6e 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -184,10 +184,12 @@ public boolean addlocaldriverjar(String line) {
+ 
+   public boolean history(String line) {
+     Iterator hist = beeLine.getConsoleReader().getHistory().entries();
+-    int index = 1;
++    String[] tmp;
+     while(hist.hasNext()){
+-      beeLine.output(beeLine.getColorBuffer().pad(index + ".", 6)
+-          .append(hist.next().toString()));
++      tmp = hist.next().toString().split(":", 2);
++      tmp[0] = Integer.toString(Integer.parseInt(tmp[0]) + 1);
++      beeLine.output(beeLine.getColorBuffer().pad(tmp[0], 6)
++          .append(":" + tmp[1]));
+     }
+     return true;
+   }
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestBeeLineHistory.java b/beeline/src/test/org/apache/hive/beeline/TestBeeLineHistory.java
+new file mode 100644
+index 0000000..e861976
+--- /dev/null
++++ b/beeline/src/test/org/apache/hive/beeline/TestBeeLineHistory.java
+@@ -0,0 +1,90 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.beeline;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.PrintStream;
++import java.io.PrintWriter;
++
++import org.junit.AfterClass;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * TestBeeLineHistory - executes tests of the !history command of BeeLine
++ */
++public class TestBeeLineHistory {
++
++  private static final String fileName = "history";
++
++  @BeforeClass
++  public static void beforeTests() throws Exception {
++    PrintWriter writer = new PrintWriter(fileName);
++    writer.println("select 1;");
++    writer.println("select 2;");
++    writer.println("select 3;");
++    writer.println("select 4;");
++    writer.println("select 5;");
++    writer.println("select 6;");
++    writer.println("select 7;");
++    writer.println("select 8;");
++    writer.println("select 9;");
++    writer.println("select 10;");
++    writer.close();
++  }
++
++  @Test
++  public void testNumHistories() throws Exception {
++    ByteArrayOutputStream os = new ByteArrayOutputStream();
++    PrintStream ops = new PrintStream(os);
++    BeeLine beeline = new BeeLine();
++    beeline.getOpts().setHistoryFile(fileName);
++    beeline.setOutputStream(ops);
++    beeline.getConsoleReader(null);
++    beeline.dispatch("!history");
++    String output = os.toString("UTF-8");
++    int numHistories = output.split("\n").length;
++    Assert.assertEquals(numHistories, 10);
++    beeline.close();
++  }
++
++  @Test
++  public void testHistory() throws Exception {
++    ByteArrayOutputStream os = new ByteArrayOutputStream();
++    PrintStream ops = new PrintStream(os);
++    BeeLine beeline = new BeeLine();
++    beeline.getOpts().setHistoryFile(fileName);
++    beeline.setOutputStream(ops);
++    beeline.getConsoleReader(null);
++    beeline.dispatch("!history");
++    String output = os.toString("UTF-8");
++    String[] tmp = output.split("\n");
++    Assert.assertTrue(tmp[0].equals("1     : select 1;"));
++    Assert.assertTrue(tmp[9].equals("10    : select 10;"));
++    beeline.close();
++  }
++
++  @AfterClass
++  public static void afterTests() throws Exception {
++    File file = new File(fileName);
++    file.delete();
++  }
++}
+-- 
+1.7.9.5
+

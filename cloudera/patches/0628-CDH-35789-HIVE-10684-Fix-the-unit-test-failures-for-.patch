@@ -1,0 +1,263 @@
+From 13d115e1f1523e6467a83d747cf4b28bb1ebe8c3 Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Thu, 28 May 2015 14:06:40 -0400
+Subject: [PATCH 0628/1164] CDH-35789 HIVE-10684: Fix the unit test failures
+ for HIVE-7553 after HIVE-10674 removed the binary
+ jar files(Ferdinand Xu, reviewed by Hari Sankar
+ Sivarama Subramaniyan and Sushanth Sowmyan)
+
+Change-Id: I2ccb6b5275d1af8b930501bda40f2f27a6e33c6d
+---
+ .../hadoop/hive/ql/session/TestSessionState.java   |   62 ++++++++++++++++++--
+ ql/src/test/resources/RefreshedJarClassV1.txt      |   26 ++++++++
+ ql/src/test/resources/RefreshedJarClassV2.txt      |   26 ++++++++
+ ql/src/test/resources/SessionStateTest.jar.v1      |  Bin 2176 -> 0 bytes
+ ql/src/test/resources/SessionStateTest.jar.v2      |  Bin 2177 -> 0 bytes
+ 5 files changed, 108 insertions(+), 6 deletions(-)
+ create mode 100644 ql/src/test/resources/RefreshedJarClassV1.txt
+ create mode 100644 ql/src/test/resources/RefreshedJarClassV2.txt
+ delete mode 100644 ql/src/test/resources/SessionStateTest.jar.v1
+ delete mode 100644 ql/src/test/resources/SessionStateTest.jar.v2
+
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/session/TestSessionState.java b/ql/src/test/org/apache/hadoop/hive/ql/session/TestSessionState.java
+index 45ba07e..45ad22a 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/session/TestSessionState.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/session/TestSessionState.java
+@@ -20,13 +20,16 @@
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNull;
+ 
++import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.IOException;
++import java.io.InputStreamReader;
+ import java.lang.reflect.Method;
+ import java.util.Arrays;
+ import java.util.Collection;
+ 
+ import org.apache.commons.io.FileUtils;
++import org.apache.commons.io.IOUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -48,13 +51,21 @@
+  */
+ @RunWith(value = Parameterized.class)
+ public class TestSessionState {
+-
+   private final boolean prewarm;
+-  private final static String clazzDistFileName = "SessionStateTest.jar.v1";
+-  private final static String clazzV2FileName = "SessionStateTest.jar.v2";
+-  private final static String reloadClazzFileName = "reloadingClazz.jar";
+-  private final static String reloadClazzName = "org.apache.test.RefreshedJarClass";
++  private final static String clazzDistFileName = "RefreshedJarClass.jar.V1";
++  private final static String clazzV2FileName = "RefreshedJarClass.jar.V2";
++  private final static String reloadClazzFileName = "RefreshedJarClass.jar";
+   private final static String versionMethodName = "version";
++  private final static String RELOADED_CLAZZ_PREFIX_NAME = "RefreshedJarClass";
++  private final static String JAVA_FILE_EXT = ".java";
++  private final static String CLAZZ_FILE_EXT = ".class";
++  private final static String JAR_FILE_EXT = ".jar";
++  private final static String TXT_FILE_EXT = ".txt";
++  private final static String V1 = "V1";
++  private final static String V2 = "V2";
++  private final String clazzFile = RELOADED_CLAZZ_PREFIX_NAME + CLAZZ_FILE_EXT;
++  private final String jarFile = RELOADED_CLAZZ_PREFIX_NAME + JAR_FILE_EXT;
++  private final String javaFile = RELOADED_CLAZZ_PREFIX_NAME + JAVA_FILE_EXT;
+   private static String hiveReloadPath;
+   private File reloadFolder;
+   public static final Log LOG = LogFactory.getLog(TestSessionState.class);
+@@ -83,6 +94,13 @@ public void setUp() {
+       reloadFolder.mkdir();
+     }
+ 
++    try {
++      generateRefreshJarFiles(V2);
++      generateRefreshJarFiles(V1);
++    } catch (Throwable e) {
++      Assert.fail("fail to generate refresh jar file due to the error " + e);
++    }
++
+     if (prewarm) {
+       HiveConf.setBoolVar(conf, ConfVars.HIVE_PREWARM_ENABLED, true);
+       HiveConf.setIntVar(conf, ConfVars.HIVE_PREWARM_NUM_CONTAINERS, 1);
+@@ -167,11 +185,43 @@ public void testClassLoaderEquality() throws Exception {
+   }
+ 
+   private String getReloadedClazzVersion(ClassLoader cl) throws Exception {
+-    Class addedClazz = Class.forName(reloadClazzName, true, cl);
++    Class addedClazz = Class.forName(RELOADED_CLAZZ_PREFIX_NAME, true, cl);
+     Method versionMethod = addedClazz.getMethod(versionMethodName);
+     return (String) versionMethod.invoke(addedClazz.newInstance());
+   }
+ 
++  private void generateRefreshJarFiles(String version) throws IOException, InterruptedException {
++    String u = HiveTestUtils.getFileFromClasspath(
++      RELOADED_CLAZZ_PREFIX_NAME + version + TXT_FILE_EXT);
++    File dir = new File(u);
++    File parentDir = dir.getParentFile();
++    File f = new File(parentDir, javaFile);
++    Files.copy(dir, f);
++    executeCmd(new String[]{"javac", javaFile}, parentDir);
++    executeCmd(new String[]{"jar", "cf", jarFile, clazzFile}, parentDir);
++    Files.move(new File(parentDir, jarFile), new File(parentDir, jarFile + "." + version));
++    f.delete();
++    new File(parentDir, clazzFile).delete();
++  }
++
++  private void executeCmd(String[] cmdArr, File dir) throws IOException, InterruptedException {
++    final Process p1 = Runtime.getRuntime().exec(cmdArr, null, dir);
++    new Thread(new Runnable() {
++      public void run() {
++        BufferedReader input = new BufferedReader(new InputStreamReader(p1.getErrorStream()));
++        String line;
++        try {
++          while ((line = input.readLine()) != null) {
++            System.out.println(line);
++          }
++        } catch (IOException e) {
++          LOG.error("Failed to execute the command due the exception " + e);
++        }
++      }
++    }).start();
++    p1.waitFor();
++  }
++
+   @Test
+   public void testReloadAuxJars2() {
+     HiveConf conf = new HiveConf();
+diff --git a/ql/src/test/resources/RefreshedJarClassV1.txt b/ql/src/test/resources/RefreshedJarClassV1.txt
+new file mode 100644
+index 0000000..036b998
+--- /dev/null
++++ b/ql/src/test/resources/RefreshedJarClassV1.txt
+@@ -0,0 +1,26 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++public class RefreshedJarClass {
++  public String version(){
++    return "version1";
++  }
++
++  public static void main(String [] args){
++    System.out.println(new RefreshedJarClass().version());
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/test/resources/RefreshedJarClassV2.txt b/ql/src/test/resources/RefreshedJarClassV2.txt
+new file mode 100644
+index 0000000..c965265
+--- /dev/null
++++ b/ql/src/test/resources/RefreshedJarClassV2.txt
+@@ -0,0 +1,26 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++public class RefreshedJarClass {
++  public String version(){
++    return "version2";
++  }
++
++  public static void main(String [] args){
++    System.out.println(new RefreshedJarClass().version());
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/test/resources/SessionStateTest.jar.v1 b/ql/src/test/resources/SessionStateTest.jar.v1
+deleted file mode 100644
+index 47bceb85977d5afcb01d3d4cce8fdcfcc3ee31ca..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 2176
+zcmWIWW@h1H00B!wF;_4HN^k;cU)K;vT~9wZ{Q#&k4h9RLGOd)^Ytn(zjX*4dtjyQZ
+z&(qB{I7H9a?X&Nh(>~t1dKY=Ub+yi&Ilno`;EM5sr$t(4&uCsOU9}}h<J5Wm#t*?I
+zdxJJPetK5L_EF8j^_=U<PSur~38{UoohKz%a_#F(U0KO>tSZ4-rhAgH(dnRWfi(6f
+zOTwmzX&+Fj*jcfY0p>6Uu)~0EfddvGE59fm?sQBQ+)x#X1&PTSsdy9$peig$EiQqp
+zhJ;A|StUPqMh1p?K&*~Mbx>+rQEG8UYKm84k#kOBaj{-9h-?iw=yljZWX^RJ-=3@2
+zBKC;uuU+7MzH53DJ119I)%_*en^e^{?S5PS((}Uu_8)<d)YwFAceG1Bdwa&FBLBVq
+zdWK~ZZ3TuL8=fnF+UWmc-pQa@#ZAWZbU5CviQ;mypSE;I)O~fQyPuY9n5?lbC{Aa`
+zq^)`F>rO6JlQ}l^ltlf5OuZR`w>C%@E^j$^^wXr(kq5Whss4~&xMhvkp#q!E@S4Ms
+z2T%8$?VXgG#`|zj)asC!6T5yr@IUG)`|_akbb&3g!G~VlzuR)~`?l99szJ?yGSwZw
+zN*zj<yWZDIo2gUnetyC7XVx2T<hJo`)A?q{%ds(c=9+t%hmYsp=(OtJzvy27iqE2V
+zb7TJUBO(z!5%L4W5}pWi6U$Qb-~o@BV&yRv0~3HABzpBSGRu(T7~LiV!kU9qi;FY!
+z^MXqfOHxBn)4&!TQCG9wN3UN3no<Z%1LkCyR*;{oSCO03JK=2BVFQ7d_my0acW?E(
+zH93%X@74+S0UCR`Duq`cnRGEP*S=0wUGMF}3y;s$81G*5ruo0a;hR@tWo@787RNJ|
+zR5_@ZtoQ9c)Xpu#Z(Sj>RO7RBq;JapmxVG%e;5?c-V}5Aci!rx4VPO>kKB^%(cC0@
+z_R%%zv)6Xl>zw|lq?VPJWLT_pu5#}wqnkh3*5^xT=&eZiKcuhgIQ@bB@9WF@e7!TX
+z*{5uf;JnoMHd4B8v6ENi(ODl`jtJGw=#+i;^yQS&h2PG*e=V}`jQBFO<@fy8@EGF&
+zmoaRi@{g;4!BY#wc4P)qK~a7|YEemMYO(0q(_GC40uC2z_az-Db>;~QC{S#*6RUN&
+z#6RPe#AeSFA?CloZ+(4Qu$r4S>5R$2=iKEwA}*zA{D+@8WCtAg+ZucM(Cv8+t9J>u
+zTKtr#Qk}Yn|C!;QGhZ`XAMaSZeP#a}m30<+D&p}T3hDNbXM9i5_`CGv?{h(?9<c{_
+zGct)V<1RaaUIPLFhPRF&8lH#|+OU_UAjKfCq!Cn(z_lTjtOye@i!@N72LT|94*;2v
+zA`szJQ27m20;WKPAOwJPJOVO7I^abjZjGQq5duIOxq*ouNh7p~gz3g!NW%0lX|%+m
+z8%L3e?0fV)3@R-kK!D-@|5hfX@Pm~dFc)DjJrJ5VVQR)KOK=+oDoqfEy(erKma+wA
+zItK%`(gkMzl15u*41c0K6~lCBS%U~n?0FMmNeVD!!4o4SFp07Rky8V_S=m75aRZ?N
+K(8*S;ARYk9sEN`5
+
+diff --git a/ql/src/test/resources/SessionStateTest.jar.v2 b/ql/src/test/resources/SessionStateTest.jar.v2
+deleted file mode 100644
+index df0da41cf9d0c57759782c24be3128e16af6b6ef..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 2177
+zcmWIWW@h1H009v_QCBbnN^k;cU)K;vT~9wZ{Q#&k4hCVMGOd)^Ytn(zjX*4dtjyQZ
+z&(qB{I7H9a?X&Nh(>~t1dKY=Ub+yi&Ilno`;EM5sr$t(4&uCsOU9}}h<J5Wm#t*?I
+zdxJJPetK5L_EF8j^_=U<PSur~38{UoohKz%a_#F(U0KO>tSZ4-rhAgH(dnRWfi(6f
+zOTwmzX&+Fj*jcfY0p>6Uu)~0EfddvGE59fm?sQBQ+)x#X1&PTSsdy9$peig$EiQqp
+zhJ=X2k7#xdMh1p?K&*~Mbx>+rQEG8UYKm84k#kOBaj{-9h-?iw=yljZWX^RJ-=3@2
+zBKC;uuU*g`C#uiNFC?<&%RbNRDc(LQ<+tBon*87(|A)m#e0j903iyrB+@4wa;oiOY
+zI7XRdi9<&f4)pb(IIg#_TFpE29Ot<TBlR7ZvlKc0MofE@RXU%e^z`IIev5W^RT@6`
+zy0%Mpm)i7M8|1^alK(U=-<jZ+aX9bDTp=s*Ztr!=Sg-$@@?d@IrA=C#hd-*seKJjF
+z)i*XX_L?@+v}JSF(x5`c*RS^4i@KLCVdsx^x==P(!0rD#HJ*LjW7WMUO7%Rr;e2I1
+z^D1lIUtxx)Q*K&Uu-Tg4Z#<f3T(Ti?<M&L54&T!$U&EyBat`}lsr)1Qwa#Vk`WI!7
+zU)3YUB6=$12L>iQ73L<ErRKpy9y7_xV=4xw06j?j>Sbh>AxAR0O$LND2d5SnXXfVx
+zmn4>?hM*>bEjpsEX1kAGzXUX;5SR$e$uO-TKUc3JH>Y>P*{s6`0xj<=xgPJ{>UV2$
+zAn)F-6YK*t_HtDUuRb#AVqUI&ovOOt+l3b%pQ|z6z2;5xe}}_2uf)pQKGiLbXDq35
+zP%l~U+kL2=TZZ4dLS(7NXX!}al>ILYWsd$ZD4xA3=J4;l)kzyJx0W8cCE267N%ZWa
+zYtm=0?XK53{ZC0PD=*2gSm|8l-cv?5f3mI5m(b8#k?wy;U)OQ^1N-0Cm-YF2XJ)fc
+z*&xArsqt;3bl+kpugIgbKDHbYs+-X%`|jz>DWwa)op=9QWZ@a{Wopas`LE$I2FWW2
+zRE~VB0tQbl5ZjR%Oa(>x1*t_PnW@F1XLoZQG7xEaXzO3NV6);%QLly0g#qmP6Mirp
+z|7LP>(v&*~wr@XYFJE7*=r3rj`{CyyS?$Ve8PN$^Y*Cz#OiKP1ym`3x`~|L?8@&v7
+zK5#$CI-ULNjJQ|7uADg%u<f={TZToRMf9U<p-B>(qYKYf2Tl1G^t5)lX6iTQ0B=Sn
+z5oX+lC(vs^Ai(g}5k$iiF+v;m!W5(!1eP>{3KF<Bq@opJ0%n;8D)k@$WbpwY6H*2u
+zoC+$yp-R9Ms1$?%kd8+{CP)XoOvJ4bR4PIMNFz5e(IaVumXR>s*h@*6{w0l;Sajnk
+zGm(9do`*rD1q28%{Quv^gcN?TvIFKK?4<`n^JYxVm}LoW!$748!mtm74Z~8lz)a_0
+zz*f4z%wN)I$Bf}mbf;pN4lQdCfr&kDA}mP-rYv}3gajs0mLPI!fHx}}$UJT!Gypo;
+Inia$Y0FhyVr2qf`
+
+-- 
+1.7.9.5
+

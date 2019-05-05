@@ -1,0 +1,144 @@
+From c5620b0eb137e01d1992497cf1991d5e72f06478 Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Thu, 1 Oct 2015 14:11:58 -0700
+Subject: [PATCH 0489/1164] CDH-36982 : HIVE-11898 : support default partition
+ in metastoredirectsql (Sergey Shelukhin, reviewed
+ by Sushanth Sowmyan)
+
+(cherry picked from commit 116c3e3b2d2b2b22fef9abed8f092b04155784cd)
+
+Conflicts:
+	metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+
+Change-Id: I8e235ccac985da48ff22e58d847cb3cdfffe2b81
+---
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |   35 ++++++++++++--------
+ 1 file changed, 22 insertions(+), 13 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index 057da4f..b5bfcf1 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -107,6 +107,7 @@
+   private final DB dbType;
+   private final int batchSize;
+   private final boolean convertMapNullsToEmptyStrings;
++  private final String defaultPartName;
+ 
+   /**
+    * Whether direct SQL can be used with the current datastore backing {@link #pm}.
+@@ -124,6 +125,7 @@ public MetaStoreDirectSql(PersistenceManager pm, Configuration conf) {
+ 
+     convertMapNullsToEmptyStrings =
+         HiveConf.getBoolVar(conf, ConfVars.METASTORE_ORM_RETRIEVE_MAPNULLS_AS_EMPTY_STRINGS);
++    defaultPartName = HiveConf.getVar(conf, ConfVars.DEFAULTPARTITIONNAME);
+ 
+     this.isCompatibleDatastore = ensureDbInit() && runTestQuery();
+     if (isCompatibleDatastore) {
+@@ -374,7 +376,7 @@ public Database getDatabase(String dbName) throws MetaException{
+     // Derby and Oracle do not interpret filters ANSI-properly in some cases and need a workaround.
+     boolean dbHasJoinCastBug = (dbType == DB.DERBY || dbType == DB.ORACLE);
+     String sqlFilter = PartitionFilterGenerator.generateSqlFilter(
+-        table, tree, params, joins, dbHasJoinCastBug);
++        table, tree, params, joins, dbHasJoinCastBug, defaultPartName);
+     if (sqlFilter == null) {
+       return null; // Cannot make SQL filter to push down.
+     }
+@@ -474,8 +476,8 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+     }
+     List<Object> sqlResult = executeWithArray(query, params, queryText);
+     long queryTime = doTrace ? System.nanoTime() : 0;
++    timingTrace(doTrace, queryText, start, queryTime);
+     if (sqlResult.isEmpty()) {
+-      timingTrace(doTrace, queryText, start, queryTime);
+       return new ArrayList<Partition>(); // no partitions, bail early.
+     }
+ 
+@@ -491,8 +493,7 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+     } else {
+       result = getPartitionsFromPartitionIds(dbName, tblName, isView, sqlResult);
+     }
+- 
+-    timingTrace(doTrace, queryText, start, queryTime);
++
+     query.closeAll();
+     return result;
+   }
+@@ -897,14 +898,16 @@ private static String trimCommaList(StringBuilder sb) {
+     private final List<Object> params;
+     private final List<String> joins;
+     private final boolean dbHasJoinCastBug;
++    private final String defaultPartName;
+ 
+-    private PartitionFilterGenerator(
+-        Table table, List<Object> params, List<String> joins, boolean dbHasJoinCastBug) {
++    private PartitionFilterGenerator(Table table, List<Object> params, List<String> joins,
++        boolean dbHasJoinCastBug, String defaultPartName) {
+       this.table = table;
+       this.params = params;
+       this.joins = joins;
+       this.dbHasJoinCastBug = dbHasJoinCastBug;
+       this.filterBuffer = new FilterBuilder(false);
++      this.defaultPartName = defaultPartName;
+     }
+ 
+     /**
+@@ -915,13 +918,14 @@ private PartitionFilterGenerator(
+      * @return the string representation of the expression tree
+      */
+     private static String generateSqlFilter(Table table, ExpressionTree tree,
+-        List<Object> params, List<String> joins, boolean dbHasJoinCastBug) throws MetaException {
++        List<Object> params, List<String> joins, boolean dbHasJoinCastBug, String defaultPartName)
++            throws MetaException {
+       assert table != null;
+       if (tree.getRoot() == null) {
+         return "";
+       }
+       PartitionFilterGenerator visitor = new PartitionFilterGenerator(
+-          table, params, joins, dbHasJoinCastBug);
++          table, params, joins, dbHasJoinCastBug, defaultPartName);
+       tree.accept(visitor);
+       if (visitor.filterBuffer.hasError()) {
+         LOG.info("Unable to push down SQL filter: " + visitor.filterBuffer.getErrorMessage());
+@@ -1047,28 +1051,33 @@ public void visit(LeafNode node) throws MetaException {
+ 
+       // Build the filter and add parameters linearly; we are traversing leaf nodes LTR.
+       String tableValue = "\"FILTER" + partColIndex + "\".\"PART_KEY_VAL\"";
++
+       if (node.isReverseOrder) {
+         params.add(nodeValue);
+       }
++      String tableColumn = tableValue;
+       if (colType != FilterType.String) {
+         // The underlying database field is varchar, we need to compare numbers.
+-        // Note that this won't work with __HIVE_DEFAULT_PARTITION__. It will fail and fall
+-        // back to JDO. That is by design; we could add an ugly workaround here but didn't.
+         if (colType == FilterType.Integral) {
+           tableValue = "cast(" + tableValue + " as decimal(21,0))";
+         } else if (colType == FilterType.Date) {
+           tableValue = "cast(" + tableValue + " as date)";
+         }
+ 
++        // Workaround for HIVE_DEFAULT_PARTITION - ignore it like JDO does, for now.
++        String tableValue0 = tableValue;
++        tableValue = "(case when " + tableColumn + " <> ?";
++        params.add(defaultPartName);
++
+         if (dbHasJoinCastBug) {
+           // This is a workaround for DERBY-6358 and Oracle bug; it is pretty horrible.
+-          tableValue = "(case when \"TBLS\".\"TBL_NAME\" = ? and \"DBS\".\"NAME\" = ? and "
++          tableValue += (" and \"TBLS\".\"TBL_NAME\" = ? and \"DBS\".\"NAME\" = ? and "
+               + "\"FILTER" + partColIndex + "\".\"PART_ID\" = \"PARTITIONS\".\"PART_ID\" and "
+-                + "\"FILTER" + partColIndex + "\".\"INTEGER_IDX\" = " + partColIndex + " then "
+-              + tableValue + " else null end)";
++                + "\"FILTER" + partColIndex + "\".\"INTEGER_IDX\" = " + partColIndex);
+           params.add(table.getTableName().toLowerCase());
+           params.add(table.getDbName().toLowerCase());
+         }
++        tableValue += " then " + tableValue0 + " else null end)";
+       }
+       if (!node.isReverseOrder) {
+         params.add(nodeValue);
+-- 
+1.7.9.5
+

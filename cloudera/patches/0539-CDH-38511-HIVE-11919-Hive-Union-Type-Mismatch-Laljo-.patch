@@ -1,0 +1,107 @@
+From 24ad52ad6b58aa038a4bae202e68a91b689894d8 Mon Sep 17 00:00:00 2001
+From: jpullokk <jpullokk@apache.org>
+Date: Wed, 7 Oct 2015 21:12:51 -0700
+Subject: [PATCH 0539/1164] CDH-38511: HIVE-11919: Hive Union Type Mismatch
+ (Laljo John Pullokkaran, reviewed by Jesus
+ Camacho Rodriguez)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java
+
+Change-Id: Ibcec2e15484b8ed5296e06568094c66b4ac1880d
+---
+ .../org/apache/hadoop/hive/ql/exec/ColumnInfo.java |    2 +-
+ .../hive/ql/udf/generic/GenericUDFUtils.java       |    3 +--
+ ql/src/test/queries/clientpositive/union36.q       |   10 +++++++
+ ql/src/test/results/clientpositive/union36.q.out   |   28 ++++++++++++++++++++
+ 4 files changed, 40 insertions(+), 3 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/union36.q
+ create mode 100644 ql/src/test/results/clientpositive/union36.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java
+index 12bb1d7..e3da7f0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java
+@@ -107,7 +107,6 @@ public ColumnInfo(ColumnInfo columnInfo) {
+     this.isVirtualCol = columnInfo.getIsVirtualCol();
+     this.isHiddenVirtualCol = columnInfo.isHiddenVirtualCol();
+     this.setType(columnInfo.getType());
+-    this.typeName = columnInfo.getType().getTypeName();
+   }
+ 
+   public String getTypeName() {
+@@ -133,6 +132,7 @@ public String getInternalName() {
+   public void setType(TypeInfo type) {
+     objectInspector =
+         TypeInfoUtils.getStandardWritableObjectInspectorFromTypeInfo(type);
++    setTypeName(type.getTypeName());
+   }
+ 
+   public void setInternalName(String internalName) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
+index f197afa..f9dd801 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
+@@ -159,8 +159,7 @@ private boolean update(ObjectInspector oi, boolean isUnionAll) throws UDFArgumen
+       // a common base class or not.
+       TypeInfo commonTypeInfo = null;
+       if (isUnionAll) {
+-        commonTypeInfo = FunctionRegistry.getCommonClassForUnionAll(oiTypeInfo,
+-          rTypeInfo);
++        commonTypeInfo = FunctionRegistry.getCommonClassForUnionAll(rTypeInfo, oiTypeInfo);
+       } else {
+         commonTypeInfo = FunctionRegistry.getCommonClass(oiTypeInfo,
+           rTypeInfo);
+diff --git a/ql/src/test/queries/clientpositive/union36.q b/ql/src/test/queries/clientpositive/union36.q
+new file mode 100644
+index 0000000..e929749
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/union36.q
+@@ -0,0 +1,10 @@
++set hive.cbo.enable=false;
++
++select (x/sum(x) over())  as y from(select cast(1 as decimal(10,0))  as x from (select * from src limit 2)s1 union all select cast(1 as decimal(10,0)) x from (select * from src limit 2) s2 union all select '100000000' x from (select * from src limit 2) s3)u order by y;
++
++select (x/sum(x) over()) as y from(select cast(1 as decimal(10,0))  as x from (select * from src limit 2)s1 union all select cast(1 as decimal(10,0)) x from (select * from src limit 2) s2 union all select cast (null as string) x from (select * from src limit 2) s3)u order by y;
++
++
++
++
++
+diff --git a/ql/src/test/results/clientpositive/union36.q.out b/ql/src/test/results/clientpositive/union36.q.out
+new file mode 100644
+index 0000000..12f060b
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/union36.q.out
+@@ -0,0 +1,28 @@
++PREHOOK: query: select (x/sum(x) over())  as y from(select cast(1 as decimal(10,0))  as x from (select * from src limit 2)s1 union all select cast(1 as decimal(10,0)) x from (select * from src limit 2) s2 union all select '100000000' x from (select * from src limit 2) s3)u order by y
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select (x/sum(x) over())  as y from(select cast(1 as decimal(10,0))  as x from (select * from src limit 2)s1 union all select cast(1 as decimal(10,0)) x from (select * from src limit 2) s2 union all select '100000000' x from (select * from src limit 2) s3)u order by y
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++4.999999900000002E-9
++4.999999900000002E-9
++4.999999900000002E-9
++4.999999900000002E-9
++0.4999999900000002
++0.4999999900000002
++PREHOOK: query: select (x/sum(x) over()) as y from(select cast(1 as decimal(10,0))  as x from (select * from src limit 2)s1 union all select cast(1 as decimal(10,0)) x from (select * from src limit 2) s2 union all select cast (null as string) x from (select * from src limit 2) s3)u order by y
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select (x/sum(x) over()) as y from(select cast(1 as decimal(10,0))  as x from (select * from src limit 2)s1 union all select cast(1 as decimal(10,0)) x from (select * from src limit 2) s2 union all select cast (null as string) x from (select * from src limit 2) s3)u order by y
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++NULL
++NULL
++0.25
++0.25
++0.25
++0.25
+-- 
+1.7.9.5
+

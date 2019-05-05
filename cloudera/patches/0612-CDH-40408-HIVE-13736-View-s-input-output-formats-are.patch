@@ -1,0 +1,695 @@
+From 11280d888cda48942cb068e90960a049545f5156 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Mon, 16 May 2016 15:40:22 -0400
+Subject: [PATCH 0612/1164] CDH-40408: HIVE-13736: View's input/output formats
+ are TEXT by default. (Yongzhi Chen, reviewed by
+ Chaoyu Tang)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+	ql/src/test/results/clientpositive/llap/selectDistinctStar.q.out
+
+Change-Id: I6d20a2b9f2435e2f162e925dffc2379427582766
+---
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |   13 ++
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |    5 +-
+ .../apache/hadoop/hive/ql/plan/CreateViewDesc.java |   24 +++-
+ .../clientpositive/create_view_defaultformats.q    |   14 +++
+ .../alter_view_as_select_with_partition.q.out      |    4 +-
+ .../clientpositive/alter_view_as_select.q.out      |   12 +-
+ .../clientpositive/create_or_replace_view.q.out    |   20 +--
+ .../test/results/clientpositive/create_view.q.out  |   56 ++++-----
+ .../create_view_defaultformats.q.out               |  130 ++++++++++++++++++++
+ .../clientpositive/create_view_partitioned.q.out   |   20 +--
+ .../clientpositive/create_view_translate.q.out     |    8 +-
+ .../clientpositive/selectDistinctStar.q.out        |    8 +-
+ .../clientpositive/tez/selectDistinctStar.q.out    |    8 +-
+ 13 files changed, 252 insertions(+), 70 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/create_view_defaultformats.q
+ create mode 100644 ql/src/test/results/clientpositive/create_view_defaultformats.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index f7dbb70..b04be9a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -4252,6 +4252,12 @@ private int createView(Hive db, CreateViewDesc crtView) throws HiveException {
+         oldview.getTTable().getParameters().putAll(crtView.getTblProps());
+       }
+       oldview.setPartCols(crtView.getPartCols());
++      if (crtView.getInputFormat() != null) {
++        oldview.setInputFormatClass(crtView.getInputFormat());
++      }
++      if (crtView.getOutputFormat() != null) {
++        oldview.setOutputFormatClass(crtView.getOutputFormat());
++      }
+       oldview.checkValidity();
+       try {
+         db.alterTable(crtView.getViewName(), oldview);
+@@ -4279,6 +4285,13 @@ private int createView(Hive db, CreateViewDesc crtView) throws HiveException {
+         tbl.setPartCols(crtView.getPartCols());
+       }
+ 
++      if (crtView.getInputFormat() != null) {
++        tbl.setInputFormatClass(crtView.getInputFormat());
++      }
++      if (crtView.getOutputFormat() != null) {
++        tbl.setOutputFormatClass(crtView.getOutputFormat());
++      }
++
+       db.createTable(tbl, crtView.getIfNotExists());
+       work.getOutputs().add(new WriteEntity(tbl, WriteEntity.WriteType.DDL_NO_LOCK));
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 06c79ce..7c1dcb5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -10965,8 +10965,11 @@ private ASTNode analyzeCreateView(ASTNode ast, QB qb)
+       orReplace = true;
+     }
+ 
++    StorageFormat defaultFmt = new StorageFormat(conf);
++    defaultFmt.fillDefaultStorageFormat();
+     createVwDesc = new CreateViewDesc(
+-      dbDotTable, cols, comment, tblProps, partColNames,
++      dbDotTable, cols, comment, defaultFmt.getInputFormat(),
++      defaultFmt.getOutputFormat(), tblProps, partColNames,
+       ifNotExists, orReplace, isAlterViewAs);
+ 
+     unparseTranslator.enable();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateViewDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateViewDesc.java
+index dd76a82..26b7407 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateViewDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateViewDesc.java
+@@ -34,6 +34,8 @@
+   private static final long serialVersionUID = 1L;
+ 
+   private String viewName;
++  private String inputFormat;
++  private String outputFormat;
+   private String originalText;
+   private String expandedText;
+   private List<FieldSchema> schema;
+@@ -52,12 +54,15 @@ public CreateViewDesc() {
+   }
+ 
+   public CreateViewDesc(String viewName, List<FieldSchema> schema,
+-      String comment, Map<String, String> tblProps,
++      String comment, String inputFormat,
++      String outputFormat, Map<String, String> tblProps,
+       List<String> partColNames, boolean ifNotExists,
+       boolean orReplace, boolean isAlterViewAs) {
+     this.viewName = viewName;
+     this.schema = schema;
+     this.comment = comment;
++    this.inputFormat = inputFormat;
++    this.outputFormat = outputFormat;
+     this.tblProps = tblProps;
+     this.partColNames = partColNames;
+     this.ifNotExists = ifNotExists;
+@@ -170,4 +175,21 @@ public boolean getIsAlterViewAs() {
+   public void setIsAlterViewAs(boolean isAlterViewAs) {
+     this.isAlterViewAs = isAlterViewAs;
+   }
++
++  public String getInputFormat() {
++    return inputFormat;
++  }
++
++  public void setInputFormat(String inputFormat) {
++    this.inputFormat = inputFormat;
++  }
++
++  public String getOutputFormat() {
++    return outputFormat;
++  }
++
++  public void setOutputFormat(String outputFormat) {
++    this.outputFormat = outputFormat;
++  }
++
+ }
+diff --git a/ql/src/test/queries/clientpositive/create_view_defaultformats.q b/ql/src/test/queries/clientpositive/create_view_defaultformats.q
+new file mode 100644
+index 0000000..66fa141
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/create_view_defaultformats.q
+@@ -0,0 +1,14 @@
++drop view if exists sfsrc;
++drop view if exists rcsrc;
++set hive.default.fileformat=SequenceFile;
++create view sfsrc as select * from src;
++set hive.default.fileformat=RcFile;
++create view rcsrc as select * from src;
++describe formatted sfsrc;
++describe formatted rcsrc;
++select * from sfsrc where key = 100 limit 1;
++select * from rcsrc where key = 100 limit 1;
++drop view sfsrc;
++drop view rcsrc;
++set hive.default.fileformat=TextFile;
++
+diff --git a/ql/src/test/results/clientnegative/alter_view_as_select_with_partition.q.out b/ql/src/test/results/clientnegative/alter_view_as_select_with_partition.q.out
+index 447dc3a..6cb06d3 100644
+--- a/ql/src/test/results/clientnegative/alter_view_as_select_with_partition.q.out
++++ b/ql/src/test/results/clientnegative/alter_view_as_select_with_partition.q.out
+@@ -56,8 +56,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/alter_view_as_select.q.out b/ql/src/test/results/clientpositive/alter_view_as_select.q.out
+index ff2d860..3bab48a 100644
+--- a/ql/src/test/results/clientpositive/alter_view_as_select.q.out
++++ b/ql/src/test/results/clientpositive/alter_view_as_select.q.out
+@@ -38,8 +38,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -80,8 +80,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -131,8 +131,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/create_or_replace_view.q.out b/ql/src/test/results/clientpositive/create_or_replace_view.q.out
+index aab78ba..d3c5e13 100644
+--- a/ql/src/test/results/clientpositive/create_or_replace_view.q.out
++++ b/ql/src/test/results/clientpositive/create_or_replace_view.q.out
+@@ -38,8 +38,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -129,8 +129,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -223,8 +223,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -294,8 +294,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -386,8 +386,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/create_view.q.out b/ql/src/test/results/clientpositive/create_view.q.out
+index c837bfb..585c2fd 100644
+--- a/ql/src/test/results/clientpositive/create_view.q.out
++++ b/ql/src/test/results/clientpositive/create_view.q.out
+@@ -256,8 +256,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -306,8 +306,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -354,8 +354,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -404,8 +404,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -767,8 +767,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -848,8 +848,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -927,8 +927,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -996,8 +996,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -1073,8 +1073,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -1146,8 +1146,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -1232,8 +1232,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -1354,8 +1354,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -1471,8 +1471,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -1557,8 +1557,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/create_view_defaultformats.q.out b/ql/src/test/results/clientpositive/create_view_defaultformats.q.out
+new file mode 100644
+index 0000000..f18d678
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/create_view_defaultformats.q.out
+@@ -0,0 +1,130 @@
++PREHOOK: query: drop view if exists sfsrc
++PREHOOK: type: DROPVIEW
++POSTHOOK: query: drop view if exists sfsrc
++POSTHOOK: type: DROPVIEW
++PREHOOK: query: drop view if exists rcsrc
++PREHOOK: type: DROPVIEW
++POSTHOOK: query: drop view if exists rcsrc
++POSTHOOK: type: DROPVIEW
++PREHOOK: query: create view sfsrc as select * from src
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@sfsrc
++POSTHOOK: query: create view sfsrc as select * from src
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@sfsrc
++PREHOOK: query: create view rcsrc as select * from src
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@rcsrc
++POSTHOOK: query: create view rcsrc as select * from src
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@rcsrc
++PREHOOK: query: describe formatted sfsrc
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@sfsrc
++POSTHOOK: query: describe formatted sfsrc
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@sfsrc
++# col_name            	data_type           	comment             
++	 	 
++key                 	string              	                    
++value               	string              	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++Table Type:         	VIRTUAL_VIEW        	 
++Table Parameters:	 	 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	null                	 
++InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++	 	 
++# View Information	 	 
++View Original Text: 	select * from src   	 
++View Expanded Text: 	select `src`.`key`, `src`.`value` from `default`.`src`	 
++PREHOOK: query: describe formatted rcsrc
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@rcsrc
++POSTHOOK: query: describe formatted rcsrc
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@rcsrc
++# col_name            	data_type           	comment             
++	 	 
++key                 	string              	                    
++value               	string              	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++Table Type:         	VIRTUAL_VIEW        	 
++Table Parameters:	 	 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	null                	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.RCFileInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.RCFileOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++	 	 
++# View Information	 	 
++View Original Text: 	select * from src   	 
++View Expanded Text: 	select `src`.`key`, `src`.`value` from `default`.`src`	 
++PREHOOK: query: select * from sfsrc where key = 100 limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@sfsrc
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select * from sfsrc where key = 100 limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@sfsrc
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++100	val_100
++PREHOOK: query: select * from rcsrc where key = 100 limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@rcsrc
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select * from rcsrc where key = 100 limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@rcsrc
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++100	val_100
++PREHOOK: query: drop view sfsrc
++PREHOOK: type: DROPVIEW
++PREHOOK: Input: default@sfsrc
++PREHOOK: Output: default@sfsrc
++POSTHOOK: query: drop view sfsrc
++POSTHOOK: type: DROPVIEW
++POSTHOOK: Input: default@sfsrc
++POSTHOOK: Output: default@sfsrc
++PREHOOK: query: drop view rcsrc
++PREHOOK: type: DROPVIEW
++PREHOOK: Input: default@rcsrc
++PREHOOK: Output: default@rcsrc
++POSTHOOK: query: drop view rcsrc
++POSTHOOK: type: DROPVIEW
++POSTHOOK: Input: default@rcsrc
++POSTHOOK: Output: default@rcsrc
+diff --git a/ql/src/test/results/clientpositive/create_view_partitioned.q.out b/ql/src/test/results/clientpositive/create_view_partitioned.q.out
+index ebf9a6b..4c4b726 100644
+--- a/ql/src/test/results/clientpositive/create_view_partitioned.q.out
++++ b/ql/src/test/results/clientpositive/create_view_partitioned.q.out
+@@ -79,8 +79,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -176,8 +176,8 @@ POSTHOOK: type: SHOW_TABLESTATUS
+ tableName:vp1
+ #### A masked pattern was here ####
+ location:null
+-inputformat:org.apache.hadoop.mapred.SequenceFileInputFormat
+-outputformat:org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+ columns:struct columns { string key}
+ partitioned:true
+ partitionColumns:struct partition_columns { string value}
+@@ -189,8 +189,8 @@ POSTHOOK: type: SHOW_TABLESTATUS
+ tableName:vp1
+ #### A masked pattern was here ####
+ location:null
+-inputformat:org.apache.hadoop.mapred.SequenceFileInputFormat
+-outputformat:org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+ columns:struct columns { string key}
+ partitioned:true
+ partitionColumns:struct partition_columns { string value}
+@@ -287,8 +287,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -401,8 +401,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/create_view_translate.q.out b/ql/src/test/results/clientpositive/create_view_translate.q.out
+index fd74058..73ff89f 100644
+--- a/ql/src/test/results/clientpositive/create_view_translate.q.out
++++ b/ql/src/test/results/clientpositive/create_view_translate.q.out
+@@ -37,8 +37,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -83,8 +83,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/selectDistinctStar.q.out b/ql/src/test/results/clientpositive/selectDistinctStar.q.out
+index d18d151..a03b490 100644
+--- a/ql/src/test/results/clientpositive/selectDistinctStar.q.out
++++ b/ql/src/test/results/clientpositive/selectDistinctStar.q.out
+@@ -1371,8 +1371,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -3802,8 +3802,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+diff --git a/ql/src/test/results/clientpositive/tez/selectDistinctStar.q.out b/ql/src/test/results/clientpositive/tez/selectDistinctStar.q.out
+index 7ec1932..b567183 100644
+--- a/ql/src/test/results/clientpositive/tez/selectDistinctStar.q.out
++++ b/ql/src/test/results/clientpositive/tez/selectDistinctStar.q.out
+@@ -1391,8 +1391,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+@@ -3842,8 +3842,8 @@ Table Parameters:
+ 	 	 
+ # Storage Information	 	 
+ SerDe Library:      	null                	 
+-InputFormat:        	org.apache.hadoop.mapred.SequenceFileInputFormat	 
+-OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
+ Compressed:         	No                  	 
+ Num Buckets:        	-1                  	 
+ Bucket Columns:     	[]                  	 
+-- 
+1.7.9.5
+

@@ -1,0 +1,246 @@
+From 79660c6914a3276ee4c47829333e682267c47264 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Wed, 13 Apr 2016 11:28:52 -0700
+Subject: [PATCH 0555/1164] CDH-38812 : HIVE-13410 : PerfLog metrics scopes
+ not closed if there are exceptions on HS2
+ (Szehon, reviewed by Aihua Xu)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+	itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
+	itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+
+Change-Id: I3071a33ca55921bec7ce470314fe4e7f61a02ec4
+---
+ .../org/apache/hadoop/hive/ql/log/PerfLogger.java  |   47 ++++++++++++++++----
+ .../hive/metastore/TestMetaStoreMetrics.java       |   14 ++++--
+ .../apache/hive/jdbc/miniHS2/TestHs2Metrics.java   |   41 +++++++++++++++--
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    1 +
+ 4 files changed, 86 insertions(+), 17 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+index 71b039d..5fbcbfb 100644
+--- a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
++++ b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+@@ -23,12 +23,17 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.common.metrics.common.Metrics;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+ import java.io.IOException;
++import java.util.Collection;
+ import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.Map;
++import java.util.Set;
+ 
+ /**
+  * PerfLogger.
+@@ -163,7 +168,6 @@ public long PerfLogEnd(String callerName, String method, String additionalInfo)
+     LOG.info(sb);
+ 
+     endMetrics(method);
+-
+     return duration;
+   }
+ 
+@@ -201,11 +205,24 @@ public Long getDuration(String method) {
+     return duration;
+   }
+ 
++
++  public ImmutableMap<String, Long> getStartTimes() {
++    return ImmutableMap.copyOf(startTimes);
++  }
++
++  public ImmutableMap<String, Long> getEndTimes() {
++    return ImmutableMap.copyOf(endTimes);
++  }
++
++  //Methods for metrics integration.  Each thread-local PerfLogger will open/close scope during each perf-log method.
++  Map<String, MetricsScope> openScopes = new HashMap<String, MetricsScope>();
++
+   private void beginMetrics(String method) {
+     Metrics metrics = MetricsFactory.getInstance();
+     try {
+       if (metrics != null) {
+-        metrics.startStoredScope(method);
++        MetricsScope scope = metrics.createScope(method);
++        openScopes.put(method, scope);
+       }
+     } catch (IOException e) {
+       LOG.warn("Error recording metrics", e);
+@@ -216,18 +233,30 @@ private void endMetrics(String method) {
+     Metrics metrics = MetricsFactory.getInstance();
+     try {
+       if (metrics != null) {
+-        metrics.endStoredScope(method);
++        MetricsScope scope = openScopes.remove(method);
++        if (scope != null) {
++          metrics.endScope(scope);
++        }
+       }
+     } catch (IOException e) {
+       LOG.warn("Error recording metrics", e);
+     }
+   }
+ 
+-  public ImmutableMap<String, Long> getStartTimes() {
+-    return ImmutableMap.copyOf(startTimes);
+-  }
+-
+-  public ImmutableMap<String, Long> getEndTimes() {
+-    return ImmutableMap.copyOf(endTimes);
++  /**
++   * Cleans up any dangling perfLog metric call scopes.
++   */
++  public void cleanupPerfLogMetrics() {
++    Metrics metrics = MetricsFactory.getInstance();
++    try {
++      if (metrics != null) {
++        for (MetricsScope openScope : openScopes.values()) {
++          metrics.endScope(openScope);
++        }
++      }
++    } catch (IOException e) {
++      LOG.warn("Error cleaning up metrics", e);
++    }
++    openScopes.clear();
+   }
+ }
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
+index 31afcdf..98cb3ec 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
+@@ -42,7 +42,6 @@
+ 
+   @BeforeClass
+   public static void before() throws Exception {
+-
+     int port = MetaStoreUtils.findFreePort();
+ 
+     hiveConf = new HiveConf(TestMetaStoreMetrics.class);
+@@ -51,11 +50,16 @@ public static void before() throws Exception {
+     hiveConf.setBoolVar(HiveConf.ConfVars.METASTORE_METRICS, true);
+     hiveConf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+ 
++    MetricsFactory.close();
++    MetricsFactory.init(hiveConf);
++    metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++
++    //Increments one HMS connection
+     MetaStoreUtils.startMetaStore(port, ShimLoader.getHadoopThriftAuthBridge(), hiveConf);
++
++    //Increments one HMS connection (Hive.get())
+     SessionState.start(new CliSessionState(hiveConf));
+     driver = new Driver(hiveConf);
+-
+-    metrics = (CodahaleMetrics) MetricsFactory.getInstance();
+   }
+ 
+ 
+@@ -63,7 +67,9 @@ public static void before() throws Exception {
+   public void testMethodCounts() throws Exception {
+     driver.run("show databases");
+     String json = metrics.dumpJson();
+-    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_get_all_databases", 1);
++
++    //one call by init, one called here.
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_get_all_databases", 2);
+   }
+ 
+   @Test
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+index 0b88936..a3f20ab 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+@@ -28,6 +28,8 @@
+ import org.apache.hadoop.hive.ql.parse.SemanticException;
+ import org.apache.hive.service.cli.CLIServiceClient;
+ import org.apache.hive.service.cli.SessionHandle;
++import org.junit.Assert;
++import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+@@ -43,7 +45,6 @@
+ 
+   private static MiniHS2 miniHS2;
+   private static Map<String, String> confOverlay;
+-  private static CodahaleMetrics metrics;
+ 
+   //Check metrics during semantic analysis.
+   public static class MetricCheckingHook implements HiveSemanticAnalyzerHook {
+@@ -78,11 +79,14 @@ public static void setup() throws Exception {
+     confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED.varname, "true");
+     confOverlay.put(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname, "false");
+     miniHS2.start(confOverlay);
+-
+-    HiveConf conf = new HiveConf();
++  }
+ 
+ 
+-    metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++  @Before
++  public void before() throws Exception {
++    HiveConf conf = new HiveConf();
++    MetricsFactory.close();
++    MetricsFactory.init(conf);
+   }
+ 
+   @Test
+@@ -107,6 +111,35 @@ public void testMetrics() throws Exception {
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 0);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_compile", 0);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 0);
++
++    serviceClient.closeSession(sessHandle);
++  }
++
++  @Test
++  public void testClosedScopes() throws Exception {
++    CLIServiceClient serviceClient = miniHS2.getServiceClient();
++    SessionHandle sessHandle = serviceClient.openSession("foo", "bar");
++
++    //this should error at analyze scope
++    Exception expectedException = null;
++    try {
++      serviceClient.executeStatement(sessHandle, "select aaa", confOverlay);
++    } catch (Exception e) {
++      expectedException = e;
++    }
++    Assert.assertNotNull("Expected semantic exception", expectedException);
++
++    //verify all scopes were recorded
++    CodahaleMetrics metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_parse", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_semanticAnalyze", 1);
++
++    //verify all scopes are closed.
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_parse", 0);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 0);
++
++    serviceClient.closeSession(sessHandle);
+   }
+ 
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index baf25e0..c4872be 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -1373,6 +1373,7 @@ private boolean requiresLock() {
+   }
+ 
+   private CommandProcessorResponse createProcessorResponse(int ret) {
++    SessionState.getPerfLogger().cleanupPerfLogMetrics();
+     queryDisplay.setErrorMessage(errorMessage);
+     return new CommandProcessorResponse(ret, errorMessage, SQLState, downstreamError);
+   }
+-- 
+1.7.9.5
+

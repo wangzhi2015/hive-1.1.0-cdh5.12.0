@@ -1,0 +1,76 @@
+From 218ebea0363964d8fd5853600e53a47d394e62b9 Mon Sep 17 00:00:00 2001
+From: Brock Noland <brock@apache.org>
+Date: Wed, 4 Mar 2015 16:17:13 -0800
+Subject: [PATCH 0064/1164] CDH-25621 - Hive on MR throws
+ DeprecatedParquetHiveInput exception
+
+---
+ .../parquet/read/ParquetRecordReaderWrapper.java   |   19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
+index f69d13c..a261996 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
+@@ -64,7 +64,7 @@
+   private boolean eof = false;
+   private int schemaSize;
+   private boolean skipTimestampConversion = false;
+-
++  private JobConf jobConf;
+   private final ProjectionPusher projectionPusher;
+ 
+   public ParquetRecordReaderWrapper(
+@@ -86,25 +86,26 @@ public ParquetRecordReaderWrapper(
+     this.splitLen = oldSplit.getLength();
+     this.projectionPusher = pusher;
+ 
+-    final ParquetInputSplit split = getSplit(oldSplit, oldJobConf);
++    jobConf = oldJobConf;
++    final ParquetInputSplit split = getSplit(oldSplit, jobConf);
+ 
+-    TaskAttemptID taskAttemptID = TaskAttemptID.forName(oldJobConf.get(IOConstants.MAPRED_TASK_ID));
++    TaskAttemptID taskAttemptID = TaskAttemptID.forName(jobConf.get(IOConstants.MAPRED_TASK_ID));
+     if (taskAttemptID == null) {
+       taskAttemptID = new TaskAttemptID();
+     }
+ 
+-    setFilter(oldJobConf);
++    setFilter(jobConf);
+ 
+     // create a TaskInputOutputContext
+-    Configuration conf = oldJobConf;
++    Configuration conf = jobConf;
+     if (skipTimestampConversion ^ HiveConf.getBoolVar(
+         conf, HiveConf.ConfVars.HIVE_PARQUET_TIMESTAMP_SKIP_CONVERSION)) {
+       conf = new JobConf(oldJobConf);
+       HiveConf.setBoolVar(conf,
+         HiveConf.ConfVars.HIVE_PARQUET_TIMESTAMP_SKIP_CONVERSION, skipTimestampConversion);
+     }
+-    final TaskAttemptContext taskContext = ContextUtil.newTaskAttemptContext(conf, taskAttemptID);
+ 
++    final TaskAttemptContext taskContext = ContextUtil.newTaskAttemptContext(conf, taskAttemptID);
+     if (split != null) {
+       try {
+         realReader = newInputFormat.createRecordReader(split, taskContext);
+@@ -236,14 +237,14 @@ protected ParquetInputSplit getSplit(
+     ParquetInputSplit split;
+     if (oldSplit instanceof FileSplit) {
+       final Path finalPath = ((FileSplit) oldSplit).getPath();
+-      final JobConf cloneJob = projectionPusher.pushProjectionsAndFilters(conf, finalPath.getParent());
++      jobConf = projectionPusher.pushProjectionsAndFilters(conf, finalPath.getParent());
+ 
+-      final ParquetMetadata parquetMetadata = ParquetFileReader.readFooter(cloneJob, finalPath);
++      final ParquetMetadata parquetMetadata = ParquetFileReader.readFooter(jobConf, finalPath);
+       final List<BlockMetaData> blocks = parquetMetadata.getBlocks();
+       final FileMetaData fileMetaData = parquetMetadata.getFileMetaData();
+ 
+       final ReadContext readContext = new DataWritableReadSupport()
+-          .init(cloneJob, fileMetaData.getKeyValueMetaData(), fileMetaData.getSchema());
++          .init(jobConf, fileMetaData.getKeyValueMetaData(), fileMetaData.getSchema());
+       schemaSize = MessageTypeParser.parseMessageType(readContext.getReadSupportMetadata()
+           .get(DataWritableReadSupport.HIVE_SCHEMA_KEY)).getFieldCount();
+       final List<BlockMetaData> splitGroup = new ArrayList<BlockMetaData>();
+-- 
+1.7.9.5
+

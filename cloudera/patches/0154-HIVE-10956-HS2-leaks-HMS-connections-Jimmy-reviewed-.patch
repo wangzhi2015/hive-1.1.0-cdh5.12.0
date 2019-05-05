@@ -1,0 +1,341 @@
+From db610d875d36b681d1ca04bac4e27a79302c95d1 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@cloudera.com>
+Date: Thu, 4 Jun 2015 14:52:40 -0700
+Subject: [PATCH 0154/1164] HIVE-10956: HS2 leaks HMS connections (Jimmy,
+ reviewed by Xuefu)
+
+---
+ .../hadoop/hive/metastore/HiveMetaStoreClient.java |   12 +++++----
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |    8 +++++-
+ .../hive/service/cli/operation/SQLOperation.java   |   16 +----------
+ .../hive/service/cli/session/HiveSession.java      |   12 ++++++++-
+ .../hive/service/cli/session/HiveSessionImpl.java  |   28 +++++++++++++++++---
+ .../cli/session/HiveSessionImplwithUGI.java        |   20 --------------
+ .../hive/service/cli/thrift/ThriftCLIService.java  |    4 +++
+ 7 files changed, 54 insertions(+), 46 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+index 638025d..1d32110 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+@@ -40,6 +40,7 @@
+ import java.util.Map;
+ import java.util.Random;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import javax.security.auth.login.LoginException;
+ 
+@@ -164,6 +165,8 @@
+ 
+   private Map<String, String> currentMetaVars;
+ 
++  private static final AtomicInteger connCount = new AtomicInteger(0);
++
+   // for thrift connects
+   private int retries = 5;
+   private long retryDelaySeconds = 0;
+@@ -413,6 +416,7 @@ private void open() throws MetaException {
+           client = new ThriftHiveMetastore.Client(protocol);
+           try {
+             transport.open();
++            LOG.info("Opened a connection to metastore, current connections: " + connCount.incrementAndGet());
+             isConnected = true;
+           } catch (TTransportException e) {
+             tte = e;
+@@ -493,6 +497,7 @@ public void close() {
+     // just in case, we make this call.
+     if ((transport != null) && transport.isOpen()) {
+       transport.close();
++      LOG.info("Closed a connection to metastore, current connections: " + connCount.decrementAndGet());
+     }
+   }
+ 
+@@ -1905,19 +1910,16 @@ public static IMetaStoreClient newSynchronizedClient(
+ 
+   private static class SynchronizedHandler implements InvocationHandler {
+     private final IMetaStoreClient client;
+-    private static final Object lock = SynchronizedHandler.class;
+ 
+     SynchronizedHandler(IMetaStoreClient client) {
+       this.client = client;
+     }
+ 
+     @Override
+-    public Object invoke(Object proxy, Method method, Object [] args)
++    public synchronized Object invoke(Object proxy, Method method, Object [] args)
+         throws Throwable {
+       try {
+-        synchronized (lock) {
+-          return method.invoke(client, args);
+-        }
++        return method.invoke(client, args);
+       } catch (InvocationTargetException e) {
+         throw e.getTargetException();
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 0eb8a2d..5cb9c13 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -59,6 +59,7 @@
+ import org.apache.hadoop.hive.metastore.HiveMetaException;
+ import org.apache.hadoop.hive.metastore.HiveMetaHook;
+ import org.apache.hadoop.hive.metastore.HiveMetaHookLoader;
++import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+ import org.apache.hadoop.hive.metastore.RetryingMetaStoreClient;
+@@ -2884,7 +2885,7 @@ public HiveMetaHook getHook(
+    */
+   @LimitedPrivate(value = {"Hive"})
+   @Unstable
+-  public IMetaStoreClient getMSC() throws MetaException {
++  public synchronized IMetaStoreClient getMSC() throws MetaException {
+     if (metaStoreClient == null) {
+       try {
+         owner = UserGroupInformation.getCurrentUser();
+@@ -2894,6 +2895,11 @@ public IMetaStoreClient getMSC() throws MetaException {
+         throw new MetaException(msg + "\n" + StringUtils.stringifyException(e));
+       }
+       metaStoreClient = createMetaStoreClient();
++      String metaStoreUris = conf.getVar(HiveConf.ConfVars.METASTOREURIS);
++      if (!org.apache.commons.lang3.StringUtils.isEmpty(metaStoreUris)) {
++        // get a synchronized wrapper if the meta store is remote.
++        metaStoreClient = HiveMetaStoreClient.newSynchronizedClient(metaStoreClient);
++      }
+     }
+     return metaStoreClient;
+   }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index 684ed7c..ab6bee1 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -38,7 +38,6 @@
+ import org.apache.hadoop.hive.ql.exec.ExplainTask;
+ import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.metadata.Hive;
+-import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.parse.VariableSubstitution;
+ import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.OperationLog;
+@@ -177,7 +176,7 @@ public void runInternal() throws HiveSQLException {
+       final SessionState parentSessionState = SessionState.get();
+       // ThreadLocal Hive object needs to be set in background thread.
+       // The metastore client in Hive is associated with right user.
+-      final Hive parentHive = getSessionHive();
++      final Hive parentHive = parentSession.getSessionHive();
+       // Current UGI will get used by metastore when metsatore is in embedded mode
+       // So this needs to get passed to the new background thread
+       final UserGroupInformation currentUGI = getCurrentUGI(opConfig);
+@@ -252,19 +251,6 @@ private UserGroupInformation getCurrentUGI(HiveConf opConfig) throws HiveSQLExce
+     }
+   }
+ 
+-  /**
+-   * Returns the ThreadLocal Hive for the current thread
+-   * @return Hive
+-   * @throws HiveSQLException
+-   */
+-  private Hive getSessionHive() throws HiveSQLException {
+-    try {
+-      return Hive.get();
+-    } catch (HiveException e) {
+-      throw new HiveSQLException("Failed to get ThreadLocal Hive object", e);
+-    }
+-  }
+-
+   private void registerCurrentOperationLog() {
+     if (isOperationLogEnabled) {
+       if (operationLog == null) {
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSession.java b/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
+index 65f9b29..4f4e92d 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
+@@ -22,8 +22,16 @@
+ import java.util.Map;
+ 
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
++import org.apache.hadoop.hive.ql.metadata.Hive;
+ import org.apache.hive.service.auth.HiveAuthFactory;
+-import org.apache.hive.service.cli.*;
++import org.apache.hive.service.cli.FetchOrientation;
++import org.apache.hive.service.cli.FetchType;
++import org.apache.hive.service.cli.GetInfoType;
++import org.apache.hive.service.cli.GetInfoValue;
++import org.apache.hive.service.cli.HiveSQLException;
++import org.apache.hive.service.cli.OperationHandle;
++import org.apache.hive.service.cli.RowSet;
++import org.apache.hive.service.cli.TableSchema;
+ 
+ public interface HiveSession extends HiveSessionBase {
+ 
+@@ -31,6 +39,8 @@
+ 
+   IMetaStoreClient getMetaStoreClient() throws HiveSQLException;
+ 
++  Hive getSessionHive()  throws HiveSQLException;
++
+   /**
+    * getInfo operation handler
+    * @param getInfoType
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+index c9d23f5..3e17b36 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+@@ -90,6 +90,9 @@
+   private final Set<OperationHandle> opHandleSet = new HashSet<OperationHandle>();
+   private boolean isOperationLogEnabled;
+   private File sessionLogDir;
++
++  private Hive sessionHive;
++
+   private volatile long lastAccessTime;
+   private volatile long lastIdleTime;
+ 
+@@ -142,6 +145,11 @@ public void open(Map<String, String> sessionConfMap) throws HiveSQLException {
+       LOG.error(msg, e);
+       throw new HiveSQLException(msg, e);
+     }
++    try {
++      sessionHive = Hive.get(getHiveConf());
++    } catch (HiveException e) {
++      throw new HiveSQLException("Failed to get metastore connection", e);
++    }
+     // Process global init file: .hiverc
+     processGlobalInitFile();
+     if (sessionConfMap != null) {
+@@ -278,6 +286,7 @@ protected synchronized void acquire(boolean userAccess) {
+     if (userAccess) {
+       lastAccessTime = System.currentTimeMillis();
+     }
++    Hive.set(sessionHive);
+   }
+ 
+   /**
+@@ -326,13 +335,16 @@ public HiveConf getHiveConf() {
+   }
+ 
+   @Override
++  public Hive getSessionHive() {
++    return sessionHive;
++  }
++
++  @Override
+   public IMetaStoreClient getMetaStoreClient() throws HiveSQLException {
+     try {
+-      return Hive.get(getHiveConf()).getMSC();
+-    } catch (HiveException e) {
+-      throw new HiveSQLException("Failed to get metastore connection: " + e, e);
++      return getSessionHive().getMSC();
+     } catch (MetaException e) {
+-      throw new HiveSQLException("Failed to get metastore connection: " + e, e);
++      throw new HiveSQLException("Error acquiring metastore connection", e);
+     }
+   }
+ 
+@@ -579,6 +591,14 @@ public void close() throws HiveSQLException {
+         }
+         sessionState = null;
+       }
++      if (sessionHive != null) {
++        try {
++          Hive.closeCurrent();
++        } catch (Throwable t) {
++          LOG.warn("Error closing sessionHive", t);
++        }
++        sessionHive = null;
++      }
+       release(true);
+     }
+   }
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java
+index e9a76f5..345ee4c 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java
+@@ -44,7 +44,6 @@
+ 
+   private UserGroupInformation sessionUgi = null;
+   private String hmsDelegationTokenStr = null;
+-  private Hive sessionHive = null;
+   private HiveSession proxySession = null;
+   static final Log LOG = LogFactory.getLog(HiveSessionImplwithUGI.class);
+ 
+@@ -53,14 +52,6 @@ public HiveSessionImplwithUGI(TProtocolVersion protocol, String username, String
+     super(protocol, username, password, hiveConf, ipAddress);
+     setSessionUGI(username);
+     setDelegationToken(delegationToken);
+-
+-    // create a new metastore connection for this particular user session
+-    Hive.set(null);
+-    try {
+-      sessionHive = Hive.get(getHiveConf());
+-    } catch (HiveException e) {
+-      throw new HiveSQLException("Failed to setup metastore connection", e);
+-    }
+   }
+ 
+   // setup appropriate UGI for the session
+@@ -88,15 +79,6 @@ public String getDelegationToken () {
+     return this.hmsDelegationTokenStr;
+   }
+ 
+-  @Override
+-  protected synchronized void acquire(boolean userAccess) {
+-    super.acquire(userAccess);
+-    // if we have a metastore connection with impersonation, then set it first
+-    if (sessionHive != null) {
+-      Hive.set(sessionHive);
+-    }
+-  }
+-
+   /**
+    * Close the file systems for the session and remove it from the FileSystem cache.
+    * Cancel the session's delegation token and close the metastore connection
+@@ -147,8 +129,6 @@ private void cancelDelegationToken() throws HiveSQLException {
+       } catch (HiveException e) {
+         throw new HiveSQLException("Couldn't cancel delegation token: " + e, e);
+       }
+-      // close the metastore connection created with this delegation token
+-      Hive.closeCurrent();
+     }
+   }
+   @Override
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+index 5a0f1c8..dfb7faa 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+@@ -24,6 +24,7 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import javax.security.auth.login.LoginException;
+ 
+@@ -67,6 +68,7 @@
+   protected CLIService cliService;
+   private static final TStatus OK_STATUS = new TStatus(TStatusCode.SUCCESS_STATUS);
+   protected static HiveAuthFactory hiveAuthFactory;
++  private static final AtomicInteger sessionCount = new AtomicInteger();
+ 
+   protected int portNum;
+   protected InetAddress serverIPAddress;
+@@ -304,6 +306,7 @@ public TOpenSessionResp OpenSession(TOpenSessionReq req) throws TException {
+       if (context != null) {
+         context.setSessionHandle(sessionHandle);
+       }
++      LOG.info("Opened a session, current sessions: " + sessionCount.incrementAndGet());
+     } catch (Exception e) {
+       LOG.warn("Error opening session: ", e);
+       resp.setStatus(HiveSQLException.toTStatus(e));
+@@ -446,6 +449,7 @@ public TCloseSessionResp CloseSession(TCloseSessionReq req) throws TException {
+     try {
+       SessionHandle sessionHandle = new SessionHandle(req.getSessionHandle());
+       cliService.closeSession(sessionHandle);
++      LOG.info("Closed a session, current sessions: " + sessionCount.decrementAndGet());
+       resp.setStatus(OK_STATUS);
+       ThriftCLIServerContext context =
+         (ThriftCLIServerContext)currentServerContext.get();
+-- 
+1.7.9.5
+

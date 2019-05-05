@@ -1,0 +1,163 @@
+From dc4c398783b8cdad6266a6b8e5b6f97e0e074e1b Mon Sep 17 00:00:00 2001
+From: Alan Gates <gates@hortonworks.com>
+Date: Mon, 2 Nov 2015 15:53:07 -0800
+Subject: [PATCH 0925/1164] =?UTF-8?q?CDH-49194=20:=20HIVE-11293=20HiveConnec?=
+ =?UTF-8?q?tion.setAutoCommit(true)=20throws=20exception=20(Micha=C5=82=20W=C4?=
+ =?UTF-8?q?=99grzyn=20and=20Alan=20Gates,=20reviewed=20by=20Thejas=20Nair)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change-Id: I0405de8d2d441ad21d17623f7373475d4e529a14
+---
+ .../java/org/apache/hive/jdbc/TestJdbcDriver2.java |   82 ++++++++++++++------
+ .../java/org/apache/hive/jdbc/HiveConnection.java  |   14 +++-
+ 2 files changed, 71 insertions(+), 25 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+index bf60eb8..8bbd6e4 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+@@ -18,25 +18,14 @@
+ 
+ package org.apache.hive.jdbc;
+ 
+-import com.google.common.collect.ImmutableSet;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+-import org.apache.hadoop.hive.metastore.TableType;
+-import org.apache.hadoop.hive.ql.exec.UDF;
+-import org.apache.hadoop.hive.ql.processors.DfsProcessor;
+-import org.apache.hive.common.util.HiveVersionInfo;
+-import org.apache.hive.jdbc.Utils.JdbcConnectionParams;
+-import org.apache.hive.service.cli.operation.ClassicTableTypeMapping;
+-import org.apache.hive.service.cli.operation.ClassicTableTypeMapping.ClassicTableTypes;
+-import org.apache.hive.service.cli.operation.HiveTableTypeMapping;
+-import org.apache.hive.service.cli.operation.TableTypeMappingFactory.TableTypeMappings;
+-import org.junit.After;
+-import org.junit.Before;
+-import org.junit.BeforeClass;
+-import org.junit.Test;
++import static org.apache.hadoop.hive.conf.SystemVariables.SET_COLUMN_NAME;
++import static org.apache.hadoop.hive.ql.exec.ExplainTask.EXPL_COLUMN_NAME;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ import java.io.File;
+ import java.io.InputStream;
+@@ -64,9 +53,28 @@
+ import java.util.Set;
+ import java.util.regex.Pattern;
+ 
+-import static org.apache.hadoop.hive.conf.SystemVariables.SET_COLUMN_NAME;
+-import static org.apache.hadoop.hive.ql.exec.ExplainTask.EXPL_COLUMN_NAME;
+-import static org.junit.Assert.*;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
++import org.apache.hadoop.hive.metastore.TableType;
++import org.apache.hadoop.hive.ql.exec.UDF;
++import org.apache.hadoop.hive.ql.processors.DfsProcessor;
++import org.apache.hive.common.util.HiveVersionInfo;
++import org.apache.hive.jdbc.Utils.JdbcConnectionParams;
++import org.apache.hive.service.cli.operation.ClassicTableTypeMapping;
++import org.apache.hive.service.cli.operation.ClassicTableTypeMapping.ClassicTableTypes;
++import org.apache.hive.service.cli.operation.HiveTableTypeMapping;
++import org.apache.hive.service.cli.operation.TableTypeMappingFactory.TableTypeMappings;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.ExpectedException;
++
++import com.google.common.collect.ImmutableSet;
+ 
+ 
+ /**
+@@ -100,6 +108,8 @@
+   private static boolean standAloneServer = false;
+   private static final float floatCompareDelta = 0.0001f;
+ 
++  @Rule public ExpectedException thrown = ExpectedException.none();
++
+   public TestJdbcDriver2() {
+     conf = new HiveConf(TestJdbcDriver2.class);
+     dataFileDir = conf.get("test.data.files").replace('\\', '/')
+@@ -2500,4 +2510,32 @@ private void verifyFetchedLog(List<String> logs, String[] expectedLogs) {
+       assertTrue(accumulatedLogs.contains(expectedLog));
+     }
+   }
++
++  @Test
++  public void testAutoCommit() throws Exception {
++    con.clearWarnings();
++    con.setAutoCommit(true);
++    assertNull(con.getWarnings());
++    con.setAutoCommit(false);
++    SQLWarning warning = con.getWarnings();
++    assertNotNull(warning);
++    assertEquals("Hive does not support autoCommit=false", warning.getMessage());
++    assertNull(warning.getNextWarning());
++    con.clearWarnings();
++  }
++
++  @Test
++  public void setAutoCommitOnClosedConnection() throws Exception {
++    Connection mycon = getConnection("");
++    try {
++      mycon.setAutoCommit(true);
++      mycon.close();
++      thrown.expect(SQLException.class);
++      thrown.expectMessage("Connection is closed");
++      mycon.setAutoCommit(true);
++    } finally {
++      mycon.close();
++    }
++
++  }
+ }
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+index dcf5d90..1eb3d39 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+@@ -86,7 +86,6 @@
+ import org.apache.http.conn.scheme.Scheme;
+ import org.apache.http.conn.ssl.SSLSocketFactory;
+ import org.apache.http.impl.client.DefaultHttpClient;
+-
+ /**
+  * HiveConnection.
+  *
+@@ -1113,8 +1112,17 @@ public void rollback(Savepoint savepoint) throws SQLException {
+ 
+   @Override
+   public void setAutoCommit(boolean autoCommit) throws SQLException {
+-    if (autoCommit) {
+-      throw new SQLException("enabling autocommit is not supported");
++    // Per JDBC spec, if the connection is closed a SQLException should be thrown.
++    if(isClosed) {
++      throw new SQLException("Connection is closed");
++    }
++    // The auto-commit mode is always enabled for this connection. Per JDBC spec,
++    // if setAutoCommit is called and the auto-commit mode is not changed, the call is a no-op.
++    if (!autoCommit) {
++      LOG.warn("Request to set autoCommit to false; Hive does not support autoCommit=false.");
++      SQLWarning warning = new SQLWarning("Hive does not support autoCommit=false");
++      if (warningChain == null) warningChain = warning;
++      else warningChain.setNextWarning(warning);
+     }
+   }
+ 
+-- 
+1.7.9.5
+

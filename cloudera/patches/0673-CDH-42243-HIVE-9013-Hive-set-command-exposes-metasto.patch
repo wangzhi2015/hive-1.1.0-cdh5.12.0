@@ -1,0 +1,282 @@
+From e82db0a6304860257b3eddc0757a8288e4226d3b Mon Sep 17 00:00:00 2001
+From: Sushanth Sowmyan <khorgath@gmail.com>
+Date: Mon, 26 Oct 2015 11:43:02 -0700
+Subject: [PATCH 0673/1164] CDH-42243 :  HIVE-9013 : Hive set command exposes
+ metastore db password (Binglin Chang, reviewed by
+ Thejas Nair, Sushanth Sowmyan)
+
+Change-Id: I1a8728d78ddb384fa377e5629d5989b633bf3a71
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   33 ++++++++++++
+ .../org/apache/hadoop/hive/conf/TestHiveConf.java  |   25 +++++++++
+ .../apache/hadoop/hive/ql/exec/mr/ExecDriver.java  |    1 +
+ .../apache/hadoop/hive/ql/exec/tez/DagUtils.java   |    1 +
+ .../hadoop/hive/ql/exec/tez/TezSessionState.java   |    1 +
+ .../hadoop/hive/ql/processors/SetProcessor.java    |   12 ++++-
+ .../hive/ql/processors/TestSetProcessor.java       |   54 ++++++++++++++++++++
+ 7 files changed, 125 insertions(+), 2 deletions(-)
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/processors/TestSetProcessor.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index b9d081d..727a5f3 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -26,6 +26,7 @@
+ import java.net.URL;
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -55,6 +56,7 @@
+ import org.apache.hive.common.HiveCompat;
+ 
+ import com.google.common.base.Joiner;
++import java.util.Set;
+ 
+ /**
+  * Hive Configuration.
+@@ -77,6 +79,7 @@
+   private static final Map<String, ConfVars> vars = new HashMap<String, ConfVars>();
+   private static final Map<String, ConfVars> metaConfs = new HashMap<String, ConfVars>();
+   private final List<String> restrictList = new ArrayList<String>();
++  private final Set<String> hiddenSet = new HashSet<String>();
+ 
+   private Pattern modWhiteListPattern = null;
+   private volatile boolean isSparkConfigUpdated = false;
+@@ -1928,6 +1931,9 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_CONF_RESTRICTED_LIST("hive.conf.restricted.list",
+         "hive.security.authenticator.manager,hive.security.authorization.manager,hive.users.in.admin.role",
+         "Comma separated list of configuration options which are immutable at runtime"),
++    HIVE_CONF_HIDDEN_LIST("hive.conf.hidden.list",
++        METASTOREPWD.varname + "," + HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname,
++        "Comma separated list of configuration options which should not be read by normal user like passwords"),
+ 
+     // If this is set all move tasks at the end of a multi-insert query will only begin once all
+     // outputs are ready
+@@ -2388,6 +2394,10 @@ public void verifyAndSet(String name, String value) throws IllegalArgumentExcept
+     }
+   }
+ 
++  public boolean isHiddenConfig(String name) {
++    return hiddenSet.contains(name);
++  }
++
+   /**
+    * check whether spark related property is updated, which includes spark configurations,
+    * RSC configurations and yarn configuration in Spark on YARN mode.
+@@ -2738,6 +2748,7 @@ private void initialize(Class<?> cls) {
+ 
+     // setup list of conf vars that are not allowed to change runtime
+     setupRestrictList();
++    setupHiddenSet();
+ 
+   }
+ 
+@@ -3041,6 +3052,28 @@ private void setupRestrictList() {
+     }
+     restrictList.add(ConfVars.HIVE_IN_TEST.varname);
+     restrictList.add(ConfVars.HIVE_CONF_RESTRICTED_LIST.varname);
++    restrictList.add(ConfVars.HIVE_CONF_HIDDEN_LIST.varname);
++  }
++
++  private void setupHiddenSet() {
++    String hiddenListStr = this.getVar(ConfVars.HIVE_CONF_HIDDEN_LIST);
++    hiddenSet.clear();
++    if (hiddenListStr != null) {
++      for (String entry : hiddenListStr.split(",")) {
++        hiddenSet.add(entry.trim());
++      }
++    }
++  }
++
++  /**
++   * Strips hidden config entries from configuration
++   */
++  public void stripHiddenConfigurations(Configuration conf) {
++    for (String name : hiddenSet) {
++      if (conf.get(name) != null) {
++        conf.set(name, "");
++      }
++    }
+   }
+ 
+   /**
+diff --git a/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java b/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
+index b753ea3..6b84c78 100644
+--- a/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
++++ b/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.hive.conf;
+ 
+ import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hive.common.util.HiveTestUtils;
+@@ -131,4 +132,28 @@ public void testSparkConfigUpdate(){
+     conf.setSparkConfigUpdated(false);
+     Assert.assertFalse(conf.getSparkConfigUpdated());
+   }
++  
++  @Test
++  public void testHiddenConfig() throws Exception {
++    HiveConf conf = new HiveConf();
++    // check password configs are hidden
++    Assert.assertTrue(conf.isHiddenConfig(HiveConf.ConfVars.METASTOREPWD.varname));
++    Assert.assertTrue(conf.isHiddenConfig(
++        HiveConf.ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname));
++    // check change hidden list should fail
++    try {
++      final String name = HiveConf.ConfVars.HIVE_CONF_HIDDEN_LIST.varname;
++      conf.verifyAndSet(name, "");
++      Assert.fail("Setting config property " + name + " should fail");
++    } catch (IllegalArgumentException e) {
++      // the verifyAndSet in this case is expected to fail with the IllegalArgumentException
++    }
++    // check stripHiddenConfigurations
++    Configuration conf2 = new Configuration(conf);
++    conf2.set(HiveConf.ConfVars.METASTOREPWD.varname, "password");
++    conf2.set(HiveConf.ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname, "password");
++    conf.stripHiddenConfigurations(conf2);
++    Assert.assertEquals("", conf2.get(HiveConf.ConfVars.METASTOREPWD.varname));
++    Assert.assertEquals("", conf2.get(HiveConf.ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname));
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+index 85e3037..f3fcfbd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+@@ -164,6 +164,7 @@ public void initialize(HiveConf conf, QueryPlan queryPlan, DriverContext driverC
+     if (StringUtils.isNotBlank(addedArchives)) {
+       HiveConf.setVar(job, ConfVars.HIVEADDEDARCHIVES, addedArchives);
+     }
++    conf.stripHiddenConfigurations(job);
+     this.jobExecHelper = new HadoopJobExecHelper(job, console, this, this);
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/DagUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/DagUtils.java
+index c9029f2..f80df70 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/DagUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/DagUtils.java
+@@ -1013,6 +1013,7 @@ public JobConf createConfiguration(HiveConf hiveConf) throws IOException {
+     conf.set("mapred.partitioner.class", HiveConf.getVar(conf, HiveConf.ConfVars.HIVEPARTITIONER));
+     conf.set("tez.runtime.partitioner.class", MRPartitioner.class.getName());
+ 
++    hiveConf.stripHiddenConfigurations(conf);
+     return conf;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java
+index 89286e5..03e4c92 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java
+@@ -172,6 +172,7 @@ public void open(HiveConf conf, String[] additionalFiles)
+     // generate basic tez config
+     TezConfiguration tezConfig = new TezConfiguration(conf);
+     tezConfig.set(TezConfiguration.TEZ_AM_STAGING_DIR, tezScratchDir.toUri().toString());
++    conf.stripHiddenConfigurations(tezConfig);
+ 
+     if (HiveConf.getBoolVar(conf, ConfVars.HIVE_PREWARM_ENABLED)) {
+       int n = HiveConf.getIntVar(conf, ConfVars.HIVE_PREWARM_NUM_CONTAINERS);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java
+index f8d5656..2f0f4ff 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/processors/SetProcessor.java
+@@ -66,6 +66,9 @@ private void dumpOptions(Properties p) {
+     for (Object one : p.keySet()) {
+       String oneProp = (String) one;
+       String oneValue = p.getProperty(oneProp);
++      if (ss.getConf().isHiddenConfig(oneProp)) {
++        continue;
++      }
+       sortedMap.put(oneProp, oneValue);
+     }
+ 
+@@ -92,7 +95,9 @@ private void dumpOptions(Properties p) {
+   private void dumpOption(String s) {
+     SessionState ss = SessionState.get();
+ 
+-    if (ss.getConf().get(s) != null) {
++    if (ss.getConf().isHiddenConfig(s)) {
++      ss.out.println(s + " is a hidden config");
++    } else if (ss.getConf().get(s) != null) {
+       ss.out.println(s + "=" + ss.getConf().get(s));
+     } else if (ss.getHiveVariables().containsKey(s)) {
+       ss.out.println(s + "=" + ss.getHiveVariables().get(s));
+@@ -240,7 +245,10 @@ private CommandProcessorResponse getVariable(String varname) throws Exception {
+       }
+     } else if (varname.indexOf(HIVECONF_PREFIX) == 0) {
+       String var = varname.substring(HIVECONF_PREFIX.length());
+-      if (ss.getConf().get(var) != null) {
++      if (ss.getConf().isHiddenConfig(var)) {
++        ss.out.println(HIVECONF_PREFIX + var + " is a hidden config");
++        return createProcessorSuccessResponse();
++      } if (ss.getConf().get(var) != null) {
+         ss.out.println(HIVECONF_PREFIX + var + "=" + ss.getConf().get(var));
+         return createProcessorSuccessResponse();
+       } else {
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/processors/TestSetProcessor.java b/ql/src/test/org/apache/hadoop/hive/ql/processors/TestSetProcessor.java
+new file mode 100644
+index 0000000..bff643a
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/processors/TestSetProcessor.java
+@@ -0,0 +1,54 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.processors;
++
++import java.io.ByteArrayOutputStream;
++import java.io.PrintStream;
++
++import junit.framework.Assert;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.junit.Test;
++
++public class TestSetProcessor {
++
++  @Test
++  public void testHiddenConfig() throws Exception {
++    HiveConf conf = new HiveConf();
++    SessionState.start(conf);
++    SessionState state = SessionState.get();
++    ByteArrayOutputStream baos = new ByteArrayOutputStream();
++    state.out = new PrintStream(baos);
++    SetProcessor processor = new SetProcessor();
++    processor.run("");
++    state.out.flush();
++    String ret = baos.toString();
++    Assert.assertFalse(ret.contains(HiveConf.ConfVars.METASTOREPWD.varname + "="));
++    Assert.assertFalse(ret.contains(HiveConf.ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname + "="));
++
++    baos = new ByteArrayOutputStream();
++    state.out = new PrintStream(baos);
++    processor.run(HiveConf.ConfVars.METASTOREPWD.varname);
++    state.out.flush();
++    ret = new String(baos.toByteArray());
++    Assert.assertTrue(baos.toString().contains("hidden"));
++  }
++
++}
+-- 
+1.7.9.5
+

@@ -1,0 +1,148 @@
+From 623db6d2732878d74692c7ae9d62af78a717fba1 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Mon, 9 May 2016 18:31:15 -0700
+Subject: [PATCH 0940/1164] CDH-47452 : HIVE-13726 : Improve dynamic partition
+ loading VI (Ashutosh Chauhan via Rui Li)
+
+Change-Id: I7d5e89eaf36b2fcdaecb6343a2e8168d00b6c820
+---
+ .../org/apache/hadoop/hive/common/FileUtils.java   |   57 +++-----------------
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |    7 +--
+ 2 files changed, 12 insertions(+), 52 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+index c242d77..3b80b21 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+@@ -52,7 +52,6 @@
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hive.common.util.ShutdownHookManager;
+ 
+-
+ /**
+  * Collection of file manipulation utilities common across Hive.
+  */
+@@ -578,48 +577,14 @@ public static boolean copy(FileSystem srcFS, Path src,
+   }
+ 
+   /**
+-   * Trashes or deletes all files under a directory. Leaves the directory as is.
+-   * @param fs FileSystem to use
+-   * @param f path of directory
+-   * @param conf hive configuration
+-   * @param forceDelete whether to force delete files if trashing does not succeed
+-   * @return true if deletion successful
+-   * @throws FileNotFoundException
+-   * @throws IOException
+-   */
+-  public static boolean trashFilesUnderDir(FileSystem fs, Path f, Configuration conf,
+-      boolean forceDelete) throws FileNotFoundException, IOException {
+-    FileStatus[] statuses = fs.listStatus(f, HIDDEN_FILES_PATH_FILTER);
+-    boolean result = true;
+-    for (FileStatus status : statuses) {
+-      result = result & moveToTrash(fs, status.getPath(), conf, forceDelete);
+-    }
+-    return result;
+-  }
+-
+-  /**
+-   * Move a particular file or directory to the trash. If for a certain reason the trashing fails
+-   * it will force deletes the file or directory
+-   * @param fs FileSystem to use
+-   * @param f path of file or directory to move to trash.
+-   * @param conf
+-   * @return true if move successful
+-   * @throws IOException
+-   */
+-  public static boolean moveToTrash(FileSystem fs, Path f, Configuration conf) throws IOException {
+-    return moveToTrash(fs, f, conf, true);
+-  }
+-
+-  /**
+    * Move a particular file or directory to the trash.
+    * @param fs FileSystem to use
+    * @param f path of file or directory to move to trash.
+    * @param conf
+-   * @param forceDelete whether force delete the file or directory if trashing fails
+    * @return true if move successful
+    * @throws IOException
+    */
+-  public static boolean moveToTrash(FileSystem fs, Path f, Configuration conf, boolean forceDelete)
++  public static boolean moveToTrash(FileSystem fs, Path f, Configuration conf)
+       throws IOException {
+     LOG.info("deleting  " + f);
+     HadoopShims hadoopShim = ShimLoader.getHadoopShims();
+@@ -628,24 +593,18 @@ public static boolean moveToTrash(FileSystem fs, Path f, Configuration conf, boo
+     try {
+       result = hadoopShim.moveToAppropriateTrash(fs, f, conf);
+       if (result) {
+-        LOG.info("Moved to trash: " + f);
++        LOG.trace("Moved to trash: " + f);
+         return true;
+       }
+     } catch (IOException ioe) {
+-      if (forceDelete) {
+-        // for whatever failure reason including that trash has lower encryption zone
+-        // retry with force delete
+-        LOG.warn(ioe.getMessage() + "; Force to delete it.");
+-      } else {
+-        throw ioe;
+-      }
++      // for whatever failure reason including that trash has lower encryption zone
++      // retry with force delete
++      LOG.warn(ioe.getMessage() + "; Force to delete it.");
+     }
+ 
+-    if (forceDelete) {
+-      result = fs.delete(f, true);
+-      if (!result) {
+-        LOG.error("Failed to delete " + f);
+-      }
++    result = fs.delete(f, true);
++    if (!result) {
++      LOG.error("Failed to delete " + f);
+     }
+ 
+     return result;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index bc9672c..a52ef76 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -42,6 +42,7 @@
+ import java.util.Map.Entry;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.ExecutionException;
+@@ -1460,7 +1461,7 @@ public Partition loadPartition(Path loadPath, Table tbl,
+ 
+       List<Path> newFiles = null;
+       if (replace || (oldPart == null && !isAcid)) {
+-        Hive.replaceFiles(tbl.getPath(), loadPath, newPartPath, oldPartPath, getConf(),
++        replaceFiles(tbl.getPath(), loadPath, newPartPath, oldPartPath, getConf(),
+             isSrcLocal);
+       } else {
+         if (conf.getBoolVar(ConfVars.FIRE_EVENTS_FOR_DML) && !tbl.isTemporary() && oldPart != null) {
+@@ -3069,7 +3070,7 @@ protected static void replaceFiles(Path tablePath, Path srcf, Path destf, Path o
+               // existing content might result in incorrect (extra) data.
+               // But not sure why we changed not to delete the oldPath in HIVE-8750 if it is
+               // not the destf or its subdir?
+-              oldPathDeleted = FileUtils.trashFilesUnderDir(fs2, oldPath, conf, true);
++              oldPathDeleted = Hive.trashFilesUnderDir(fs2, oldPath, conf);
+             }
+           }
+         } catch (IOException e) {
+@@ -3126,7 +3127,7 @@ protected static void replaceFiles(Path tablePath, Path srcf, Path destf, Path o
+    * @return true if deletion successful
+    * @throws IOException
+    */
+-  private boolean trashFilesUnderDir(final FileSystem fs, Path f, final Configuration conf)
++  private static boolean trashFilesUnderDir(final FileSystem fs, Path f, final Configuration conf)
+       throws IOException {
+     FileStatus[] statuses = fs.listStatus(f, FileUtils.HIDDEN_FILES_PATH_FILTER);
+     boolean result = true;
+-- 
+1.7.9.5
+

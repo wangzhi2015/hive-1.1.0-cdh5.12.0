@@ -1,0 +1,465 @@
+From 9305e8564a8c0db1e6557589081ad6dbda25ed4d Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Tue, 14 Mar 2017 17:41:34 -0400
+Subject: [PATCH 1094/1164] CDH-40499: Backport HIVE-13780: Allow user to
+ update AVRO table schema via command even if
+ table's definition was defined through schema
+ file (Adam Szita, reviewed by Aihua Xu)
+
+Change-Id: I665a5310cbea25528887f22b672725098dce3924
+---
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |   28 ++--
+ .../clientnegative/avro_add_column_extschema.q     |   18 +++
+ .../clientpositive/avro_add_column_extschema.q     |   48 ++++++
+ .../clientnegative/avro_add_column_extschema.q.out |   43 ++++++
+ .../clientpositive/avro_add_column_extschema.q.out |  161 ++++++++++++++++++++
+ .../hadoop/hive/serde2/avro/AvroSerdeUtils.java    |   21 +++
+ 6 files changed, 309 insertions(+), 10 deletions(-)
+ create mode 100644 ql/src/test/queries/clientnegative/avro_add_column_extschema.q
+ create mode 100644 ql/src/test/queries/clientpositive/avro_add_column_extschema.q
+ create mode 100644 ql/src/test/results/clientnegative/avro_add_column_extschema.q.out
+ create mode 100644 ql/src/test/results/clientpositive/avro_add_column_extschema.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 4fd1469..de62f4b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -196,6 +196,7 @@
+ import org.apache.hadoop.hive.serde2.Deserializer;
+ import org.apache.hadoop.hive.serde2.MetadataTypedColumnsetSerDe;
+ import org.apache.hadoop.hive.serde2.SerDeSpec;
++import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
+ import org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe;
+ import org.apache.hadoop.hive.serde2.dynamic_type.DynamicSerDe;
+ import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
+@@ -3415,6 +3416,10 @@ private int alterTable(Hive db, AlterTableDesc alterTbl) throws HiveException {
+     return 0;
+   }
+ 
++  private static StorageDescriptor retrieveStorageDescriptor(Table tbl, Partition part) {
++    return (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++  }
++
+   private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Partition part)
+       throws HiveException {
+ 
+@@ -3422,10 +3427,11 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+       tbl.setDbName(Utilities.getDatabaseName(alterTbl.getNewName()));
+       tbl.setTableName(Utilities.getTableName(alterTbl.getNewName()));
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ADDCOLS) {
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
++      String serializationLib = sd.getSerdeInfo().getSerializationLib();
++      AvroSerdeUtils.handleAlterTableForAvro(conf, serializationLib, tbl.getTTable().getParameters());
+       List<FieldSchema> oldCols = (part == null ? tbl.getCols() : part.getCols());
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
+       List<FieldSchema> newCols = alterTbl.getNewCols();
+-      String serializationLib = sd.getSerdeInfo().getSerializationLib();
+       if (serializationLib.equals(
+           "org.apache.hadoop.hive.serde.thrift.columnsetSerDe")) {
+         console
+@@ -3450,8 +3456,10 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+         sd.setCols(oldCols);
+       }
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.RENAMECOLUMN) {
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
++      String serializationLib = sd.getSerdeInfo().getSerializationLib();
++      AvroSerdeUtils.handleAlterTableForAvro(conf, serializationLib, tbl.getTTable().getParameters());
+       List<FieldSchema> oldCols = (part == null ? tbl.getCols() : part.getCols());
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
+       List<FieldSchema> newCols = new ArrayList<FieldSchema>();
+       Iterator<FieldSchema> iterOldCols = oldCols.iterator();
+       String oldName = alterTbl.getOldColName();
+@@ -3514,7 +3522,7 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+ 
+       sd.setCols(newCols);
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.REPLACECOLS) {
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
+       // change SerDe to LazySimpleSerDe if it is columnsetSerDe
+       String serializationLib = sd.getSerdeInfo().getSerializationLib();
+       if (serializationLib.equals(
+@@ -3539,10 +3547,10 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+         tbl.getTTable().getParameters().remove(keyItr.next());
+       }
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ADDSERDEPROPS) {
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
+       sd.getSerdeInfo().getParameters().putAll(alterTbl.getProps());
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ADDSERDE) {
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
+       String serdeName = alterTbl.getSerdeName();
+       sd.getSerdeInfo().setSerializationLib(serdeName);
+       if ((alterTbl.getProps() != null) && (alterTbl.getProps().size() > 0)) {
+@@ -3557,7 +3565,7 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+         }
+       }
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ADDFILEFORMAT) {
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
+       sd.setInputFormat(alterTbl.getInputFormat());
+       sd.setOutputFormat(alterTbl.getOutputFormat());
+       if (alterTbl.getSerdeName() != null) {
+@@ -3578,7 +3586,7 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+         tbl.setProtectMode(mode);
+       }
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ADDCLUSTERSORTCOLUMN) {
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
+       // validate sort columns and bucket columns
+       List<String> columns = Utilities.getColumnNamesFromFieldSchema(tbl
+           .getCols());
+@@ -3603,7 +3611,7 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+         sd.setSortCols(alterTbl.getSortColumns());
+       }
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ALTERLOCATION) {
+-      StorageDescriptor sd = (part == null ? tbl.getTTable().getSd() : part.getTPartition().getSd());
++      StorageDescriptor sd = retrieveStorageDescriptor(tbl, part);
+       String newLocation = alterTbl.getNewLocation();
+       try {
+         URI locUri = new URI(newLocation);
+@@ -4407,7 +4415,7 @@ private int truncateTable(Hive db, TruncateTableDesc truncateTableDesc) throws H
+       HadoopShims shim = ShimLoader.getHadoopShims();
+       for (Path location : getLocations(db, table, partSpec)) {
+         FileSystem fs = location.getFileSystem(conf);
+-        
++
+         HdfsFileStatus fullFileStatus = shim.getFullFileStatus(conf, fs, location);
+         fs.delete(location, true);
+         fs.mkdirs(location);
+diff --git a/ql/src/test/queries/clientnegative/avro_add_column_extschema.q b/ql/src/test/queries/clientnegative/avro_add_column_extschema.q
+new file mode 100644
+index 0000000..d36906c
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/avro_add_column_extschema.q
+@@ -0,0 +1,18 @@
++-- verify that we can modify avro tables created by externalschemas
++
++CREATE TABLE avro_extschema
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.literal'='{
++  "namespace": "org.apache.hive",
++  "name": "ext_schema",
++  "type": "record",
++  "fields": [
++    { "name":"number", "type":"int" },
++    { "name":"first_name", "type":"string" },
++    { "name":"last_name", "type":"string" }
++  ] }');
++
++DESCRIBE avro_extschema;
++
++ALTER TABLE avro_extschema
++CHANGE COLUMN number number bigint;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/avro_add_column_extschema.q b/ql/src/test/queries/clientpositive/avro_add_column_extschema.q
+new file mode 100644
+index 0000000..1234678
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/avro_add_column_extschema.q
+@@ -0,0 +1,48 @@
++-- verify that we can modify avro tables created by externalschemas if we drop avro-related tblproperties
++
++CREATE TABLE avro_extschema_literal
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.literal'='{
++  "namespace": "org.apache.hive",
++  "name": "ext_schema",
++  "type": "record",
++  "fields": [
++    { "name":"number", "type":"int" },
++    { "name":"first_name", "type":"string" },
++    { "name":"last_name", "type":"string" }
++  ] }');
++
++DESCRIBE avro_extschema_literal;
++
++ALTER TABLE avro_extschema_literal UNSET TBLPROPERTIES ('avro.schema.literal');
++
++ALTER TABLE avro_extschema_literal
++CHANGE COLUMN number number bigint;
++
++DESCRIBE avro_extschema_literal;
++
++ALTER TABLE avro_extschema_literal
++ADD COLUMNS (age int);
++
++DESCRIBE avro_extschema_literal;
++
++dfs -cp ${system:hive.root}data/files/grad.avsc ${system:test.tmp.dir}/;
++
++
++CREATE TABLE avro_extschema_url
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.url'='${system:test.tmp.dir}/grad.avsc');
++
++DESCRIBE avro_extschema_url;
++
++ALTER TABLE avro_extschema_url UNSET TBLPROPERTIES ('avro.schema.url');
++
++ALTER TABLE avro_extschema_url
++CHANGE COLUMN col6 col6 bigint;
++
++DESCRIBE avro_extschema_url;
++
++ALTER TABLE avro_extschema_url
++ADD COLUMNS (col7 int);
++
++DESCRIBE avro_extschema_url;
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientnegative/avro_add_column_extschema.q.out b/ql/src/test/results/clientnegative/avro_add_column_extschema.q.out
+new file mode 100644
+index 0000000..a1b1b9c
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/avro_add_column_extschema.q.out
+@@ -0,0 +1,43 @@
++PREHOOK: query: CREATE TABLE avro_extschema
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.literal'='{
++  "namespace": "org.apache.hive",
++  "name": "ext_schema",
++  "type": "record",
++  "fields": [
++    { "name":"number", "type":"int" },
++    { "name":"first_name", "type":"string" },
++    { "name":"last_name", "type":"string" }
++  ] }')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@avro_extschema
++POSTHOOK: query: CREATE TABLE avro_extschema
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.literal'='{
++  "namespace": "org.apache.hive",
++  "name": "ext_schema",
++  "type": "record",
++  "fields": [
++    { "name":"number", "type":"int" },
++    { "name":"first_name", "type":"string" },
++    { "name":"last_name", "type":"string" }
++  ] }')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@avro_extschema
++PREHOOK: query: DESCRIBE avro_extschema
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema
++POSTHOOK: query: DESCRIBE avro_extschema
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema
++number              	int                 	                    
++first_name          	string              	                    
++last_name           	string              	                    
++PREHOOK: query: ALTER TABLE avro_extschema
++CHANGE COLUMN number number bigint
++PREHOOK: type: ALTERTABLE_RENAMECOL
++PREHOOK: Input: default@avro_extschema
++PREHOOK: Output: default@avro_extschema
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Not allowed to alter schema of Avro stored table having external schema. Consider removing avro.schema.literal or avro.schema.url from table properties.
+diff --git a/ql/src/test/results/clientpositive/avro_add_column_extschema.q.out b/ql/src/test/results/clientpositive/avro_add_column_extschema.q.out
+new file mode 100644
+index 0000000..670dc1e
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/avro_add_column_extschema.q.out
+@@ -0,0 +1,161 @@
++PREHOOK: query: CREATE TABLE avro_extschema_literal
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.literal'='{
++  "namespace": "org.apache.hive",
++  "name": "ext_schema",
++  "type": "record",
++  "fields": [
++    { "name":"number", "type":"int" },
++    { "name":"first_name", "type":"string" },
++    { "name":"last_name", "type":"string" }
++  ] }')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@avro_extschema_literal
++POSTHOOK: query: CREATE TABLE avro_extschema_literal
++STORED AS AVRO
++TBLPROPERTIES ('avro.schema.literal'='{
++  "namespace": "org.apache.hive",
++  "name": "ext_schema",
++  "type": "record",
++  "fields": [
++    { "name":"number", "type":"int" },
++    { "name":"first_name", "type":"string" },
++    { "name":"last_name", "type":"string" }
++  ] }')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@avro_extschema_literal
++PREHOOK: query: DESCRIBE avro_extschema_literal
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema_literal
++POSTHOOK: query: DESCRIBE avro_extschema_literal
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema_literal
++number              	int                 	                    
++first_name          	string              	                    
++last_name           	string              	                    
++PREHOOK: query: ALTER TABLE avro_extschema_literal UNSET TBLPROPERTIES ('avro.schema.literal')
++PREHOOK: type: ALTERTABLE_PROPERTIES
++PREHOOK: Input: default@avro_extschema_literal
++PREHOOK: Output: default@avro_extschema_literal
++POSTHOOK: query: ALTER TABLE avro_extschema_literal UNSET TBLPROPERTIES ('avro.schema.literal')
++POSTHOOK: type: ALTERTABLE_PROPERTIES
++POSTHOOK: Input: default@avro_extschema_literal
++POSTHOOK: Output: default@avro_extschema_literal
++PREHOOK: query: ALTER TABLE avro_extschema_literal
++CHANGE COLUMN number number bigint
++PREHOOK: type: ALTERTABLE_RENAMECOL
++PREHOOK: Input: default@avro_extschema_literal
++PREHOOK: Output: default@avro_extschema_literal
++POSTHOOK: query: ALTER TABLE avro_extschema_literal
++CHANGE COLUMN number number bigint
++POSTHOOK: type: ALTERTABLE_RENAMECOL
++POSTHOOK: Input: default@avro_extschema_literal
++POSTHOOK: Output: default@avro_extschema_literal
++PREHOOK: query: DESCRIBE avro_extschema_literal
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema_literal
++POSTHOOK: query: DESCRIBE avro_extschema_literal
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema_literal
++number              	bigint              	                    
++first_name          	string              	                    
++last_name           	string              	                    
++PREHOOK: query: ALTER TABLE avro_extschema_literal
++ADD COLUMNS (age int)
++PREHOOK: type: ALTERTABLE_ADDCOLS
++PREHOOK: Input: default@avro_extschema_literal
++PREHOOK: Output: default@avro_extschema_literal
++POSTHOOK: query: ALTER TABLE avro_extschema_literal
++ADD COLUMNS (age int)
++POSTHOOK: type: ALTERTABLE_ADDCOLS
++POSTHOOK: Input: default@avro_extschema_literal
++POSTHOOK: Output: default@avro_extschema_literal
++PREHOOK: query: DESCRIBE avro_extschema_literal
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema_literal
++POSTHOOK: query: DESCRIBE avro_extschema_literal
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema_literal
++number              	bigint              	                    
++first_name          	string              	                    
++last_name           	string              	                    
++age                 	int                 	                    
++PREHOOK: query: CREATE TABLE avro_extschema_url
++STORED AS AVRO
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@avro_extschema_url
++POSTHOOK: query: CREATE TABLE avro_extschema_url
++STORED AS AVRO
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@avro_extschema_url
++PREHOOK: query: DESCRIBE avro_extschema_url
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema_url
++POSTHOOK: query: DESCRIBE avro_extschema_url
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema_url
++col1                	string              	                    
++col2                	string              	                    
++col3                	double              	                    
++col4                	string              	                    
++col5                	string              	                    
++col6                	int                 	                    
++PREHOOK: query: ALTER TABLE avro_extschema_url UNSET TBLPROPERTIES ('avro.schema.url')
++PREHOOK: type: ALTERTABLE_PROPERTIES
++PREHOOK: Input: default@avro_extschema_url
++PREHOOK: Output: default@avro_extschema_url
++POSTHOOK: query: ALTER TABLE avro_extschema_url UNSET TBLPROPERTIES ('avro.schema.url')
++POSTHOOK: type: ALTERTABLE_PROPERTIES
++POSTHOOK: Input: default@avro_extschema_url
++POSTHOOK: Output: default@avro_extschema_url
++PREHOOK: query: ALTER TABLE avro_extschema_url
++CHANGE COLUMN col6 col6 bigint
++PREHOOK: type: ALTERTABLE_RENAMECOL
++PREHOOK: Input: default@avro_extschema_url
++PREHOOK: Output: default@avro_extschema_url
++POSTHOOK: query: ALTER TABLE avro_extschema_url
++CHANGE COLUMN col6 col6 bigint
++POSTHOOK: type: ALTERTABLE_RENAMECOL
++POSTHOOK: Input: default@avro_extschema_url
++POSTHOOK: Output: default@avro_extschema_url
++PREHOOK: query: DESCRIBE avro_extschema_url
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema_url
++POSTHOOK: query: DESCRIBE avro_extschema_url
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema_url
++col1                	string              	                    
++col2                	string              	                    
++col3                	double              	                    
++col4                	string              	                    
++col5                	string              	                    
++col6                	bigint              	                    
++PREHOOK: query: ALTER TABLE avro_extschema_url
++ADD COLUMNS (col7 int)
++PREHOOK: type: ALTERTABLE_ADDCOLS
++PREHOOK: Input: default@avro_extschema_url
++PREHOOK: Output: default@avro_extschema_url
++POSTHOOK: query: ALTER TABLE avro_extschema_url
++ADD COLUMNS (col7 int)
++POSTHOOK: type: ALTERTABLE_ADDCOLS
++POSTHOOK: Input: default@avro_extschema_url
++POSTHOOK: Output: default@avro_extschema_url
++PREHOOK: query: DESCRIBE avro_extschema_url
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@avro_extschema_url
++POSTHOOK: query: DESCRIBE avro_extschema_url
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@avro_extschema_url
++col1                	string              	                    
++col2                	string              	                    
++col3                	double              	                    
++col4                	string              	                    
++col5                	string              	                    
++col6                	bigint              	                    
++col7                	int                 	                    
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerdeUtils.java b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerdeUtils.java
+index b7508bd..ce40579 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerdeUtils.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerdeUtils.java
+@@ -44,6 +44,7 @@
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.ArrayList;
++import java.util.Map;
+ import java.util.Properties;
+ 
+ /**
+@@ -285,4 +286,24 @@ public static Schema getSchemaFor(InputStream stream) {
+     }
+     return schema;
+   }
++    /**
++     * Called on specific alter table events, removes schema url and schema literal from given tblproperties
++     * After the change, HMS solely will be responsible for handling the schema
++     *
++     * @param conf
++     * @param serializationLib
++     * @param parameters
++     */
++    public static void handleAlterTableForAvro(HiveConf conf, String serializationLib, Map<String, String> parameters) {
++      if (AvroSerDe.class.getName().equals(serializationLib)) {
++        String literalPropName = AvroTableProperties.SCHEMA_LITERAL.getPropName();
++        String urlPropName = AvroTableProperties.SCHEMA_URL.getPropName();
++
++        if (parameters.containsKey(literalPropName) || parameters.containsKey(urlPropName)) {
++          throw new RuntimeException("Not allowed to alter schema of Avro stored table having external schema." +
++                  " Consider removing "+AvroTableProperties.SCHEMA_LITERAL.getPropName() + " or " +
++                  AvroTableProperties.SCHEMA_URL.getPropName() + " from table properties.");
++        }
++      }
++    }
+ }
+-- 
+1.7.9.5
+

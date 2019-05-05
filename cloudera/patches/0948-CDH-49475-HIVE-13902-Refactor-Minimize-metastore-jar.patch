@@ -1,0 +1,135 @@
+From 270bf8134f231f4f3e10ca81bbacae91edb0e6e5 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Tue, 31 May 2016 23:18:00 -0800
+Subject: [PATCH 0948/1164] CDH-49475: HIVE-13902 : [Refactor] Minimize
+ metastore jar dependencies on task nodes
+ (Ashutosh Chauhan via Sergey Shelukhin)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+(cherry picked from commit 8d34a3d5721e5a26cd4882ec3ba9fa41613327d3)
+
+Change-Id: I79e885b4cf4695b65e9428348dc77792e7d612c8
+---
+ .../apache/hive/common/util/HiveStringUtils.java   |   16 +++++++++++++++
+ .../hadoop/hive/metastore/MetaStoreUtils.java      |   21 +++-----------------
+ .../hadoop/hive/ql/exec/FileSinkOperator.java      |    5 +++--
+ 3 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/common/src/java/org/apache/hive/common/util/HiveStringUtils.java b/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
+index 9b6d1fb..d1c9195 100644
+--- a/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
++++ b/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
+@@ -38,6 +38,7 @@
+ import java.util.Locale;
+ import java.util.Properties;
+ import java.util.StringTokenizer;
++import java.util.regex.Pattern;
+ 
+ import com.google.common.collect.Interner;
+ import com.google.common.collect.Interners;
+@@ -1032,4 +1033,19 @@ public static boolean commentProvided(char[] chars) {
+     }
+     return false;
+   }
++
++  public static String getPartitionValWithInvalidCharacter(List<String> partVals,
++      Pattern partitionValidationPattern) {
++    if (partitionValidationPattern == null) {
++      return null;
++    }
++  
++    for (String partVal : partVals) {
++      if (!partitionValidationPattern.matcher(partVal).matches()) {
++        return partVal;
++      }
++    }
++  
++    return null;
++  }
+ }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+index 5ff0d82..9a28671 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+@@ -80,6 +80,7 @@
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.hive.thrift.HadoopThriftAuthBridge;
++import org.apache.hive.common.util.HiveStringUtils;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+ import javax.annotation.Nullable;
+@@ -1550,7 +1551,7 @@ public static void validatePartitionNameCharacters(List<String> partVals,
+       Pattern partitionValidationPattern) throws MetaException {
+ 
+     String invalidPartitionVal =
+-        getPartitionValWithInvalidCharacter(partVals, partitionValidationPattern);
++        HiveStringUtils.getPartitionValWithInvalidCharacter(partVals, partitionValidationPattern);
+     if (invalidPartitionVal != null) {
+       throw new MetaException("Partition value '" + invalidPartitionVal +
+           "' contains a character " + "not matched by whitelist pattern '" +
+@@ -1561,7 +1562,7 @@ public static void validatePartitionNameCharacters(List<String> partVals,
+ 
+   public static boolean partitionNameHasValidCharacters(List<String> partVals,
+       Pattern partitionValidationPattern) {
+-    return getPartitionValWithInvalidCharacter(partVals, partitionValidationPattern) == null;
++    return HiveStringUtils.getPartitionValWithInvalidCharacter(partVals, partitionValidationPattern) == null;
+   }
+ 
+   /**
+@@ -1610,22 +1611,6 @@ public static boolean compareFieldColumns(List<FieldSchema> schema1, List<FieldS
+     return ShimLoader.getHadoopThriftAuthBridge().getHadoopSaslProperties(conf);
+   }
+ 
+-
+-  public static String getPartitionValWithInvalidCharacter(List<String> partVals,
+-      Pattern partitionValidationPattern) {
+-    if (partitionValidationPattern == null) {
+-      return null;
+-    }
+-
+-    for (String partVal : partVals) {
+-      if (!partitionValidationPattern.matcher(partVal).matches()) {
+-        return partVal;
+-      }
+-    }
+-
+-    return null;
+-  }
+-
+   public static ProtectMode getProtectMode(Partition partition) {
+     return getProtectMode(partition.getParameters());
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+index 4340cb1..920cc7d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+@@ -38,7 +38,6 @@
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.StatsSetupConst;
+ import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+ import org.apache.hadoop.hive.ql.io.AcidUtils;
+ import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
+@@ -73,6 +72,8 @@
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.util.ReflectionUtils;
++import org.apache.hive.common.util.HiveStringUtils;
++
+ 
+ /**
+  * File Sink operator implementation.
+@@ -656,7 +657,7 @@ public void processOp(Object row, int tag) throws HiveException {
+         }
+ 
+         String invalidPartitionVal;
+-        if((invalidPartitionVal = MetaStoreUtils.getPartitionValWithInvalidCharacter(dpVals, dpCtx.getWhiteListPattern()))!=null) {
++        if((invalidPartitionVal = HiveStringUtils.getPartitionValWithInvalidCharacter(dpVals, dpCtx.getWhiteListPattern()))!=null) {
+           throw new HiveFatalException("Partition value '" + invalidPartitionVal +
+               "' contains a character not matched by whitelist pattern '" +
+               dpCtx.getWhiteListPattern().toString() + "'.  " + "(configure with " +
+-- 
+1.7.9.5
+

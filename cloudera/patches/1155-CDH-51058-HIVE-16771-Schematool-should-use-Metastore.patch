@@ -1,0 +1,1419 @@
+From 984ce93311f59934c5aaa2e312f69c8aa5f42b3e Mon Sep 17 00:00:00 2001
+From: Vihang Karajgaonkar <vihang@cloudera.com>
+Date: Sat, 27 May 2017 16:22:09 -0700
+Subject: [PATCH 1155/1164] CDH-51058 : HIVE-16771 : Schematool should use
+ MetastoreSchemaInfo to get the metastore schema
+ version from database
+
+Change-Id: I42be3e0280fca7d84c6ecf53eb3626ce52c8606b
+---
+ .../org/apache/hive/beeline/HiveSchemaHelper.java  |  497 ------------------
+ .../org/apache/hive/beeline/HiveSchemaTool.java    |   79 +--
+ .../apache/hive/beeline/TestHiveSchemaTool.java    |    1 +
+ .../org/apache/hive/beeline/TestSchemaTool.java    |    6 +-
+ .../hive/metastore/IMetaStoreSchemaInfo.java       |   14 +
+ .../hadoop/hive/metastore/MetaStoreSchemaInfo.java |   34 +-
+ .../hive/metastore/tools/HiveSchemaHelper.java     |  545 ++++++++++++++++++++
+ 7 files changed, 624 insertions(+), 552 deletions(-)
+ delete mode 100644 beeline/src/java/org/apache/hive/beeline/HiveSchemaHelper.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/tools/HiveSchemaHelper.java
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/HiveSchemaHelper.java b/beeline/src/java/org/apache/hive/beeline/HiveSchemaHelper.java
+deleted file mode 100644
+index a6b11ba..0000000
+--- a/beeline/src/java/org/apache/hive/beeline/HiveSchemaHelper.java
++++ /dev/null
+@@ -1,497 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hive.beeline;
+-
+-import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.collect.Lists;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.metastore.HiveMetaException;
+-
+-import java.io.BufferedReader;
+-import java.io.File;
+-import java.io.FileReader;
+-import java.io.IOException;
+-import java.sql.Connection;
+-import java.sql.DriverManager;
+-import java.sql.SQLException;
+-import java.util.IllegalFormatException;
+-import java.util.List;
+-
+-public class HiveSchemaHelper {
+-  public static final String DB_DERBY = "derby";
+-  public static final String DB_MSSQL = "mssql";
+-  public static final String DB_MYSQL = "mysql";
+-  public static final String DB_POSTGRACE = "postgres";
+-  public static final String DB_ORACLE = "oracle";
+-
+-  /***
+-   * Get JDBC connection to metastore db
+-   *
+-   * @param userName metastore connection username
+-   * @param password metastore connection password
+-   * @param printInfo print connection parameters
+-   * @param hiveConf hive config object
+-   * @return metastore connection object
+-   * @throws org.apache.hadoop.hive.metastore.api.MetaException
+-   */
+-  public static Connection getConnectionToMetastore(String userName,
+-      String password, boolean printInfo, HiveConf hiveConf)
+-      throws HiveMetaException {
+-    try {
+-      String connectionURL = getValidConfVar(
+-          HiveConf.ConfVars.METASTORECONNECTURLKEY, hiveConf);
+-      String driver = getValidConfVar(
+-          HiveConf.ConfVars.METASTORE_CONNECTION_DRIVER, hiveConf);
+-      if (printInfo) {
+-        System.out.println("Metastore connection URL:\t " + connectionURL);
+-        System.out.println("Metastore Connection Driver :\t " + driver);
+-        System.out.println("Metastore connection User:\t " + userName);
+-      }
+-      if ((userName == null) || userName.isEmpty()) {
+-        throw new HiveMetaException("UserName empty ");
+-      }
+-
+-      // load required JDBC driver
+-      Class.forName(driver);
+-
+-      // Connect using the JDBC URL and user/pass from conf
+-      return DriverManager.getConnection(connectionURL, userName, password);
+-    } catch (IOException e) {
+-      throw new HiveMetaException("Failed to get schema version.", e);
+-    } catch (SQLException e) {
+-      throw new HiveMetaException("Failed to get schema version.", e);
+-    } catch (ClassNotFoundException e) {
+-      throw new HiveMetaException("Failed to load driver", e);
+-    }
+-  }
+-
+-  public static String getValidConfVar(HiveConf.ConfVars confVar, HiveConf hiveConf)
+-      throws IOException {
+-    String confVarStr = hiveConf.get(confVar.varname);
+-    if (confVarStr == null || confVarStr.isEmpty()) {
+-      throw new IOException("Empty " + confVar.varname);
+-    }
+-    return confVarStr;
+-  }
+-
+-  public interface NestedScriptParser {
+-
+-    public enum CommandType {
+-      PARTIAL_STATEMENT,
+-      TERMINATED_STATEMENT,
+-      COMMENT
+-    }
+-
+-    static final String DEFAUTL_DELIMITER = ";";
+-
+-    /**
+-     * Find the type of given command
+-     *
+-     * @param dbCommand
+-     * @return
+-     */
+-    public boolean isPartialCommand(String dbCommand) throws IllegalArgumentException;
+-
+-    /**
+-     * Parse the DB specific nesting format and extract the inner script name if any
+-     *
+-     * @param dbCommand command from parent script
+-     * @return
+-     * @throws IllegalFormatException
+-     */
+-    public String getScriptName(String dbCommand) throws IllegalArgumentException;
+-
+-    /**
+-     * Find if the given command is a nested script execution
+-     *
+-     * @param dbCommand
+-     * @return
+-     */
+-    public boolean isNestedScript(String dbCommand);
+-
+-    /**
+-     * Find if the given command should not be passed to DB
+-     *
+-     * @param dbCommand
+-     * @return
+-     */
+-    public boolean isNonExecCommand(String dbCommand);
+-
+-    /**
+-     * Get the SQL statement delimiter
+-     *
+-     * @return
+-     */
+-    public String getDelimiter();
+-
+-    /**
+-     * Clear any client specific tags
+-     *
+-     * @return
+-     */
+-    public String cleanseCommand(String dbCommand);
+-
+-    /**
+-     * Does the DB required table/column names quoted
+-     *
+-     * @return
+-     */
+-    public boolean needsQuotedIdentifier();
+-
+-    /**
+-     * Flatten the nested upgrade script into a buffer
+-     *
+-     * @param scriptDir  upgrade script directory
+-     * @param scriptFile upgrade script file
+-     * @return string of sql commands
+-     */
+-    public String buildCommand(String scriptDir, String scriptFile)
+-        throws IllegalFormatException, IOException;
+-  }
+-
+-  /***
+-   * Base implemenation of NestedScriptParser
+-   * abstractCommandParser.
+-   *
+-   */
+-  private static abstract class AbstractCommandParser implements NestedScriptParser {
+-    private List<String> dbOpts;
+-    private String msUsername;
+-    private String msPassword;
+-    private HiveConf hiveConf;
+-
+-    public AbstractCommandParser(String dbOpts, String msUsername, String msPassword,
+-        HiveConf hiveConf) {
+-      setDbOpts(dbOpts);
+-      this.msUsername = msUsername;
+-      this.msPassword = msPassword;
+-      this.hiveConf = hiveConf;
+-    }
+-
+-    @Override
+-    public boolean isPartialCommand(String dbCommand) throws IllegalArgumentException{
+-      if (dbCommand == null || dbCommand.isEmpty()) {
+-        throw new IllegalArgumentException("invalid command line " + dbCommand);
+-      }
+-      dbCommand = dbCommand.trim();
+-      if (dbCommand.endsWith(getDelimiter()) || isNonExecCommand(dbCommand)) {
+-        return false;
+-      } else {
+-        return true;
+-      }
+-    }
+-
+-    @Override
+-    public boolean isNonExecCommand(String dbCommand) {
+-      return (dbCommand.startsWith("--") || dbCommand.startsWith("#"));
+-    }
+-
+-    @Override
+-    public String getDelimiter() {
+-      return DEFAUTL_DELIMITER;
+-    }
+-
+-    @Override
+-    public String cleanseCommand(String dbCommand) {
+-      // strip off the delimiter
+-      if (dbCommand.endsWith(getDelimiter())) {
+-        dbCommand = dbCommand.substring(0,
+-            dbCommand.length() - getDelimiter().length());
+-      }
+-      return dbCommand;
+-    }
+-
+-    @Override
+-    public boolean needsQuotedIdentifier() {
+-      return false;
+-    }
+-
+-    @Override
+-    public String buildCommand(
+-      String scriptDir, String scriptFile) throws IllegalFormatException, IOException {
+-      BufferedReader bfReader =
+-          new BufferedReader(new FileReader(scriptDir + File.separatorChar + scriptFile));
+-      String currLine;
+-      StringBuilder sb = new StringBuilder();
+-      String currentCommand = null;
+-      while ((currLine = bfReader.readLine()) != null) {
+-        currLine = currLine.trim();
+-        if (currLine.isEmpty()) {
+-          continue; // skip empty lines
+-        }
+-
+-        if (currentCommand == null) {
+-          currentCommand = currLine;
+-        } else {
+-          currentCommand = currentCommand + " " + currLine;
+-        }
+-        if (isPartialCommand(currLine)) {
+-          // if its a partial line, continue collecting the pieces
+-          continue;
+-        }
+-
+-        // if this is a valid executable command then add it to the buffer
+-        if (!isNonExecCommand(currentCommand)) {
+-          currentCommand = cleanseCommand(currentCommand);
+-          if (isNestedScript(currentCommand)) {
+-            // if this is a nested sql script then flatten it
+-            String currScript = getScriptName(currentCommand);
+-            sb.append(buildCommand(scriptDir, currScript));
+-          } else {
+-            // Now we have a complete statement, process it
+-            // write the line to buffer
+-            sb.append(currentCommand);
+-            sb.append(System.getProperty("line.separator"));
+-          }
+-        }
+-        currentCommand = null;
+-      }
+-      bfReader.close();
+-      return sb.toString();
+-    }
+-
+-    private void setDbOpts(String dbOpts) {
+-      if (dbOpts != null) {
+-        this.dbOpts = Lists.newArrayList(dbOpts.split(","));
+-      } else {
+-        this.dbOpts = Lists.newArrayList();
+-      }
+-    }
+-
+-    protected List<String> getDbOpts() {
+-      return dbOpts;
+-    }
+-
+-    protected String getMsUsername() {
+-      return msUsername;
+-    }
+-
+-    protected String getMsPassword() {
+-      return msPassword;
+-    }
+-
+-    protected HiveConf getHiveConf() {
+-      return hiveConf;
+-    }
+-  }
+-
+-  // Derby commandline parser
+-  public static class DerbyCommandParser extends AbstractCommandParser {
+-    private static String DERBY_NESTING_TOKEN = "RUN";
+-
+-    public DerbyCommandParser(String dbOpts, String msUsername, String msPassword,
+-        HiveConf hiveConf) {
+-      super(dbOpts, msUsername, msPassword, hiveConf);
+-    }
+-
+-    @Override
+-    public String getScriptName(String dbCommand) throws IllegalArgumentException {
+-
+-      if (!isNestedScript(dbCommand)) {
+-        throw new IllegalArgumentException("Not a script format " + dbCommand);
+-      }
+-      String[] tokens = dbCommand.split(" ");
+-      if (tokens.length != 2) {
+-        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
+-      }
+-      return tokens[1].replace(";", "").replaceAll("'", "");
+-    }
+-
+-    @Override
+-    public boolean isNestedScript(String dbCommand) {
+-      // Derby script format is RUN '<file>'
+-     return dbCommand.startsWith(DERBY_NESTING_TOKEN);
+-    }
+-  }
+-
+-  // MySQL parser
+-  public static class MySqlCommandParser extends AbstractCommandParser {
+-    private static final String MYSQL_NESTING_TOKEN = "SOURCE";
+-    private static final String DELIMITER_TOKEN = "DELIMITER";
+-    private String delimiter = DEFAUTL_DELIMITER;
+-
+-    public MySqlCommandParser(String dbOpts, String msUsername, String msPassword,
+-        HiveConf hiveConf) {
+-      super(dbOpts, msUsername, msPassword, hiveConf);
+-    }
+-
+-    @Override
+-    public boolean isPartialCommand(String dbCommand) throws IllegalArgumentException{
+-      boolean isPartial = super.isPartialCommand(dbCommand);
+-      // if this is a delimiter directive, reset our delimiter
+-      if (dbCommand.startsWith(DELIMITER_TOKEN)) {
+-        String[] tokens = dbCommand.split(" ");
+-        if (tokens.length != 2) {
+-          throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
+-        }
+-        delimiter = tokens[1];
+-      }
+-      return isPartial;
+-    }
+-
+-    @Override
+-    public String getScriptName(String dbCommand) throws IllegalArgumentException {
+-      String[] tokens = dbCommand.split(" ");
+-      if (tokens.length != 2) {
+-        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
+-      }
+-      // remove ending ';'
+-      return tokens[1].replace(";", "");
+-    }
+-
+-    @Override
+-    public boolean isNestedScript(String dbCommand) {
+-      return dbCommand.startsWith(MYSQL_NESTING_TOKEN);
+-    }
+-
+-    @Override
+-    public String getDelimiter() {
+-      return delimiter;
+-    }
+-
+-    @Override
+-    public boolean isNonExecCommand(String dbCommand) {
+-      return super.isNonExecCommand(dbCommand) ||
+-          (dbCommand.startsWith("/*") && dbCommand.endsWith("*/")) ||
+-          dbCommand.startsWith(DELIMITER_TOKEN);
+-    }
+-
+-    @Override
+-    public String cleanseCommand(String dbCommand) {
+-      return super.cleanseCommand(dbCommand).replaceAll("/\\*.*?\\*/[^;]", "");
+-    }
+-
+-  }
+-
+-  // Postgres specific parser
+-  public static class PostgresCommandParser extends AbstractCommandParser {
+-    private static String POSTGRES_NESTING_TOKEN = "\\i";
+-    @VisibleForTesting
+-    public static String POSTGRES_STANDARD_STRINGS_OPT = "SET standard_conforming_strings";
+-    @VisibleForTesting
+-    public static String POSTGRES_SKIP_STANDARD_STRINGS_DBOPT = "postgres.filter.81";
+-
+-    public PostgresCommandParser(String dbOpts, String msUsername, String msPassword,
+-        HiveConf hiveConf) {
+-      super(dbOpts, msUsername, msPassword, hiveConf);
+-    }
+-
+-    @Override
+-    public String getScriptName(String dbCommand) throws IllegalArgumentException {
+-      String[] tokens = dbCommand.split(" ");
+-      if (tokens.length != 2) {
+-        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
+-      }
+-      // remove ending ';'
+-      return tokens[1].replace(";", "");
+-    }
+-
+-    @Override
+-    public boolean isNestedScript(String dbCommand) {
+-      return dbCommand.startsWith(POSTGRES_NESTING_TOKEN);
+-    }
+-
+-    @Override
+-    public boolean needsQuotedIdentifier() {
+-      return true;
+-    }
+-
+-    @Override
+-    public boolean isNonExecCommand(String dbCommand) {
+-      // Skip "standard_conforming_strings" command which is read-only in older
+-      // Postgres versions like 8.1
+-      // See: http://www.postgresql.org/docs/8.2/static/release-8-1.html
+-      if (getDbOpts().contains(POSTGRES_SKIP_STANDARD_STRINGS_DBOPT)) {
+-        if (dbCommand.startsWith(POSTGRES_STANDARD_STRINGS_OPT)) {
+-          return true;
+-        }
+-      }
+-      return super.isNonExecCommand(dbCommand);
+-    }
+-  }
+-
+-  //Oracle specific parser
+-  public static class OracleCommandParser extends AbstractCommandParser {
+-    private static String ORACLE_NESTING_TOKEN = "@";
+-
+-    public OracleCommandParser(String dbOpts, String msUsername, String msPassword,
+-        HiveConf hiveConf) {
+-      super(dbOpts, msUsername, msPassword, hiveConf);
+-    }
+-
+-    @Override
+-    public String getScriptName(String dbCommand) throws IllegalArgumentException {
+-      if (!isNestedScript(dbCommand)) {
+-        throw new IllegalArgumentException("Not a nested script format " + dbCommand);
+-      }
+-      // remove ending ';' and starting '@'
+-      return dbCommand.replace(";", "").replace(ORACLE_NESTING_TOKEN, "");
+-    }
+-
+-    @Override
+-    public boolean isNestedScript(String dbCommand) {
+-      return dbCommand.startsWith(ORACLE_NESTING_TOKEN);
+-    }
+-  }
+-
+-  //MSSQL specific parser
+-  public static class MSSQLCommandParser extends AbstractCommandParser {
+-    private static String MSSQL_NESTING_TOKEN = ":r";
+-
+-    public MSSQLCommandParser(String dbOpts, String msUsername, String msPassword,
+-        HiveConf hiveConf) {
+-      super(dbOpts, msUsername, msPassword, hiveConf);
+-    }
+-
+-    @Override
+-    public String getScriptName(String dbCommand) throws IllegalArgumentException {
+-      String[] tokens = dbCommand.split(" ");
+-      if (tokens.length != 2) {
+-        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
+-      }
+-      return tokens[1];
+-    }
+-
+-    @Override
+-    public boolean isNestedScript(String dbCommand) {
+-      return dbCommand.startsWith(MSSQL_NESTING_TOKEN);
+-    }
+-  }
+-
+-  public static NestedScriptParser getDbCommandParser(String dbName) {
+-    return getDbCommandParser(dbName, null, null, null, null);
+-  }
+-
+-  public static NestedScriptParser getDbCommandParser(String dbName,
+-      String dbOpts, String msUsername, String msPassword,
+-      HiveConf hiveConf) {
+-    if (dbName.equalsIgnoreCase(DB_DERBY)) {
+-      return new DerbyCommandParser(dbOpts, msUsername, msPassword, hiveConf);
+-    } else if (dbName.equalsIgnoreCase(DB_MSSQL)) {
+-      return new MSSQLCommandParser(dbOpts, msUsername, msPassword, hiveConf);
+-    } else if (dbName.equalsIgnoreCase(DB_MYSQL)) {
+-      return new MySqlCommandParser(dbOpts, msUsername, msPassword, hiveConf);
+-    } else if (dbName.equalsIgnoreCase(DB_POSTGRACE)) {
+-      return new PostgresCommandParser(dbOpts, msUsername, msPassword, hiveConf);
+-    } else if (dbName.equalsIgnoreCase(DB_ORACLE)) {
+-      return new OracleCommandParser(dbOpts, msUsername, msPassword, hiveConf);
+-    } else {
+-      throw new IllegalArgumentException("Unknown dbType " + dbName);
+-    }
+-  }
+-}
+\ No newline at end of file
+diff --git a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+index 2898a67..06bb732 100644
+--- a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
++++ b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+@@ -54,8 +54,10 @@
+ import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfoFactory;
+ import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper.MetaStoreConnectionInfo;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper.NestedScriptParser;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+-import org.apache.hive.beeline.HiveSchemaHelper.NestedScriptParser;
+ import com.google.common.collect.ImmutableMap;
+ 
+ import java.io.BufferedReader;
+@@ -77,6 +79,8 @@
+   private final HiveConf hiveConf;
+   private final String dbType;
+   private final IMetaStoreSchemaInfo metaStoreSchemaInfo;
++  private boolean needsQuotedIdentifier;
++  
+   static Log LOG = LogFactory.getLog("HiveSchemaTool");
+ 
+   public HiveSchemaTool(String dbType) throws HiveMetaException {
+@@ -90,6 +94,7 @@ public HiveSchemaTool(String hiveHome, HiveConf hiveConf, String dbType)
+     }
+     this.hiveConf = hiveConf;
+     this.dbType = dbType;
++    this.needsQuotedIdentifier = getDbCommandParser(dbType).needsQuotedIdentifier();
+     this.metaStoreSchemaInfo = MetaStoreSchemaInfoFactory.get(hiveConf, hiveHome, dbType);
+   }
+ 
+@@ -149,45 +154,14 @@ private NestedScriptParser getDbCommandParser(String dbType) {
+    * @throws MetaException
+    */
+   public void showInfo() throws HiveMetaException {
+-    Connection metastoreConn = getConnectionToMetastore(true);
+     String hiveVersion = metaStoreSchemaInfo.getHiveSchemaVersion();
+-    String dbVersion = getMetaStoreSchemaVersion(metastoreConn);
++    String dbVersion = metaStoreSchemaInfo.getMetaStoreSchemaVersion(getConnectionInfo(true));
+     System.out.println("Hive distribution version:\t " + hiveVersion);
+     System.out.println("Metastore schema version:\t " + dbVersion);
+     assertCompatibleVersion(hiveVersion, dbVersion);
+ 
+   }
+ 
+-  private String getMetaStoreSchemaVersion(Connection metastoreConn)
+-      throws HiveMetaException {
+-    return getMetaStoreSchemaVersion(metastoreConn, false);
+-  }
+-
+-  // read schema version from metastore
+-  private String getMetaStoreSchemaVersion(Connection metastoreConn,
+-      boolean checkDuplicatedVersion) throws HiveMetaException {
+-    String versionQuery;
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
+-      versionQuery = "select t.\"SCHEMA_VERSION\" from \"VERSION\" t";
+-    } else {
+-      versionQuery = "select t.SCHEMA_VERSION from VERSION t";
+-    }
+-    try {
+-      Statement stmt = metastoreConn.createStatement();
+-      ResultSet res = stmt.executeQuery(versionQuery);
+-      if (!res.next()) {
+-        throw new HiveMetaException("Could not find version info in metastore VERSION table.");
+-      }
+-      String currentSchemaVersion = res.getString(1);
+-      if (checkDuplicatedVersion && res.next()) {
+-        throw new HiveMetaException("Multiple versions were found in metastore.");
+-      }
+-      return currentSchemaVersion;
+-    } catch (SQLException e) {
+-      throw new HiveMetaException("Failed to get schema version, Cause:" + e.getMessage());
+-    }
+-  }
+-
+   boolean validateLocations(Connection conn, URI[] defaultServers) throws HiveMetaException {
+     System.out.println("Validating database/table/partition locations");
+     boolean rtn;
+@@ -209,7 +183,7 @@ private boolean checkMetaStoreDBLocation(Connection conn, URI[] defaultServers)
+     String dbLoc;
+     boolean isValid = true;
+     int numOfInvalid = 0;
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       dbLoc = "select dbt.\"DB_ID\", dbt.\"NAME\", dbt.\"DB_LOCATION_URI\" from \"DBS\" dbt";
+     } else {
+       dbLoc = "select dbt.DB_ID, dbt.NAME, dbt.DB_LOCATION_URI from DBS dbt";
+@@ -238,13 +212,13 @@ private boolean checkMetaStoreTableLocation(Connection conn, URI[] defaultServer
+     String tabLoc, tabIDRange;
+     boolean isValid = true;
+     int numOfInvalid = 0;
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       tabIDRange = "select max(\"TBL_ID\"), min(\"TBL_ID\") from \"TBLS\" ";
+     } else {
+       tabIDRange = "select max(TBL_ID), min(TBL_ID) from TBLS";
+     }
+ 
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       tabLoc = "select tbl.\"TBL_ID\", tbl.\"TBL_NAME\", sd.\"LOCATION\", dbt.\"DB_ID\", dbt.\"NAME\" from \"TBLS\" tbl inner join " +
+     "\"SDS\" sd on tbl.\"SD_ID\" = sd.\"SD_ID\" and tbl.\"TBL_TYPE\" != '" + TableType.VIRTUAL_VIEW +
+     "' and tbl.\"TBL_ID\" >= ? and tbl.\"TBL_ID\"<= ? " + "inner join \"DBS\" dbt on tbl.\"DB_ID\" = dbt.\"DB_ID\" ";
+@@ -298,13 +272,13 @@ private boolean checkMetaStorePartitionLocation(Connection conn, URI[] defaultSe
+     String partLoc, partIDRange;
+     boolean isValid = true;
+     int numOfInvalid = 0;
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       partIDRange = "select max(\"PART_ID\"), min(\"PART_ID\") from \"PARTITIONS\" ";
+     } else {
+       partIDRange = "select max(PART_ID), min(PART_ID) from PARTITIONS";
+     }
+ 
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       partLoc = "select pt.\"PART_ID\", pt.\"PART_NAME\", sd.\"LOCATION\", tbl.\"TBL_ID\", tbl.\"TBL_NAME\",dbt.\"DB_ID\", dbt.\"NAME\" from \"PARTITIONS\" pt "
+            + "inner join \"SDS\" sd on pt.\"SD_ID\" = sd.\"SD_ID\" and pt.\"PART_ID\" >= ? and pt.\"PART_ID\"<= ? "
+            + " inner join \"TBLS\" tbl on pt.\"TBL_ID\" = tbl.\"TBL_ID\" inner join "
+@@ -359,13 +333,13 @@ private boolean checkMetaStoreSkewedColumnsLocation(Connection conn, URI[] defau
+     String skewedColLoc, skewedColIDRange;
+     boolean isValid = true;
+     int numOfInvalid = 0;
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       skewedColIDRange = "select max(\"STRING_LIST_ID_KID\"), min(\"STRING_LIST_ID_KID\") from \"SKEWED_COL_VALUE_LOC_MAP\" ";
+     } else {
+       skewedColIDRange = "select max(STRING_LIST_ID_KID), min(STRING_LIST_ID_KID) from SKEWED_COL_VALUE_LOC_MAP";
+     }
+ 
+-    if (getDbCommandParser(dbType).needsQuotedIdentifier()) {
++    if (needsQuotedIdentifier) {
+       skewedColLoc = "select t.\"TBL_NAME\", t.\"TBL_ID\", sk.\"STRING_LIST_ID_KID\", sk.\"LOCATION\", db.\"NAME\", db.\"DB_ID\" from \"TBLS\" t, \"SDS\" s, \"DBS\" db, \"SKEWED_COL_VALUE_LOC_MAP\" sk "
+            + "where sk.\"SD_ID\" = s.\"SD_ID\" and s.\"SD_ID\" = t.\"SD_ID\" and t.\"DB_ID\" = db.\"DB_ID\" and sk.\"STRING_LIST_ID_KID\" >= ? and sk.\"STRING_LIST_ID_KID\" <= ? ";
+     } else {
+@@ -480,11 +454,9 @@ public void verifySchemaVersion() throws HiveMetaException {
+     if (dryRun) {
+       return;
+     }
+-    String newSchemaVersion = getMetaStoreSchemaVersion(
+-        getConnectionToMetastore(false));
++    String newSchemaVersion = metaStoreSchemaInfo.getMetaStoreSchemaVersion(getConnectionInfo(false));
+     // verify that the new version is added to schema
+     assertCompatibleVersion(metaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
+-
+   }
+ 
+   private void assertCompatibleVersion(String hiveSchemaVersion, String dbSchemaVersion)
+@@ -500,8 +472,8 @@ private void assertCompatibleVersion(String hiveSchemaVersion, String dbSchemaVe
+    * @throws MetaException
+    */
+   public void doUpgrade() throws HiveMetaException {
+-    String fromVersion = getMetaStoreSchemaVersion(
+-        getConnectionToMetastore(false));
++    String fromVersion =
++      metaStoreSchemaInfo.getMetaStoreSchemaVersion(getConnectionInfo(false));
+     if (fromVersion == null || fromVersion.isEmpty()) {
+       throw new HiveMetaException("Schema version not stored in the metastore. " +
+           "Metastore schema is too old or corrupt. Try specifying the version manually");
+@@ -509,6 +481,10 @@ public void doUpgrade() throws HiveMetaException {
+     doUpgrade(fromVersion);
+   }
+ 
++  private MetaStoreConnectionInfo getConnectionInfo(boolean printInfo) {
++    return new MetaStoreConnectionInfo(userName, passWord, printInfo, hiveConf,
++        dbType);
++  }
+   /**
+    * Perform metastore schema upgrade
+    *
+@@ -665,10 +641,10 @@ boolean validateSequences(Connection conn) throws HiveMetaException {
+       for (String seqName : seqNameToTable.keySet()) {
+         String tableName = seqNameToTable.get(seqName).getLeft();
+         String tableKey = seqNameToTable.get(seqName).getRight();
+-        String seqQuery = getDbCommandParser(dbType).needsQuotedIdentifier() ?
++        String seqQuery = needsQuotedIdentifier ?
+             ("select t.\"NEXT_VAL\" from \"SEQUENCE_TABLE\" t WHERE t.\"SEQUENCE_NAME\"='org.apache.hadoop.hive.metastore.model." + seqName + "'")
+             : ("select t.NEXT_VAL from SEQUENCE_TABLE t WHERE t.SEQUENCE_NAME='org.apache.hadoop.hive.metastore.model." + seqName + "'");
+-        String maxIdQuery = getDbCommandParser(dbType).needsQuotedIdentifier() ?
++        String maxIdQuery = needsQuotedIdentifier ?
+             ("select max(\"" + tableKey + "\") from \"" + tableName + "\"")
+             : ("select max(" + tableKey + ") from " + tableName);
+ 
+@@ -698,7 +674,7 @@ boolean validateSequences(Connection conn) throws HiveMetaException {
+   boolean validateSchemaVersions(Connection conn) throws HiveMetaException {
+     System.out.println("Validating schema version");
+     try {
+-      String newSchemaVersion = getMetaStoreSchemaVersion(conn, true);
++      String newSchemaVersion = metaStoreSchemaInfo.getMetaStoreSchemaVersion(getConnectionInfo(false));
+       assertCompatibleVersion(metaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
+     } catch (HiveMetaException hme) {
+       if (hme.getMessage().contains("Metastore schema version is not compatible")
+@@ -726,7 +702,7 @@ boolean validateSchemaTables(Connection conn) throws HiveMetaException {
+ 
+     System.out.println("Validating metastore schema tables");
+     try {
+-      version = getMetaStoreSchemaVersion(hmsConn);
++      version = metaStoreSchemaInfo.getMetaStoreSchemaVersion(getConnectionInfo(false));
+     } catch (HiveMetaException he) {
+       System.err.println("Failed to determine schema version from Hive Metastore DB. " + he.getMessage());
+       System.out.println("Failed in schema version validation.");
+@@ -766,7 +742,8 @@ boolean validateSchemaTables(Connection conn) throws HiveMetaException {
+     // parse the schema file to determine the tables that are expected to exist
+     // we are using oracle schema because it is simpler to parse, no quotes or backticks etc
+     String baseDir    = new File(metaStoreSchemaInfo.getMetaStoreScriptDir()).getParent();
+-    String schemaFile = baseDir  + "/" + dbType + "/hive-schema-" + version + "." + dbType + ".sql";
++    String schemaFile = new File(metaStoreSchemaInfo.getMetaStoreScriptDir(),
++      metaStoreSchemaInfo.generateInitFileName(version)).getPath();
+ 
+     try {
+       LOG.debug("Parsing schema script " + schemaFile);
+@@ -881,7 +858,7 @@ boolean validateColumnNullValues(Connection conn) throws HiveMetaException {
+     boolean isValid = true;
+     try {
+       Statement stmt = conn.createStatement();
+-      String tblQuery = getDbCommandParser(dbType).needsQuotedIdentifier() ?
++      String tblQuery = needsQuotedIdentifier ?
+           ("select t.* from \"TBLS\" t WHERE t.\"SD_ID\" IS NULL and (t.\"TBL_TYPE\"='" + TableType.EXTERNAL_TABLE + "' or t.\"TBL_TYPE\"='" + TableType.MANAGED_TABLE + "')")
+           : ("select t.* from TBLS t WHERE t.SD_ID IS NULL and (t.TBL_TYPE='" + TableType.EXTERNAL_TABLE + "' or t.TBL_TYPE='" + TableType.MANAGED_TABLE + "')");
+ 
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java b/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java
+index 8d386da..cfe393c 100644
+--- a/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java
++++ b/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java
+@@ -1,6 +1,7 @@
+ package org.apache.hive.beeline;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper;
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
+index 1bec42d..f87fe27 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
+@@ -36,11 +36,11 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.HiveMetaException;
+ import org.apache.hadoop.hive.metastore.IMetaStoreSchemaInfo;
+-import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfo;
+ import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfoFactory;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper.NestedScriptParser;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper.PostgresCommandParser;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+-import org.apache.hive.beeline.HiveSchemaHelper.NestedScriptParser;
+-import org.apache.hive.beeline.HiveSchemaHelper.PostgresCommandParser;
+ 
+ public class TestSchemaTool extends TestCase {
+   private HiveSchemaTool schemaTool;
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java b/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java
+index d662743..e8e1148 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java
+@@ -18,7 +18,9 @@
+ package org.apache.hadoop.hive.metastore;
+ 
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
++
+ import java.util.List;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper;
+ 
+ /**
+  * Defines the method which must be implemented to be used using schema tool to support metastore
+@@ -78,6 +80,18 @@
+   String getHiveSchemaVersion();
+ 
+   /**
++   * Get the schema version from the backend database. This version is used by SchemaTool to to
++   * compare the version returned by getHiveSchemaVersion and determine the upgrade order and
++   * scripts needed to upgrade the metastore schema
++   *
++   * @param metastoreDbConnectionInfo Connection information needed to connect to the backend
++   *          database
++   * @return
++   * @throws HiveMetaException when unable to fetch the schema version
++   */
++  String getMetaStoreSchemaVersion(
++      HiveSchemaHelper.MetaStoreConnectionInfo metastoreDbConnectionInfo) throws HiveMetaException;
++  /**
+    * A dbVersion is compatible with hive version if it is greater or equal to the hive version. This
+    * is result of the db schema upgrade design principles followed in hive project. The state where
+    * db schema version is ahead of hive software version is often seen when a 'rolling upgrade' or
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
+index e5e706d..3135160 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
+@@ -22,11 +22,16 @@
+ import java.io.FileNotFoundException;
+ import java.io.FileReader;
+ import java.io.IOException;
++import java.sql.Connection;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ 
+-import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper;
++import org.apache.hadoop.hive.metastore.tools.HiveSchemaHelper.MetaStoreConnectionInfo;
+ import org.apache.hive.common.util.HiveVersionInfo;
+ 
+ import com.google.common.collect.ImmutableMap;
+@@ -195,4 +200,31 @@ public boolean isVersionCompatible(String hiveVersion, String dbVersion) {
+     return true;
+   }
+ 
++  @Override
++  public String getMetaStoreSchemaVersion(MetaStoreConnectionInfo connectionInfo)
++      throws HiveMetaException {
++    String versionQuery;
++    boolean needsQuotedIdentifier =
++        HiveSchemaHelper.getDbCommandParser(connectionInfo.getDbType()).needsQuotedIdentifier();
++    if (needsQuotedIdentifier) {
++      versionQuery = "select t.\"SCHEMA_VERSION\" from \"VERSION\" t";
++    } else {
++      versionQuery = "select t.SCHEMA_VERSION from VERSION t";
++    }
++    try (Connection metastoreDbConnection =
++        HiveSchemaHelper.getConnectionToMetastore(connectionInfo)) {
++      Statement stmt = metastoreDbConnection.createStatement();
++      ResultSet res = stmt.executeQuery(versionQuery);
++      if (!res.next()) {
++        throw new HiveMetaException("Could not find version info in metastore VERSION table.");
++      }
++      String currentSchemaVersion = res.getString(1);
++      if (res.next()) {
++        throw new HiveMetaException("Multiple versions were found in metastore.");
++      }
++      return currentSchemaVersion;
++    } catch (SQLException e) {
++      throw new HiveMetaException("Failed to get schema version, Cause:" + e.getMessage());
++    }
++  }
+ }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/tools/HiveSchemaHelper.java b/metastore/src/java/org/apache/hadoop/hive/metastore/tools/HiveSchemaHelper.java
+new file mode 100644
+index 0000000..52349b5
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/tools/HiveSchemaHelper.java
+@@ -0,0 +1,545 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.metastore.tools;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.Lists;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.HiveMetaException;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileReader;
++import java.io.IOException;
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.SQLException;
++import java.util.IllegalFormatException;
++import java.util.List;
++
++public class HiveSchemaHelper {
++  public static final String DB_DERBY = "derby";
++  public static final String DB_MSSQL = "mssql";
++  public static final String DB_MYSQL = "mysql";
++  public static final String DB_POSTGRACE = "postgres";
++  public static final String DB_ORACLE = "oracle";
++
++  /***
++   * Get JDBC connection to metastore db
++   *
++   * @param userName metastore connection username
++   * @param password metastore connection password
++   * @param printInfo print connection parameters
++   * @param hiveConf hive config object
++   * @return metastore connection object
++   * @throws org.apache.hadoop.hive.metastore.api.MetaException
++   */
++  public static Connection getConnectionToMetastore(String userName,
++      String password, boolean printInfo, HiveConf hiveConf)
++      throws HiveMetaException {
++    try {
++      String connectionURL = getValidConfVar(
++          HiveConf.ConfVars.METASTORECONNECTURLKEY, hiveConf);
++      String driver = getValidConfVar(
++          HiveConf.ConfVars.METASTORE_CONNECTION_DRIVER, hiveConf);
++      if (printInfo) {
++        System.out.println("Metastore connection URL:\t " + connectionURL);
++        System.out.println("Metastore Connection Driver :\t " + driver);
++        System.out.println("Metastore connection User:\t " + userName);
++      }
++      if ((userName == null) || userName.isEmpty()) {
++        throw new HiveMetaException("UserName empty ");
++      }
++
++      // load required JDBC driver
++      Class.forName(driver);
++
++      // Connect using the JDBC URL and user/pass from conf
++      return DriverManager.getConnection(connectionURL, userName, password);
++    } catch (IOException e) {
++      throw new HiveMetaException("Failed to get schema version.", e);
++    } catch (SQLException e) {
++      throw new HiveMetaException("Failed to get schema version.", e);
++    } catch (ClassNotFoundException e) {
++      throw new HiveMetaException("Failed to load driver", e);
++    }
++  }
++
++  public static Connection getConnectionToMetastore(MetaStoreConnectionInfo info)
++    throws HiveMetaException {
++    return getConnectionToMetastore(info.getUsername(), info.getPassword(), info.getPrintInfo(),
++      info.getHiveConf());
++  }
++
++  public static String getValidConfVar(HiveConf.ConfVars confVar, HiveConf hiveConf)
++      throws IOException {
++    String confVarStr = hiveConf.get(confVar.varname);
++    if (confVarStr == null || confVarStr.isEmpty()) {
++      throw new IOException("Empty " + confVar.varname);
++    }
++    return confVarStr;
++  }
++
++  public interface NestedScriptParser {
++
++    public enum CommandType {
++      PARTIAL_STATEMENT,
++      TERMINATED_STATEMENT,
++      COMMENT
++    }
++
++    static final String DEFAUTL_DELIMITER = ";";
++
++    /**
++     * Find the type of given command
++     *
++     * @param dbCommand
++     * @return
++     */
++    public boolean isPartialCommand(String dbCommand) throws IllegalArgumentException;
++
++    /**
++     * Parse the DB specific nesting format and extract the inner script name if any
++     *
++     * @param dbCommand command from parent script
++     * @return
++     * @throws IllegalFormatException
++     */
++    public String getScriptName(String dbCommand) throws IllegalArgumentException;
++
++    /**
++     * Find if the given command is a nested script execution
++     *
++     * @param dbCommand
++     * @return
++     */
++    public boolean isNestedScript(String dbCommand);
++
++    /**
++     * Find if the given command should not be passed to DB
++     *
++     * @param dbCommand
++     * @return
++     */
++    public boolean isNonExecCommand(String dbCommand);
++
++    /**
++     * Get the SQL statement delimiter
++     *
++     * @return
++     */
++    public String getDelimiter();
++
++    /**
++     * Clear any client specific tags
++     *
++     * @return
++     */
++    public String cleanseCommand(String dbCommand);
++
++    /**
++     * Does the DB required table/column names quoted
++     *
++     * @return
++     */
++    public boolean needsQuotedIdentifier();
++
++    /**
++     * Flatten the nested upgrade script into a buffer
++     *
++     * @param scriptDir  upgrade script directory
++     * @param scriptFile upgrade script file
++     * @return string of sql commands
++     */
++    public String buildCommand(String scriptDir, String scriptFile)
++        throws IllegalFormatException, IOException;
++  }
++
++  /***
++   * Base implemenation of NestedScriptParser
++   * abstractCommandParser.
++   *
++   */
++  private static abstract class AbstractCommandParser implements NestedScriptParser {
++    private List<String> dbOpts;
++    private String msUsername;
++    private String msPassword;
++    private HiveConf hiveConf;
++
++    public AbstractCommandParser(String dbOpts, String msUsername, String msPassword,
++        HiveConf hiveConf) {
++      setDbOpts(dbOpts);
++      this.msUsername = msUsername;
++      this.msPassword = msPassword;
++      this.hiveConf = hiveConf;
++    }
++
++    @Override
++    public boolean isPartialCommand(String dbCommand) throws IllegalArgumentException{
++      if (dbCommand == null || dbCommand.isEmpty()) {
++        throw new IllegalArgumentException("invalid command line " + dbCommand);
++      }
++      dbCommand = dbCommand.trim();
++      if (dbCommand.endsWith(getDelimiter()) || isNonExecCommand(dbCommand)) {
++        return false;
++      } else {
++        return true;
++      }
++    }
++
++    @Override
++    public boolean isNonExecCommand(String dbCommand) {
++      return (dbCommand.startsWith("--") || dbCommand.startsWith("#"));
++    }
++
++    @Override
++    public String getDelimiter() {
++      return DEFAUTL_DELIMITER;
++    }
++
++    @Override
++    public String cleanseCommand(String dbCommand) {
++      // strip off the delimiter
++      if (dbCommand.endsWith(getDelimiter())) {
++        dbCommand = dbCommand.substring(0,
++            dbCommand.length() - getDelimiter().length());
++      }
++      return dbCommand;
++    }
++
++    @Override
++    public boolean needsQuotedIdentifier() {
++      return false;
++    }
++
++    @Override
++    public String buildCommand(
++      String scriptDir, String scriptFile) throws IllegalFormatException, IOException {
++      BufferedReader bfReader =
++          new BufferedReader(new FileReader(scriptDir + File.separatorChar + scriptFile));
++      String currLine;
++      StringBuilder sb = new StringBuilder();
++      String currentCommand = null;
++      while ((currLine = bfReader.readLine()) != null) {
++        currLine = currLine.trim();
++        if (currLine.isEmpty()) {
++          continue; // skip empty lines
++        }
++
++        if (currentCommand == null) {
++          currentCommand = currLine;
++        } else {
++          currentCommand = currentCommand + " " + currLine;
++        }
++        if (isPartialCommand(currLine)) {
++          // if its a partial line, continue collecting the pieces
++          continue;
++        }
++
++        // if this is a valid executable command then add it to the buffer
++        if (!isNonExecCommand(currentCommand)) {
++          currentCommand = cleanseCommand(currentCommand);
++          if (isNestedScript(currentCommand)) {
++            // if this is a nested sql script then flatten it
++            String currScript = getScriptName(currentCommand);
++            sb.append(buildCommand(scriptDir, currScript));
++          } else {
++            // Now we have a complete statement, process it
++            // write the line to buffer
++            sb.append(currentCommand);
++            sb.append(System.getProperty("line.separator"));
++          }
++        }
++        currentCommand = null;
++      }
++      bfReader.close();
++      return sb.toString();
++    }
++
++    private void setDbOpts(String dbOpts) {
++      if (dbOpts != null) {
++        this.dbOpts = Lists.newArrayList(dbOpts.split(","));
++      } else {
++        this.dbOpts = Lists.newArrayList();
++      }
++    }
++
++    protected List<String> getDbOpts() {
++      return dbOpts;
++    }
++
++    protected String getMsUsername() {
++      return msUsername;
++    }
++
++    protected String getMsPassword() {
++      return msPassword;
++    }
++
++    protected HiveConf getHiveConf() {
++      return hiveConf;
++    }
++  }
++
++  // Derby commandline parser
++  public static class DerbyCommandParser extends AbstractCommandParser {
++    private static String DERBY_NESTING_TOKEN = "RUN";
++
++    public DerbyCommandParser(String dbOpts, String msUsername, String msPassword,
++        HiveConf hiveConf) {
++      super(dbOpts, msUsername, msPassword, hiveConf);
++    }
++
++    @Override
++    public String getScriptName(String dbCommand) throws IllegalArgumentException {
++
++      if (!isNestedScript(dbCommand)) {
++        throw new IllegalArgumentException("Not a script format " + dbCommand);
++      }
++      String[] tokens = dbCommand.split(" ");
++      if (tokens.length != 2) {
++        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
++      }
++      return tokens[1].replace(";", "").replaceAll("'", "");
++    }
++
++    @Override
++    public boolean isNestedScript(String dbCommand) {
++      // Derby script format is RUN '<file>'
++     return dbCommand.startsWith(DERBY_NESTING_TOKEN);
++    }
++  }
++
++  // MySQL parser
++  public static class MySqlCommandParser extends AbstractCommandParser {
++    private static final String MYSQL_NESTING_TOKEN = "SOURCE";
++    private static final String DELIMITER_TOKEN = "DELIMITER";
++    private String delimiter = DEFAUTL_DELIMITER;
++
++    public MySqlCommandParser(String dbOpts, String msUsername, String msPassword,
++        HiveConf hiveConf) {
++      super(dbOpts, msUsername, msPassword, hiveConf);
++    }
++
++    @Override
++    public boolean isPartialCommand(String dbCommand) throws IllegalArgumentException{
++      boolean isPartial = super.isPartialCommand(dbCommand);
++      // if this is a delimiter directive, reset our delimiter
++      if (dbCommand.startsWith(DELIMITER_TOKEN)) {
++        String[] tokens = dbCommand.split(" ");
++        if (tokens.length != 2) {
++          throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
++        }
++        delimiter = tokens[1];
++      }
++      return isPartial;
++    }
++
++    @Override
++    public String getScriptName(String dbCommand) throws IllegalArgumentException {
++      String[] tokens = dbCommand.split(" ");
++      if (tokens.length != 2) {
++        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
++      }
++      // remove ending ';'
++      return tokens[1].replace(";", "");
++    }
++
++    @Override
++    public boolean isNestedScript(String dbCommand) {
++      return dbCommand.startsWith(MYSQL_NESTING_TOKEN);
++    }
++
++    @Override
++    public String getDelimiter() {
++      return delimiter;
++    }
++
++    @Override
++    public boolean isNonExecCommand(String dbCommand) {
++      return super.isNonExecCommand(dbCommand) ||
++          (dbCommand.startsWith("/*") && dbCommand.endsWith("*/")) ||
++          dbCommand.startsWith(DELIMITER_TOKEN);
++    }
++
++    @Override
++    public String cleanseCommand(String dbCommand) {
++      return super.cleanseCommand(dbCommand).replaceAll("/\\*.*?\\*/[^;]", "");
++    }
++
++  }
++
++  // Postgres specific parser
++  public static class PostgresCommandParser extends AbstractCommandParser {
++    private static String POSTGRES_NESTING_TOKEN = "\\i";
++    @VisibleForTesting
++    public static String POSTGRES_STANDARD_STRINGS_OPT = "SET standard_conforming_strings";
++    @VisibleForTesting
++    public static String POSTGRES_SKIP_STANDARD_STRINGS_DBOPT = "postgres.filter.81";
++
++    public PostgresCommandParser(String dbOpts, String msUsername, String msPassword,
++        HiveConf hiveConf) {
++      super(dbOpts, msUsername, msPassword, hiveConf);
++    }
++
++    @Override
++    public String getScriptName(String dbCommand) throws IllegalArgumentException {
++      String[] tokens = dbCommand.split(" ");
++      if (tokens.length != 2) {
++        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
++      }
++      // remove ending ';'
++      return tokens[1].replace(";", "");
++    }
++
++    @Override
++    public boolean isNestedScript(String dbCommand) {
++      return dbCommand.startsWith(POSTGRES_NESTING_TOKEN);
++    }
++
++    @Override
++    public boolean needsQuotedIdentifier() {
++      return true;
++    }
++
++    @Override
++    public boolean isNonExecCommand(String dbCommand) {
++      // Skip "standard_conforming_strings" command which is read-only in older
++      // Postgres versions like 8.1
++      // See: http://www.postgresql.org/docs/8.2/static/release-8-1.html
++      if (getDbOpts().contains(POSTGRES_SKIP_STANDARD_STRINGS_DBOPT)) {
++        if (dbCommand.startsWith(POSTGRES_STANDARD_STRINGS_OPT)) {
++          return true;
++        }
++      }
++      return super.isNonExecCommand(dbCommand);
++    }
++  }
++
++  //Oracle specific parser
++  public static class OracleCommandParser extends AbstractCommandParser {
++    private static String ORACLE_NESTING_TOKEN = "@";
++
++    public OracleCommandParser(String dbOpts, String msUsername, String msPassword,
++        HiveConf hiveConf) {
++      super(dbOpts, msUsername, msPassword, hiveConf);
++    }
++
++    @Override
++    public String getScriptName(String dbCommand) throws IllegalArgumentException {
++      if (!isNestedScript(dbCommand)) {
++        throw new IllegalArgumentException("Not a nested script format " + dbCommand);
++      }
++      // remove ending ';' and starting '@'
++      return dbCommand.replace(";", "").replace(ORACLE_NESTING_TOKEN, "");
++    }
++
++    @Override
++    public boolean isNestedScript(String dbCommand) {
++      return dbCommand.startsWith(ORACLE_NESTING_TOKEN);
++    }
++  }
++
++  //MSSQL specific parser
++  public static class MSSQLCommandParser extends AbstractCommandParser {
++    private static String MSSQL_NESTING_TOKEN = ":r";
++
++    public MSSQLCommandParser(String dbOpts, String msUsername, String msPassword,
++        HiveConf hiveConf) {
++      super(dbOpts, msUsername, msPassword, hiveConf);
++    }
++
++    @Override
++    public String getScriptName(String dbCommand) throws IllegalArgumentException {
++      String[] tokens = dbCommand.split(" ");
++      if (tokens.length != 2) {
++        throw new IllegalArgumentException("Couldn't parse line " + dbCommand);
++      }
++      return tokens[1];
++    }
++
++    @Override
++    public boolean isNestedScript(String dbCommand) {
++      return dbCommand.startsWith(MSSQL_NESTING_TOKEN);
++    }
++  }
++
++  public static NestedScriptParser getDbCommandParser(String dbName) {
++    return getDbCommandParser(dbName, null, null, null, null);
++  }
++
++  public static NestedScriptParser getDbCommandParser(String dbName,
++      String dbOpts, String msUsername, String msPassword,
++      HiveConf hiveConf) {
++    if (dbName.equalsIgnoreCase(DB_DERBY)) {
++      return new DerbyCommandParser(dbOpts, msUsername, msPassword, hiveConf);
++    } else if (dbName.equalsIgnoreCase(DB_MSSQL)) {
++      return new MSSQLCommandParser(dbOpts, msUsername, msPassword, hiveConf);
++    } else if (dbName.equalsIgnoreCase(DB_MYSQL)) {
++      return new MySqlCommandParser(dbOpts, msUsername, msPassword, hiveConf);
++    } else if (dbName.equalsIgnoreCase(DB_POSTGRACE)) {
++      return new PostgresCommandParser(dbOpts, msUsername, msPassword, hiveConf);
++    } else if (dbName.equalsIgnoreCase(DB_ORACLE)) {
++      return new OracleCommandParser(dbOpts, msUsername, msPassword, hiveConf);
++    } else {
++      throw new IllegalArgumentException("Unknown dbType " + dbName);
++    }
++  }
++
++  public static class MetaStoreConnectionInfo {
++    private final String userName;
++    private final String password;
++    private final boolean printInfo;
++    private final HiveConf hiveConf;
++    private final String dbType;
++
++    public MetaStoreConnectionInfo(String userName, String password, boolean printInfo,
++      HiveConf hiveConf, String dbType) {
++      super();
++      this.userName = userName;
++      this.password = password;
++      this.printInfo = printInfo;
++      this.hiveConf = hiveConf;
++      this.dbType = dbType;
++    }
++
++    public String getPassword() {
++      return password;
++    }
++
++    public boolean isPrintInfo() {
++      return printInfo;
++    }
++
++    public HiveConf getHiveConf() {
++      return hiveConf;
++    }
++
++    public String getUsername() {
++      return userName;
++    }
++
++    public boolean getPrintInfo() {
++      return printInfo;
++    }
++
++    public String getDbType() {
++      return dbType;
++    }
++  }
++}
+\ No newline at end of file
+-- 
+1.7.9.5
+

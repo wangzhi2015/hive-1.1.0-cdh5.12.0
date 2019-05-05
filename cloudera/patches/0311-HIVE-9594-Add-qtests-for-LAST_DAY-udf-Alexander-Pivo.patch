@@ -1,0 +1,335 @@
+From a0045229cfdd822f90334e4d8ef9e994b2856aed Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Wed, 11 Feb 2015 10:22:41 +0000
+Subject: [PATCH 0311/1164] HIVE-9594: Add qtests for LAST_DAY udf (Alexander
+ Pivovarov via Jason Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1658914 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hive/ql/udf/generic/GenericUDFLastDay.java     |   13 +-
+ .../hive/ql/udf/generic/TestGenericUDFLastDay.java |    6 +-
+ .../queries/clientnegative/udf_last_day_error_1.q  |    1 +
+ .../queries/clientnegative/udf_last_day_error_2.q  |    1 +
+ ql/src/test/queries/clientpositive/udf_last_day.q  |   50 +++++++
+ .../clientnegative/udf_last_day_error_1.q.out      |    1 +
+ .../clientnegative/udf_last_day_error_2.q.out      |    1 +
+ .../test/results/clientpositive/udf_last_day.q.out |  138 ++++++++++++++++++++
+ 8 files changed, 201 insertions(+), 10 deletions(-)
+ create mode 100644 ql/src/test/queries/clientnegative/udf_last_day_error_1.q
+ create mode 100644 ql/src/test/queries/clientnegative/udf_last_day_error_2.q
+ create mode 100644 ql/src/test/results/clientnegative/udf_last_day_error_1.q.out
+ create mode 100644 ql/src/test/results/clientnegative/udf_last_day_error_2.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java
+index 911ee46..c5669a1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java
+@@ -68,7 +68,7 @@ public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumen
+     }
+     if (arguments[0].getCategory() != ObjectInspector.Category.PRIMITIVE) {
+       throw new UDFArgumentTypeException(0, "Only primitive type arguments are accepted but "
+-          + arguments[0].getTypeName() + " is passed. as first arguments");
++          + arguments[0].getTypeName() + " is passed");
+     }
+     inputType1 = ((PrimitiveObjectInspector) arguments[0]).getPrimitiveCategory();
+     ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+@@ -91,9 +91,8 @@ public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumen
+           PrimitiveObjectInspectorFactory.writableDateObjectInspector);
+       break;
+     default:
+-      throw new UDFArgumentException(
+-          " LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got "
+-              + inputType1);
++      throw new UDFArgumentTypeException(0,
++          "LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
+     }
+     return outputOI;
+   }
+@@ -112,23 +111,21 @@ public Object evaluate(DeferredObject[] arguments) throws HiveException {
+       } catch (ParseException e) {
+         return null;
+       }
+-      lastDay(date);
+       break;
+     case TIMESTAMP:
+       Timestamp ts = ((TimestampWritable) timestampConverter.convert(arguments[0].get()))
+           .getTimestamp();
+       date = ts;
+-      lastDay(date);
+       break;
+     case DATE:
+       DateWritable dw = (DateWritable) dateWritableConverter.convert(arguments[0].get());
+       date = dw.get();
+-      lastDay(date);
+       break;
+     default:
+-      throw new UDFArgumentException(
++      throw new UDFArgumentTypeException(0,
+           "LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
+     }
++    lastDay(date);
+     Date newDate = calendar.getTime();
+     output.set(formatter.format(newDate));
+     return output;
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java
+index f31e9b8..4b233a6 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java
+@@ -43,6 +43,8 @@ public void testLastDay() throws HiveException {
+     runAndVerify("2016-02-03", "2016-02-29", udf);
+     runAndVerify("2016-02-28", "2016-02-29", udf);
+     runAndVerify("2016-02-29", "2016-02-29", udf);
++    runAndVerify("01/14/2014", null, udf);
++    runAndVerify(null, null, udf);
+ 
+     runAndVerify("2014-01-01 10:30:45", "2014-01-31", udf);
+     runAndVerify("2014-01-14 10:30:45", "2014-01-31", udf);
+@@ -56,9 +58,9 @@ public void testLastDay() throws HiveException {
+ 
+   private void runAndVerify(String str, String expResult, GenericUDF udf)
+       throws HiveException {
+-    DeferredObject valueObj0 = new DeferredJavaObject(new Text(str));
++    DeferredObject valueObj0 = new DeferredJavaObject(str != null ? new Text(str) : null);
+     DeferredObject[] args = { valueObj0 };
+     Text output = (Text) udf.evaluate(args);
+-    assertEquals("last_day() test ", expResult, output.toString());
++    assertEquals("last_day() test ", expResult, output != null ? output.toString() : null);
+   }
+ }
+diff --git a/ql/src/test/queries/clientnegative/udf_last_day_error_1.q b/ql/src/test/queries/clientnegative/udf_last_day_error_1.q
+new file mode 100644
+index 0000000..83e815a
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/udf_last_day_error_1.q
+@@ -0,0 +1 @@
++select last_day(1423199465);
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientnegative/udf_last_day_error_2.q b/ql/src/test/queries/clientnegative/udf_last_day_error_2.q
+new file mode 100644
+index 0000000..4d1e6b7
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/udf_last_day_error_2.q
+@@ -0,0 +1 @@
++select last_day(map('2014-01-14','test'));
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/udf_last_day.q b/ql/src/test/queries/clientpositive/udf_last_day.q
+index 1dc9b43..f8b2748 100644
+--- a/ql/src/test/queries/clientpositive/udf_last_day.q
++++ b/ql/src/test/queries/clientpositive/udf_last_day.q
+@@ -1,2 +1,52 @@
+ DESCRIBE FUNCTION last_day;
+ DESCRIBE FUNCTION EXTENDED last_day;
++
++explain select last_day('2015-02-05');
++
++select
++last_day('2014-01-01'),
++last_day('2014-01-14'),
++last_day('2014-01-31'),
++last_day('2014-02-02'),
++last_day('2014-02-28'),
++last_day('2016-02-03'),
++last_day('2016-02-28'),
++last_day('2016-02-29'),
++last_day('2014-01-34'),
++last_day(cast(null as string)),
++last_day('01/29/2014');
++
++select
++last_day('2014-01-01 10:30:45'),
++last_day('2014-01-14 10:30:45'),
++last_day('2014-01-31 10:30:45'),
++last_day('2014-02-02 10:30:45'),
++last_day('2014-02-28 10:30:45'),
++last_day('2016-02-03 10:30:45'),
++last_day('2016-02-28 10:30:45'),
++last_day('2016-02-29 10:30:45'),
++last_day('2014-01-34 10:30:45'),
++last_day(cast(null as string)),
++last_day('01/29/2014 10:30:45');
++
++select
++last_day(cast('2014-01-01' as date)),
++last_day(cast('2014-01-14' as date)),
++last_day(cast('2014-01-31' as date)),
++last_day(cast('2014-02-02' as date)),
++last_day(cast('2014-02-28' as date)),
++last_day(cast('2016-02-03' as date)),
++last_day(cast('2016-02-28' as date)),
++last_day(cast('2016-02-29' as date)),
++last_day(cast(null as date));
++
++select
++last_day(cast('2014-01-01 10:30:45' as timestamp)),
++last_day(cast('2014-01-14 10:30:45' as timestamp)),
++last_day(cast('2014-01-31 10:30:45' as timestamp)),
++last_day(cast('2014-02-02 10:30:45' as timestamp)),
++last_day(cast('2014-02-28 10:30:45' as timestamp)),
++last_day(cast('2016-02-03 10:30:45' as timestamp)),
++last_day(cast('2016-02-28 10:30:45' as timestamp)),
++last_day(cast('2016-02-29 10:30:45' as timestamp)),
++last_day(cast(null as timestamp));
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out b/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out
+new file mode 100644
+index 0000000..6e718a0
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out
+@@ -0,0 +1 @@
++FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch '1423199465': LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types, got INT
+diff --git a/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out b/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out
+new file mode 100644
+index 0000000..dc8e3d1
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out
+@@ -0,0 +1 @@
++FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch ''test'': Only primitive type arguments are accepted but map<string,string> is passed
+diff --git a/ql/src/test/results/clientpositive/udf_last_day.q.out b/ql/src/test/results/clientpositive/udf_last_day.q.out
+index a39a10a..2d39e38 100644
+--- a/ql/src/test/results/clientpositive/udf_last_day.q.out
++++ b/ql/src/test/results/clientpositive/udf_last_day.q.out
+@@ -12,3 +12,141 @@ date is a string in the format 'yyyy-MM-dd HH:mm:ss' or 'yyyy-MM-dd'. The time p
+ Example:
+   > SELECT last_day('2009-01-12') FROM src LIMIT 1;
+  '2009-01-31'
++PREHOOK: query: explain select last_day('2015-02-05')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select last_day('2015-02-05')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2015-02-28' (type: string)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++last_day('2014-01-01'),
++last_day('2014-01-14'),
++last_day('2014-01-31'),
++last_day('2014-02-02'),
++last_day('2014-02-28'),
++last_day('2016-02-03'),
++last_day('2016-02-28'),
++last_day('2016-02-29'),
++last_day('2014-01-34'),
++last_day(cast(null as string)),
++last_day('01/29/2014')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++last_day('2014-01-01'),
++last_day('2014-01-14'),
++last_day('2014-01-31'),
++last_day('2014-02-02'),
++last_day('2014-02-28'),
++last_day('2016-02-03'),
++last_day('2016-02-28'),
++last_day('2016-02-29'),
++last_day('2014-01-34'),
++last_day(cast(null as string)),
++last_day('01/29/2014')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-31	2014-01-31	2014-01-31	2014-02-28	2014-02-28	2016-02-29	2016-02-29	2016-02-29	2014-02-28	NULL	NULL
++PREHOOK: query: select
++last_day('2014-01-01 10:30:45'),
++last_day('2014-01-14 10:30:45'),
++last_day('2014-01-31 10:30:45'),
++last_day('2014-02-02 10:30:45'),
++last_day('2014-02-28 10:30:45'),
++last_day('2016-02-03 10:30:45'),
++last_day('2016-02-28 10:30:45'),
++last_day('2016-02-29 10:30:45'),
++last_day('2014-01-34 10:30:45'),
++last_day(cast(null as string)),
++last_day('01/29/2014 10:30:45')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++last_day('2014-01-01 10:30:45'),
++last_day('2014-01-14 10:30:45'),
++last_day('2014-01-31 10:30:45'),
++last_day('2014-02-02 10:30:45'),
++last_day('2014-02-28 10:30:45'),
++last_day('2016-02-03 10:30:45'),
++last_day('2016-02-28 10:30:45'),
++last_day('2016-02-29 10:30:45'),
++last_day('2014-01-34 10:30:45'),
++last_day(cast(null as string)),
++last_day('01/29/2014 10:30:45')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-31	2014-01-31	2014-01-31	2014-02-28	2014-02-28	2016-02-29	2016-02-29	2016-02-29	2014-02-28	NULL	NULL
++PREHOOK: query: select
++last_day(cast('2014-01-01' as date)),
++last_day(cast('2014-01-14' as date)),
++last_day(cast('2014-01-31' as date)),
++last_day(cast('2014-02-02' as date)),
++last_day(cast('2014-02-28' as date)),
++last_day(cast('2016-02-03' as date)),
++last_day(cast('2016-02-28' as date)),
++last_day(cast('2016-02-29' as date)),
++last_day(cast(null as date))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++last_day(cast('2014-01-01' as date)),
++last_day(cast('2014-01-14' as date)),
++last_day(cast('2014-01-31' as date)),
++last_day(cast('2014-02-02' as date)),
++last_day(cast('2014-02-28' as date)),
++last_day(cast('2016-02-03' as date)),
++last_day(cast('2016-02-28' as date)),
++last_day(cast('2016-02-29' as date)),
++last_day(cast(null as date))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-31	2014-01-31	2014-01-31	2014-02-28	2014-02-28	2016-02-29	2016-02-29	2016-02-29	NULL
++PREHOOK: query: select
++last_day(cast('2014-01-01 10:30:45' as timestamp)),
++last_day(cast('2014-01-14 10:30:45' as timestamp)),
++last_day(cast('2014-01-31 10:30:45' as timestamp)),
++last_day(cast('2014-02-02 10:30:45' as timestamp)),
++last_day(cast('2014-02-28 10:30:45' as timestamp)),
++last_day(cast('2016-02-03 10:30:45' as timestamp)),
++last_day(cast('2016-02-28 10:30:45' as timestamp)),
++last_day(cast('2016-02-29 10:30:45' as timestamp)),
++last_day(cast(null as timestamp))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++last_day(cast('2014-01-01 10:30:45' as timestamp)),
++last_day(cast('2014-01-14 10:30:45' as timestamp)),
++last_day(cast('2014-01-31 10:30:45' as timestamp)),
++last_day(cast('2014-02-02 10:30:45' as timestamp)),
++last_day(cast('2014-02-28 10:30:45' as timestamp)),
++last_day(cast('2016-02-03 10:30:45' as timestamp)),
++last_day(cast('2016-02-28 10:30:45' as timestamp)),
++last_day(cast('2016-02-29 10:30:45' as timestamp)),
++last_day(cast(null as timestamp))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-31	2014-01-31	2014-01-31	2014-02-28	2014-02-28	2016-02-29	2016-02-29	2016-02-29	NULL
+-- 
+1.7.9.5
+

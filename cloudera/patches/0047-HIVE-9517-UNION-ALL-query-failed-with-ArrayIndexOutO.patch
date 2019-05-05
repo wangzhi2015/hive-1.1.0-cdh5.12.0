@@ -1,0 +1,56 @@
+From 759af07ac9bfc6a9e1c9d97dc3b7e4e4fdef51c1 Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xuefu@apache.org>
+Date: Sat, 7 Feb 2015 19:51:00 +0000
+Subject: [PATCH 0047/1164] HIVE-9517: UNION ALL query failed with
+ ArrayIndexOutOfBoundsException [Spark Branch]
+ (Chao via Xuefu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/branches/spark@1658102 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../test/resources/testconfiguration.properties    |    1 +
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   14 ++++++++++++--
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index 239629c..e0b2d0a 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -570,6 +570,7 @@ spark.query.files=add_part_multiple.q, \
+   bucketsortoptimize_insert_6.q, \
+   bucketsortoptimize_insert_7.q, \
+   bucketsortoptimize_insert_8.q, \
++  cbo_gby_empty.q, \
+   column_access_stats.q, \
+   count.q, \
+   create_merge_compressed.q, \
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 720a5a9..9423b5c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -9138,11 +9138,21 @@ private Operator genUnionPlan(String unionalias, String leftalias,
+       unionoutRR.put(unionalias, field, unionColInfo);
+     }
+ 
+-    if (!(leftOp instanceof UnionOperator)) {
++    // For Spark, we rely on the generated SelectOperator to do the type casting.
++    // Consider:
++    //    SEL_1 (int)   SEL_2 (int)    SEL_3 (double)
++    // If we first merge SEL_1 and SEL_2 into a UNION_1, and then merge UNION_1
++    // with SEL_3 to get UNION_2, then no SelectOperator will be inserted. Hence error
++    // will happen afterwards. The solution here is to insert one after UNION_1, which
++    // cast int to double.
++    boolean isSpark = HiveConf.getVar(conf,
++        HiveConf.ConfVars.HIVE_EXECUTION_ENGINE).equals("spark");
++
++    if (isSpark || !(leftOp instanceof UnionOperator)) {
+       leftOp = genInputSelectForUnion(leftOp, leftmap, leftalias, unionoutRR, unionalias);
+     }
+ 
+-    if (!(rightOp instanceof UnionOperator)) {
++    if (isSpark || !(rightOp instanceof UnionOperator)) {
+       rightOp = genInputSelectForUnion(rightOp, rightmap, rightalias, unionoutRR, unionalias);
+     }
+ 
+-- 
+1.7.9.5
+

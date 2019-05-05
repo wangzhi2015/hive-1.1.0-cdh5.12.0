@@ -1,0 +1,296 @@
+From 77a0b70025c87962b921416a9b2c6075402ba078 Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Mon, 30 Jan 2017 15:37:39 +0100
+Subject: [PATCH 0960/1164] CDH-48190: HIVE-14854. Add a core cluster type to
+ QTestUtil. (Siddharth Seth, reviewed by Prasanth
+ Jayachandran)
+
+(cherry picked from commit 474425aa62e3f25b119419439373aa684c6c2121)
+
+Change-Id: I1940c8b978754f3aa79fadd6e19afe5d34273708
+---
+ itests/util/pom.xml                                |   60 ++++++++++++++++++
+ .../hadoop/hive/cli/control/AbstractCliConfig.java |   13 +++-
+ .../hadoop/hive/cli/control/CoreCliDriver.java     |    3 +-
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |   66 +++++++++++---------
+ 4 files changed, 109 insertions(+), 33 deletions(-)
+
+diff --git a/itests/util/pom.xml b/itests/util/pom.xml
+index c45c28c..a4d7a7b 100644
+--- a/itests/util/pom.xml
++++ b/itests/util/pom.xml
+@@ -82,6 +82,66 @@
+       <version>${project.version}</version>
+       <classifier>tests</classifier>
+     </dependency>
++    <dependency>
++      <groupId>org.apache.tez</groupId>
++      <artifactId>tez-api</artifactId>
++      <version>${tez.version}</version>
++      <optional>true</optional>
++      <exclusions>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-common</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-mapreduce-client-core</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-mapreduce-client-jobclient</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-mapreduce-client-common</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-hdfs</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-annotations</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-yarn-client</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-yarn-api</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.hadoop</groupId>
++          <artifactId>hadoop-yarn-common</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>org.apache.commons</groupId>
++          <artifactId>commons-collections4</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>com.google.protobuf</groupId>
++          <artifactId>protobuf-java</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>com.google.code.findbugs</groupId>
++          <artifactId>jsr305</artifactId>
++        </exclusion>
++        <exclusion>
++          <groupId>javax.servlet</groupId>
++          <artifactId>servlet-api</artifactId>
++        </exclusion>
++      </exclusions>
++    </dependency>
+     <!-- test inter-project -->
+     <dependency>
+       <groupId>junit</groupId>
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCliConfig.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCliConfig.java
+index 03d4075..c12f51e 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCliConfig.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCliConfig.java
+@@ -409,7 +409,18 @@ public CliAdapter getCliAdapter() {
+   }
+ 
+   protected void setMetastoreType(MetastoreType mt) {
+-    metastoreType=mt;
++    String metaStoreTypeProperty = getSysPropValue("metaStoreType");
++    if (metaStoreTypeProperty != null) {
++      if (metaStoreTypeProperty.equalsIgnoreCase("sql")) {
++        metastoreType = MetastoreType.sql;
++      } else if (metaStoreTypeProperty.equalsIgnoreCase("hbase")) {
++        metastoreType = MetastoreType.hbase;
++      } else {
++        throw new IllegalArgumentException("Unknown metastore type: " + metaStoreTypeProperty);
++      }
++    } else {
++      metastoreType = mt;
++    }
+   }
+ 
+   public MetastoreType getMetastoreType() {
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreCliDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreCliDriver.java
+index 6779088..bd10886 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreCliDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreCliDriver.java
+@@ -60,8 +60,7 @@ public void beforeClass() {
+         @Override
+         public QTestUtil invokeInternal() throws Exception {
+           return new QTestUtil((cliConfig.getResultsDir()), (cliConfig.getLogDir()), miniMR,
+-              hiveConfDir, hadoopVer, initScript, cleanupScript, false,
+-              cliConfig.getFsType());
++              hiveConfDir, hadoopVer, initScript, cleanupScript, cliConfig.getFsType());
+         }
+       }.invoke("QtestUtil instance created", LOG, true);
+ 
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index 1e4db78..65f35d0 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -51,6 +51,7 @@
+ import java.util.Collection;
+ import java.util.Comparator;
+ import java.util.Deque;
++import java.util.EnumSet;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -143,7 +144,6 @@
+ 
+   private String testWarehouse;
+   private final String testFiles;
+-  private final boolean localMode;
+   protected final String outDir;
+   protected final String logDir;
+   private final TreeMap<String, String> qMap;
+@@ -383,6 +383,11 @@ private void createRemoteDirs() {
+     }
+   }
+ 
++  private enum CoreClusterType {
++    MR,
++    TEZ,
++    SPARK
++  }
+ 
+   public enum FsType {
+     local,
+@@ -392,28 +397,37 @@ private void createRemoteDirs() {
+ 
+   public enum MiniClusterType {
+ 
+-    mr(FsType.hdfs),
+-    tez(FsType.hdfs),
+-    spark(FsType.local),
+-    miniSparkOnYarn(FsType.hdfs),
+-    none(FsType.local);
+-
++    mr(CoreClusterType.MR, FsType.hdfs),
++    tez(CoreClusterType.TEZ, FsType.hdfs),
++    tez_local(CoreClusterType.TEZ, FsType.local),
++    spark(CoreClusterType.SPARK, FsType.local),
++    miniSparkOnYarn(CoreClusterType.SPARK, FsType.hdfs),
++    none(CoreClusterType.MR, FsType.local);
+ 
++    private final CoreClusterType coreClusterType;
+     private final FsType defaultFsType;
+ 
+-    MiniClusterType(FsType defaultFsType) {
++    MiniClusterType(CoreClusterType coreClusterType, FsType defaultFsType) {
++      this.coreClusterType = coreClusterType;
+       this.defaultFsType = defaultFsType;
+     }
+ 
++    public CoreClusterType getCoreClusterType() {
++      return coreClusterType;
++    }
++
+     public FsType getDefaultFsType() {
+       return defaultFsType;
+     }
+ 
+     public static MiniClusterType valueForString(String type) {
++      // Replace this with valueOf.
+       if (type.equals("miniMR")) {
+         return mr;
+       } else if (type.equals("tez")) {
+         return tez;
++      } else if (type.equals("tez_local")) {
++        return tez_local;
+       } else if (type.equals("spark")) {
+         return spark;
+       } else if (type.equals("miniSparkOnYarn")) {
+@@ -434,27 +448,23 @@ private String getKeyProviderURI() {
+   }
+ 
+   public QTestUtil(String outDir, String logDir, MiniClusterType clusterType,
+-                   String confDir, String hadoopVer, String initScript, String cleanupScript)
+-      throws Exception {
+-    this(outDir, logDir, clusterType, confDir, hadoopVer, initScript, cleanupScript, false, null);
++      String confDir, String hadoopVer, String initScript, String cleanupScript) throws Exception {
++    this(outDir, logDir, clusterType, confDir, hadoopVer, initScript, cleanupScript, null);
+   }
+ 
+   public QTestUtil(String outDir, String logDir, MiniClusterType clusterType,
+-      String confDir, String hadoopVer, String initScript, String cleanupScript,
+-      boolean localMode, FsType fsType)
++      String confDir, String hadoopVer, String initScript, String cleanupScript, FsType fsType)
+     throws Exception {
+     LOG.info("Setting up QtestUtil with outDir=" + outDir + ", logDir=" + logDir
+         + ", clusterType=" + clusterType + ", confDir=" + confDir + ", hadoopVer=" + hadoopVer
+         + ", initScript=" + initScript + ", cleanupScript=" + cleanupScript
+-        + ", useHbaseMetaStore=false, withLlapIo=false"
+-        + ", localMode=" + localMode + ", fsType=" + fsType);
++        + ", useHbaseMetaStore=false, withLlapIo=false" + ", fsType=" + fsType);
+     Preconditions.checkNotNull(clusterType, "ClusterType cannot be null");
+     if (fsType != null) {
+       this.fsType = fsType;
+     } else {
+       this.fsType = clusterType.getDefaultFsType();
+     }
+-    this.localMode = localMode;
+     this.outDir = outDir;
+     this.logDir = logDir;
+     this.srcTables=getSrcTables();
+@@ -541,22 +551,15 @@ private void setupFileSystem(HadoopShims shims) throws IOException {
+   private void setupMiniCluster(HadoopShims shims, String confDir) throws
+       IOException {
+ 
+-    if (localMode) {
+-      Preconditions
+-          .checkState(clusterType == MiniClusterType.tez,
+-              "localMode can currently only be set for tez or llap");
+-    }
+-
+     String uriString = WindowsPathUtil.getHdfsUriString(fs.getUri().toString());
+ 
+-    if (clusterType == MiniClusterType.tez) {
++    if (clusterType.getCoreClusterType() == CoreClusterType.TEZ) {
+       if (confDir != null && !confDir.isEmpty()) {
+         conf.addResource(new URL("file://" + new File(confDir).toURI().getPath()
+             + "/tez-site.xml"));
+       }
+-      int numTrackers;
+-      numTrackers = 4;
+-      if (localMode) {
++      int numTrackers = 4;
++      if (EnumSet.of(MiniClusterType.tez_local).contains(clusterType)) {
+         mr = shims.getLocalMiniTezCluster(conf, false);
+       } else {
+         mr = shims.getMiniTezCluster(conf, numTrackers, uriString, 1);
+@@ -574,6 +577,9 @@ public void shutdown() throws Exception {
+       cleanUp();
+     }
+ 
++    if (clusterType.getCoreClusterType() == CoreClusterType.TEZ) {
++      SessionState.get().getTezSession().close(false);
++    }
+     setup.tearDown();
+     if (sparkSession != null) {
+       try {
+@@ -1065,8 +1071,8 @@ public String cliInit(String tname, boolean recreate) throws Exception {
+     ss.setIsSilent(true);
+     SessionState oldSs = SessionState.get();
+ 
+-    if (oldSs != null && (clusterType == MiniClusterType.tez || clusterType == MiniClusterType.spark
+-        || clusterType == MiniClusterType.miniSparkOnYarn)) {
++    if (oldSs != null && (clusterType.getCoreClusterType() == CoreClusterType.TEZ
++        || clusterType.getCoreClusterType() == CoreClusterType.SPARK)) {
+       sparkSession = oldSs.getSparkSession();
+       ss.setSparkSession(sparkSession);
+       oldSs.setSparkSession(null);
+@@ -1129,8 +1135,8 @@ private CliSessionState startSessionState()
+     ss.err = System.out;
+ 
+     SessionState oldSs = SessionState.get();
+-    if (oldSs != null && (clusterType == MiniClusterType.tez || clusterType == MiniClusterType.spark
+-        || clusterType == MiniClusterType.miniSparkOnYarn)) {
++    if (oldSs != null && (clusterType.getCoreClusterType() == CoreClusterType.TEZ
++        || clusterType.getCoreClusterType() == CoreClusterType.SPARK)) {
+       sparkSession = oldSs.getSparkSession();
+       ss.setSparkSession(sparkSession);
+       oldSs.setSparkSession(null);
+-- 
+1.7.9.5
+

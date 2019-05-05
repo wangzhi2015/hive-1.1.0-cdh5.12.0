@@ -1,0 +1,197 @@
+From f7cc12892ae308540077525c828f0051b5c652c7 Mon Sep 17 00:00:00 2001
+From: Pengcheng Xiong <pxiong@apache.org>
+Date: Tue, 12 Jan 2016 10:08:40 -0800
+Subject: [PATCH 0641/1164] CDH-41554: HIVE-12785: View with union type and
+ UDF to  the struct is broken (Pengcheng Xiong,
+ reviewed by Laljo John Pullokkaran)
+
+Change-Id: Iedad4f2ed74bb9425c22ee7f8e647313eaf328bd
+---
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   42 +++++------
+ .../test/queries/clientpositive/struct_in_view.q   |   16 +++++
+ .../results/clientpositive/struct_in_view.q.out    |   76 ++++++++++++++++++++
+ 3 files changed, 110 insertions(+), 24 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 7c1dcb5..4bfb979 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -10398,14 +10398,14 @@ private ExprNodeDesc getExprNodeDescCached(ASTNode expr, RowResolver input)
+     }
+ 
+     Map<ExprNodeDesc,String> nodeToText = new HashMap<>();
+-    List<Entry<ASTNode, ExprNodeDesc>> fieldDescList = new ArrayList<>();
++    List<ASTNode> fieldDescList = new ArrayList<>();
+ 
+     for (Map.Entry<ASTNode, ExprNodeDesc> entry : nodeOutputs.entrySet()) {
+       if (!(entry.getValue() instanceof ExprNodeColumnDesc)) {
+         // we need to translate the ExprNodeFieldDesc too, e.g., identifiers in
+         // struct<>.
+         if (entry.getValue() instanceof ExprNodeFieldDesc) {
+-          fieldDescList.add(entry);
++          fieldDescList.add(entry.getKey());
+         }
+         continue;
+       }
+@@ -10426,34 +10426,28 @@ private ExprNodeDesc getExprNodeDescCached(ASTNode expr, RowResolver input)
+       unparseTranslator.addTranslation(node, replacementText.toString());
+     }
+ 
+-    if (fieldDescList.size() != 0) {
+-      // Sorting the list based on the length of fieldName
+-      // For example, in Column[a].b.c and Column[a].b, Column[a].b should be
+-      // unparsed before Column[a].b.c
+-      Collections.sort(fieldDescList, new Comparator<Map.Entry<ASTNode, ExprNodeDesc>>() {
+-        public int compare(Entry<ASTNode, ExprNodeDesc> o1, Entry<ASTNode, ExprNodeDesc> o2) {
+-          ExprNodeFieldDesc fieldDescO1 = (ExprNodeFieldDesc) o1.getValue();
+-          ExprNodeFieldDesc fieldDescO2 = (ExprNodeFieldDesc) o2.getValue();
+-          return fieldDescO1.toString().length() < fieldDescO2.toString().length() ? -1 : 1;
+-        }
+-      });
+-      for (Map.Entry<ASTNode, ExprNodeDesc> entry : fieldDescList) {
+-        ASTNode node = entry.getKey();
+-        ExprNodeFieldDesc fieldDesc = (ExprNodeFieldDesc) entry.getValue();
+-        ExprNodeDesc exprNodeDesc = fieldDesc.getDesc();
+-        String fieldName = fieldDesc.getFieldName();
+-        StringBuilder replacementText = new StringBuilder();
+-        replacementText.append(nodeToText.get(exprNodeDesc));
+-        replacementText.append(".");
+-        replacementText.append(HiveUtils.unparseIdentifier(fieldName, conf));
+-        nodeToText.put(fieldDesc, replacementText.toString());
+-        unparseTranslator.addTranslation(node, replacementText.toString());
++    for (ASTNode node : fieldDescList) {
++      Map<ASTNode, String> map = translateFieldDesc(node);
++      for (Entry<ASTNode, String> entry : map.entrySet()) {
++        unparseTranslator.addTranslation(entry.getKey(), entry.getValue());
+       }
+     }
+ 
+     return nodeOutputs;
+   }
+ 
++  private Map<ASTNode, String> translateFieldDesc(ASTNode node) {
++    Map<ASTNode, String> map = new HashMap<>();
++    if (node.getType() == HiveParser.DOT) {
++      for (Node child : node.getChildren()) {
++        map.putAll(translateFieldDesc((ASTNode) child));
++      }
++    } else if (node.getType() == HiveParser.Identifier) {
++      map.put(node, HiveUtils.unparseIdentifier(node.getText(), conf));
++    }
++    return map;
++  }
++
+   @Override
+   public void validate() throws SemanticException {
+     LOG.debug("validation start");
+diff --git a/ql/src/test/queries/clientpositive/struct_in_view.q b/ql/src/test/queries/clientpositive/struct_in_view.q
+index d420030..fa1ae9c 100644
+--- a/ql/src/test/queries/clientpositive/struct_in_view.q
++++ b/ql/src/test/queries/clientpositive/struct_in_view.q
+@@ -26,3 +26,19 @@ drop view vs1;
+ 
+ drop view vs2;
+ 
++create view v as select named_struct('key', 1).key from src limit 1;
++
++desc extended v;
++
++select * from v;
++
++drop view v;
++
++create view v as select named_struct('end', 1).`end` from src limit 1;
++
++desc extended v;
++
++select * from v;
++
++drop view v;
++
+diff --git a/ql/src/test/results/clientpositive/struct_in_view.q.out b/ql/src/test/results/clientpositive/struct_in_view.q.out
+index 10b2f2e..e57d17e 100644
+--- a/ql/src/test/results/clientpositive/struct_in_view.q.out
++++ b/ql/src/test/results/clientpositive/struct_in_view.q.out
+@@ -116,3 +116,79 @@ POSTHOOK: query: drop view vs2
+ POSTHOOK: type: DROPVIEW
+ POSTHOOK: Input: default@vs2
+ POSTHOOK: Output: default@vs2
++PREHOOK: query: create view v as select named_struct('key', 1).key from src limit 1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v
++POSTHOOK: query: create view v as select named_struct('key', 1).key from src limit 1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v
++PREHOOK: query: desc extended v
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@v
++POSTHOOK: query: desc extended v
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@v
++key                 	int                 	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: select * from v
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Input: default@v
++#### A masked pattern was here ####
++POSTHOOK: query: select * from v
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@v
++#### A masked pattern was here ####
++1
++PREHOOK: query: drop view v
++PREHOOK: type: DROPVIEW
++PREHOOK: Input: default@v
++PREHOOK: Output: default@v
++POSTHOOK: query: drop view v
++POSTHOOK: type: DROPVIEW
++POSTHOOK: Input: default@v
++POSTHOOK: Output: default@v
++PREHOOK: query: create view v as select named_struct('end', 1).`end` from src limit 1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v
++POSTHOOK: query: create view v as select named_struct('end', 1).`end` from src limit 1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v
++PREHOOK: query: desc extended v
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@v
++POSTHOOK: query: desc extended v
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@v
++end                 	int                 	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: select * from v
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Input: default@v
++#### A masked pattern was here ####
++POSTHOOK: query: select * from v
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@v
++#### A masked pattern was here ####
++1
++PREHOOK: query: drop view v
++PREHOOK: type: DROPVIEW
++PREHOOK: Input: default@v
++PREHOOK: Output: default@v
++POSTHOOK: query: drop view v
++POSTHOOK: type: DROPVIEW
++POSTHOOK: Input: default@v
++POSTHOOK: Output: default@v
+-- 
+1.7.9.5
+

@@ -1,0 +1,397 @@
+From e9cc9eca350172d6e78153da48705285633d5564 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Fri, 22 Jan 2016 15:37:37 -0500
+Subject: [PATCH 0478/1164] HIVE-12550 : Cache and display last N completed
+ queries in HS2 WebUI (Szehon, reviewed by Aihua
+ Xu and Mohit Sabharwal)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+	pom.xml
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+	service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+
+Change-Id: I7cc441da56ab29d934a0f6eebeb345952ebc7fcd
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    2 +
+ pom.xml                                            |    2 +-
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    8 ++++
+ .../hive/service/cli/operation/Operation.java      |   12 ++++-
+ .../service/cli/operation/OperationManager.java    |   49 +++++++++++++++++++-
+ .../hive/service/cli/operation/SQLOperation.java   |   22 ++++++++-
+ .../service/cli/operation/SQLOperationInfo.java    |   48 +++++++++++++++++++
+ .../hive-webapps/hiveserver2/hiveserver2.jsp       |   41 +++++++++++++++-
+ 8 files changed, 179 insertions(+), 5 deletions(-)
+ create mode 100644 service/src/java/org/apache/hive/service/cli/operation/SQLOperationInfo.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 4e77bd0..ff8c831 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1760,6 +1760,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_SERVER2_WEBUI_BIND_HOST("hive.server2.webui.host", "0.0.0.0", "The host address the HiveServer2 WebUI will listen on"),
+     HIVE_SERVER2_WEBUI_PORT("hive.server2.webui.port", 10002, "The port the HiveServer2 WebUI will listen on"),
+     HIVE_SERVER2_WEBUI_MAX_THREADS("hive.server2.webui.max.threads", 50, "The max HiveServer2 WebUI threads"),
++    HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES("hive.server2.webui.max.historic.queries", 25,
++      "The maximum number of past queries to show in HiverSever2 WebUI."),
+     HIVE_SERVER2_WEBUI_USE_SSL("hive.server2.webui.use.ssl", false,
+       "Set this to true for using SSL encryption for HiveServer2 WebUI."),
+     HIVE_SERVER2_WEBUI_SSL_KEYSTORE_PATH("hive.server2.webui.keystore.path", "",
+diff --git a/pom.xml b/pom.xml
+index bbe4148..bde3dfc 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -122,7 +122,7 @@
+     <commons-dbcp.version>1.4</commons-dbcp.version>
+     <derby.version>10.11.1.1</derby.version>
+     <metrics-core.version>${cdh.metrics-core.version}</metrics-core.version>
+-    <guava.version>14.0.1</guava.version>
++    <guava.version>15.0</guava.version>
+     <groovy.version>2.4.4</groovy.version>
+     <hadoop-20S.version>${cdh.mr1.version}</hadoop-20S.version>
+     <hadoop-23.version>${cdh.hadoop.version}</hadoop-23.version>
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index ca431cb..0a4904d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -155,6 +155,9 @@
+ 
+   private String userName;
+ 
++  // For WebUI.  Kept alive after queryPlan is freed.
++  private String savedQueryString;
++
+   private boolean checkConcurrency() {
+     boolean supportConcurrency = conf.getBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY);
+     if (!supportConcurrency) {
+@@ -379,6 +382,7 @@ public int compile(String command, boolean resetTaskIds) {
+     } catch (Exception e) {
+       LOG.warn("WARNING! Query command could not be redacted." + e);
+     }
++    this.savedQueryString = queryStr;
+ 
+     //holder for parent command type/string when executing reentrant queries
+     QueryState queryState = new QueryState();
+@@ -1877,4 +1881,8 @@ public String getErrorMsg() {
+     return errorMessage;
+   }
+ 
++
++  public String getQueryString() {
++    return savedQueryString == null ? "Unknown" : savedQueryString;
++  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index 6d12c1d..a1688a2 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -72,6 +72,7 @@
+ 
+   private long operationTimeout;
+   private volatile long lastAccessTime;
++  private final long beginTime;
+ 
+   protected static final EnumSet<FetchOrientation> DEFAULT_FETCH_ORIENTATION_SET =
+       EnumSet.of(FetchOrientation.FETCH_NEXT,FetchOrientation.FETCH_FIRST);
+@@ -87,7 +88,8 @@ protected Operation(HiveSession parentSession, Map<String, String> confOverlay,
+     }
+     this.runAsync = runInBackground;
+     this.opHandle = new OperationHandle(opType, parentSession.getProtocolVersion());
+-    lastAccessTime = System.currentTimeMillis();
++    beginTime = System.currentTimeMillis();
++    lastAccessTime = beginTime;
+     operationTimeout = HiveConf.getTimeVar(parentSession.getHiveConf(),
+         HiveConf.ConfVars.HIVE_SERVER2_IDLE_OPERATION_TIMEOUT, TimeUnit.MILLISECONDS);
+     setMetrics(state);
+@@ -411,4 +413,12 @@ protected void setMetrics(OperationState state) {
+        }
+     }
+   }
++
++  public long getBeginTime() {
++    return beginTime;
++  }
++
++  protected OperationState getState() {
++    return state;
++  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+index 2266887..45da4d3 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+@@ -22,12 +22,16 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Iterator;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Queue;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import com.google.common.collect.EvictingQueue;
+ import org.apache.hadoop.hive.common.metrics.common.Metrics;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+@@ -61,6 +65,9 @@
+   private final ConcurrentHashMap<OperationHandle, Operation> handleToOperation =
+       new ConcurrentHashMap<OperationHandle, Operation>();
+ 
++  //for displaying historical queries on WebUI
++  private Queue<SQLOperationInfo> historicSqlOperations;
++
+   public OperationManager() {
+     super(OperationManager.class.getSimpleName());
+   }
+@@ -73,6 +80,11 @@ public synchronized void init(HiveConf hiveConf) {
+     } else {
+       LOG.debug("Operation level logging is turned off");
+     }
++    if ((hiveConf.getIntVar(HiveConf.ConfVars.HIVE_SERVER2_WEBUI_PORT) != 0) &&
++      hiveConf.getIntVar(HiveConf.ConfVars.HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES) > 0) {
++      historicSqlOperations = EvictingQueue.create(
++        hiveConf.getIntVar(ConfVars.HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES));
++    }
+     super.init(hiveConf);
+   }
+ 
+@@ -169,6 +181,7 @@ private Operation removeTimedOutOperation(OperationHandle operationHandle) {
+     Operation operation = handleToOperation.get(operationHandle);
+     if (operation != null && operation.isTimedOut(System.currentTimeMillis())) {
+       handleToOperation.remove(operationHandle, operation);
++      cacheOldOperationInfo(operation);
+       return operation;
+     }
+     return null;
+@@ -179,7 +192,9 @@ private void addOperation(Operation operation) {
+   }
+ 
+   private Operation removeOperation(OperationHandle opHandle) {
+-    return handleToOperation.remove(opHandle);
++    Operation result = handleToOperation.remove(opHandle);
++    cacheOldOperationInfo(result);
++    return result;
+   }
+ 
+   public OperationStatus getOperationStatus(OperationHandle opHandle)
+@@ -308,4 +323,36 @@ public OperationLog getOperationLogByThread() {
+     }
+     return removed;
+   }
++
++  //Cache a number of historical operation info, at max number of
++  //hive.server2.webui.max.historic.queries.
++  private void cacheOldOperationInfo(Operation oldOperation) {
++    if ((getHiveConf().getIntVar(HiveConf.ConfVars.HIVE_SERVER2_WEBUI_PORT) != 0) &&
++      getHiveConf().getIntVar(HiveConf.ConfVars.HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES) > 0) {
++      if (oldOperation instanceof SQLOperation) {
++        SQLOperation query = (SQLOperation) oldOperation;
++        SQLOperationInfo queryInfo = query.getSQLOperationInfo();
++        if (queryInfo != null) {
++          synchronized (historicSqlOperations) {
++            historicSqlOperations.add(queryInfo);
++          }
++        }
++      }
++    }
++  }
++
++  /**
++   * @return a number of historical SQLOperation info, at max number of
++   * hive.server2.webui.max.historic.queries
++   */
++  public List<SQLOperationInfo> getHistoricalSQLOpInfo() {
++    List<SQLOperationInfo> result = new LinkedList<>();
++    synchronized (historicSqlOperations) {
++      Iterator<SQLOperationInfo> opIterator = historicSqlOperations.iterator();
++      while (opIterator.hasNext()) {
++        result.add(opIterator.next());
++      }
++    }
++    return result;
++  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index f31cba7..8140de6 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -160,7 +160,7 @@ public void prepare(HiveConf sqlOperationConf) throws HiveSQLException {
+   }
+ 
+   public String getQueryStr() {
+-    return driver == null || driver.getPlan() == null ? "Unknown" : driver.getPlan().getQueryStr();
++    return driver == null ? "Unknown" : driver.getQueryString();
+   }
+ 
+   private void runQuery(HiveConf sqlOperationConf) throws HiveSQLException {
+@@ -196,6 +196,7 @@ private void runQuery(HiveConf sqlOperationConf) throws HiveSQLException {
+   public void runInternal() throws HiveSQLException {
+     setState(OperationState.PENDING);
+     final HiveConf opConfig = getConfigForOperation();
++
+     prepare(opConfig);
+     if (!shouldRunAsync()) {
+       runQuery(opConfig);
+@@ -301,6 +302,7 @@ private void cleanup(OperationState state) throws HiveSQLException {
+         backgroundHandle.cancel(true);
+       }
+     }
++
+     if (driver != null) {
+       driver.close();
+       driver.destroy();
+@@ -481,4 +483,22 @@ public HiveConf getConfigForOperation() throws HiveSQLException {
+     }
+     return sqlOperationConf;
+   }
++
++  /**
++   * Get summary information of this SQLOperation for display in WebUI.
++   */
++  public SQLOperationInfo getSQLOperationInfo() {
++    try {
++      return new SQLOperationInfo(
++        getParentSession().getUserName(),
++        driver.getQueryString(),
++        getConfigForOperation().getVar(HiveConf.ConfVars.HIVE_EXECUTION_ENGINE),
++        getState(),
++        (int) (System.currentTimeMillis() - getBeginTime()) / 1000,
++        System.currentTimeMillis());
++    } catch (HiveSQLException e) {
++      LOG.warn("Error calcluating SQL Operation Info for webui", e);
++    }
++    return null;
++  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperationInfo.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperationInfo.java
+new file mode 100644
+index 0000000..179f6dd
+--- /dev/null
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperationInfo.java
+@@ -0,0 +1,48 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.service.cli.operation;
++
++import org.apache.hive.service.cli.OperationState;
++
++/**
++ * Used to display some info in the HS2 WebUI.
++ */
++public class SQLOperationInfo {
++  public String userName;
++  public String queryStr;
++  public String executionEngine;
++  public OperationState endState; //state before CLOSED (one of CANCELLED, FINISHED, ERROR)
++  public int elapsedTime;
++  public long endTime;
++
++  public SQLOperationInfo(
++    String userName,
++    String queryStr,
++    String executionEngine,
++    OperationState endState,
++    int elapsedTime,
++    long endTime
++  ) {
++    this.userName = userName;
++    this.queryStr = queryStr;
++    this.executionEngine = executionEngine;
++    this.endState = endState;
++    this.elapsedTime = elapsedTime;
++    this.endTime = endTime;
++  }
++}
+diff --git a/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp b/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
+index a91b008..a0b5d2e 100644
+--- a/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
++++ b/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
+@@ -24,11 +24,13 @@
+   import="org.apache.hive.common.util.HiveVersionInfo"
+   import="org.apache.hive.service.cli.operation.Operation"
+   import="org.apache.hive.service.cli.operation.SQLOperation"
++  import="org.apache.hive.service.cli.operation.SQLOperationInfo"
+   import="org.apache.hive.service.cli.session.SessionManager"
+   import="org.apache.hive.service.cli.session.HiveSession"
+   import="javax.servlet.ServletContext"
+   import="java.util.Collection"
+   import="java.util.Date"
++  import="java.util.List"
+ %>
+ 
+ <%
+@@ -145,7 +147,7 @@ for (Operation operation: operations) {
+         <td><%= query.getQueryStr() %></td>
+         <td><%= query.getConfigForOperation().getVar(ConfVars.HIVE_EXECUTION_ENGINE) %>
+         <td><%= query.getStatus().getState() %></td>
+-        <td><%= (currentTime - query.getLastAccessTime())/1000 %></td>
++        <td><%= (currentTime - query.getBeginTime())/1000 %></td>
+     </tr>
+ <%
+   }
+@@ -156,6 +158,43 @@ for (Operation operation: operations) {
+ </tr>
+ </table>
+ </section>
++
++
++<section>
++<h2>Last Max <%= conf.get(ConfVars.HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES.varname) %> Completed Queries</h2>
++<table id="attributes_table" class="table table-striped">
++    <tr>
++        <th>User Name</th>
++        <th>Query</th>
++        <th>Execution Engine</th>
++        <th>State</th>
++        <th>Elapsed Time (s)</th>
++        <th>End Time </th>
++    </tr>
++<%
++queries = 0;
++List<SQLOperationInfo> sqlOperations = sessionManager.getOperationManager().getHistoricalSQLOpInfo();
++for (SQLOperationInfo sqlOperation: sqlOperations) {
++  queries++;
++%>
++    <tr>
++        <td><%= sqlOperation.userName %></td>
++        <td><%= sqlOperation.queryStr %></td>
++        <td><%= sqlOperation.executionEngine %></td>
++        <td><%= sqlOperation.endState %></td>
++        <td><%= sqlOperation.elapsedTime %></td>
++        <td><%= new Date(sqlOperation.endTime) %></td>
++    </tr>
++<%
++}
++
++%>
++<tr>
++  <td colspan="6">Total number of queries: <%= queries %></td>
++</tr>
++</table>
++</section>
++
+ <% 
+  }
+ %>
+-- 
+1.7.9.5
+

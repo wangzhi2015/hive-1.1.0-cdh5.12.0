@@ -1,0 +1,92 @@
+From bcec2b2eb8fa4898049b6c64a1d28e15815474b9 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Tue, 1 Mar 2016 12:07:48 -0800
+Subject: [PATCH 0807/1164] CDH-46864: HIVE-12757 : Fix
+ TestCodahaleMetrics#testFileReporting (Szehon,
+ reviewed by Aihua Xu)
+
+(cherry picked from commit 14e927036e4f7122f694bad10e1957e076a6ec25)
+
+Change-Id: I55ebfd2fd3b48db7097967364c963ebfabf744b2
+---
+ .../hive/common/metrics/MetricsTestUtils.java      |    9 +++++++
+ .../metrics/metrics2/TestCodahaleMetrics.java      |   27 +++++---------------
+ 2 files changed, 15 insertions(+), 21 deletions(-)
+
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+index 892e17c..4667658 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+@@ -57,4 +57,13 @@ public static JsonNode getJsonNode(String json, MetricsCategory category, String
+     JsonNode metricsNode = categoryNode.path(metricsName);
+     return metricsNode.path(category.metricsHandle);
+   }
++
++  public static byte[] getFileData(String path, int timeoutInterval, int tries) throws Exception {
++    File file = new File(path);
++    do {
++      Thread.sleep(timeoutInterval);
++      tries--;
++    } while (tries > 0 && !file.exists());
++    return Files.readAllBytes(Paths.get(path));
++  }
+ }
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java b/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java
+index 27825b1..2788bb2 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java
+@@ -22,7 +22,7 @@
+ import com.codahale.metrics.Timer;
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+-import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -124,11 +124,9 @@ public void testFileReporting() throws Exception {
+     int runs = 5;
+     for (int i = 0; i < runs; i++) {
+       MetricsFactory.getInstance().incrementCounter("count2");
+-      Thread.sleep(100);
+     }
+ 
+-    Thread.sleep(2000);
+-    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
++    byte[] jsonData = MetricsTestUtils.getFileData(jsonReportFile.getAbsolutePath(), 2000, 3);
+     ObjectMapper objectMapper = new ObjectMapper();
+ 
+     JsonNode rootNode = objectMapper.readTree(jsonData);
+@@ -156,25 +154,12 @@ public void testGauge() throws Exception {
+     testVar.setValue(20);
+ 
+     MetricsFactory.getInstance().addGauge("gauge1", testVar);
+-    Thread.sleep(2000);
+-    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    ObjectMapper objectMapper = new ObjectMapper();
++    String json = ((CodahaleMetrics) MetricsFactory.getInstance()).dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, "gauge1", testVar.getValue());
+ 
+-    JsonNode rootNode = objectMapper.readTree(jsonData);
+-    JsonNode gaugesNode = rootNode.path("gauges");
+-    JsonNode methodGaugeNode = gaugesNode.path("gauge1");
+-    JsonNode countNode = methodGaugeNode.path("value");
+-    Assert.assertEquals(countNode.asInt(), testVar.getValue());
+ 
+     testVar.setValue(40);
+-    Thread.sleep(2000);
+-
+-    jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-
+-    rootNode = objectMapper.readTree(jsonData);
+-    gaugesNode = rootNode.path("gauges");
+-    methodGaugeNode = gaugesNode.path("gauge1");
+-    countNode = methodGaugeNode.path("value");
+-    Assert.assertEquals(countNode.asInt(), testVar.getValue());
++    json = ((CodahaleMetrics) MetricsFactory.getInstance()).dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, "gauge1", testVar.getValue());
+   }
+ }
+-- 
+1.7.9.5
+

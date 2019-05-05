@@ -1,0 +1,346 @@
+From 8ec478106ac42478d6285d3860a532b4e6ea109b Mon Sep 17 00:00:00 2001
+From: Eugene Koifman <ekoifman@hortonworks.com>
+Date: Fri, 22 May 2015 13:28:13 -0700
+Subject: [PATCH 0261/1164] CDH-29235: HIVE-10658 - Insert with values clause
+ may expose data that should be encrypted(Eugene
+ Koifman, reviewed by Serio Pena)
+
+Conflicts:
+	itests/src/test/resources/testconfiguration.properties
+	ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
+	ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_static.q.out
+---
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../java/org/apache/hadoop/hive/ql/parse/QB.java   |   19 ++++++
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   64 ++++++++++++++++--
+ .../org/apache/hadoop/hive/ql/parse/TestIUD.java   |    7 ++
+ .../clientpositive/encryption_insert_values.q      |   15 +++++
+ .../encryption_insert_partition_dynamic.q.out      |    6 +-
+ .../encrypted/encryption_insert_values.q.out       |   71 ++++++++++++++++++++
+ 7 files changed, 178 insertions(+), 7 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/encryption_insert_values.q
+ create mode 100644 ql/src/test/results/clientpositive/encrypted/encryption_insert_values.q.out
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index 326c839..5de25b4 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -314,7 +314,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_unencrypted_nonhdfs_external_tables.q \
+   encryption_move_tbl.q \
+   encryption_drop_table.q \
+-  encryption_drop_view.q
++  encryption_drop_view.q \
++  encryption_insert_values.q
+ 
+ beeline.positive.exclude=add_part_exist.q,\
+   alter1.q,\
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
+index cf6941c..bef7cd1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hive.ql.parse;
+ 
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+@@ -27,6 +28,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.ql.metadata.Table;
+ import org.apache.hadoop.hive.ql.plan.CreateTableDesc;
+ 
+@@ -55,6 +57,7 @@
+   private boolean isAnalyzeRewrite;
+   private CreateTableDesc tblDesc = null; // table descriptor of the final
+   private CreateTableDesc localDirectoryDesc = null ;
++  private List<Path> encryptedTargetTablePaths;
+ 
+   // used by PTFs
+   /*
+@@ -387,4 +390,20 @@ public QBSubQuery getHavingClauseSubQueryPredicate() {
+     return havingClauseSubQueryPredicate;
+   }
+ 
++  void addEncryptedTargetTablePath(Path p) {
++    if(encryptedTargetTablePaths == null) {
++      encryptedTargetTablePaths = new ArrayList<>();
++    }
++    encryptedTargetTablePaths.add(p);
++  }
++  /**
++   * List of dbName.tblName of encrypted target tables of insert statement
++   * Used to support Insert ... values(...)
++   */
++  List<Path> getEncryptedTargetTablePaths() {
++    if(encryptedTargetTablePaths == null) {
++      return Collections.emptyList();
++    }
++    return encryptedTargetTablePaths;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 5ddbfa0..64d20ed 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -207,6 +207,7 @@
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+ import org.apache.hadoop.hive.shims.HadoopShims;
++import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.mapred.InputFormat;
+@@ -720,8 +721,19 @@ private String processTable(QB qb, ASTNode tabref) throws SemanticException {
+     return this.nameToSplitSample;
+   }
+ 
+-  // Generate a temp table out of a value clause
+-  private ASTNode genValuesTempTable(ASTNode originalFrom) throws SemanticException {
++  /**
++   * Generate a temp table out of a value clause
++   * See also {@link #preProcessForInsert(ASTNode, QB)}
++   */
++  private ASTNode genValuesTempTable(ASTNode originalFrom, QB qb) throws SemanticException {
++    Path dataDir = null;
++    if(!qb.getEncryptedTargetTablePaths().isEmpty()) {
++      //currently only Insert into T values(...) is supported thus only 1 values clause
++      //and only 1 target table are possible.  If/when support for 
++      //select ... from values(...) is added an insert statement may have multiple
++      //encrypted target tables.
++      dataDir = ctx.getMRTmpPath(qb.getEncryptedTargetTablePaths().get(0).toUri());
++    }
+     // Pick a name for the table
+     SessionState ss = SessionState.get();
+     String tableName = VALUES_TMP_TABLE_NAME_PREFIX + ss.getNextValuesTempTableSuffix();
+@@ -758,7 +770,14 @@ private ASTNode genValuesTempTable(ASTNode originalFrom) throws SemanticExceptio
+     Path tablePath = null;
+     FileSystem fs = null;
+     try {
+-      tablePath = Warehouse.getDnsPath(new Path(ss.getTempTableSpace(), tableName), conf);
++      if(dataDir == null) {
++        tablePath = Warehouse.getDnsPath(new Path(ss.getTempTableSpace(), tableName), conf);
++      }
++      else {
++        //if target table of insert is encrypted, make sure temporary table data is stored
++        //similarly encrypted
++        tablePath = Warehouse.getDnsPath(new Path(dataDir, tableName), conf);
++      }
+       fs = tablePath.getFileSystem(conf);
+       fs.mkdirs(tablePath);
+       Path dataFile = new Path(tablePath, "data_file");
+@@ -1202,7 +1221,7 @@ public boolean doPhase1(ASTNode ast, QB qb, Phase1Ctx ctx_1, PlannerContext plan
+         } else if (frm.getToken().getType() == HiveParser.TOK_VIRTUAL_TABLE) {
+           // Create a temp table with the passed values in it then rewrite this portion of the
+           // tree to be from that table.
+-          ASTNode newFrom = genValuesTempTable(frm);
++          ASTNode newFrom = genValuesTempTable(frm, qb);
+           ast.setChild(0, newFrom);
+           processTable(qb, newFrom);
+         } else if (frm.getToken().getType() == HiveParser.TOK_SUBQUERY) {
+@@ -10175,6 +10194,7 @@ boolean genResolvedParseTree(ASTNode ast, PlannerContext plannerCtx) throws Sema
+ 
+     // 4. continue analyzing from the child ASTNode.
+     Phase1Ctx ctx_1 = initPhase1Ctx();
++    preProcessForInsert(child, qb);
+     if (!doPhase1(child, qb, ctx_1, plannerCtx)) {
+       // if phase1Result false return
+       return false;
+@@ -10190,6 +10210,42 @@ boolean genResolvedParseTree(ASTNode ast, PlannerContext plannerCtx) throws Sema
+     return true;
+   }
+ 
++  /**
++   * This will walk AST of an INSERT statement and assemble a list of target tables
++   * which are in an HDFS encryption zone.  This is needed to make sure that so that
++   * the data from values clause of Insert ... select values(...) is stored securely.
++   * See also {@link #genValuesTempTable(ASTNode, QB)}
++   * @throws SemanticException
++   */
++  private void preProcessForInsert(ASTNode node, QB qb) throws SemanticException {
++    try {
++      if(!(node != null && node.getToken() != null && node.getToken().getType() == HiveParser.TOK_QUERY)) {
++        return;
++      }
++      for (Node child : node.getChildren()) {
++        //each insert of multi insert looks like 
++        //(TOK_INSERT (TOK_INSERT_INTO (TOK_TAB (TOK_TABNAME T1)))
++        if (((ASTNode) child).getToken().getType() != HiveParser.TOK_INSERT) {
++          continue;
++        }
++        ASTNode n = (ASTNode) ((ASTNode) child).getFirstChildWithType(HiveParser.TOK_INSERT_INTO);
++        if (n == null) continue;
++        n = (ASTNode) n.getFirstChildWithType(HiveParser.TOK_TAB);
++        if (n == null) continue;
++        n = (ASTNode) n.getFirstChildWithType(HiveParser.TOK_TABNAME);
++        if (n == null) continue;
++        String[] dbTab = getQualifiedTableName(n);
++        Table t = db.getTable(dbTab[0], dbTab[1]);
++        Path tablePath = t.getPath();
++        if (isPathEncrypted(tablePath)) {
++          qb.addEncryptedTargetTablePath(tablePath);
++        }
++      }
++    }
++    catch(Exception ex) {
++      throw new SemanticException(ex);
++    }
++  }
+   Operator genOPTree(ASTNode ast, PlannerContext plannerCtx) throws SemanticException {
+     return genPlan(qb);
+   }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/parse/TestIUD.java b/ql/src/test/org/apache/hadoop/hive/ql/parse/TestIUD.java
+index a8d03a9..1003ce3 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/parse/TestIUD.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/parse/TestIUD.java
+@@ -244,4 +244,11 @@ public void testInsertIntoTableFromAnonymousTable() throws ParseException {
+         "(TOK_SELECT (TOK_SELEXPR TOK_ALLCOLREF))))",
+       ast.toStringTree());
+   }
++  @Test
++  public void testMultiInsert() throws ParseException {
++    ASTNode ast = parse("from S insert into T1 select a, b insert into T2 select c, d");
++    Assert.assertEquals("AST doesn't match", "(TOK_QUERY (TOK_FROM (TOK_TABREF (TOK_TABNAME S))) " +
++      "(TOK_INSERT (TOK_INSERT_INTO (TOK_TAB (TOK_TABNAME T1))) (TOK_SELECT (TOK_SELEXPR (TOK_TABLE_OR_COL a)) (TOK_SELEXPR (TOK_TABLE_OR_COL b)))) " +
++      "(TOK_INSERT (TOK_INSERT_INTO (TOK_TAB (TOK_TABNAME T2))) (TOK_SELECT (TOK_SELEXPR (TOK_TABLE_OR_COL c)) (TOK_SELEXPR (TOK_TABLE_OR_COL d)))))", ast.toStringTree());
++  }
+ }
+diff --git a/ql/src/test/queries/clientpositive/encryption_insert_values.q b/ql/src/test/queries/clientpositive/encryption_insert_values.q
+new file mode 100644
+index 0000000..2dd3e9a
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/encryption_insert_values.q
+@@ -0,0 +1,15 @@
++-- SORT_QUERY_RESULTS;
++
++DROP TABLE IF EXISTS encrypted_table PURGE;
++CREATE TABLE encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table';
++CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
++CRYPTO CREATE_ZONE --keyName key_128 --path ${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table;
++
++INSERT INTO encrypted_table values(1,'foo'),(2,'bar');
++
++select * from encrypted_table;
++
++-- this checks that we've actually created temp table data under encrypted_table folder 
++describe formatted values__tmp__table__1;
++
++CRYPTO DELETE_KEY --keyName key_128;
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out
+index c37123b..8175734 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out
+@@ -93,9 +93,9 @@ STAGE PLANS:
+                 value expressions: _col0 (type: string), _col1 (type: string)
+                 auto parallelism: false
+       Path -> Alias:
+-#### A masked pattern was here ####
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
+       Path -> Partition:
+-#### A masked pattern was here ####
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
+           Partition
+             base file name: Values__Tmp__Table__1
+             input format: org.apache.hadoop.mapred.TextInputFormat
+@@ -106,6 +106,7 @@ STAGE PLANS:
+               columns.comments 
+               columns.types string:string
+ #### A masked pattern was here ####
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
+               name default.values__tmp__table__1
+               serialization.ddl struct values__tmp__table__1 { string tmp_values_col1, string tmp_values_col2}
+               serialization.format 1
+@@ -120,6 +121,7 @@ STAGE PLANS:
+                 columns.comments 
+                 columns.types string:string
+ #### A masked pattern was here ####
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
+                 name default.values__tmp__table__1
+                 serialization.ddl struct values__tmp__table__1 { string tmp_values_col1, string tmp_values_col2}
+                 serialization.format 1
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_insert_values.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_insert_values.q.out
+new file mode 100644
+index 0000000..888a612
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_insert_values.q.out
+@@ -0,0 +1,71 @@
++PREHOOK: query: -- SORT_QUERY_RESULTS;
++
++DROP TABLE IF EXISTS encrypted_table PURGE
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: -- SORT_QUERY_RESULTS;
++
++DROP TABLE IF EXISTS encrypted_table PURGE
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@encrypted_table
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@encrypted_table
++Encryption key created: 'key_128'
++Encryption zone created: '/build/ql/test/data/warehouse/default/encrypted_table' using key: 'key_128'
++PREHOOK: query: INSERT INTO encrypted_table values(1,'foo'),(2,'bar')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@encrypted_table
++POSTHOOK: query: INSERT INTO encrypted_table values(1,'foo'),(2,'bar')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@encrypted_table
++POSTHOOK: Lineage: encrypted_table.key EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: encrypted_table.value SIMPLE [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++PREHOOK: query: select * from encrypted_table
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encrypted_table
++#### A PARTIAL masked pattern was here #### data/warehouse/default/encrypted_table/.hive-staging
++POSTHOOK: query: select * from encrypted_table
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encrypted_table
++#### A PARTIAL masked pattern was here #### data/warehouse/default/encrypted_table/.hive-staging
++1	foo
++2	bar
++PREHOOK: query: -- this checks that we've actually created temp table data under encrypted_table folder 
++describe formatted values__tmp__table__1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@values__tmp__table__1
++POSTHOOK: query: -- this checks that we've actually created temp table data under encrypted_table folder 
++describe formatted values__tmp__table__1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@values__tmp__table__1
++# col_name            	data_type           	comment             
++	 	 
++tmp_values_col1     	string              	                    
++tmp_values_col2     	string              	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A PARTIAL masked pattern was here #### data/warehouse/default/encrypted_table/.hive-staging
++Table Type:         	MANAGED_TABLE       	 
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
+-- 
+1.7.9.5
+

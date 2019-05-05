@@ -1,0 +1,225 @@
+From 50533316fbbb930b89ff09e4df95e0bf26447c69 Mon Sep 17 00:00:00 2001
+From: Adam Szita <szita@cloudera.com>
+Date: Tue, 9 May 2017 11:22:07 +0200
+Subject: [PATCH 1102/1164] CDH-53591: Backport HIVE-14380: Queries on tables
+ with remote HDFS paths fail in "encryption"
+ checks.
+
+Change-Id: Ia6c1358b50f1912ec7954e083713d7710782a94b
+---
+ .../hadoop/hive/metastore/HiveMetaStore.java       |    2 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |    9 ++++---
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   11 ++++-----
+ .../hadoop/hive/ql/session/SessionState.java       |   26 ++++++++++++++------
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |   21 +++++++++++++---
+ .../org/apache/hadoop/hive/shims/HadoopShims.java  |   17 +++++++++++++
+ 6 files changed, 65 insertions(+), 21 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 29b1e9b..3a5ae3d 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -1703,7 +1703,7 @@ private void checkTrashPurgeCombination(Path pathToData, String objectName, bool
+       if (trashEnabled) {
+         try {
+           HadoopShims.HdfsEncryptionShim shim =
+-            ShimLoader.getHadoopShims().createHdfsEncryptionShim(FileSystem.get(hiveConf), hiveConf);
++            ShimLoader.getHadoopShims().createHdfsEncryptionShim(pathToData.getFileSystem(hiveConf), hiveConf);
+           if (shim.isPathEncrypted(pathToData)) {
+             throw new MetaException("Unable to drop " + objectName + " because it is in an encryption zone" +
+               " and trash is enabled.  Use PURGE option to skip trash.");
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index ce4a925..6308bf5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -2946,10 +2946,13 @@ static protected boolean needToCopy(Path srcf, Path destf, FileSystem srcFs, Fil
+     }
+ 
+     //Check if different encryption zones
+-    HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
++    HadoopShims.HdfsEncryptionShim srcHdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim(srcFs);
++    HadoopShims.HdfsEncryptionShim destHdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim(destFs);
+     try {
+-      return hdfsEncryptionShim != null && (hdfsEncryptionShim.isPathEncrypted(srcf) || hdfsEncryptionShim.isPathEncrypted(destf))
+-        && !hdfsEncryptionShim.arePathsOnSameEncryptionZone(srcf, destf);
++      return srcHdfsEncryptionShim != null
++          && destHdfsEncryptionShim != null
++          && (srcHdfsEncryptionShim.isPathEncrypted(srcf) || destHdfsEncryptionShim.isPathEncrypted(destf))
++          && !srcHdfsEncryptionShim.arePathsOnSameEncryptionZone(srcf, destf, destHdfsEncryptionShim);
+     } catch (IOException e) {
+       throw new HiveException(e);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 8321f36..aa222a2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -1911,17 +1911,16 @@ public void getMetaData(QB qb, ReadEntity parentInput) throws SemanticException
+    * @throws HiveException If an error occurs while checking for encryption
+    */
+   private boolean isPathEncrypted(Path path) throws HiveException {
+-    HadoopShims.HdfsEncryptionShim hdfsEncryptionShim;
+ 
+-    hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
+-    if (hdfsEncryptionShim != null) {
+-      try {
++    try {
++      HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim(path.getFileSystem(conf));
++      if (hdfsEncryptionShim != null) {
+         if (hdfsEncryptionShim.isPathEncrypted(path)) {
+           return true;
+         }
+-      } catch (Exception e) {
+-        throw new HiveException("Unable to determine if " + path + " is encrypted: " + e, e);
+       }
++    } catch (Exception e) {
++        throw new HiveException("Unable to determine if " + path + " is encrypted: " + e, e);
+     }
+ 
+     return false;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index bfa0359..8562546 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -42,6 +42,7 @@
+ import java.util.Set;
+ import java.util.UUID;
+ 
++import com.google.common.collect.Maps;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.lang3.ArrayUtils;
+ import org.apache.commons.logging.Log;
+@@ -214,7 +215,7 @@
+   /**
+    * Gets information about HDFS encryption
+    */
+-  private HadoopShims.HdfsEncryptionShim hdfsEncryptionShim;
++  private Map<URI, HadoopShims.HdfsEncryptionShim> hdfsEncryptionShims = Maps.newHashMap();
+ 
+   /**
+    * Lineage state.
+@@ -440,11 +441,22 @@ public boolean isAutoCommit() {
+   }
+ 
+   public HadoopShims.HdfsEncryptionShim getHdfsEncryptionShim() throws HiveException {
+-    if (hdfsEncryptionShim == null) {
++    try {
++      return getHdfsEncryptionShim(FileSystem.get(conf));
++    }
++    catch(HiveException hiveException) {
++      throw hiveException;
++    }
++    catch(Exception exception) {
++      throw new HiveException(exception);
++    }
++  }
++
++  public HadoopShims.HdfsEncryptionShim getHdfsEncryptionShim(FileSystem fs) throws HiveException {
++    if (!hdfsEncryptionShims.containsKey(fs.getUri())) {
+       try {
+-        FileSystem fs = FileSystem.get(conf);
+         if ("hdfs".equals(fs.getUri().getScheme())) {
+-          hdfsEncryptionShim = ShimLoader.getHadoopShims().createHdfsEncryptionShim(fs, conf);
++          hdfsEncryptionShims.put(fs.getUri(), ShimLoader.getHadoopShims().createHdfsEncryptionShim(fs, conf));
+         } else {
+           LOG.info("Could not get hdfsEncryptionShim, it is only applicable to hdfs filesystem.");
+         }
+@@ -453,10 +465,10 @@ public boolean isAutoCommit() {
+       }
+     }
+ 
+-    return hdfsEncryptionShim;
++    return hdfsEncryptionShims.get(fs.getUri());
+   }
+ 
+-  // SessionState is not available in runtime and Hive.get().getConf() is not safe to call 
++  // SessionState is not available in runtime and Hive.get().getConf() is not safe to call
+   private static class SessionStates {
+     private SessionState state;
+     private HiveConf conf;
+@@ -472,7 +484,7 @@ private void attach(HiveConf conf) {
+       }
+     }
+   }
+-  
++
+   /**
+    * Singleton Session object per thread.
+    *
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index 7e6baad..52c187c 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -1281,11 +1281,11 @@ public boolean isPathEncrypted(Path path) throws IOException {
+ 
+     @Override
+     public boolean arePathsOnSameEncryptionZone(Path path1, Path path2) throws IOException {
+-      EncryptionZone zone1, zone2;
+-
+-      zone1 = hdfsAdmin.getEncryptionZoneForPath(path1);
+-      zone2 = hdfsAdmin.getEncryptionZoneForPath(path2);
++      return equivalentEncryptionZones(hdfsAdmin.getEncryptionZoneForPath(path1),
++                                       hdfsAdmin.getEncryptionZoneForPath(path2));
++    }
+ 
++    private boolean equivalentEncryptionZones(EncryptionZone zone1, EncryptionZone zone2) {
+       if (zone1 == null && zone2 == null) {
+         return true;
+       } else if (zone1 == null || zone2 == null) {
+@@ -1296,6 +1296,19 @@ public boolean arePathsOnSameEncryptionZone(Path path1, Path path2) throws IOExc
+     }
+ 
+     @Override
++    public boolean arePathsOnSameEncryptionZone(Path path1, Path path2,
++                                                HadoopShims.HdfsEncryptionShim encryptionShim2) throws IOException {
++      if (!(encryptionShim2 instanceof Hadoop23Shims.HdfsEncryptionShim)) {
++        LOG.warn("EncryptionShim for path2 (" + path2 + ") is of unexpected type: " + encryptionShim2.getClass()
++            + ". Assuming path2 is on the same EncryptionZone as path1(" + path1 + ").");
++        return true;
++      }
++
++      return equivalentEncryptionZones(hdfsAdmin.getEncryptionZoneForPath(path1),
++          ((HdfsEncryptionShim)encryptionShim2).hdfsAdmin.getEncryptionZoneForPath(path2));
++    }
++
++    @Override
+     public int comparePathKeyStrength(Path path1, Path path2) throws IOException {
+       EncryptionZone zone1, zone2;
+ 
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+index d29fcc9..3137c34 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+@@ -595,6 +595,17 @@ public void checkFileAccess(FileSystem fs, FileStatus status, FsAction action)
+     public boolean arePathsOnSameEncryptionZone(Path path1, Path path2) throws IOException;
+ 
+     /**
++     * Checks if two HDFS paths are on the same encrypted or unencrypted zone.
++     *
++     * @param path1 Path to HDFS file system
++     * @param path2 Path to HDFS file system
++     * @param encryptionShim2 The encryption-shim corresponding to path2.
++     * @return True if both paths are in the same zone; False otherwise.
++     * @throws IOException If an error occurred attempting to get encryption information
++     */
++    public boolean arePathsOnSameEncryptionZone(Path path1, Path path2, HdfsEncryptionShim encryptionShim2) throws IOException;
++
++    /**
+      * Compares two encrypted path strengths.
+      *
+      * @param path1 HDFS path to compare.
+@@ -649,6 +660,12 @@ public boolean arePathsOnSameEncryptionZone(Path path1, Path path2) throws IOExc
+     }
+ 
+     @Override
++    public boolean arePathsOnSameEncryptionZone(Path path1, Path path2, HdfsEncryptionShim encryptionShim2) throws IOException {
++      // Not supported.
++      return true;
++    }
++
++    @Override
+     public int comparePathKeyStrength(Path path1, Path path2) throws IOException {
+     /* not supported */
+       return 0;
+-- 
+1.7.9.5
+

@@ -1,0 +1,190 @@
+From e8f991c92038af0e03bcc164cd142a2d7bbdc025 Mon Sep 17 00:00:00 2001
+From: Nachiket Vaidya <nvaidya@cloudera.com>
+Date: Wed, 8 Feb 2017 10:35:22 -0600
+Subject: [PATCH 0974/1164] CDH-48896: HIVE-15754: exchange partition is not
+ generating notifications (Nachiket Vaidya,
+ reviewed by Sergio Pena)
+
+Change-Id: I21c4c605b2dd3f78d933d3908b2a1508bba61152
+---
+ .../listener/TestDbNotificationListener.java       |   73 +++++++++++++++++++-
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   38 +++++++++-
+ 2 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+index d16f29b..44d2c4d 100644
+--- a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
++++ b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+@@ -39,6 +39,8 @@
+ import org.apache.htrace.fasterxml.jackson.databind.node.ObjectNode;
+ import org.apache.thrift.TDeserializer;
+ import org.apache.thrift.protocol.TJSONProtocol;
++import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.Lists;
+ import org.apache.hadoop.hive.cli.CliSessionState;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+@@ -64,6 +66,7 @@
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -412,6 +415,74 @@ public void dropPartition() throws Exception {
+   }
+ 
+   @Test
++  public void exchangePartition() throws Exception {
++    String dbName = "default";
++    List<FieldSchema> cols = new ArrayList<FieldSchema>();
++    cols.add(new FieldSchema("col1", "int", "nocomment"));
++    List<FieldSchema> partCols = new ArrayList<FieldSchema>();
++    partCols.add(new FieldSchema("part", "int", ""));
++    SerDeInfo serde = new SerDeInfo("serde", "seriallib", null);
++    StorageDescriptor sd1 = new StorageDescriptor(cols, "file:/tmp/1", "input", "output", false, 0,
++        serde, null, null, emptyParameters);
++    Table tab1 = new Table("tab1", dbName, "me", startTime, startTime, 0, sd1, partCols,
++        emptyParameters, null, null, null);
++    msClient.createTable(tab1);
++    NotificationEventResponse rsp = msClient.getNextNotification(firstEventId, 0, null);
++    assertEquals(1, rsp.getEventsSize()); // add_table
++
++    StorageDescriptor sd2 = new StorageDescriptor(cols, "file:/tmp/2", "input", "output", false, 0,
++        serde, null, null, emptyParameters);
++    Table tab2 = new Table("tab2", dbName, "me", startTime, startTime, 0, sd2, partCols,
++        emptyParameters, null, null, null); // add_table
++    msClient.createTable(tab2);
++    rsp = msClient.getNextNotification(firstEventId + 1, 0, null);
++    assertEquals(1, rsp.getEventsSize());
++
++    StorageDescriptor sd1part = new StorageDescriptor(cols, "file:/tmp/1/part=1", "input", "output", false, 0,
++        serde, null, null, emptyParameters);
++    StorageDescriptor sd2part = new StorageDescriptor(cols, "file:/tmp/1/part=2", "input", "output", false, 0,
++        serde, null, null, emptyParameters);
++    StorageDescriptor sd3part = new StorageDescriptor(cols, "file:/tmp/1/part=3", "input", "output", false, 0,
++        serde, null, null, emptyParameters);
++    Partition part1 = new Partition(Arrays.asList("1"), "default", tab1.getTableName(),
++        startTime, startTime, sd1part, emptyParameters);
++    Partition part2 = new Partition(Arrays.asList("2"), "default", tab1.getTableName(),
++        startTime, startTime, sd2part, emptyParameters);
++    Partition part3 = new Partition(Arrays.asList("3"), "default", tab1.getTableName(),
++        startTime, startTime, sd3part, emptyParameters);
++    msClient.add_partitions(Arrays.asList(part1, part2, part3));
++    rsp = msClient.getNextNotification(firstEventId + 2, 0, null);
++    assertEquals(1, rsp.getEventsSize()); // add_partition
++
++    msClient.exchange_partition(ImmutableMap.of("part", "1"),
++        dbName, tab1.getTableName(), dbName, tab2.getTableName());
++
++    rsp = msClient.getNextNotification(firstEventId + 3, 0, null);
++    assertEquals(2, rsp.getEventsSize());
++
++    NotificationEvent event = rsp.getEvents().get(0);
++    assertEquals(firstEventId + 4, event.getEventId());
++    assertTrue(event.getEventTime() >= startTime);
++    assertEquals(HCatConstants.HCAT_ADD_PARTITION_EVENT, event.getEventType());
++    assertEquals(dbName, event.getDbName());
++    assertEquals(tab2.getTableName(), event.getTableName());
++    assertTrue(event.getMessage().matches("\\{\"eventType\":\"ADD_PARTITION\",\"server\":\"\"," +
++        "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
++        "\"tab2\",\"timestamp\":[0-9]+,\"partitions\":\\[\\{\"part\":\"1\"}]}"));
++
++    event = rsp.getEvents().get(1);
++    assertEquals(firstEventId + 5, event.getEventId());
++    assertTrue(event.getEventTime() >= startTime);
++    assertEquals(HCatConstants.HCAT_DROP_PARTITION_EVENT, event.getEventType());
++    assertEquals(dbName, event.getDbName());
++    assertEquals(tab1.getTableName(), event.getTableName());
++    assertTrue(event.getMessage().matches("\\{\"eventType\":\"DROP_PARTITION\",\"server\":\"\"," +
++        "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
++        "\"tab1\",\"timestamp\":[0-9]+,\"partitions\":\\[\\{\"part\":\"1\"}]}"));
++
++  }
++
++  @Test
+   public void createFunction() throws Exception {
+     String funcName = "createFunction";
+     String dbName = "default";
+@@ -953,4 +1024,4 @@ private Index getIndexObj(JsonNode jsonTree, String indexObjKey) throws Exceptio
+     deSerializer.deserialize(indexObj, tableJson, "UTF-8");
+     return indexObj;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index b5b7018..b52e18a 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -33,6 +33,7 @@
+ import org.apache.commons.cli.OptionBuilder;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.commons.collections.CollectionUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -2826,8 +2827,8 @@ public Partition exchange_partition(Map<String, String> partitionSpecs,
+           Warehouse.makePartName(partitionKeysPresent, partValsPresent));
+       Path destPath = new Path(destinationTable.getSd().getLocation(),
+           Warehouse.makePartName(partitionKeysPresent, partValsPresent));
++      List<Partition> destPartitions = new ArrayList<Partition>();
+       try {
+-        List<Partition> destPartitions = new ArrayList<Partition>();
+         for (Partition partition: partitionsToExchange) {
+           Partition destPartition = new Partition(partition);
+           destPartition.setDbName(destDbName);
+@@ -2851,6 +2852,12 @@ public Partition exchange_partition(Map<String, String> partitionSpecs,
+          * once https://issues.apache.org/jira/browse/HDFS-3370 is done
+          */
+         pathCreated = wh.renameDir(sourcePath, destPath);
++
++        // Setting success to false to make sure that if the listener fails, rollback happens.
++        success = false;
++        fireMetaStoreExchangePartitionEvent(sourceTable, partitionsToExchange,
++            destinationTable, destPartitions, transactionalListeners, true);
++
+         success = ms.commitTransaction();
+         return destPartitions;
+       } finally {
+@@ -2859,6 +2866,35 @@ public Partition exchange_partition(Map<String, String> partitionSpecs,
+           if (pathCreated) {
+             wh.renameDir(destPath, sourcePath);
+           }
++
++          fireMetaStoreExchangePartitionEvent(sourceTable, partitionsToExchange,
++              destinationTable, destPartitions, listeners, success);
++        }
++      }
++    }
++
++    private void fireMetaStoreExchangePartitionEvent(Table sourceTable,
++        List<Partition> partitionsToExchange, Table destinationTable,
++        List<Partition> destPartitions,
++        List<MetaStoreEventListener> eventListeners,
++        boolean status) throws MetaException {
++      if (sourceTable != null && destinationTable != null
++          && !CollectionUtils.isEmpty(partitionsToExchange)
++          && !CollectionUtils.isEmpty(destPartitions)) {
++        if (eventListeners.size() > 0) {
++          AddPartitionEvent addPartitionEvent =
++              new AddPartitionEvent(destinationTable, destPartitions, status, this);
++          for (MetaStoreEventListener eventListener : eventListeners) {
++            eventListener.onAddPartition(addPartitionEvent);
++          }
++
++          for (Partition partition : partitionsToExchange) {
++            DropPartitionEvent dropPartitionEvent =
++                new DropPartitionEvent(sourceTable, partition, true, status, this);
++            for (MetaStoreEventListener eventListener : eventListeners) {
++              eventListener.onDropPartition(dropPartitionEvent);
++            }
++          }
+         }
+       }
+     }
+-- 
+1.7.9.5
+

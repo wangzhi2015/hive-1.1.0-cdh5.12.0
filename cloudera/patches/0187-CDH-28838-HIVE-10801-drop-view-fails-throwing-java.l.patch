@@ -1,0 +1,101 @@
+From 686d0c9fa57e93c14b761ad9bc27b33957c35a26 Mon Sep 17 00:00:00 2001
+From: Hari Subramaniyan <harisankar@apache.org>
+Date: Tue, 26 May 2015 10:19:03 -0700
+Subject: [PATCH 0187/1164] CDH-28838 HIVE-10801 : 'drop view' fails throwing
+ java.lang.NullPointerException (Hari
+ Subramaniyan, reviewed by Eugene Koifman)
+
+Conflicts:
+	itests/src/test/resources/testconfiguration.properties
+---
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../hadoop/hive/metastore/HiveMetaStore.java       |    3 +-
+ .../queries/clientpositive/encryption_drop_view.q  |    6 ++++
+ .../encrypted/encryption_drop_view.q.out           |   34 ++++++++++++++++++++
+ 4 files changed, 44 insertions(+), 2 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/encryption_drop_view.q
+ create mode 100644 ql/src/test/results/clientpositive/encrypted/encryption_drop_view.q.out
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index dc098cf..3e6fff5 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -313,7 +313,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_load_data_to_encrypted_tables.q, \
+   encryption_unencrypted_nonhdfs_external_tables.q \
+   encryption_move_tbl.q \
+-  encryption_drop_table.q
++  encryption_drop_table.q \
++  encryption_drop_view.q
+ 
+ beeline.positive.exclude=add_part_exist.q,\
+   alter1.q,\
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 9c0d807..bacaac8 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -1533,7 +1533,8 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+           }
+         }
+ 
+-        if(!ifPurge) {
++        // tblPath will be null when tbl is a view. We skip the following if block in that case.
++        if(tblPath != null && !ifPurge) {
+           String trashInterval = hiveConf.get("fs.trash.interval");
+           boolean trashEnabled = trashInterval != null && trashInterval.length() > 0
+             && Float.parseFloat(trashInterval) > 0;
+diff --git a/ql/src/test/queries/clientpositive/encryption_drop_view.q b/ql/src/test/queries/clientpositive/encryption_drop_view.q
+new file mode 100644
+index 0000000..911583a
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/encryption_drop_view.q
+@@ -0,0 +1,6 @@
++DROP TABLE IF EXISTS dve_encrypted_table PURGE;
++CREATE TABLE dve_encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/dve_encrypted_table';
++CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
++CRYPTO CREATE_ZONE --keyName key_128 --path ${hiveconf:hive.metastore.warehouse.dir}/default/dve_encrypted_table;
++CREATE VIEW dve_view AS SELECT * FROM dve_encrypted_table;
++DROP VIEW dve_view;
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_drop_view.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_drop_view.q.out
+new file mode 100644
+index 0000000..7958b39
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_drop_view.q.out
+@@ -0,0 +1,34 @@
++PREHOOK: query: DROP TABLE IF EXISTS dve_encrypted_table PURGE
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS dve_encrypted_table PURGE
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@dve_encrypted_table
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@dve_encrypted_table
++Encryption key created: 'key_128'
++Encryption zone created: '/build/ql/test/data/warehouse/default/dve_encrypted_table' using key: 'key_128'
++PREHOOK: query: CREATE VIEW dve_view AS SELECT * FROM dve_encrypted_table
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@dve_encrypted_table
++PREHOOK: Output: database:default
++PREHOOK: Output: default@dve_view
++POSTHOOK: query: CREATE VIEW dve_view AS SELECT * FROM dve_encrypted_table
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@dve_encrypted_table
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@dve_view
++PREHOOK: query: DROP VIEW dve_view
++PREHOOK: type: DROPVIEW
++PREHOOK: Input: default@dve_view
++PREHOOK: Output: default@dve_view
++POSTHOOK: query: DROP VIEW dve_view
++POSTHOOK: type: DROPVIEW
++POSTHOOK: Input: default@dve_view
++POSTHOOK: Output: default@dve_view
+-- 
+1.7.9.5
+

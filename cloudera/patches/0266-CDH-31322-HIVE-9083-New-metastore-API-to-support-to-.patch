@@ -1,0 +1,531 @@
+From 9171d0e822482189d0272b1675649cabd84fbb46 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Wed, 9 Sep 2015 15:43:04 -0500
+Subject: [PATCH 0266/1164] CDH-31322: HIVE-9083 : New metastore API to
+ support to purge partition-data directly in
+ dropPartitions(). (Mithun Radhakrishnan via
+ Ashutosh Chauhan)
+
+---
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   33 +++++--
+ .../hadoop/hive/metastore/HiveMetaStoreClient.java |   53 ++++++++++-
+ .../hadoop/hive/metastore/IMetaStoreClient.java    |   49 ++++++++++
+ .../hive/metastore/PartitionDropOptions.java       |   60 ++++++++++++
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |   11 ++-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   27 +++++-
+ .../apache/hadoop/hive/ql/metadata/TestHive.java   |   98 ++++++++++++++++++++
+ 7 files changed, 312 insertions(+), 19 deletions(-)
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/PartitionDropOptions.java
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 4ba803d..74e8e75 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -2624,15 +2624,24 @@ private boolean drop_partition_common(RawStore ms, String db_name, String tbl_na
+           ms.rollbackTransaction();
+         } else if (deleteData && ((partPath != null) || (archiveParentDir != null))) {
+           if (tbl != null && !isExternal(tbl)) {
++            // Data needs deletion. Check if trash may be skipped.
++            boolean mustPurge = (envContext != null)
++                                && Boolean.parseBoolean(envContext.getProperties().get("ifPurge"));
++            if (mustPurge) {
++              LOG.info("dropPartition() will purge " + partPath + " directly, skipping trash.");
++            }
++            else {
++              LOG.info("dropPartition() will move " + partPath + " to trash-directory.");
++            }
+             // Archived partitions have har:/to_har_file as their location.
+             // The original directory was saved in params
+             if (isArchived) {
+               assert (archiveParentDir != null);
+-              wh.deleteDir(archiveParentDir, true);
++              wh.deleteDir(archiveParentDir, true, mustPurge);
+             } else {
+               assert (partPath != null);
+-              wh.deleteDir(partPath, true);
+-              deleteParentRecursive(partPath.getParent(), part_vals.size() - 1);
++              wh.deleteDir(partPath, true, mustPurge);
++              deleteParentRecursive(partPath.getParent(), part_vals.size() - 1, mustPurge);
+             }
+             // ok even if the data is not deleted
+           }
+@@ -2647,10 +2656,10 @@ private boolean drop_partition_common(RawStore ms, String db_name, String tbl_na
+       return true;
+     }
+ 
+-    private void deleteParentRecursive(Path parent, int depth) throws IOException, MetaException {
++    private void deleteParentRecursive(Path parent, int depth, boolean mustPurge) throws IOException, MetaException {
+       if (depth > 0 && parent != null && wh.isWritable(parent) && wh.isEmpty(parent)) {
+-        wh.deleteDir(parent, true);
+-        deleteParentRecursive(parent.getParent(), depth - 1);
++        wh.deleteDir(parent, true, mustPurge);
++        deleteParentRecursive(parent.getParent(), depth - 1, mustPurge);
+       }
+     }
+ 
+@@ -2777,15 +2786,21 @@ public DropPartitionsResult drop_partitions_req(
+         if (!success) {
+           ms.rollbackTransaction();
+         } else if (deleteData && !isExternal(tbl)) {
++          // Data needs deletion. Check if trash may be skipped.
++          boolean mustPurge = (envContext != null)
++                              && Boolean.parseBoolean(envContext.getProperties().get("ifPurge"));
++          LOG.info( mustPurge?
++                      "dropPartition() will purge partition-directories directly, skipping trash."
++                    :  "dropPartition() will move partition-directories to trash-directory.");
+           // Archived partitions have har:/to_har_file as their location.
+           // The original directory was saved in params
+           for (Path path : archToDelete) {
+-            wh.deleteDir(path, true);
++            wh.deleteDir(path, true, mustPurge);
+           }
+           for (PathAndPartValSize p : dirsToDelete) {
+-            wh.deleteDir(p.path, true);
++            wh.deleteDir(p.path, true, mustPurge);
+             try {
+-              deleteParentRecursive(p.path.getParent(), p.partValSize - 1);
++              deleteParentRecursive(p.path.getParent(), p.partValSize - 1, mustPurge);
+             } catch (IOException ex) {
+               LOG.warn("Error from deleteParentRecursive", ex);
+               throw new MetaException("Failed to delete parent: " + ex.getMessage());
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+index c47fbd0..ba4c23f 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+@@ -768,6 +768,12 @@ public boolean dropPartition(String dbName, String tableName, String partName, b
+     return dropPartition(dbName, tableName, partName, deleteData, null);
+   }
+ 
++  private static EnvironmentContext getEnvironmentContextWithIfPurgeSet() {
++    Map<String, String> warehouseOptions = new HashMap<String, String>();
++    warehouseOptions.put("ifPurge", "TRUE");
++    return new EnvironmentContext(warehouseOptions);
++  }
++
+   public boolean dropPartition(String dbName, String tableName, String partName, boolean deleteData,
+       EnvironmentContext envContext) throws NoSuchObjectException, MetaException, TException {
+     return client.drop_partition_by_name_with_environment_context(dbName, tableName, partName,
+@@ -794,6 +800,13 @@ public boolean dropPartition(String db_name, String tbl_name,
+     return dropPartition(db_name, tbl_name, part_vals, deleteData, null);
+   }
+ 
++  @Override
++  public boolean dropPartition(String db_name, String tbl_name,
++      List<String> part_vals, PartitionDropOptions options) throws TException {
++    return dropPartition(db_name, tbl_name, part_vals, options.deleteData,
++                         options.purgeData? getEnvironmentContextWithIfPurgeSet() : null);
++  }
++
+   public boolean dropPartition(String db_name, String tbl_name, List<String> part_vals,
+       boolean deleteData, EnvironmentContext envContext) throws NoSuchObjectException,
+       MetaException, TException {
+@@ -803,8 +816,8 @@ public boolean dropPartition(String db_name, String tbl_name, List<String> part_
+ 
+   @Override
+   public List<Partition> dropPartitions(String dbName, String tblName,
+-      List<ObjectPair<Integer, byte[]>> partExprs, boolean deleteData, boolean ignoreProtection,
+-      boolean ifExists) throws NoSuchObjectException, MetaException, TException {
++                                        List<ObjectPair<Integer, byte[]>> partExprs, PartitionDropOptions options)
++      throws TException {
+     RequestPartsSpec rps = new RequestPartsSpec();
+     List<DropPartitionsExpr> exprs = new ArrayList<DropPartitionsExpr>(partExprs.size());
+     for (ObjectPair<Integer, byte[]> partExpr : partExprs) {
+@@ -815,13 +828,43 @@ public boolean dropPartition(String db_name, String tbl_name, List<String> part_
+     }
+     rps.setExprs(exprs);
+     DropPartitionsRequest req = new DropPartitionsRequest(dbName, tblName, rps);
+-    req.setDeleteData(deleteData);
+-    req.setIgnoreProtection(ignoreProtection);
++    req.setDeleteData(options.deleteData);
++    req.setIgnoreProtection(options.ignoreProtection);
+     req.setNeedResult(true);
+-    req.setIfExists(ifExists);
++    req.setIfExists(options.ifExists);
++    if (options.purgeData) {
++      LOG.info("Dropped partitions will be purged!");
++      req.setEnvironmentContext(getEnvironmentContextWithIfPurgeSet());
++    }
+     return client.drop_partitions_req(req).getPartitions();
+   }
+ 
++  @Override
++  public List<Partition> dropPartitions(String dbName, String tblName,
++      List<ObjectPair<Integer, byte[]>> partExprs, boolean deleteData, boolean ignoreProtection,
++      boolean ifExists, boolean needResult) throws NoSuchObjectException, MetaException, TException {
++
++    return dropPartitions(dbName, tblName, partExprs,
++                          PartitionDropOptions.instance()
++                                              .deleteData(deleteData)
++                                              .ignoreProtection(ignoreProtection)
++                                              .ifExists(ifExists)
++                                              .returnResults(needResult));
++
++  }
++
++  @Override
++  public List<Partition> dropPartitions(String dbName, String tblName,
++      List<ObjectPair<Integer, byte[]>> partExprs, boolean deleteData, boolean ignoreProtection,
++      boolean ifExists) throws NoSuchObjectException, MetaException, TException {
++    // By default, we need the results from dropPartitions();
++    return dropPartitions(dbName, tblName, partExprs,
++                          PartitionDropOptions.instance()
++                                              .deleteData(deleteData)
++                                              .ignoreProtection(ignoreProtection)
++                                              .ifExists(ifExists));
++  }
++
+   /**
+    * {@inheritDoc}
+    * @see #dropTable(String, String, boolean, boolean, EnvironmentContext)
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreClient.java
+index 8eba921..a0eed49 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreClient.java
+@@ -18,6 +18,26 @@
+ 
+ package org.apache.hadoop.hive.metastore;
+ 
++import org.apache.hadoop.hive.common.ValidTxnList;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.api.CompactionType;
++import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
++import org.apache.hadoop.hive.metastore.api.GetOpenTxnsInfoResponse;
++import org.apache.hadoop.hive.metastore.api.HeartbeatTxnRangeResponse;
++import org.apache.hadoop.hive.metastore.api.LockRequest;
++import org.apache.hadoop.hive.metastore.api.LockResponse;
++import org.apache.hadoop.hive.metastore.api.NoSuchLockException;
++import org.apache.hadoop.hive.metastore.api.NoSuchTxnException;
++import org.apache.hadoop.hive.metastore.api.NotificationEvent;
++import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
++import org.apache.hadoop.hive.metastore.api.OpenTxnsResponse;
++import org.apache.hadoop.hive.metastore.api.ShowCompactResponse;
++import org.apache.hadoop.hive.metastore.api.ShowLocksResponse;
++import org.apache.hadoop.hive.metastore.api.TxnAbortedException;
++import org.apache.hadoop.hive.metastore.api.TxnOpenException;
++import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
++import org.apache.thrift.TException;
++
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -663,10 +683,39 @@ boolean dropPartition(String db_name, String tbl_name,
+       List<String> part_vals, boolean deleteData) throws NoSuchObjectException,
+       MetaException, TException;
+ 
++  /**
++   * Method to dropPartitions() with the option to purge the partition data directly,
++   * rather than to move data to trash.
++   * @param db_name Name of the database.
++   * @param tbl_name Name of the table.
++   * @param part_vals Specification of the partitions being dropped.
++   * @param options PartitionDropOptions for the operation.
++   * @return True (if partitions are dropped), else false.
++   * @throws TException
++   */
++  boolean dropPartition(String db_name, String tbl_name, List<String> part_vals,
++                        PartitionDropOptions options) throws TException;
++
+   List<Partition> dropPartitions(String dbName, String tblName,
+       List<ObjectPair<Integer, byte[]>> partExprs, boolean deleteData, boolean ignoreProtection,
+       boolean ifExists) throws NoSuchObjectException, MetaException, TException;
+ 
++  List<Partition> dropPartitions(String dbName, String tblName,
++      List<ObjectPair<Integer, byte[]>> partExprs, boolean deleteData, boolean ignoreProtection,
++      boolean ifExists, boolean needResults) throws NoSuchObjectException, MetaException, TException;
++
++  /**
++   * Generalization of dropPartitions(),
++   * @param dbName Name of the database
++   * @param tblName Name of the table
++   * @param partExprs Partition-specification
++   * @param options Boolean options for dropping partitions
++   * @return List of Partitions dropped
++   * @throws TException On failure
++   */
++  List<Partition> dropPartitions(String dbName, String tblName,
++                                 List<ObjectPair<Integer, byte[]>> partExprs, PartitionDropOptions options) throws TException;
++
+   boolean dropPartition(String db_name, String tbl_name,
+       String name, boolean deleteData) throws NoSuchObjectException,
+       MetaException, TException;
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/PartitionDropOptions.java b/metastore/src/java/org/apache/hadoop/hive/metastore/PartitionDropOptions.java
+new file mode 100644
+index 0000000..5b2811f
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/PartitionDropOptions.java
+@@ -0,0 +1,60 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++/**
++ * Class to generalize the switches for dropPartitions().
++ */
++public class PartitionDropOptions {
++
++  public boolean deleteData = true;
++  public boolean ignoreProtection = false;
++  public boolean ifExists = false;
++  public boolean returnResults = true;
++  public boolean purgeData = false;
++
++  public static PartitionDropOptions instance() { return new PartitionDropOptions(); }
++
++  public PartitionDropOptions deleteData(boolean deleteData) {
++    this.deleteData = deleteData;
++    return this;
++  }
++
++  public PartitionDropOptions ignoreProtection(boolean ignoreProtection) {
++    this.ignoreProtection = ignoreProtection;
++    return this;
++  }
++
++  public PartitionDropOptions ifExists(boolean ifExists) {
++    this.ifExists = ifExists;
++    return this;
++  }
++
++  public PartitionDropOptions returnResults(boolean returnResults) {
++    this.returnResults = returnResults;
++    return this;
++  }
++
++  public PartitionDropOptions purgeData(boolean purgeData) {
++    this.purgeData = purgeData;
++    return this;
++  }
++
++} // class PartitionDropSwitches;
++
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 43bdeac..1a3b026 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -32,6 +32,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
++import org.apache.hadoop.hive.metastore.PartitionDropOptions;
+ import org.apache.hadoop.hive.metastore.ProtectMode;
+ import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+@@ -3670,8 +3671,14 @@ private void dropTableOrPartitions(Hive db, DropTableDesc dropTbl) throws HiveEx
+ 
+   private void dropPartitions(Hive db, Table tbl, DropTableDesc dropTbl) throws HiveException {
+     // ifExists is currently verified in DDLSemanticAnalyzer
+-    List<Partition> droppedParts = db.dropPartitions(dropTbl.getTableName(),
+-        dropTbl.getPartSpecs(), true, dropTbl.getIgnoreProtection(), true);
++    List<Partition> droppedParts
++        = db.dropPartitions(dropTbl.getTableName(),
++                            dropTbl.getPartSpecs(),
++                            PartitionDropOptions.instance()
++                                                .deleteData(true)
++                                                .ignoreProtection(dropTbl.getIgnoreProtection())
++                                                .ifExists(true)
++                                                .purgeData(dropTbl.getIfPurge()));
+     for (Partition partition : droppedParts) {
+       console.printInfo("Dropped the partition " + partition.getName());
+       // We have already locked the table, don't lock the partitions.
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index c64e55a..f6ab09d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -62,6 +62,7 @@
+ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
++import org.apache.hadoop.hive.metastore.PartitionDropOptions;
+ import org.apache.hadoop.hive.metastore.RetryingMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+@@ -1863,8 +1864,14 @@ public boolean dropPartition(String tblName, List<String> part_vals, boolean del
+ 
+   public boolean dropPartition(String db_name, String tbl_name,
+       List<String> part_vals, boolean deleteData) throws HiveException {
++    return dropPartition(db_name, tbl_name, part_vals,
++                         PartitionDropOptions.instance().deleteData(deleteData));
++  }
++
++  public boolean dropPartition(String dbName, String tableName, List<String> partVals, PartitionDropOptions options)
++      throws HiveException {
+     try {
+-      return getMSC().dropPartition(db_name, tbl_name, part_vals, deleteData);
++      return getMSC().dropPartition(dbName, tableName, partVals, options);
+     } catch (NoSuchObjectException e) {
+       throw new HiveException("Partition or table doesn't exist.", e);
+     } catch (Exception e) {
+@@ -1882,7 +1889,21 @@ public boolean dropPartition(String db_name, String tbl_name,
+   public List<Partition> dropPartitions(String dbName, String tblName,
+       List<DropTableDesc.PartSpec> partSpecs,  boolean deleteData, boolean ignoreProtection,
+       boolean ifExists) throws HiveException {
+-    //TODO: add support for ifPurge
++    return dropPartitions(dbName, tblName, partSpecs,
++                          PartitionDropOptions.instance()
++                                              .deleteData(deleteData)
++                                              .ignoreProtection(ignoreProtection)
++                                              .ifExists(ifExists));
++  }
++
++  public List<Partition> dropPartitions(String tblName, List<DropTableDesc.PartSpec> partSpecs,
++                                        PartitionDropOptions dropOptions) throws HiveException {
++    String[] names = Utilities.getDbTableName(tblName);
++    return dropPartitions(names[0], names[1], partSpecs, dropOptions);
++  }
++
++  public List<Partition> dropPartitions(String dbName, String tblName,
++      List<DropTableDesc.PartSpec> partSpecs, PartitionDropOptions dropOptions) throws HiveException {
+     try {
+       Table tbl = getTable(dbName, tblName);
+       List<ObjectPair<Integer, byte[]>> partExprs =
+@@ -1892,7 +1913,7 @@ public boolean dropPartition(String db_name, String tbl_name,
+             Utilities.serializeExpressionToKryo(partSpec.getPartSpec())));
+       }
+       List<org.apache.hadoop.hive.metastore.api.Partition> tParts = getMSC().dropPartitions(
+-          dbName, tblName, partExprs, deleteData, ignoreProtection, ifExists);
++          dbName, tblName, partExprs, dropOptions);
+       return convertFromMetastore(tbl, tParts, null);
+     } catch (NoSuchObjectException e) {
+       throw new HiveException("Partition or table doesn't exist.", e);
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
+index 71e10e6..c115ec6 100755
+--- a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
+@@ -28,6 +28,7 @@
+ import java.util.Map;
+ import java.util.regex.Pattern;
+ 
++import com.google.common.collect.ImmutableMap;
+ import junit.framework.TestCase;
+ 
+ import org.apache.hadoop.fs.FileStatus;
+@@ -36,6 +37,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
++import org.apache.hadoop.hive.metastore.PartitionDropOptions;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+@@ -426,6 +428,102 @@ public void testDropTableTrash() throws Throwable {
+     }
+   }
+ 
++  private FileStatus[] getTrashContents() throws Exception {
++    FileSystem fs = FileSystem.get(hiveConf);
++    Path trashDir = ShimLoader.getHadoopShims().getCurrentTrashPath(hiveConf, fs);
++    return fs.globStatus(trashDir.suffix("/*"));
++  }
++
++  private Table createPartitionedTable(String dbName, String tableName) throws Exception {
++    try {
++
++      hm.dropTable(dbName, tableName);
++      hm.createTable(tableName,
++                     Arrays.asList("key", "value"),   // Data columns.
++                     Arrays.asList("ds", "hr"),       // Partition columns.
++                     TextInputFormat.class,
++                     HiveIgnoreKeyTextOutputFormat.class);
++      return hm.getTable(dbName, tableName);
++    }
++    catch (Exception exception) {
++      fail("Unable to drop and create table " + dbName + "." + tableName
++           + " because " + StringUtils.stringifyException(exception));
++      throw exception;
++    }
++  }
++
++  private void cleanUpTableQuietly(String dbName, String tableName) {
++    try {
++      hm.dropTable(dbName, tableName, true, true, true);
++    }
++    catch(Exception exception) {
++      fail("Unexpected exception: " + StringUtils.stringifyException(exception));
++    }
++  }
++
++  /**
++   * Test for PURGE support for dropping partitions.
++   * 1. Drop partitions without PURGE, and check that the data isn't moved to Trash.
++   * 2. Drop partitions with PURGE, and check that the data is moved to Trash.
++   * @throws Exception on failure.
++   */
++  public void testDropPartitionsWithPurge() throws Exception {
++    String dbName = MetaStoreUtils.DEFAULT_DATABASE_NAME;
++    String tableName = "table_for_testDropPartitionsWithPurge";
++
++    try {
++
++      Map<String, String> partitionSpec =  new ImmutableMap.Builder<String, String>()
++                                                 .put("ds", "20141216")
++                                                 .put("hr", "12")
++                                                 .build();
++
++      int trashSizeBeforeDrop = getTrashContents().length;
++
++      Table table = createPartitionedTable(dbName, tableName);
++      hm.createPartition(table, partitionSpec);
++
++      Partition partition = hm.getPartition(table, partitionSpec, false);
++      assertNotNull("Newly created partition shouldn't be null!", partition);
++
++      hm.dropPartition(dbName, tableName,
++                       partition.getValues(),
++                       PartitionDropOptions.instance()
++                                           .deleteData(true)
++                                           .purgeData(true)
++                      );
++
++      int trashSizeAfterDropPurge = getTrashContents().length;
++
++      assertEquals("After dropPartitions(purge), trash should've remained unchanged!",
++                 trashSizeBeforeDrop, trashSizeAfterDropPurge);
++
++      // Repeat, and drop partition without purge.
++      hm.createPartition(table, partitionSpec);
++
++      partition = hm.getPartition(table, partitionSpec, false);
++      assertNotNull("Newly created partition shouldn't be null!", partition);
++
++      hm.dropPartition(dbName, tableName,
++                       partition.getValues(),
++                       PartitionDropOptions.instance()
++                                           .deleteData(true)
++                                           .purgeData(false)
++                      );
++
++      int trashSizeWithoutPurge = getTrashContents().length;
++
++      assertEquals("After dropPartitions(noPurge), data should've gone to trash!",
++                  trashSizeBeforeDrop, trashSizeWithoutPurge);
++
++    }
++    catch (Exception e) {
++      fail("Unexpected exception: " + StringUtils.stringifyException(e));
++    }
++    finally {
++      cleanUpTableQuietly(dbName, tableName);
++    }
++  }
+ 
+   public void testPartition() throws Throwable {
+     try {
+-- 
+1.7.9.5
+

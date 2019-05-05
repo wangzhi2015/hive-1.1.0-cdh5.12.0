@@ -1,0 +1,204 @@
+From 487203ad63a90aadf16dfbbe4226106c8e51a4eb Mon Sep 17 00:00:00 2001
+From: aihuaxu <aihuaxu@apache.org>
+Date: Fri, 30 Oct 2015 13:31:08 -0400
+Subject: [PATCH 0411/1164] CDH-34634: HIVE-12304: "drop database cascade"
+ needs to unregister functions
+
+Change-Id: I41185fb33e12860aedac4cb1963b42126d33326e
+---
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    7 +-
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    9 +++
+ .../org/apache/hadoop/hive/ql/exec/Registry.java   |   12 +++
+ .../queries/clientnegative/drop_database_cascade.q |   26 ++++++
+ .../clientnegative/drop_database_cascade.q.out     |   85 ++++++++++++++++++++
+ 5 files changed, 138 insertions(+), 1 deletion(-)
+ create mode 100644 ql/src/test/queries/clientnegative/drop_database_cascade.q
+ create mode 100644 ql/src/test/results/clientnegative/drop_database_cascade.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 0cc9bc0..b42f42f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -3813,7 +3813,12 @@ private int createDatabase(Hive db, CreateDatabaseDesc crtDb)
+   private int dropDatabase(Hive db, DropDatabaseDesc dropDb)
+       throws HiveException {
+     try {
+-      db.dropDatabase(dropDb.getDatabaseName(), true, dropDb.getIfExists(), dropDb.isCasdade());
++      String dbName = dropDb.getDatabaseName();
++      db.dropDatabase(dbName, true, dropDb.getIfExists(), dropDb.isCasdade());
++      // Unregister the functions as well
++      if (dropDb.isCasdade()) {
++        FunctionRegistry.unregisterPermanentFunctions(dbName);
++      }
+     }
+     catch (NoSuchObjectException ex) {
+       throw new HiveException(ex, ErrorMsg.DATABASE_NOT_EXISTS, dropDb.getDatabaseName());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index d084d16..e23be50 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -1492,6 +1492,15 @@ public static void unregisterPermanentFunction(String functionName) throws HiveE
+     unregisterTemporaryUDF(functionName);
+   }
+ 
++  /**
++   * Unregisters all the functions under the database dbName
++   * @param dbName specified database name
++   * @throws HiveException
++   */
++  public static void unregisterPermanentFunctions(String dbName) throws HiveException {
++    system.unregisterFunctions(dbName);
++  }
++
+   private FunctionRegistry() {
+     // prevent instantiation
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java
+index a5d59ae..ad9fa4e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java
+@@ -419,6 +419,18 @@ public synchronized void unregisterFunction(String functionName) throws HiveExce
+     }
+   }
+ 
++  /**
++   * Unregisters all the functions belonging to the specified database
++   * @param dbName database name
++   * @throws HiveException
++   */
++  public synchronized void unregisterFunctions(String dbName) throws HiveException {
++    Set<String> funcNames = getFunctionNames(dbName.toLowerCase() + "\\..*");
++    for (String funcName : funcNames) {
++      unregisterFunction(funcName);
++    }
++  }
++
+   public GenericUDAFResolver getGenericUDAFResolver(String functionName) throws SemanticException {
+     FunctionInfo info = getFunctionInfo(functionName);
+     if (info != null) {
+diff --git a/ql/src/test/queries/clientnegative/drop_database_cascade.q b/ql/src/test/queries/clientnegative/drop_database_cascade.q
+new file mode 100644
+index 0000000..d544692
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/drop_database_cascade.q
+@@ -0,0 +1,26 @@
++-- This test verifies that if the functions and tables unregistered when the database is dropped
++-- and other databases are not affected
++
++CREATE DATABASE TEST_database;
++
++USE TEST_database;
++
++CREATE TABLE test_table (key STRING, value STRING);
++
++CREATE FUNCTION test_func as 'org.apache.hadoop.hive.ql.udf.UDFAscii';
++
++USE default;
++
++CREATE TABLE test_table (key STRING, value STRING);
++
++CREATE FUNCTION test_func as 'org.apache.hadoop.hive.ql.udf.UDFAscii';
++
++DROP DATABASE TEST_database CASCADE;
++
++describe test_table;
++
++describe function test_func;
++
++describe function TEST_database.test_func;
++
++describe TEST_database.test_table;
+diff --git a/ql/src/test/results/clientnegative/drop_database_cascade.q.out b/ql/src/test/results/clientnegative/drop_database_cascade.q.out
+new file mode 100644
+index 0000000..304b967
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/drop_database_cascade.q.out
+@@ -0,0 +1,85 @@
++PREHOOK: query: -- This test verifies that if the functions and tables unregistered when the database is dropped
++-- and other databases are not affected
++
++CREATE DATABASE TEST_database
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:TEST_database
++POSTHOOK: query: -- This test verifies that if the functions and tables unregistered when the database is dropped
++-- and other databases are not affected
++
++CREATE DATABASE TEST_database
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:TEST_database
++PREHOOK: query: USE TEST_database
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:test_database
++POSTHOOK: query: USE TEST_database
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:test_database
++PREHOOK: query: CREATE TABLE test_table (key STRING, value STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: TEST_database@test_table
++PREHOOK: Output: database:test_database
++POSTHOOK: query: CREATE TABLE test_table (key STRING, value STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: TEST_database@test_table
++POSTHOOK: Output: database:test_database
++PREHOOK: query: CREATE FUNCTION test_func as 'org.apache.hadoop.hive.ql.udf.UDFAscii'
++PREHOOK: type: CREATEFUNCTION
++PREHOOK: Output: database:test_database
++PREHOOK: Output: test_database.test_func
++POSTHOOK: query: CREATE FUNCTION test_func as 'org.apache.hadoop.hive.ql.udf.UDFAscii'
++POSTHOOK: type: CREATEFUNCTION
++POSTHOOK: Output: database:test_database
++POSTHOOK: Output: test_database.test_func
++PREHOOK: query: USE default
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:default
++POSTHOOK: query: USE default
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:default
++PREHOOK: query: CREATE TABLE test_table (key STRING, value STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@test_table
++POSTHOOK: query: CREATE TABLE test_table (key STRING, value STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@test_table
++PREHOOK: query: CREATE FUNCTION test_func as 'org.apache.hadoop.hive.ql.udf.UDFAscii'
++PREHOOK: type: CREATEFUNCTION
++PREHOOK: Output: database:default
++PREHOOK: Output: default.test_func
++POSTHOOK: query: CREATE FUNCTION test_func as 'org.apache.hadoop.hive.ql.udf.UDFAscii'
++POSTHOOK: type: CREATEFUNCTION
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default.test_func
++PREHOOK: query: DROP DATABASE TEST_database CASCADE
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:test_database
++PREHOOK: Output: database:test_database
++PREHOOK: Output: test_database@test_table
++POSTHOOK: query: DROP DATABASE TEST_database CASCADE
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:test_database
++POSTHOOK: Output: database:test_database
++POSTHOOK: Output: test_database@test_table
++PREHOOK: query: describe test_table
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@test_table
++POSTHOOK: query: describe test_table
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@test_table
++key                 	string              	                    
++value               	string              	                    
++PREHOOK: query: describe function test_func
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: describe function test_func
++POSTHOOK: type: DESCFUNCTION
++test_func(str) - returns the numeric value of the first character of str
++PREHOOK: query: describe function TEST_database.test_func
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: describe function TEST_database.test_func
++POSTHOOK: type: DESCFUNCTION
++Function 'TEST_database.test_func' does not exist.
++FAILED: SemanticException [Error 10001]: Table not found TEST_database.test_table
+-- 
+1.7.9.5
+

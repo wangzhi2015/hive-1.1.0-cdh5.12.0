@@ -1,0 +1,742 @@
+From b1ecd1819f7ac36f91cfbb4aa47a8ad37feddc80 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <sz.ho@criteo.com>
+Date: Mon, 24 Oct 2016 11:29:07 -0400
+Subject: [PATCH 0808/1164] CDH-46340: HIVE-14753 : Track the number of
+ open/closed/abandoned sessions in HS2 (Barna
+ Zsombor Klara via Szehon)
+
+Change-Id: I989c60ff776b89ef421d8bf78acee51f023b6024
+---
+ .../hadoop/hive/common/metrics/LegacyMetrics.java  |    6 +
+ .../hadoop/hive/common/metrics/common/Metrics.java |   10 +
+ .../common/metrics/common/MetricsConstant.java     |    5 +
+ .../common/metrics/metrics2/CodahaleMetrics.java   |   17 +-
+ .../metrics/metrics2/MetricVariableRatioGauge.java |   46 ++++
+ .../hive/common/metrics/MetricsTestUtils.java      |    7 +-
+ .../metrics2/TestMetricVariableRatioGauge.java     |  115 +++++++++
+ .../hive/service/cli/session/SessionManager.java   |   66 +++++
+ .../cli/session/TestSessionManagerMetrics.java     |  265 +++++++++++++++++++-
+ 9 files changed, 525 insertions(+), 12 deletions(-)
+ create mode 100644 common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/MetricVariableRatioGauge.java
+ create mode 100644 common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestMetricVariableRatioGauge.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
+index ba2267b..0f082f6 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
+@@ -225,6 +225,12 @@ public void addGauge(String name, MetricsVariable variable) {
+     //Not implemented.
+   }
+ 
++  @Override
++  public void addRatio(String name, MetricsVariable<Integer> numerator,
++                       MetricsVariable<Integer> denominator) {
++    //Not implemented
++  }
++
+   public void set(String name, Object value) {
+     metrics.put(name,value);
+   }
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
+index 9b263d9..8fb7c5a 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
+@@ -93,4 +93,14 @@
+    * @param variable variable to track.
+    */
+   public void addGauge(String name, final MetricsVariable variable);
++
++  /**
++   * Add a ratio metric to track the correlation between two variables
++   * @param name name of the ratio gauge
++   * @param numerator numerator of the ratio
++   * @param denominator denominator of the ratio
++   */
++  public void addRatio(String name, MetricsVariable<Integer> numerator,
++                           MetricsVariable<Integer> denominator);
++
+ }
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+index 8d73cab..ae453b1 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+@@ -68,5 +68,10 @@
+   public static final String HIVE_SPARK_TASKS = "hive_spark_tasks";
+   // The number of tez tasks executed by the HiveServer2 since the last restart
+   public static final String HIVE_TEZ_TASKS = "hive_tez_tasks";
++  public static final String HS2_OPEN_SESSIONS = "hs2_open_sessions";
++  public static final String HS2_ACTIVE_SESSIONS = "hs2_active_sessions";
++  public static final String HS2_ABANDONED_SESSIONS = "hs2_abandoned_sessions";
++  public static final String HS2_AVG_OPEN_SESSION_TIME = "hs2_avg_open_session_time";
++  public static final String HS2_AVG_ACTIVE_SESSION_TIME = "hs2_avg_active_session_time";
+ 
+ }
+\ No newline at end of file
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+index a041ee5..1bf1a6b 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+@@ -34,6 +34,7 @@
+ import com.codahale.metrics.jvm.ThreadStatesGaugeSet;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ import com.google.common.base.Splitter;
+ import com.google.common.cache.CacheBuilder;
+ import com.google.common.cache.CacheLoader;
+@@ -287,13 +288,27 @@ public Object getValue() {
+         return variable.getValue();
+       }
+     };
++    addGaugeInternal(name, gauge);
++  }
++
++  @Override
++  public void addRatio(String name, MetricsVariable<Integer> numerator,
++                           MetricsVariable<Integer> denominator) {
++    Preconditions.checkArgument(numerator != null, "Numerator must not be null");
++    Preconditions.checkArgument(denominator != null, "Denominator must not be null");
++
++    MetricVariableRatioGauge gauge = new MetricVariableRatioGauge(numerator, denominator);
++    addGaugeInternal(name, gauge);
++  }
++
++  private void addGaugeInternal(String name, Gauge gauge) {
+     try {
+       gaugesLock.lock();
+       gauges.put(name, gauge);
+       // Metrics throws an Exception if we don't do this when the key already exists
+       if (metricRegistry.getGauges().containsKey(name)) {
+         LOGGER.warn("A Gauge with name [" + name + "] already exists. "
+-          + " The old gauge will be overwritten, but this is not recommended");
++            + " The old gauge will be overwritten, but this is not recommended");
+         metricRegistry.remove(name);
+       }
+       metricRegistry.register(name, gauge);
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/MetricVariableRatioGauge.java b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/MetricVariableRatioGauge.java
+new file mode 100644
+index 0000000..3de5dd1
+--- /dev/null
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/MetricVariableRatioGauge.java
+@@ -0,0 +1,46 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.common.metrics.metrics2;
++
++import com.codahale.metrics.RatioGauge;
++import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
++
++/**
++ * Combines two numeric metric variables into one gauge type metric displaying their ratio
++ */
++public class MetricVariableRatioGauge extends RatioGauge {
++
++  private final MetricsVariable<Integer> numerator;
++  private final MetricsVariable<Integer> denominator;
++
++  public MetricVariableRatioGauge(MetricsVariable<Integer> numerator,
++                                      MetricsVariable<Integer> denominator) {
++    this.numerator = numerator;
++    this.denominator = denominator;
++  }
++
++  @Override
++  protected Ratio getRatio() {
++    Integer numValue = numerator.getValue();
++    Integer denomValue = denominator.getValue();
++    if(numValue != null && denomValue != null) {
++      return Ratio.of(numValue.doubleValue(), denomValue.doubleValue());
++    }
++    return Ratio.of(0d,0d);
++  }
++}
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+index 4667658..3bb7a1e 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+@@ -23,7 +23,6 @@
+ 
+ import java.io.File;
+ import java.nio.file.Files;
+-import java.nio.file.Path;
+ import java.nio.file.Paths;
+ 
+ /**
+@@ -50,6 +49,12 @@ public static void verifyMetricsJson(String json, MetricsCategory category, Stri
+     Assert.assertEquals(expectedValue.toString(), jsonNode.asText());
+   }
+ 
++  public static void verifyMetricsJson(String json, MetricsCategory category, String metricsName,
++                                           Double expectedValue, Double delta) throws Exception {
++    JsonNode jsonNode = getJsonNode(json, category, metricsName);
++    Assert.assertEquals(expectedValue, Double.valueOf(jsonNode.asText()), delta);
++  }
++
+   public static JsonNode getJsonNode(String json, MetricsCategory category, String metricsName) throws Exception {
+     ObjectMapper objectMapper = new ObjectMapper();
+     JsonNode rootNode = objectMapper.readTree(json);
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestMetricVariableRatioGauge.java b/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestMetricVariableRatioGauge.java
+new file mode 100644
+index 0000000..eb92e65
+--- /dev/null
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestMetricVariableRatioGauge.java
+@@ -0,0 +1,115 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.common.metrics.metrics2;
++
++import com.codahale.metrics.MetricRegistry;
++import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++/**
++ * Unit test for the RatioGauge implementation.
++ */
++public class TestMetricVariableRatioGauge {
++
++  public static MetricRegistry metricRegistry;
++
++  @Before
++  public void before() throws Exception {
++    HiveConf conf = new HiveConf();
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_CLASS, CodahaleMetrics.class.getCanonicalName());
++    // disable json file writing
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "60000m");
++
++    MetricsFactory.init(conf);
++    metricRegistry = ((CodahaleMetrics) MetricsFactory.getInstance()).getMetricRegistry();
++  }
++
++  @After
++  public void after() throws Exception {
++    MetricsFactory.close();
++  }
++
++  @Test
++  public void testRatioIsCalculated() throws Exception {
++    NumericVariable num = new NumericVariable(10);
++    NumericVariable ord = new NumericVariable(5);
++
++    MetricsFactory.getInstance().addRatio("rat", num, ord);
++    String json = ((CodahaleMetrics) MetricsFactory.getInstance()).dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, "rat", 2d);
++  }
++
++  @Test
++  public void testRatioIsCalculatedNonExact() throws Exception {
++    NumericVariable num = new NumericVariable(20);
++    NumericVariable ord = new NumericVariable(3);
++
++    MetricsFactory.getInstance().addRatio("rat", num, ord);
++    String json = ((CodahaleMetrics) MetricsFactory.getInstance()).dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, "rat", 6.6666d, 1e-4);
++  }
++
++  @Test(expected = IllegalArgumentException.class)
++  public void testMissingNumeratorRatio() throws Exception {
++    MetricsFactory.getInstance().addRatio("rat", null, new NumericVariable(5));
++  }
++
++  @Test(expected = IllegalArgumentException.class)
++  public void testMissingDenominatorRatio() throws Exception {
++    MetricsFactory.getInstance().addRatio("rat", new NumericVariable(5), null);
++  }
++
++  @Test
++  public void testEmptyRatio() throws Exception {
++    NumericVariable num = new NumericVariable(null);
++    NumericVariable ord = new NumericVariable(null);
++
++    MetricsFactory.getInstance().addRatio("rat", num, ord);
++    String json = ((CodahaleMetrics) MetricsFactory.getInstance()).dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, "rat", "NaN");
++  }
++
++  @Test
++  public void testZeroRatio() throws Exception {
++    NumericVariable num = new NumericVariable(10);
++    NumericVariable ord = new NumericVariable(0);
++
++    MetricsFactory.getInstance().addRatio("rat", num, ord);
++    String json = ((CodahaleMetrics) MetricsFactory.getInstance()).dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, "rat", "NaN");
++  }
++
++  private class NumericVariable implements MetricsVariable<Integer> {
++
++    private final Integer value;
++
++    public NumericVariable(Integer value) {
++      this.value = value;
++    }
++
++    @Override
++    public Integer getValue() {
++      return value;
++    }
++  }
++}
+diff --git a/service/src/java/org/apache/hive/service/cli/session/SessionManager.java b/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+index 13897a2..c56f27e 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
++++ b/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+@@ -33,6 +33,8 @@
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ 
++import com.google.common.base.Predicate;
++import com.google.common.collect.Iterables;
+ import org.apache.commons.io.FileUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -93,9 +95,68 @@ public synchronized void init(HiveConf hiveConf) {
+     }
+     createBackgroundOperationPool();
+     addService(operationManager);
++    Metrics metrics = MetricsFactory.getInstance();
++    if(metrics != null){
++      registerOpenSesssionMetrics(metrics);
++      registerActiveSesssionMetrics(metrics);
++    }
+     super.init(hiveConf);
+   }
+ 
++  private void registerOpenSesssionMetrics(Metrics metrics) {
++    MetricsVariable<Integer> openSessionCnt = new MetricsVariable<Integer>() {
++      @Override
++      public Integer getValue() {
++        return getSessions().size();
++      }
++    };
++    MetricsVariable<Integer> openSessionTime = new MetricsVariable<Integer>() {
++      @Override
++      public Integer getValue() {
++        long sum = 0;
++        long currentTime = System.currentTimeMillis();
++        for (HiveSession s : getSessions()) {
++          sum += currentTime - s.getCreationTime();
++        }
++        // in case of an overflow return -1
++        return (int) sum != sum ? -1 : (int) sum;
++      }
++    };
++    metrics.addGauge(MetricsConstant.HS2_OPEN_SESSIONS, openSessionCnt);
++    metrics.addRatio(MetricsConstant.HS2_AVG_OPEN_SESSION_TIME, openSessionTime, openSessionCnt);
++  }
++
++  private void registerActiveSesssionMetrics(Metrics metrics) {
++    MetricsVariable<Integer> activeSessionCnt = new MetricsVariable<Integer>() {
++      @Override
++      public Integer getValue() {
++        Iterable<HiveSession> filtered = Iterables.filter(getSessions(), new Predicate<HiveSession>() {
++          @Override
++          public boolean apply(HiveSession hiveSession) {
++            return hiveSession.getNoOperationTime() == 0L;
++          }
++        });
++        return Iterables.size(filtered);
++      }
++    };
++    MetricsVariable<Integer> activeSessionTime = new MetricsVariable<Integer>() {
++      @Override
++      public Integer getValue() {
++        long sum = 0;
++        long currentTime = System.currentTimeMillis();
++        for (HiveSession s : getSessions()) {
++          if (s.getNoOperationTime() == 0L) {
++            sum += currentTime - s.getLastAccessTime();
++          }
++        }
++        // in case of an overflow return -1
++        return (int) sum != sum ? -1 : (int) sum;
++      }
++    };
++    metrics.addGauge(MetricsConstant.HS2_ACTIVE_SESSIONS, activeSessionCnt);
++    metrics.addRatio(MetricsConstant.HS2_AVG_ACTIVE_SESSION_TIME, activeSessionTime, activeSessionCnt);
++  }
++
+   private void createBackgroundOperationPool() {
+     int poolSize = hiveConf.getIntVar(ConfVars.HIVE_SERVER2_ASYNC_EXEC_THREADS);
+     LOG.info("HiveServer2: Background operation thread pool size: " + poolSize);
+@@ -201,6 +262,11 @@ public void run() {
+                 closeSession(handle);
+               } catch (HiveSQLException e) {
+                 LOG.warn("Exception is thrown closing session " + handle, e);
++              } finally {
++                Metrics metrics = MetricsFactory.getInstance();
++                if (metrics != null) {
++                  metrics.incrementCounter(MetricsConstant.HS2_ABANDONED_SESSIONS);
++                }
+               }
+             } else {
+               session.closeExpiredOperations();
+diff --git a/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java b/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+index 42a0b1c..93077a5 100644
+--- a/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
++++ b/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+@@ -18,22 +18,38 @@
+ 
+ package org.apache.hive.service.cli.session;
+ 
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
+ import java.util.concurrent.BrokenBarrierException;
+ import java.util.concurrent.CyclicBarrier;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+-
+ import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+ import org.apache.hadoop.hive.common.metrics.metrics2.CodahaleMetrics;
+ import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.metadata.Hive;
++import org.apache.hadoop.util.Time;
++import org.apache.hive.service.cli.FetchOrientation;
++import org.apache.hive.service.cli.HiveSQLException;
++import org.apache.hive.service.cli.OperationHandle;
++import org.apache.hive.service.cli.OperationType;
++import org.apache.hive.service.cli.RowSet;
++import org.apache.hive.service.cli.SessionHandle;
++import org.apache.hive.service.cli.TableSchema;
++import org.apache.hive.service.cli.operation.MetadataOperation;
++import org.apache.hive.service.cli.operation.OperationManager;
++import org.apache.hive.service.cli.thrift.TProtocolVersion;
+ import org.apache.hive.service.server.HiveServer2;
+ import org.junit.Assert;
+-import org.junit.BeforeClass;
++import org.junit.Before;
+ import org.junit.Test;
+ 
++import java.util.HashMap;
++
+ /**
+  * Test metrics from SessionManager.
+  */
+@@ -46,15 +62,15 @@
+       + BARRIER_AWAIT_TIMEOUT + " seconds before the %s metrics verification.";
+   private static final String FAIL_TO_COMPLETE_MSG = "The tasks could not be completed within "
+       + BARRIER_AWAIT_TIMEOUT + " seconds after the %s metrics verification.";
+-  private final CyclicBarrier ready = new CyclicBarrier(3);
+-  private final CyclicBarrier completed = new CyclicBarrier(3);
+ 
+-  @BeforeClass
+-  public static void setup() throws Exception {
++  @Before
++  public void setup() throws Exception {
+     HiveConf conf = new HiveConf();
+     conf.setIntVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_THREADS, 2);
+     conf.setIntVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_WAIT_QUEUE_SIZE, 10);
+     conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_KEEPALIVE_TIME, "1000000s");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_IDLE_SESSION_TIMEOUT, "500ms");
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_SESSION_CHECK_INTERVAL, "3s");
+ 
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED, true);
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+@@ -66,9 +82,21 @@ public static void setup() throws Exception {
+     sm.init(conf);
+ 
+     metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++
++    Hive doNothingHive = mock(Hive.class);
++    Hive.set(doNothingHive);
+   }
+ 
+   class BarrierRunnable implements Runnable {
++
++    private final CyclicBarrier ready;
++    private final CyclicBarrier completed;
++
++    BarrierRunnable(CyclicBarrier ready, CyclicBarrier completed) {
++      this.ready = ready;
++      this.completed = completed;
++    }
++
+     @Override
+     public void run() {
+       try {
+@@ -80,6 +108,39 @@ public void run() {
+     }
+   }
+ 
++  class BlockingOperation extends MetadataOperation {
++
++    private final CyclicBarrier ready;
++    private final CyclicBarrier completed;
++
++    BlockingOperation(HiveSession parentSession, OperationType opType,
++                         CyclicBarrier ready, CyclicBarrier completed) {
++      super(parentSession, opType);
++      this.ready = ready;
++      this.completed = completed;
++    }
++
++    @Override
++    protected void runInternal() throws HiveSQLException {
++      try {
++        ready.await();
++        completed.await();
++      } catch (InterruptedException | BrokenBarrierException e) {
++        throw new RuntimeException(e);
++      }
++    }
++
++    @Override
++    public TableSchema getResultSetSchema() throws HiveSQLException {
++      return null;
++    }
++
++    @Override
++    public RowSet getNextRowSet(FetchOrientation orientation, long maxRows) throws HiveSQLException {
++      return null;
++    }
++  }
++
+   /**
+    * Tests metrics regarding async thread pool.
+    *
+@@ -101,11 +162,13 @@ public void run() {
+   public void testThreadPoolMetrics() throws Exception {
+ 
+     String errorMessage = null;
++    CyclicBarrier ready = new CyclicBarrier(3);
++    CyclicBarrier completed = new CyclicBarrier(3);
+     try {
+-      sm.submitBackgroundOperation(new BarrierRunnable());
+-      sm.submitBackgroundOperation(new BarrierRunnable());
+-      sm.submitBackgroundOperation(new BarrierRunnable());
+-      sm.submitBackgroundOperation(new BarrierRunnable());
++      sm.submitBackgroundOperation(new BarrierRunnable(ready, completed));
++      sm.submitBackgroundOperation(new BarrierRunnable(ready, completed));
++      sm.submitBackgroundOperation(new BarrierRunnable(ready, completed));
++      sm.submitBackgroundOperation(new BarrierRunnable(ready, completed));
+ 
+       errorMessage = String.format(FAIL_TO_START_MSG, "first");
+       ready.await(BARRIER_AWAIT_TIMEOUT, TimeUnit.SECONDS);
+@@ -133,4 +196,186 @@ public void testThreadPoolMetrics() throws Exception {
+       Assert.fail(errorMessage);
+     }
+   }
++
++  @Test
++  public void testOpenSessionMetrics() throws Exception {
++
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_OPEN_SESSIONS, 0);
++
++    SessionHandle handle =
++        sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7, "user", "passw", "127.0.0.1",
++            new HashMap<String, String>());
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_OPEN_SESSIONS, 1);
++
++    sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7, "user", "passw", "127.0.0.1",
++        new HashMap<String, String>());
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_OPEN_SESSIONS, 2);
++
++    sm.closeSession(handle);
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_OPEN_SESSIONS, 1);
++  }
++
++  @Test
++  public void testOpenSessionTimeMetrics() throws Exception {
++
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE,
++        MetricsConstant.HS2_AVG_OPEN_SESSION_TIME, "NaN");
++
++    long firstSessionOpen = System.currentTimeMillis();
++    SessionHandle handle =
++        sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7,  "user", "passw", "127.0.0.1",
++            new HashMap<String, String>());
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_AVG_OPEN_SESSION_TIME,
++        (double)(System.currentTimeMillis() - firstSessionOpen), 100d);
++
++    long secondSessionOpen = System.currentTimeMillis();
++    sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7, "user", "passw", "127.0.0.1",
++        new HashMap<String, String>());
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_AVG_OPEN_SESSION_TIME,
++        (double)(System.currentTimeMillis() - firstSessionOpen +
++                 System.currentTimeMillis() - secondSessionOpen) / 2d, 100d);
++
++    sm.closeSession(handle);
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_AVG_OPEN_SESSION_TIME,
++        (double)(System.currentTimeMillis() - secondSessionOpen), 100d);
++
++  }
++
++  @Test
++  public void testActiveSessionMetrics() throws Exception {
++
++    final CyclicBarrier ready = new CyclicBarrier(2);
++    CyclicBarrier completed = new CyclicBarrier(2);
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_ACTIVE_SESSIONS, 0);
++
++    SessionHandle handle =
++        sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7, "user", "passw", "127.0.0.1",
++            new HashMap<String, String>());
++
++    final HiveSession session = sm.getSession(handle);
++    OperationManager operationManager = mock(OperationManager.class);
++    when(operationManager.
++        newGetTablesOperation(session, "catalog", "schema", "table", null))
++          .thenReturn(new BlockingOperation(session, OperationType.GET_TABLES, ready, completed));
++    session.setOperationManager(operationManager);
++
++    new Thread(new Runnable() {
++
++      @Override
++      public void run() {
++        try {
++          OperationHandle handle = session.getTables("catalog", "schema", "table", null);
++          session.closeOperation(handle);
++        } catch (Exception e) {
++          throw new RuntimeException(e);
++        } finally {
++          try {
++            ready.await();
++          } catch (InterruptedException | BrokenBarrierException e) {
++            // ignore
++          }
++        }
++      }
++    }).start();
++
++    ready.await(2, TimeUnit.SECONDS);
++    ready.reset();
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_ACTIVE_SESSIONS, 1);
++
++    completed.await(2, TimeUnit.SECONDS);
++    ready.await(2, TimeUnit.SECONDS);
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_ACTIVE_SESSIONS, 0);
++  }
++
++  @Test
++  public void testActiveSessionTimeMetrics() throws Exception {
++
++    final CyclicBarrier ready = new CyclicBarrier(2);
++    CyclicBarrier completed = new CyclicBarrier(2);
++
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE,
++        MetricsConstant.HS2_AVG_ACTIVE_SESSION_TIME, "NaN");
++
++    SessionHandle handle =
++        sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7, "user", "passw", "127.0.0.1",
++            new HashMap<String, String>());
++
++    final HiveSession session = sm.getSession(handle);
++    OperationManager operationManager = mock(OperationManager.class);
++    when(operationManager.
++        newGetTablesOperation(session, "catalog", "schema", "table", null))
++        .thenReturn(new BlockingOperation(session, OperationType.GET_TABLES, ready, completed));
++    session.setOperationManager(operationManager);
++
++    long sessionActivateTime = System.currentTimeMillis();
++    new Thread(new Runnable() {
++
++      @Override
++      public void run() {
++        try {
++          OperationHandle handle = session.getTables("catalog", "schema", "table", null);
++          session.closeOperation(handle);
++        } catch (Exception e) {
++          throw new RuntimeException(e);
++        } finally {
++          try {
++            ready.await();
++          } catch (InterruptedException | BrokenBarrierException e) {
++            // ignore
++          }
++        }
++      }
++    }).start();
++
++    ready.await(2, TimeUnit.SECONDS);
++    ready.reset();
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.HS2_AVG_ACTIVE_SESSION_TIME,
++        (double)System.currentTimeMillis() - sessionActivateTime, 100d);
++
++    completed.await(2, TimeUnit.SECONDS);
++    ready.await(2, TimeUnit.SECONDS);
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE,
++        MetricsConstant.HS2_AVG_ACTIVE_SESSION_TIME, "NaN");
++  }
++
++
++  @Test
++  public void testAbandonedSessionMetrics() throws Exception {
++
++    sm.start();
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.HS2_ABANDONED_SESSIONS, "");
++
++    sm.openSession(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7, "user", "passw", "127.0.0.1",
++                    new HashMap<String, String>());
++
++    Thread.sleep(3200);
++
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.HS2_ABANDONED_SESSIONS, 1);
++  }
+ }
+-- 
+1.7.9.5
+

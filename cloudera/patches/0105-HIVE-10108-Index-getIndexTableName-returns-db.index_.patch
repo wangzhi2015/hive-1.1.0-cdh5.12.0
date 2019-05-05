@@ -1,0 +1,1043 @@
+From ff1099cb9ccebb4735621f97a9562cc68a54e5f9 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Fri, 3 Apr 2015 15:20:37 +0000
+Subject: [PATCH 0105/1164] HIVE-10108: Index#getIndexTableName() returns
+ db.index_table_name
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1671087 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |    6 +---
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   18 +++++++----
+ .../apache/hadoop/hive/ql/metadata/TestHive.java   |    2 +-
+ .../alter_concatenate_indexed_table.q.out          |    2 +-
+ .../alter_concatenate_indexed_table.q.out          |    4 +--
+ .../test/results/clientpositive/index_auth.q.out   |    2 +-
+ .../test/results/clientpositive/index_auto.q.out   |    2 +-
+ .../clientpositive/index_auto_file_format.q.out    |    4 +--
+ .../clientpositive/index_auto_mult_tables.q.out    |    4 +--
+ .../index_auto_mult_tables_compact.q.out           |    4 +--
+ .../clientpositive/index_auto_multiple.q.out       |    2 +-
+ .../clientpositive/index_auto_partitioned.q.out    |    2 +-
+ .../clientpositive/index_auto_self_join.q.out      |    4 +--
+ .../results/clientpositive/index_auto_update.q.out |    2 +-
+ .../index_bitmap_auto_partitioned.q.out            |    2 +-
+ .../clientpositive/index_bitmap_compression.q.out  |    2 +-
+ .../results/clientpositive/index_compression.q.out |    2 +-
+ .../test/results/clientpositive/index_serde.q.out  |    2 +-
+ .../results/clientpositive/index_skewtable.q.out   |    2 +-
+ .../clientpositive/ql_rewrite_gbtoidx.q.out        |   18 +++++------
+ .../clientpositive/ql_rewrite_gbtoidx_cbo_1.q.out  |   18 +++++------
+ .../clientpositive/ql_rewrite_gbtoidx_cbo_2.q.out  |   22 ++++++-------
+ .../clientpositive/show_indexes_edge_cases.q.out   |    8 ++---
+ .../clientpositive/show_indexes_syntax.q.out       |    6 ++--
+ .../clientpositive/spark/ql_rewrite_gbtoidx.q.out  |   18 +++++------
+ .../spark/ql_rewrite_gbtoidx_cbo_1.q.out           |   18 +++++------
+ .../test/results/clientpositive/union_view.q.out   |   34 ++++++++++----------
+ 27 files changed, 105 insertions(+), 105 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index c870757..7afb6a7 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -3121,10 +3121,6 @@ private Index convertToIndex(MIndex mIndex) throws MetaException {
+     MTable origTable = mIndex.getOrigTable();
+     MTable indexTable = mIndex.getIndexTable();
+ 
+-    String[] qualified = MetaStoreUtils.getQualifiedName(
+-        origTable.getDatabase().getName(), indexTable.getTableName());
+-    String indexTableName = qualified[0] + "." + qualified[1];
+-
+     return new Index(
+     mIndex.getIndexName(),
+     mIndex.getIndexHandlerClass(),
+@@ -3132,7 +3128,7 @@ private Index convertToIndex(MIndex mIndex) throws MetaException {
+     origTable.getTableName(),
+     mIndex.getCreateTime(),
+     mIndex.getLastAccessTime(),
+-    indexTableName,
++    indexTable.getTableName(),
+     convertToStorageDescriptor(mIndex.getSd()),
+     mIndex.getParameters(),
+     mIndex.getDeferredRebuild());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 9ab307f..b974558 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -129,6 +129,7 @@
+  * get methods in this class.
+  */
+ 
++@SuppressWarnings({"deprecation", "rawtypes"})
+ public class Hive {
+ 
+   static final private Log LOG = LogFactory.getLog("hive.ql.metadata.Hive");
+@@ -731,6 +732,13 @@ public void createIndex(String tableName, String indexName, String indexHandlerC
+       throws HiveException {
+ 
+     try {
++      String tdname = Utilities.getDatabaseName(tableName);
++      String idname = Utilities.getDatabaseName(indexTblName);
++      if (!idname.equals(tdname)) {
++        throw new HiveException("Index on different database (" + idname
++          + ") from base table (" + tdname + ") is not supported.");
++      }
++
+       Index old_index = null;
+       try {
+         old_index = getIndex(tableName, indexName);
+@@ -821,9 +829,8 @@ public void createIndex(String tableName, String indexName, String indexHandlerC
+       org.apache.hadoop.hive.metastore.api.Table tt = null;
+       HiveIndexHandler indexHandler = HiveUtils.getIndexHandler(this.getConf(), indexHandlerClass);
+ 
++      String itname = Utilities.getTableName(indexTblName);
+       if (indexHandler.usesIndexTable()) {
+-        String idname = Utilities.getDatabaseName(indexTblName);
+-        String itname = Utilities.getTableName(indexTblName);
+         tt = new org.apache.hadoop.hive.ql.metadata.Table(idname, itname).getTTable();
+         List<FieldSchema> partKeys = baseTbl.getPartitionKeys();
+         tt.setPartitionKeys(partKeys);
+@@ -848,9 +855,6 @@ public void createIndex(String tableName, String indexName, String indexHandlerC
+         throw new RuntimeException("Please specify deferred rebuild using \" WITH DEFERRED REBUILD \".");
+       }
+ 
+-      String tdname = Utilities.getDatabaseName(tableName);
+-      String ttname = Utilities.getTableName(tableName);
+-
+       StorageDescriptor indexSd = new StorageDescriptor(
+           indexTblCols,
+           location,
+@@ -863,7 +867,8 @@ public void createIndex(String tableName, String indexName, String indexHandlerC
+           sortCols,
+           null/*parameters*/);
+ 
+-      Index indexDesc = new Index(indexName, indexHandlerClass, tdname, ttname, time, time, indexTblName,
++      String ttname = Utilities.getTableName(tableName);
++      Index indexDesc = new Index(indexName, indexHandlerClass, tdname, ttname, time, time, itname,
+           indexSd, new HashMap<String,String>(), deferredRebuild);
+       if (indexComment != null) {
+         indexDesc.getParameters().put("comment", indexComment);
+@@ -2675,7 +2680,6 @@ protected static void replaceFiles(Path tablePath, Path srcf, Path destf, Path o
+       List<List<Path[]>> result = checkPaths(conf, destFs, srcs, srcFs, destf,
+           true);
+ 
+-      HadoopShims shims = ShimLoader.getHadoopShims();
+       if (oldPath != null) {
+         try {
+           FileSystem fs2 = oldPath.getFileSystem(conf);
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
+index da7d082..71e10e6 100755
+--- a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
+@@ -550,7 +550,7 @@ public void testIndex() throws Throwable {
+             index.getIndexName());
+         assertEquals("Table names don't match for index: " + indexName, tableName,
+             index.getOrigTableName());
+-        assertEquals("Index table names didn't match for index: " + indexName, qIndexTableName,
++        assertEquals("Index table names didn't match for index: " + indexName, indexTableName,
+             index.getIndexTableName());
+         assertEquals("Index handler classes didn't match for index: " + indexName,
+             indexHandlerClass, index.getIndexHandlerClass());
+diff --git a/ql/src/test/results/clientnegative/alter_concatenate_indexed_table.q.out b/ql/src/test/results/clientnegative/alter_concatenate_indexed_table.q.out
+index 7461ba3..19fbf51 100644
+--- a/ql/src/test/results/clientnegative/alter_concatenate_indexed_table.q.out
++++ b/ql/src/test/results/clientnegative/alter_concatenate_indexed_table.q.out
+@@ -76,5 +76,5 @@ PREHOOK: query: show indexes on src_rc_concatenate_test
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: show indexes on src_rc_concatenate_test
+ POSTHOOK: type: SHOWINDEXES
+-src_rc_concatenate_test_index	src_rc_concatenate_test	key                 	default.default__src_rc_concatenate_test_src_rc_concatenate_test_index__	compact             	
++src_rc_concatenate_test_index	src_rc_concatenate_test	key                 	default__src_rc_concatenate_test_src_rc_concatenate_test_index__	compact             	
+ FAILED: SemanticException org.apache.hadoop.hive.ql.parse.SemanticException: can not do merge because source table default.src_rc_concatenate_test is indexed.
+diff --git a/ql/src/test/results/clientpositive/alter_concatenate_indexed_table.q.out b/ql/src/test/results/clientpositive/alter_concatenate_indexed_table.q.out
+index 7f8458d..ffcbcf9 100644
+--- a/ql/src/test/results/clientpositive/alter_concatenate_indexed_table.q.out
++++ b/ql/src/test/results/clientpositive/alter_concatenate_indexed_table.q.out
+@@ -76,7 +76,7 @@ PREHOOK: query: show indexes on src_rc_concatenate_test
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: show indexes on src_rc_concatenate_test
+ POSTHOOK: type: SHOWINDEXES
+-src_rc_concatenate_test_index	src_rc_concatenate_test	key                 	default.default__src_rc_concatenate_test_src_rc_concatenate_test_index__	compact             	
++src_rc_concatenate_test_index	src_rc_concatenate_test	key                 	default__src_rc_concatenate_test_src_rc_concatenate_test_index__	compact             	
+ PREHOOK: query: alter table src_rc_concatenate_test concatenate
+ PREHOOK: type: ALTER_TABLE_MERGE
+ PREHOOK: Input: default@src_rc_concatenate_test
+@@ -215,7 +215,7 @@ PREHOOK: query: show indexes on src_rc_concatenate_test_part
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: show indexes on src_rc_concatenate_test_part
+ POSTHOOK: type: SHOWINDEXES
+-src_rc_concatenate_test_part_index	src_rc_concatenate_test_part	key                 	default.default__src_rc_concatenate_test_part_src_rc_concatenate_test_part_index__	compact             	
++src_rc_concatenate_test_part_index	src_rc_concatenate_test_part	key                 	default__src_rc_concatenate_test_part_src_rc_concatenate_test_part_index__	compact             	
+ PREHOOK: query: alter table src_rc_concatenate_test_part partition (ds='2011') concatenate
+ PREHOOK: type: ALTER_PARTITION_MERGE
+ PREHOOK: Input: default@src_rc_concatenate_test_part
+diff --git a/ql/src/test/results/clientpositive/index_auth.q.out b/ql/src/test/results/clientpositive/index_auth.q.out
+index 39a1096..385b639 100644
+--- a/ql/src/test/results/clientpositive/index_auth.q.out
++++ b/ql/src/test/results/clientpositive/index_auth.q.out
+@@ -24,7 +24,7 @@ PREHOOK: query: SHOW INDEXES ON foobar
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: SHOW INDEXES ON foobar
+ POSTHOOK: type: SHOWINDEXES
+-srcpart_auth_index  	foobar              	key                 	default.default__foobar_srcpart_auth_index__	bitmap              	
++srcpart_auth_index  	foobar              	key                 	default__foobar_srcpart_auth_index__	bitmap              	
+ PREHOOK: query: grant select on table foobar to user hive_test_user
+ PREHOOK: type: GRANT_PRIVILEGE
+ PREHOOK: Output: default@foobar
+diff --git a/ql/src/test/results/clientpositive/index_auto.q.out b/ql/src/test/results/clientpositive/index_auto.q.out
+index 20d2aee..28f1e96 100644
+--- a/ql/src/test/results/clientpositive/index_auto.q.out
++++ b/ql/src/test/results/clientpositive/index_auto.q.out
+@@ -146,7 +146,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: ((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) (type: boolean)
+             Filter Operator
+               predicate: ((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_file_format.q.out b/ql/src/test/results/clientpositive/index_auto_file_format.q.out
+index 3622069..8f62188 100644
+--- a/ql/src/test/results/clientpositive/index_auto_file_format.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_file_format.q.out
+@@ -40,7 +40,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: (UDFToDouble(key) = 86.0) (type: boolean)
+             Filter Operator
+               predicate: (UDFToDouble(key) = 86.0) (type: boolean)
+@@ -156,7 +156,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: (UDFToDouble(key) = 86.0) (type: boolean)
+             Filter Operator
+               predicate: (UDFToDouble(key) = 86.0) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_mult_tables.q.out b/ql/src/test/results/clientpositive/index_auto_mult_tables.q.out
+index a2a6d57..f25a7b7 100644
+--- a/ql/src/test/results/clientpositive/index_auto_mult_tables.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_mult_tables.q.out
+@@ -211,7 +211,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__srcpart_srcpart_index__
++            alias: default__srcpart_srcpart_index__
+             filterExpr: (((((UDFToDouble(key) > 70.0) and (UDFToDouble(key) < 90.0)) and (UDFToDouble(key) > 80.0)) and (UDFToDouble(key) < 100.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+             Filter Operator
+               predicate: (((((UDFToDouble(key) > 70.0) and (UDFToDouble(key) < 90.0)) and (UDFToDouble(key) > 80.0)) and (UDFToDouble(key) < 100.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+@@ -311,7 +311,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: (((((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (UDFToDouble(key) > 70.0)) and (UDFToDouble(key) < 90.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+             Filter Operator
+               predicate: (((((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (UDFToDouble(key) > 70.0)) and (UDFToDouble(key) < 90.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_mult_tables_compact.q.out b/ql/src/test/results/clientpositive/index_auto_mult_tables_compact.q.out
+index dbb0fd1..e3dfcb7 100644
+--- a/ql/src/test/results/clientpositive/index_auto_mult_tables_compact.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_mult_tables_compact.q.out
+@@ -221,7 +221,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__srcpart_srcpart_index__
++            alias: default__srcpart_srcpart_index__
+             filterExpr: ((((UDFToDouble(key) > 70.0) and (UDFToDouble(key) < 90.0)) and (UDFToDouble(key) > 80.0)) and (UDFToDouble(key) < 100.0)) (type: boolean)
+             Filter Operator
+               predicate: ((((UDFToDouble(key) > 70.0) and (UDFToDouble(key) < 90.0)) and (UDFToDouble(key) > 80.0)) and (UDFToDouble(key) < 100.0)) (type: boolean)
+@@ -339,7 +339,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: ((((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (UDFToDouble(key) > 70.0)) and (UDFToDouble(key) < 90.0)) (type: boolean)
+             Filter Operator
+               predicate: ((((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (UDFToDouble(key) > 70.0)) and (UDFToDouble(key) < 90.0)) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_multiple.q.out b/ql/src/test/results/clientpositive/index_auto_multiple.q.out
+index 5c389b7..d56cd34 100644
+--- a/ql/src/test/results/clientpositive/index_auto_multiple.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_multiple.q.out
+@@ -60,7 +60,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_key_index__
++            alias: default__src_src_key_index__
+             filterExpr: (UDFToDouble(key) = 86.0) (type: boolean)
+             Filter Operator
+               predicate: (UDFToDouble(key) = 86.0) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_partitioned.q.out b/ql/src/test/results/clientpositive/index_auto_partitioned.q.out
+index 90f03f3..f3ae876 100644
+--- a/ql/src/test/results/clientpositive/index_auto_partitioned.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_partitioned.q.out
+@@ -54,7 +54,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__srcpart_src_part_index__
++            alias: default__srcpart_src_part_index__
+             filterExpr: ((UDFToDouble(key) = 86.0) and (ds = '2008-04-09')) (type: boolean)
+             Filter Operator
+               predicate: (UDFToDouble(key) = 86.0) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_self_join.q.out b/ql/src/test/results/clientpositive/index_auto_self_join.q.out
+index 19ff6b0..5c0e7ed 100644
+--- a/ql/src/test/results/clientpositive/index_auto_self_join.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_self_join.q.out
+@@ -131,7 +131,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: (((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+             Filter Operator
+               predicate: (((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+@@ -232,7 +232,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: (((UDFToDouble(key) > 70.0) and (UDFToDouble(key) < 90.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+             Filter Operator
+               predicate: (((UDFToDouble(key) > 70.0) and (UDFToDouble(key) < 90.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_auto_update.q.out b/ql/src/test/results/clientpositive/index_auto_update.q.out
+index b36bd65..52509be 100644
+--- a/ql/src/test/results/clientpositive/index_auto_update.q.out
++++ b/ql/src/test/results/clientpositive/index_auto_update.q.out
+@@ -219,7 +219,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__temp_temp_index__
++            alias: default__temp_temp_index__
+             filterExpr: (UDFToDouble(key) = 86.0) (type: boolean)
+             Filter Operator
+               predicate: (UDFToDouble(key) = 86.0) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_bitmap_auto_partitioned.q.out b/ql/src/test/results/clientpositive/index_bitmap_auto_partitioned.q.out
+index 66a4593..50c4491 100644
+--- a/ql/src/test/results/clientpositive/index_bitmap_auto_partitioned.q.out
++++ b/ql/src/test/results/clientpositive/index_bitmap_auto_partitioned.q.out
+@@ -52,7 +52,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__srcpart_src_part_index__
++            alias: default__srcpart_src_part_index__
+             filterExpr: ((UDFToDouble(key) = 86.0) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+             Filter Operator
+               predicate: ((UDFToDouble(key) = 86.0) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_bitmap_compression.q.out b/ql/src/test/results/clientpositive/index_bitmap_compression.q.out
+index 7b17363..451fa9b 100644
+--- a/ql/src/test/results/clientpositive/index_bitmap_compression.q.out
++++ b/ql/src/test/results/clientpositive/index_bitmap_compression.q.out
+@@ -38,7 +38,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: (((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+             Filter Operator
+               predicate: (((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) and (not EWAH_BITMAP_EMPTY(_bitmaps))) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_compression.q.out b/ql/src/test/results/clientpositive/index_compression.q.out
+index 2e94a10..2ce196b 100644
+--- a/ql/src/test/results/clientpositive/index_compression.q.out
++++ b/ql/src/test/results/clientpositive/index_compression.q.out
+@@ -42,7 +42,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_src_index__
++            alias: default__src_src_index__
+             filterExpr: ((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) (type: boolean)
+             Filter Operator
+               predicate: ((UDFToDouble(key) > 80.0) and (UDFToDouble(key) < 100.0)) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_serde.q.out b/ql/src/test/results/clientpositive/index_serde.q.out
+index c0fc7e5..5b4cbfc 100644
+--- a/ql/src/test/results/clientpositive/index_serde.q.out
++++ b/ql/src/test/results/clientpositive/index_serde.q.out
+@@ -134,7 +134,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__doctors_doctors_index__
++            alias: default__doctors_doctors_index__
+             filterExpr: (number > 6) (type: boolean)
+             Filter Operator
+               predicate: (number > 6) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/index_skewtable.q.out b/ql/src/test/results/clientpositive/index_skewtable.q.out
+index 02fd1f4..fac53e5 100644
+--- a/ql/src/test/results/clientpositive/index_skewtable.q.out
++++ b/ql/src/test/results/clientpositive/index_skewtable.q.out
+@@ -92,7 +92,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__kv_kv_index__
++            alias: default__kv_kv_index__
+             filterExpr: (value > '15') (type: boolean)
+             Filter Operator
+               predicate: (value > '15') (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx.q.out b/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx.q.out
+index 3630332..68c00ac 100644
+--- a/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx.q.out
++++ b/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx.q.out
+@@ -257,7 +257,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -580,7 +580,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -754,7 +754,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: lastyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: lastyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (year(l_shipdate) = 1997) (type: boolean)
+@@ -838,7 +838,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: thisyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: thisyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (year(l_shipdate) = 1998) (type: boolean)
+@@ -908,7 +908,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: null-subquery1:dummy-subquery1:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: null-subquery1:dummy-subquery1:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -1083,7 +1083,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__tbl_tbl_key_idx__
++            alias: default__tbl_tbl_key_idx__
+             Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+             Select Operator
+               expressions: key (type: int), _count_of_key (type: bigint)
+@@ -1189,7 +1189,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__tbl_tbl_key_idx__
++            alias: default__tbl_tbl_key_idx__
+             Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+             Select Operator
+               expressions: key (type: int), _count_of_key (type: bigint)
+@@ -2340,7 +2340,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__tblpart_tbl_part_index__
++            alias: default__tblpart_tbl_part_index__
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (key < 10) (type: boolean)
+@@ -2537,7 +2537,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__tbl_tbl_key_idx__
++            alias: default__tbl_tbl_key_idx__
+             Statistics: Num rows: 6 Data size: 430 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: key (type: int), _count_of_key (type: bigint)
+diff --git a/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_1.q.out b/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_1.q.out
+index d46b0a9..07eb085 100644
+--- a/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_1.q.out
++++ b/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_1.q.out
+@@ -257,7 +257,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: $hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -580,7 +580,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: $hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: year(l_shipdate) (type: int), month(l_shipdate) (type: int), l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -754,7 +754,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: lastyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: lastyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (year(l_shipdate) = 1997) (type: boolean)
+@@ -838,7 +838,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: thisyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: thisyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (year(l_shipdate) = 1998) (type: boolean)
+@@ -908,7 +908,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: null-subquery1:$hdt$_0-subquery1:$hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++            alias: null-subquery1:$hdt$_0-subquery1:$hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+             Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -1083,7 +1083,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__tbl_tbl_key_idx__
++            alias: $hdt$_0:$hdt$_0:default__tbl_tbl_key_idx__
+             Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+             Select Operator
+               expressions: key (type: int), _count_of_key (type: bigint)
+@@ -1189,7 +1189,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__tbl_tbl_key_idx__
++            alias: $hdt$_0:$hdt$_0:default__tbl_tbl_key_idx__
+             Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+             Select Operator
+               expressions: key (type: int), _count_of_key (type: bigint)
+@@ -2352,7 +2352,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__tblpart_tbl_part_index__
++            alias: $hdt$_0:$hdt$_0:default__tblpart_tbl_part_index__
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (key < 10) (type: boolean)
+@@ -2549,7 +2549,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__tbl_tbl_key_idx__
++            alias: $hdt$_0:$hdt$_0:default__tbl_tbl_key_idx__
+             Statistics: Num rows: 6 Data size: 430 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: key (type: int), _count_of_key (type: bigint)
+diff --git a/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_2.q.out b/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_2.q.out
+index 3810109..3bca5c6 100644
+--- a/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_2.q.out
++++ b/ql/src/test/results/clientpositive/ql_rewrite_gbtoidx_cbo_2.q.out
+@@ -180,7 +180,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: $hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_orderkey (type: int), _count_of_l_orderkey (type: bigint)
+@@ -1267,7 +1267,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: $hdt$_0:$hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_orderkey (type: int), _count_of_l_orderkey (type: bigint)
+@@ -1975,7 +1975,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:$hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: $hdt$_0:$hdt$_0:$hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (l_orderkey < 7) (type: boolean)
+@@ -2144,7 +2144,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: taba:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: taba:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (l_orderkey < 7) (type: boolean)
+@@ -2224,7 +2224,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: tabb:default.default__src_src_key_idx__
++            alias: tabb:default__src_src_key_idx__
+             Statistics: Num rows: 309 Data size: 23663 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: key (type: string), _count_of_key (type: bigint)
+@@ -2890,7 +2890,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: taba:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: taba:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (l_orderkey < 7) (type: boolean)
+@@ -2970,7 +2970,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: tabb:default.default__src_src_key_idx__
++            alias: tabb:default__src_src_key_idx__
+             Statistics: Num rows: 309 Data size: 23663 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (key < '2') (type: boolean)
+@@ -3272,7 +3272,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: $hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: l_orderkey (type: int), (l_orderkey + 1) (type: int), _count_of_l_orderkey (type: bigint)
+@@ -3366,7 +3366,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: $hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+               expressions: (l_orderkey + 2) (type: int), l_orderkey (type: int), _count_of_l_orderkey (type: bigint)
+@@ -3492,7 +3492,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0-subquery1:$hdt$_0-subquery1:$hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_orderkey_idx__
++            alias: $hdt$_0-subquery1:$hdt$_0-subquery1:$hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_orderkey_idx__
+             Statistics: Num rows: 26 Data size: 2604 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (l_orderkey < 7) (type: boolean)
+@@ -3587,7 +3587,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: $hdt$_0-subquery2:$hdt$_0-subquery2:$hdt$_0:$hdt$_0:default.default__lineitem_ix_lineitem_ix_l_partkey_idx__
++            alias: $hdt$_0-subquery2:$hdt$_0-subquery2:$hdt$_0:$hdt$_0:default__lineitem_ix_lineitem_ix_l_partkey_idx__
+             Statistics: Num rows: 100 Data size: 8937 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (l_partkey < 10) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/show_indexes_edge_cases.q.out b/ql/src/test/results/clientpositive/show_indexes_edge_cases.q.out
+index eb2f3bc..cc6a405 100644
+--- a/ql/src/test/results/clientpositive/show_indexes_edge_cases.q.out
++++ b/ql/src/test/results/clientpositive/show_indexes_edge_cases.q.out
+@@ -118,10 +118,10 @@ PREHOOK: query: SHOW INDEXES ON show_idx_full
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: SHOW INDEXES ON show_idx_full
+ POSTHOOK: type: SHOWINDEXES
+-idx_1               	show_idx_full       	key                 	default.default__show_idx_full_idx_1__	compact             	
+-idx_2               	show_idx_full       	value1              	default.default__show_idx_full_idx_2__	compact             	
+-idx_comment         	show_idx_full       	value2              	default.default__show_idx_full_idx_comment__	compact             	index comment       
+-idx_compound        	show_idx_full       	key, value1         	default.default__show_idx_full_idx_compound__	compact             	
++idx_1               	show_idx_full       	key                 	default__show_idx_full_idx_1__	compact             	
++idx_2               	show_idx_full       	value1              	default__show_idx_full_idx_2__	compact             	
++idx_comment         	show_idx_full       	value2              	default__show_idx_full_idx_comment__	compact             	index comment       
++idx_compound        	show_idx_full       	key, value1         	default__show_idx_full_idx_compound__	compact             	
+ PREHOOK: query: EXPLAIN SHOW INDEXES ON show_idx_empty
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: EXPLAIN SHOW INDEXES ON show_idx_empty
+diff --git a/ql/src/test/results/clientpositive/show_indexes_syntax.q.out b/ql/src/test/results/clientpositive/show_indexes_syntax.q.out
+index e3cdd09..bc96359 100644
+--- a/ql/src/test/results/clientpositive/show_indexes_syntax.q.out
++++ b/ql/src/test/results/clientpositive/show_indexes_syntax.q.out
+@@ -53,7 +53,7 @@ PREHOOK: query: SHOW INDEX ON show_idx_t1
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: SHOW INDEX ON show_idx_t1
+ POSTHOOK: type: SHOWINDEXES
+-idx_t1              	show_idx_t1         	key                 	default.default__show_idx_t1_idx_t1__	compact             	
++idx_t1              	show_idx_t1         	key                 	default__show_idx_t1_idx_t1__	compact             	
+ PREHOOK: query: EXPLAIN
+ SHOW INDEXES ON show_idx_t1
+ PREHOOK: type: SHOWINDEXES
+@@ -79,7 +79,7 @@ PREHOOK: query: SHOW INDEXES ON show_idx_t1
+ PREHOOK: type: SHOWINDEXES
+ POSTHOOK: query: SHOW INDEXES ON show_idx_t1
+ POSTHOOK: type: SHOWINDEXES
+-idx_t1              	show_idx_t1         	key                 	default.default__show_idx_t1_idx_t1__	compact             	
++idx_t1              	show_idx_t1         	key                 	default__show_idx_t1_idx_t1__	compact             	
+ PREHOOK: query: EXPLAIN
+ SHOW FORMATTED INDEXES ON show_idx_t1
+ PREHOOK: type: SHOWINDEXES
+@@ -108,7 +108,7 @@ POSTHOOK: type: SHOWINDEXES
+ idx_name            	tab_name            	col_names           	idx_tab_name        	idx_type            	comment             
+ 	 	 	 	 	 
+ 	 	 	 	 	 
+-idx_t1              	show_idx_t1         	key                 	default.default__show_idx_t1_idx_t1__	compact             	
++idx_t1              	show_idx_t1         	key                 	default__show_idx_t1_idx_t1__	compact             	
+ PREHOOK: query: DROP TABLE show_idx_t1
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@show_idx_t1
+diff --git a/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx.q.out b/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx.q.out
+index 88feb99..6ca7acf 100644
+--- a/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx.q.out
++++ b/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx.q.out
+@@ -268,7 +268,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -593,7 +593,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -763,7 +763,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: lastyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: lastyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Filter Operator
+                     predicate: (year(l_shipdate) = 1997) (type: boolean)
+@@ -790,7 +790,7 @@ STAGE PLANS:
+         Map 4 
+             Map Operator Tree:
+                 TableScan
+-                  alias: thisyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: thisyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Filter Operator
+                     predicate: (year(l_shipdate) = 1998) (type: boolean)
+@@ -920,7 +920,7 @@ STAGE PLANS:
+         Map 2 
+             Map Operator Tree:
+                 TableScan
+-                  alias: null-subquery1:dummy-subquery1:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: null-subquery1:dummy-subquery1:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -1071,7 +1071,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tbl_tbl_key_idx__
++                  alias: default__tbl_tbl_key_idx__
+                   Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+                   Select Operator
+                     expressions: key (type: int), _count_of_key (type: bigint)
+@@ -1189,7 +1189,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tbl_tbl_key_idx__
++                  alias: default__tbl_tbl_key_idx__
+                   Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+                   Select Operator
+                     expressions: key (type: int), _count_of_key (type: bigint)
+@@ -2454,7 +2454,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tblpart_tbl_part_index__
++                  alias: default__tblpart_tbl_part_index__
+                   Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+                   Filter Operator
+                     predicate: (key < 10) (type: boolean)
+@@ -2653,7 +2653,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tbl_tbl_key_idx__
++                  alias: default__tbl_tbl_key_idx__
+                   Statistics: Num rows: 6 Data size: 430 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: key (type: int), _count_of_key (type: bigint)
+diff --git a/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx_cbo_1.q.out b/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx_cbo_1.q.out
+index 3372611..a1ed50f 100644
+--- a/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx_cbo_1.q.out
++++ b/ql/src/test/results/clientpositive/spark/ql_rewrite_gbtoidx_cbo_1.q.out
+@@ -268,7 +268,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -593,7 +593,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -763,7 +763,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: lastyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: lastyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Filter Operator
+                     predicate: (year(l_shipdate) = 1997) (type: boolean)
+@@ -790,7 +790,7 @@ STAGE PLANS:
+         Map 4 
+             Map Operator Tree:
+                 TableScan
+-                  alias: thisyear:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: thisyear:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Filter Operator
+                     predicate: (year(l_shipdate) = 1998) (type: boolean)
+@@ -920,7 +920,7 @@ STAGE PLANS:
+         Map 2 
+             Map Operator Tree:
+                 TableScan
+-                  alias: null-subquery1:dummy-subquery1:default.default__lineitem_ix_lineitem_ix_lshipdate_idx__
++                  alias: null-subquery1:dummy-subquery1:default__lineitem_ix_lineitem_ix_lshipdate_idx__
+                   Statistics: Num rows: 95 Data size: 8960 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: l_shipdate (type: string), _count_of_l_shipdate (type: bigint)
+@@ -1071,7 +1071,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tbl_tbl_key_idx__
++                  alias: default__tbl_tbl_key_idx__
+                   Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+                   Select Operator
+                     expressions: key (type: int), _count_of_key (type: bigint)
+@@ -1189,7 +1189,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tbl_tbl_key_idx__
++                  alias: default__tbl_tbl_key_idx__
+                   Statistics: Num rows: 0 Data size: 0 Basic stats: NONE Column stats: NONE
+                   Select Operator
+                     expressions: key (type: int), _count_of_key (type: bigint)
+@@ -2454,7 +2454,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tblpart_tbl_part_index__
++                  alias: default__tblpart_tbl_part_index__
+                   Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+                   Filter Operator
+                     predicate: (key < 10) (type: boolean)
+@@ -2653,7 +2653,7 @@ STAGE PLANS:
+         Map 1 
+             Map Operator Tree:
+                 TableScan
+-                  alias: default.default__tbl_tbl_key_idx__
++                  alias: default__tbl_tbl_key_idx__
+                   Statistics: Num rows: 6 Data size: 430 Basic stats: COMPLETE Column stats: NONE
+                   Select Operator
+                     expressions: key (type: int), _count_of_key (type: bigint)
+diff --git a/ql/src/test/results/clientpositive/union_view.q.out b/ql/src/test/results/clientpositive/union_view.q.out
+index 5e69ec2..f69d4bd 100644
+--- a/ql/src/test/results/clientpositive/union_view.q.out
++++ b/ql/src/test/results/clientpositive/union_view.q.out
+@@ -54,7 +54,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_1_src_union_1_key_idx__
++            alias: default__src_union_1_src_union_1_key_idx__
+             filterExpr: ((key = 86) and (ds = '1')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -113,7 +113,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_2_src_union_2_key_idx__
++            alias: default__src_union_2_src_union_2_key_idx__
+             filterExpr: ((key = 86) and (ds = '2')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -172,7 +172,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: ((key = 86) and (ds = '3')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -236,7 +236,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_1_src_union_1_key_idx__
++            alias: default__src_union_1_src_union_1_key_idx__
+             filterExpr: (ds = '1') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+@@ -307,7 +307,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_2_src_union_2_key_idx__
++            alias: default__src_union_2_src_union_2_key_idx__
+             filterExpr: (ds = '2') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+@@ -378,7 +378,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: (ds = '3') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+@@ -452,7 +452,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_1_src_union_1_key_idx__
++            alias: default__src_union_1_src_union_1_key_idx__
+             filterExpr: ((key = 86) and (ds = '1')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -517,7 +517,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_2_src_union_2_key_idx__
++            alias: default__src_union_2_src_union_2_key_idx__
+             filterExpr: ((key = 86) and (ds = '2')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -582,7 +582,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: ((key = 86) and (ds = '3')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -651,7 +651,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_1_src_union_1_key_idx__
++            alias: default__src_union_1_src_union_1_key_idx__
+             filterExpr: (key = 86) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -757,7 +757,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_2_src_union_2_key_idx__
++            alias: default__src_union_2_src_union_2_key_idx__
+             filterExpr: (key = 86) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -781,7 +781,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: (key = 86) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -828,7 +828,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_1_src_union_1_key_idx__
++            alias: default__src_union_1_src_union_1_key_idx__
+             filterExpr: (ds = '1') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+@@ -903,7 +903,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_2_src_union_2_key_idx__
++            alias: default__src_union_2_src_union_2_key_idx__
+             filterExpr: (ds = '2') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+@@ -978,7 +978,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: (ds = '3') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+@@ -1056,7 +1056,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: ((key = 86) and (ds = '4')) (type: boolean)
+             Filter Operator
+               predicate: (key = 86) (type: boolean)
+@@ -1122,7 +1122,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: default.default__src_union_3_src_union_3_key_idx__
++            alias: default__src_union_3_src_union_3_key_idx__
+             filterExpr: (ds = '4') (type: boolean)
+             Select Operator
+               expressions: _bucketname (type: string), _offsets (type: array<bigint>)
+-- 
+1.7.9.5
+

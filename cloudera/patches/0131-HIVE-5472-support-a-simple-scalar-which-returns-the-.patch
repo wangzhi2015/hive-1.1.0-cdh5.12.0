@@ -1,0 +1,457 @@
+From 4eb02bf52160a4d054f503428f032c28b2e4547f Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Mon, 2 Feb 2015 19:19:01 +0000
+Subject: [PATCH 0131/1164] HIVE-5472: support a simple scalar which returns
+ the current timestamp (Jason Dere, reviewed by
+ Thejas Nair)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1656544 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   14 ++--
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    2 +
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    2 +
+ .../org/apache/hadoop/hive/ql/parse/HiveLexer.g    |    2 +
+ .../hadoop/hive/ql/parse/IdentifiersParser.g       |   19 +++++
+ .../hadoop/hive/ql/session/SessionState.java       |   29 +++++++
+ .../hive/ql/udf/generic/GenericUDFCurrentDate.java |   87 ++++++++++++++++++++
+ .../ql/udf/generic/GenericUDFCurrentTimestamp.java |   83 +++++++++++++++++++
+ .../clientpositive/current_date_timestamp.q        |    4 +
+ .../clientpositive/current_date_timestamp.q.out    |   26 ++++++
+ .../results/clientpositive/show_functions.q.out    |    6 ++
+ 11 files changed, 268 insertions(+), 6 deletions(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentDate.java
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentTimestamp.java
+ create mode 100644 ql/src/test/queries/clientpositive/current_date_timestamp.q
+ create mode 100644 ql/src/test/results/clientpositive/current_date_timestamp.q.out
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 1f741f6..fc9f0dd 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -847,20 +847,22 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+ 
+     // test mode in hive mode
+     HIVETESTMODE("hive.test.mode", false,
+-        "Whether Hive is running in test mode. If yes, it turns on sampling and prefixes the output tablename."),
++        "Whether Hive is running in test mode. If yes, it turns on sampling and prefixes the output tablename.",
++        false),
+     HIVETESTMODEPREFIX("hive.test.mode.prefix", "test_",
+-        "In test mode, specfies prefixes for the output table"),
++        "In test mode, specfies prefixes for the output table", false),
+     HIVETESTMODESAMPLEFREQ("hive.test.mode.samplefreq", 32,
+         "In test mode, specfies sampling frequency for table, which is not bucketed,\n" +
+         "For example, the following query:\n" +
+         "  INSERT OVERWRITE TABLE dest SELECT col1 from src\n" +
+         "would be converted to\n" +
+         "  INSERT OVERWRITE TABLE test_dest\n" +
+-        "  SELECT col1 from src TABLESAMPLE (BUCKET 1 out of 32 on rand(1))"),
++        "  SELECT col1 from src TABLESAMPLE (BUCKET 1 out of 32 on rand(1))", false),
+     HIVETESTMODENOSAMPLE("hive.test.mode.nosamplelist", "",
+-        "In test mode, specifies comma separated table names which would not apply sampling"),
+-    HIVETESTMODEDUMMYSTATAGGR("hive.test.dummystats.aggregator", "", "internal variable for test"),
+-    HIVETESTMODEDUMMYSTATPUB("hive.test.dummystats.publisher", "", "internal variable for test"),
++        "In test mode, specifies comma separated table names which would not apply sampling", false),
++    HIVETESTMODEDUMMYSTATAGGR("hive.test.dummystats.aggregator", "", "internal variable for test", false),
++    HIVETESTMODEDUMMYSTATPUB("hive.test.dummystats.publisher", "", "internal variable for test", false),
++    HIVETESTCURRENTTIMESTAMP("hive.test.currenttimestamp", null, "current timestamp for test", false),
+ 
+     HIVEMERGEMAPFILES("hive.merge.mapfiles", true,
+         "Merge small files at the end of a map-only job"),
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 065cf98..bc280cf 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -381,6 +381,8 @@ public int compile(String command, boolean resetTaskIds) {
+     String queryId = QueryPlan.makeQueryId();
+     conf.setVar(HiveConf.ConfVars.HIVEQUERYID, queryId);
+ 
++    SessionState.get().setupQueryCurrentTimestamp();
++
+     try {
+       command = new VariableSubstitution().substitute(conf,command);
+       ctx = new Context(conf);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 23d77ca..bfb4dc2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -304,6 +304,8 @@
+     registerUDF("~", UDFOPBitNot.class, true);
+ 
+     registerGenericUDF("current_database", UDFCurrentDB.class);
++    registerGenericUDF("current_date", GenericUDFCurrentDate.class);
++    registerGenericUDF("current_timestamp", GenericUDFCurrentTimestamp.class);
+ 
+     registerGenericUDF("isnull", GenericUDFOPNull.class);
+     registerGenericUDF("isnotnull", GenericUDFOPNotNull.class);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
+index f412010..20c73cd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
+@@ -270,6 +270,8 @@ KW_UNBOUNDED: 'UNBOUNDED';
+ KW_PRECEDING: 'PRECEDING';
+ KW_FOLLOWING: 'FOLLOWING';
+ KW_CURRENT: 'CURRENT';
++KW_CURRENT_DATE: 'CURRENT_DATE';
++KW_CURRENT_TIMESTAMP: 'CURRENT_TIMESTAMP';
+ KW_LESS: 'LESS';
+ KW_MORE: 'MORE';
+ KW_OVER: 'OVER';
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+index c960a6b..bbb8eb3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+@@ -173,11 +173,29 @@ function
+                             -> ^(TOK_FUNCTIONDI functionName (selectExpression+)?)
+     ;
+ 
++nonParenthesizedFunction
++@init { gParent.pushMsg("non-parenthesized function name", state); }
++@after { gParent.popMsg(state); }
++    :
++    nonParenthesizedFunctionName
++        -> ^(TOK_FUNCTION nonParenthesizedFunctionName)
++    ;
++
++nonParenthesizedFunctionName
++@init { gParent.pushMsg("non-parenthesized function name", state); }
++@after { gParent.popMsg(state); }
++    :
++    KW_CURRENT_DATE | KW_CURRENT_TIMESTAMP
++    ;
++
+ functionName
+ @init { gParent.pushMsg("function name", state); }
+ @after { gParent.popMsg(state); }
+     : // Keyword IF is also a function name
+     KW_IF | KW_ARRAY | KW_MAP | KW_STRUCT | KW_UNIONTYPE | functionIdentifier
++    |
++    // This allows current_timestamp() to work as well as current_timestamp
++    nonParenthesizedFunctionName
+     ;
+ 
+ castExpression
+@@ -273,6 +291,7 @@ atomExpression
+     | castExpression
+     | caseExpression
+     | whenExpression
++    | nonParenthesizedFunction
+     | (functionName LPAREN) => function
+     | tableOrColumn
+     | LPAREN! expression RPAREN!
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index c315985..d81b44c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -25,6 +25,7 @@
+ import java.io.PrintStream;
+ import java.net.URI;
+ import java.net.URLClassLoader;
++import java.sql.Timestamp;
+ import java.util.*;
+ 
+ import org.apache.commons.io.FileUtils;
+@@ -252,6 +253,11 @@
+   private final Set<String> preReloadableAuxJars = new HashSet<String>();
+ 
+   /**
++   * CURRENT_TIMESTAMP value for query
++   */
++  private Timestamp queryCurrentTimestamp;
++
++  /**
+    * Get the lineage state stored in this session.
+    *
+    * @return LineageState
+@@ -1410,4 +1416,27 @@ public String getNextValuesTempTableSuffix() {
+     return Integer.toString(nextValueTempTableSuffix++);
+   }
+ 
++  /**
++   * Initialize current timestamp, other necessary query initialization.
++   */
++  public void setupQueryCurrentTimestamp() {
++    queryCurrentTimestamp = new Timestamp(System.currentTimeMillis());
++
++    // Provide a facility to set current timestamp during tests
++    if (conf.getBoolVar(ConfVars.HIVE_IN_TEST)) {
++      String overrideTimestampString =
++          HiveConf.getVar(conf, HiveConf.ConfVars.HIVETESTCURRENTTIMESTAMP, null);
++      if (overrideTimestampString != null && overrideTimestampString.length() > 0) {
++        queryCurrentTimestamp = Timestamp.valueOf(overrideTimestampString);
++      }
++    }
++  }
++
++  /**
++   * Get query current timestamp
++   * @return
++   */
++  public Timestamp getQueryCurrentTimestamp() {
++    return queryCurrentTimestamp;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentDate.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentDate.java
+new file mode 100644
+index 0000000..67f3c64
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentDate.java
+@@ -0,0 +1,87 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import java.sql.Date;
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.udf.UDFType;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++
++// If there is a new UDFType to describe a function that is deterministic within a query
++// but changes value between queries, this function would fall into that category.
++@UDFType(deterministic = true)
++@Description(name = "current_date",
++    value = "_FUNC_() - Returns the current date at the start of query evaluation."
++    + " All calls of current_date within the same query return the same value.")
++public class GenericUDFCurrentDate extends GenericUDF {
++
++  protected DateWritable currentDate;
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments)
++      throws UDFArgumentException {
++    if (arguments.length != 0) {
++      throw new UDFArgumentLengthException(
++          "The function CURRENT_DATE does not take any arguments, but found "
++          + arguments.length);
++    }
++
++    if (currentDate == null) {
++      Date dateVal =
++          Date.valueOf(SessionState.get().getQueryCurrentTimestamp().toString().substring(0, 10));
++      currentDate = new DateWritable(dateVal);
++    }
++
++    return PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    return currentDate;
++  }
++
++  public DateWritable getCurrentDate() {
++    return currentDate;
++  }
++
++  public void setCurrentDate(DateWritable currentDate) {
++    this.currentDate = currentDate;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return "CURRENT_DATE()";
++  }
++
++
++  @Override
++  public void copyToNewInstance(Object newInstance) throws UDFArgumentException {
++    super.copyToNewInstance(newInstance);
++    // Need to preserve currentDate
++    GenericUDFCurrentDate other = (GenericUDFCurrentDate) newInstance;
++    if (this.currentDate != null) {
++      other.currentDate = new DateWritable(this.currentDate);
++    }
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentTimestamp.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentTimestamp.java
+new file mode 100644
+index 0000000..cc7d0d4
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentTimestamp.java
+@@ -0,0 +1,83 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.udf.UDFType;
++import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++
++// If there is a new UDFType to describe a function that is deterministic within a query
++// but changes value between queries, this function would fall into that category.
++@UDFType(deterministic = true)
++@Description(name = "current_timestamp",
++    value = "_FUNC_() - Returns the current timestamp at the start of query evaluation."
++    + " All calls of current_timestamp within the same query return the same value.")
++public class GenericUDFCurrentTimestamp extends GenericUDF {
++
++  protected TimestampWritable currentTimestamp;
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments)
++      throws UDFArgumentException {
++    if (arguments.length != 0) {
++      throw new UDFArgumentLengthException(
++          "The function CURRENT_TIMESTAMP does not take any arguments, but found "
++          + arguments.length);
++    }
++
++    if (currentTimestamp == null) {
++      currentTimestamp = new TimestampWritable(SessionState.get().getQueryCurrentTimestamp());
++    }
++
++    return PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    return currentTimestamp;
++  }
++
++  public TimestampWritable getCurrentTimestamp() {
++    return currentTimestamp;
++  }
++
++  public void setCurrentTimestamp(TimestampWritable currentTimestamp) {
++    this.currentTimestamp = currentTimestamp;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return "CURRENT_TIMESTAMP()";
++  }
++
++  @Override
++  public void copyToNewInstance(Object newInstance) throws UDFArgumentException {
++    super.copyToNewInstance(newInstance);
++    // Need to preserve currentTimestamp
++    GenericUDFCurrentTimestamp other = (GenericUDFCurrentTimestamp) newInstance;
++    if (this.currentTimestamp != null) {
++      other.currentTimestamp = new TimestampWritable(this.currentTimestamp);
++    }
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/current_date_timestamp.q b/ql/src/test/queries/clientpositive/current_date_timestamp.q
+new file mode 100644
+index 0000000..9bed885
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/current_date_timestamp.q
+@@ -0,0 +1,4 @@
++select current_timestamp = current_timestamp(), current_date = current_date() from src limit 5;
++
++set hive.test.currenttimestamp =2012-01-01 01:02:03;
++select current_date, current_timestamp from src limit 5;
+diff --git a/ql/src/test/results/clientpositive/current_date_timestamp.q.out b/ql/src/test/results/clientpositive/current_date_timestamp.q.out
+new file mode 100644
+index 0000000..9c26095
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/current_date_timestamp.q.out
+@@ -0,0 +1,26 @@
++PREHOOK: query: select current_timestamp = current_timestamp(), current_date = current_date() from src limit 5
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select current_timestamp = current_timestamp(), current_date = current_date() from src limit 5
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++true	true
++true	true
++true	true
++true	true
++true	true
++PREHOOK: query: select current_date, current_timestamp from src limit 5
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select current_date, current_timestamp from src limit 5
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++2012-01-01	2012-01-01 01:02:03
++2012-01-01	2012-01-01 01:02:03
++2012-01-01	2012-01-01 01:02:03
++2012-01-01	2012-01-01 01:02:03
++2012-01-01	2012-01-01 01:02:03
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index 36c8743..e21b54b 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -52,6 +52,8 @@ covar_samp
+ create_union
+ cume_dist
+ current_database
++current_date
++current_timestamp
+ date_add
+ date_sub
+ datediff
+@@ -228,6 +230,8 @@ covar_samp
+ create_union
+ cume_dist
+ current_database
++current_date
++current_timestamp
+ PREHOOK: query: SHOW FUNCTIONS '.*e$'
+ PREHOOK: type: SHOWFUNCTIONS
+ POSTHOOK: query: SHOW FUNCTIONS '.*e$'
+@@ -236,6 +240,7 @@ assert_true
+ case
+ coalesce
+ current_database
++current_date
+ decode
+ e
+ encode
+@@ -277,6 +282,7 @@ PREHOOK: query: SHOW FUNCTIONS '.*date.*'
+ PREHOOK: type: SHOWFUNCTIONS
+ POSTHOOK: query: SHOW FUNCTIONS '.*date.*'
+ POSTHOOK: type: SHOWFUNCTIONS
++current_date
+ date_add
+ date_sub
+ datediff
+-- 
+1.7.9.5
+

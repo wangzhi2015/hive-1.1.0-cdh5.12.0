@@ -1,0 +1,146 @@
+From fccd7ea5283caddfc7d2597fd621cceadf6ef9e0 Mon Sep 17 00:00:00 2001
+From: Rajat Khandelwal <prongs@apache.org>
+Date: Mon, 10 Aug 2015 17:51:09 +0530
+Subject: [PATCH 0929/1164] CDH-48814: HIVE-11376 : Removes legacy code wrt
+ skipping files with codec to HiveInputFormat from
+ CombineHiveInputFormat (Rajat Khandelwal,
+ reviewed by Amareshwari)
+
+(cherry picked from commit cfda5700a715b71f5c4c6b325d4adaa213ff7618)
+
+Change-Id: If83a8b2f14e234890f962de7a5a30006876efe80
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    2 -
+ .../hadoop/hive/ql/io/CombineHiveInputFormat.java  |   39 --------------------
+ .../hadoop/hive/ql/optimizer/GenMapRedUtils.java   |    2 -
+ .../org/apache/hadoop/hive/ql/plan/MapWork.java    |   10 -----
+ .../org/apache/hadoop/hive/ql/plan/PlanUtils.java  |    9 +----
+ 5 files changed, 1 insertion(+), 61 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 1c98b97..cc20eb9 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1120,8 +1120,6 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVEROWOFFSET("hive.exec.rowoffset", false,
+         "Whether to provide the row offset virtual column"),
+ 
+-    HIVE_COMBINE_INPUT_FORMAT_SUPPORTS_SPLITTABLE("hive.hadoop.supports.splittable.combineinputformat", false, ""),
+-
+     // Optimizer
+     HIVEOPTINDEXFILTER("hive.optimize.index.filter", false,
+         "Whether to enable automatic use of indexes"),
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+index b0bb864..12affcf 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+@@ -375,45 +375,6 @@ public int hashCode() {
+       }
+       FileSystem inpFs = path.getFileSystem(job);
+ 
+-      // Since there is no easy way of knowing whether MAPREDUCE-1597 is present in the tree or not,
+-      // we use a configuration variable for the same
+-      if (this.mrwork != null && !this.mrwork.getHadoopSupportsSplittable()) {
+-        // The following code should be removed, once
+-        // https://issues.apache.org/jira/browse/MAPREDUCE-1597 is fixed.
+-        // Hadoop does not handle non-splittable files correctly for CombineFileInputFormat,
+-        // so don't use CombineFileInputFormat for non-splittable files
+-
+-        //ie, dont't combine if inputformat is a TextInputFormat and has compression turned on
+-
+-        if (inputFormat instanceof TextInputFormat) {
+-          Queue<Path> dirs = new LinkedList<Path>();
+-          FileStatus fStats = inpFs.getFileStatus(path);
+-
+-          // If path is a directory
+-          if (fStats.isDir()) {
+-            dirs.offer(path);
+-          } else if ((new CompressionCodecFactory(job)).getCodec(path) != null) {
+-            //if compresssion codec is set, use HiveInputFormat.getSplits (don't combine)
+-            splits = super.getSplits(job, numSplits);
+-            return splits;
+-          }
+-
+-          while (dirs.peek() != null) {
+-            Path tstPath = dirs.remove();
+-            FileStatus[] fStatus = inpFs.listStatus(tstPath, FileUtils.HIDDEN_FILES_PATH_FILTER);
+-            for (int idx = 0; idx < fStatus.length; idx++) {
+-              if (fStatus[idx].isDir()) {
+-                dirs.offer(fStatus[idx].getPath());
+-              } else if ((new CompressionCodecFactory(job)).getCodec(
+-                  fStatus[idx].getPath()) != null) {
+-                //if compresssion codec is set, use HiveInputFormat.getSplits (don't combine)
+-                splits = super.getSplits(job, numSplits);
+-                return splits;
+-              }
+-            }
+-          }
+-        }
+-      }
+       //don't combine if inputformat is a SymlinkTextInputFormat
+       if (inputFormat instanceof SymlinkTextInputFormat) {
+         splits = super.getSplits(job, numSplits);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+index 957c7f7..c8e492c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+@@ -934,8 +934,6 @@ public static MapredWork getMapRedWorkFromConf(HiveConf conf) {
+     work.setPathToAliases(new LinkedHashMap<String, ArrayList<String>>());
+     work.setPathToPartitionInfo(new LinkedHashMap<String, PartitionDesc>());
+     work.setAliasToWork(new LinkedHashMap<String, Operator<? extends OperatorDesc>>());
+-    work.setHadoopSupportsSplittable(
+-        conf.getBoolVar(HiveConf.ConfVars.HIVE_COMBINE_INPUT_FORMAT_SUPPORTS_SPLITTABLE));
+     return mrWork;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java
+index f6616fb..5b7b8fb 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java
+@@ -62,8 +62,6 @@
+ 
+   private static final Log LOG = LogFactory.getLog(MapWork.class);
+ 
+-  private boolean hadoopSupportsSplittable;
+-
+   // use LinkedHashMap to make sure the iteration order is
+   // deterministic, to ease testing
+   private LinkedHashMap<String, ArrayList<String>> pathToAliases = new LinkedHashMap<String, ArrayList<String>>();
+@@ -426,14 +424,6 @@ public boolean isMapperCannotSpanPartns() {
+     return this.mapperCannotSpanPartns;
+   }
+ 
+-  public boolean getHadoopSupportsSplittable() {
+-    return hadoopSupportsSplittable;
+-  }
+-
+-  public void setHadoopSupportsSplittable(boolean hadoopSupportsSplittable) {
+-    this.hadoopSupportsSplittable = hadoopSupportsSplittable;
+-  }
+-
+   public String getIndexIntermediateFile() {
+     return indexIntermediateFile;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
+index 9ff691d..aaaf709 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
+@@ -98,14 +98,7 @@ public static synchronized long getCountForMapJoinDumpFilePrefix() {
+ 
+   @SuppressWarnings("nls")
+   public static MapredWork getMapRedWork() {
+-    try {
+-      MapredWork work = new MapredWork();
+-      work.getMapWork().setHadoopSupportsSplittable(Hive.get().getConf().getBoolVar(
+-          HiveConf.ConfVars.HIVE_COMBINE_INPUT_FORMAT_SUPPORTS_SPLITTABLE));
+-      return work;
+-    } catch (HiveException ex) {
+-      throw new RuntimeException(ex);
+-    }
++    return new MapredWork();
+   }
+ 
+   public static TableDesc getDefaultTableDesc(CreateTableDesc directoryDesc,
+-- 
+1.7.9.5
+

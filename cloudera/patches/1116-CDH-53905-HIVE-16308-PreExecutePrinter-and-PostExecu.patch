@@ -1,0 +1,121 @@
+From e198bcf411b5f574b2147164180771e43474fc54 Mon Sep 17 00:00:00 2001
+From: Chaoyu Tang <ctang@cloudera.com>
+Date: Sat, 1 Apr 2017 10:51:39 -0400
+Subject: [PATCH 1116/1164] CDH-53905: HIVE-16308: PreExecutePrinter and
+ PostExecutePrinter should log to INFO level
+ instead of ERROR (Sahil Takiar via Chaoyu Tang)
+
+(cherry picked from commit 3c29f8ff5c23031e3e7b5cc0c9b099964162c899)
+
+Change-Id: Ia38f1755aaaf36a16ec8334adc14173cc59c4349
+---
+ .../main/java/org/apache/hive/beeline/QFile.java   |    2 +-
+ .../hadoop/hive/ql/hooks/PostExecutePrinter.java   |    6 +++---
+ .../hadoop/hive/ql/hooks/PreExecutePrinter.java    |    6 +++---
+ .../hadoop/hive/ql/session/SessionState.java       |   10 +++++++++-
+ .../cli/operation/LogDivertAppenderForTest.java    |    2 +-
+ 5 files changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/QFile.java b/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
+index 4c3efa6..3d9ca99 100644
+--- a/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
++++ b/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
+@@ -274,7 +274,7 @@ private static RegexFilterSet getStaticFilterSet() {
+     // Pattern to remove the timestamp and other infrastructural info from the out file
+     return new RegexFilterSet()
+         .addFilter("Reading log file: .*\n", "")
+-        .addFilter("ERROR : ", "")
++        .addFilter("INFO  : ", "")
+         .addFilter(".*/tmp/.*\n", MASK_PATTERN)
+         .addFilter(".*file:.*\n", MASK_PATTERN)
+         .addFilter(".*file\\..*\n", MASK_PATTERN)
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/hooks/PostExecutePrinter.java b/ql/src/java/org/apache/hadoop/hive/ql/hooks/PostExecutePrinter.java
+index 5337154..a27f5d0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/hooks/PostExecutePrinter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/hooks/PostExecutePrinter.java
+@@ -117,10 +117,10 @@ public void run(String query, String type, Set<ReadEntity> inputs,
+     }
+ 
+     if (query != null) {
+-      console.printError("POSTHOOK: query: " + query.trim());
++      console.printInfo("POSTHOOK: query: " + query.trim(), false);
+     }
+     if (type != null) {
+-      console.printError("POSTHOOK: type: " + type);
++      console.printInfo("POSTHOOK: type: " + type, false);
+     }
+ 
+     PreExecutePrinter.printEntities(console, inputs, "POSTHOOK: Input: ");
+@@ -170,7 +170,7 @@ public void run(String query, String type, Set<ReadEntity> inputs,
+         }
+         sb.append("]");
+ 
+-        console.printError(sb.toString());
++        console.printInfo(sb.toString(), false);
+       }
+     }
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/hooks/PreExecutePrinter.java b/ql/src/java/org/apache/hadoop/hive/ql/hooks/PreExecutePrinter.java
+index bd3cc62..20673b6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/hooks/PreExecutePrinter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/hooks/PreExecutePrinter.java
+@@ -65,10 +65,10 @@ public void run(String query, String type, Set<ReadEntity> inputs,
+     }
+ 
+     if (query != null) {
+-      console.printError("PREHOOK: query: " + query.trim());
++      console.printInfo("PREHOOK: query: " + query.trim(), false);
+     }
+     if (type != null) {
+-      console.printError("PREHOOK: type: " + type);
++      console.printInfo("PREHOOK: type: " + type, false);
+     }
+ 
+     printEntities(console, inputs, "PREHOOK: Input: ");
+@@ -82,7 +82,7 @@ static void printEntities(LogHelper console, Set<?> entities, String prefix) {
+     }
+     Collections.sort(strings);
+     for (String s : strings) {
+-      console.printError(prefix + s);
++      console.printInfo(prefix + s, false);
+     }
+   }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index 8562546..0dd1070 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -991,8 +991,16 @@ public void printInfo(String info) {
+       printInfo(info, null);
+     }
+ 
++    public void printInfo(String info, boolean isSilent) {
++      printInfo(info, null, isSilent);
++    }
++
+     public void printInfo(String info, String detail) {
+-      if (!getIsSilent()) {
++      printInfo(info, detail, getIsSilent());
++    }
++
++    public void printInfo(String info, String detail, boolean isSilent) {
++      if (!isSilent) {
+         getInfoStream().println(info);
+       }
+       LOG.info(info + StringUtils.defaultString(detail));
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/LogDivertAppenderForTest.java b/service/src/java/org/apache/hive/service/cli/operation/LogDivertAppenderForTest.java
+index 358794e..cccf168 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/LogDivertAppenderForTest.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/LogDivertAppenderForTest.java
+@@ -84,7 +84,7 @@ private void initLayout(boolean isVerbose) {
+   private static class TestFilter extends Filter {
+     @Override
+     public int decide(LoggingEvent event) {
+-      if (event.getLevel().equals(Level.ERROR) && "SessionState".equals(event.getLoggerName())) {
++      if (event.getLevel().equals(Level.INFO) && "SessionState".equals(event.getLoggerName())) {
+         if (event.getRenderedMessage().startsWith("PREHOOK:")
+             || event.getRenderedMessage().startsWith("POSTHOOK:")) {
+           return Filter.ACCEPT;
+-- 
+1.7.9.5
+

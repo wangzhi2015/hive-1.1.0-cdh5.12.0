@@ -1,0 +1,126 @@
+From 53dd17a7c75473be9dc6ac63636b311198f3e284 Mon Sep 17 00:00:00 2001
+From: Carl Steinbach <cws@apache.org>
+Date: Sun, 27 Mar 2016 15:41:38 -0700
+Subject: [PATCH 0586/1164] CDH-38612 : HIVE-13115: MetaStore Direct SQL
+ getPartitions call fail when the columns schemas
+ for a partition are null (Ratandeep Ratti
+ reviewed by Carl Steinbach)
+
+(cherry picked from commit 69cfd357eb482c426161aa3c4a00d574ee29416e)
+
+Change-Id: I1b25c5388d45e3cf0c1af3dbea4e9a539ef164c1
+---
+ .../hadoop/hive/metastore/TestHiveMetaStore.java   |   20 +++++++++++-
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |   32 +++++++++++---------
+ 2 files changed, 37 insertions(+), 15 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
+index a624c36..f25004b 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
+@@ -276,6 +276,24 @@ public static void partitionTester(HiveMetaStoreClient client, HiveConf hiveConf
+       }
+       assertTrue("Partitions are not same", part.equals(part_get));
+ 
++      // check null cols schemas for a partition
++      List<String> vals6 = makeVals("2016-02-22 00:00:00", "16");
++      Partition part6 = makePartitionObject(dbName, tblName, vals6, tbl, "/part5");
++      part6.getSd().setCols(null);
++      LOG.info("Creating partition will null field schema");
++      client.add_partition(part6);
++      LOG.info("Listing all partitions for table " + dbName + "." + tblName);
++      final List<Partition> partitions = client.listPartitions(dbName, tblName, (short) -1);
++      boolean foundPart = false;
++      for (Partition p : partitions) {
++        if (p.getValues().equals(vals6)) {
++          assertNull(p.getSd().getCols());
++          LOG.info("Found partition " + p + " having null field schema");
++          foundPart = true;
++        }
++      }
++      assertTrue(foundPart);
++
+       String partName = "ds=" + FileUtils.escapePathName("2008-07-01 14:13:12") + "/hr=14";
+       String part2Name = "ds=" + FileUtils.escapePathName("2008-07-01 14:13:12") + "/hr=15";
+       String part3Name = "ds=" + FileUtils.escapePathName("2008-07-02 14:13:12") + "/hr=15";
+@@ -309,7 +327,7 @@ public static void partitionTester(HiveMetaStoreClient client, HiveConf hiveConf
+       partialVals.clear();
+       partialVals.add("");
+       partialNames = client.listPartitionNames(dbName, tblName, partialVals, (short) -1);
+-      assertTrue("Should have returned 4 partition names", partialNames.size() == 4);
++      assertTrue("Should have returned 5 partition names", partialNames.size() == 5);
+       assertTrue("Not all part names returned", partialNames.containsAll(partNames));
+ 
+       // Test partition listing with a partial spec - hr is specified but ds is not
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index 2655e1c..a7e99be 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -555,14 +555,14 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+       Long sdId = extractSqlLong(fields[1]);
+       Long colId = extractSqlLong(fields[2]);
+       Long serdeId = extractSqlLong(fields[3]);
+-      // A partition must have either everything set, or nothing set if it's a view.
+-      if (sdId == null || colId == null || serdeId == null) {
++      // A partition must have at least sdId and serdeId set, or nothing set if it's a view.
++      if (sdId == null || serdeId == null) {
+         if (isView == null) {
+           isView = isViewTable(dbName, tblName);
+         }
+         if ((sdId != null || colId != null || serdeId != null) || !isView) {
+-          throw new MetaException("Unexpected null for one of the IDs, SD " + sdId + ", column "
+-              + colId + ", serde " + serdeId + " for a " + (isView ? "" : "non-") + " view");
++          throw new MetaException("Unexpected null for one of the IDs, SD " + sdId +
++                  ", serde " + serdeId + " for a " + (isView ? "" : "non-") + " view");
+         }
+       }
+ 
+@@ -578,7 +578,7 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+       partitions.put(partitionId, part);
+ 
+       if (sdId == null) continue; // Probably a view.
+-      assert colId != null && serdeId != null;
++      assert serdeId != null;
+ 
+       // We assume each partition has an unique SD.
+       StorageDescriptor sd = new StorageDescriptor();
+@@ -603,14 +603,16 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+       sdSb.append(sdId).append(",");
+       part.setSd(sd);
+ 
+-      List<FieldSchema> cols = colss.get(colId);
+-      // We expect that colId will be the same for all (or many) SDs.
+-      if (cols == null) {
+-        cols = new ArrayList<FieldSchema>();
+-        colss.put(colId, cols);
+-        colsSb.append(colId).append(",");
++      if (colId != null) {
++        List<FieldSchema> cols = colss.get(colId);
++        // We expect that colId will be the same for all (or many) SDs.
++        if (cols == null) {
++          cols = new ArrayList<FieldSchema>();
++          colss.put(colId, cols);
++          colsSb.append(colId).append(",");
++        }
++        sd.setCols(cols);
+       }
+-      sd.setCols(cols);
+ 
+       // We assume each SD has an unique serde.
+       SerDeInfo serde = new SerDeInfo();
+@@ -652,8 +654,10 @@ public void apply(Partition t, Object[] fields) {
+       assert serdeSb.length() == 0 && colsSb.length() == 0;
+       return orderedResult; // No SDs, probably a view.
+     }
+-    String sdIds = trimCommaList(sdSb), serdeIds = trimCommaList(serdeSb),
+-        colIds = trimCommaList(colsSb);
++
++    String sdIds = trimCommaList(sdSb);
++    String serdeIds = trimCommaList(serdeSb);
++    String colIds = trimCommaList(colsSb);
+ 
+     // Get all the stuff for SD. Don't do empty-list check - we expect partitions do have SDs.
+     queryText = "select \"SD_ID\", \"PARAM_KEY\", \"PARAM_VALUE\" from \"SD_PARAMS\""
+-- 
+1.7.9.5
+

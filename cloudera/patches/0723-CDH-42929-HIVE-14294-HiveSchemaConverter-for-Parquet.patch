@@ -1,0 +1,106 @@
+From 121cd3f5fba27c561a4ef3d3b1a536a05a375f02 Mon Sep 17 00:00:00 2001
+From: Gabor Szadovszky <gabor.szadovszky@cloudera.com>
+Date: Fri, 29 Jul 2016 10:25:41 -0500
+Subject: [PATCH 0723/1164] CDH-42929: HIVE-14294: HiveSchemaConverter for
+ Parquet doesn't translate TINYINT and SMALLINT
+ into proper Parquet types (Gabor Szadovszky,
+ reviewed by Aihua Xu)
+
+(cherry picked from commit c6aa5552c1bf5c0e0ecf06e338f5724fb6b93a58)
+
+Change-Id: Ifccd19c3a0ac466c2cbaa26ac6ecb11918615edd
+---
+ .../ql/io/parquet/convert/HiveSchemaConverter.java |   10 ++++--
+ .../ql/io/parquet/TestHiveSchemaConverter.java     |   33 +++++++++++++++-----
+ 2 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/convert/HiveSchemaConverter.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/convert/HiveSchemaConverter.java
+index 67cbfd5..755c247 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/convert/HiveSchemaConverter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/convert/HiveSchemaConverter.java
+@@ -64,10 +64,14 @@ private static Type convertType(final String name, final TypeInfo typeInfo,
+       if (typeInfo.equals(TypeInfoFactory.stringTypeInfo)) {
+         return Types.primitive(PrimitiveTypeName.BINARY, repetition).as(OriginalType.UTF8)
+           .named(name);
+-      } else if (typeInfo.equals(TypeInfoFactory.intTypeInfo) ||
+-          typeInfo.equals(TypeInfoFactory.shortTypeInfo) ||
+-          typeInfo.equals(TypeInfoFactory.byteTypeInfo)) {
++      } else if (typeInfo.equals(TypeInfoFactory.intTypeInfo)) {
+         return Types.primitive(PrimitiveTypeName.INT32, repetition).named(name);
++      } else if (typeInfo.equals(TypeInfoFactory.shortTypeInfo)) {
++        return Types.primitive(PrimitiveTypeName.INT32, repetition)
++            .as(OriginalType.INT_16).named(name);
++      } else if (typeInfo.equals(TypeInfoFactory.byteTypeInfo)) {
++        return Types.primitive(PrimitiveTypeName.INT32, repetition)
++            .as(OriginalType.INT_8).named(name);
+       } else if (typeInfo.equals(TypeInfoFactory.longTypeInfo)) {
+         return Types.primitive(PrimitiveTypeName.INT64, repetition).named(name);
+       } else if (typeInfo.equals(TypeInfoFactory.doubleTypeInfo)) {
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestHiveSchemaConverter.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestHiveSchemaConverter.java
+index f232c57..0f62b16 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestHiveSchemaConverter.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestHiveSchemaConverter.java
+@@ -20,7 +20,6 @@
+ import java.util.List;
+ 
+ import org.apache.hadoop.hive.ql.io.parquet.convert.HiveSchemaConverter;
+-import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+ import org.junit.Test;
+@@ -28,8 +27,7 @@
+ import parquet.schema.MessageType;
+ import parquet.schema.MessageTypeParser;
+ import parquet.schema.OriginalType;
+-import parquet.schema.Types;
+-import parquet.schema.PrimitiveType.PrimitiveTypeName;
++import parquet.schema.Type;
+ import parquet.schema.Type.Repetition;
+ 
+ public class TestHiveSchemaConverter {
+@@ -63,17 +61,38 @@ private void testConversion(final String columnNamesStr, final String columnsTyp
+     final MessageType messageTypeFound = HiveSchemaConverter.convert(columnNames, columnTypes);
+     final MessageType expectedMT = MessageTypeParser.parseMessageType(expectedSchema);
+     assertEquals("converting " + columnNamesStr + ": " + columnsTypeStr + " to " + expectedSchema, expectedMT, messageTypeFound);
++
++    // Required to check the original types manually as PrimitiveType.equals does not care about it
++    List<Type> expectedFields = expectedMT.getFields();
++    List<Type> actualFields = messageTypeFound.getFields();
++    for (int i = 0, n = expectedFields.size(); i < n; ++i) {
++      OriginalType exp = expectedFields.get(i).getOriginalType();
++      OriginalType act = actualFields.get(i).getOriginalType();
++      assertEquals("Original types of the field do not match", exp, act);
++    }
+   }
+ 
+   @Test
+   public void testSimpleType() throws Exception {
+     testConversion(
+-            "a,b,c",
+-            "int,double,boolean",
++            "a,b,c,d",
++            "int,bigint,double,boolean",
+             "message hive_schema {\n"
+             + "  optional int32 a;\n"
+-            + "  optional double b;\n"
+-            + "  optional boolean c;\n"
++            + "  optional int64 b;\n"
++            + "  optional double c;\n"
++            + "  optional boolean d;\n"
++            + "}\n");
++  }
++
++  @Test
++  public void testSpecialIntType() throws Exception {
++    testConversion(
++            "a,b",
++            "tinyint,smallint",
++            "message hive_schema {\n"
++            + "  optional int32 a (INT_8);\n"
++            + "  optional int32 b (INT_16);\n"
+             + "}\n");
+   }
+ 
+-- 
+1.7.9.5
+

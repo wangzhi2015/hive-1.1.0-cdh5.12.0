@@ -1,0 +1,340 @@
+From 34b26cfd4982cc5ba7fcca518e08aec4cb1b4a0f Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Tue, 2 Jun 2015 20:03:51 -0400
+Subject: [PATCH 0473/1164] CDH-36482 HIVE-10821 Beeline-CLI: Implement CLI
+ source command using Beeline
+ functionality(Ferdinand Xu, Reviewed By Zhang
+ Xuefu and Chinna Rao Lalam)
+
+Change-Id: I3ebacc42553f8d907fc7b2b2f6b3fddd639d6532
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |   75 ++++++++++-----
+ .../src/java/org/apache/hive/beeline/Commands.java |    1 -
+ .../org/apache/hive/beeline/cli/TestHiveCli.java   |   97 +++++++++++---------
+ 3 files changed, 106 insertions(+), 67 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index 05b789c..07304bd 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -828,12 +828,13 @@ public int begin(String[] args, InputStream inputStream) throws IOException {
+         }
+       } else {
+         int code = initArgsFromCliVars(args);
++        defaultConnect(false);
+         if (code != 0)
+           return code;
+       }
+ 
+       if (getOpts().getScriptFile() != null) {
+-        return executeFile(getOpts().getScriptFile());
++        return executeFile(getOpts().getScriptFile(), false);
+       }
+       try {
+         info(getApplicationTitle());
+@@ -852,7 +853,7 @@ int runInit() {
+     if (initFile != null) {
+       info("Running init script " + initFile);
+       try {
+-        return executeFile(initFile);
++        return executeFile(initFile, false);
+       } finally {
+         exit = false;
+       }
+@@ -887,7 +888,7 @@ public int defaultConnect(boolean exitOnError) {
+     return ERRNO_OK;
+   }
+ 
+-  private int executeFile(String fileName) {
++  private int executeFile(String fileName, boolean isSourceCMD) {
+     FileInputStream initStream = null;
+     try {
+       initStream = new FileInputStream(fileName);
+@@ -897,27 +898,49 @@ private int executeFile(String fileName) {
+       return ERRNO_OTHER;
+     } finally {
+       IOUtils.closeStream(initStream);
+-      consoleReader = null;
+-      output("");   // dummy new line
++      if(!isSourceCMD) {
++        consoleReader = null;
++        output("");   // dummy new line
++      }
++    }
++  }
++
++  private boolean isSourceCMD(String cmd) {
++    if (cmd == null || cmd.isEmpty())
++      return false;
++    String[] tokens = tokenizeCmd(cmd);
++    return tokens[0].equalsIgnoreCase("!source");
++  }
++
++  private boolean sourceFile(String cmd) {
++    String[] tokens = tokenizeCmd(cmd);
++    String cmd_1 = getFirstCmd(cmd, tokens[0].length());
++    File sourceFile = new File(cmd_1);
++    if (!sourceFile.isFile()) {
++      return false;
++    } else {
++      boolean ret = (executeFile(cmd_1, true) == ERRNO_OK);
++      // For source command, we should not exit even when meeting some empty line.
++      setExit(false);
++      return ret;
+     }
+   }
+ 
+   private int execute(ConsoleReader reader, boolean exitOnError) {
+     String line;
+-    if (!isBeeLine) {
+-      if (defaultConnect(exitOnError) != ERRNO_OK && exitOnError) {
+-        return ERRNO_OTHER;
+-      }
+-    }
+     while (!exit) {
+       try {
+         // Execute one instruction; terminate on executing a script if there is an error
+         // in silent mode, prevent the query and prompt being echoed back to terminal
+-        line = (getOpts().isSilent() && getOpts().getScriptFile() != null) ?
+-                 reader.readLine(null, ConsoleReader.NULL_MASK) : reader.readLine(getPrompt());
++        line = (getOpts().isSilent() && getOpts().getScriptFile() != null) ? reader
++            .readLine(null, ConsoleReader.NULL_MASK) : reader.readLine(getPrompt());
++
++        // trim line
++        line = (line == null) ? null : line.trim();
+         if (!isBeeLine) {
+           line = cliToBeelineCmd(line);
+         }
++
+         if (!dispatch(line) && exitOnError) {
+           return ERRNO_OTHER;
+         }
+@@ -1015,7 +1038,6 @@ public void run() {
+     return consoleReader;
+   }
+ 
+-
+   void usage() {
+     output(loc("cmd-usage"));
+   }
+@@ -1024,19 +1046,23 @@ void usage() {
+     return cmd.split("\\s+");
+   }
+ 
+-  public String cliToBeelineCmd(String cmd) {
++  /**
++   * Extract and clean up the first command in the input.
++   */
++  private String getFirstCmd(String cmd, int length) {
++    return cmd.substring(length).trim();
++  }
++
++  private String cliToBeelineCmd(String cmd) {
+     if (cmd == null)
+       return null;
+-    String cmd_trimmed = cmd.trim();
+-    String[] tokens = tokenizeCmd(cmd_trimmed);
+-
+-    if (cmd_trimmed.equalsIgnoreCase("quit") || cmd_trimmed.equalsIgnoreCase("exit")) {
++    String[] tokens = tokenizeCmd(cmd);
++    if (cmd.equalsIgnoreCase("quit") || cmd.equalsIgnoreCase("exit")) {
+       return null;
+     } else if (tokens[0].equalsIgnoreCase("source")) {
+-      //TODO
+-      return cmd;
+-    } else if (cmd_trimmed.startsWith("!")) {
+-      String shell_cmd = cmd_trimmed.substring(1);
++      return COMMAND_PREFIX + cmd;
++    } else if (cmd.startsWith("!")) {
++      String shell_cmd = cmd.substring(1);
+       return "!sh " + shell_cmd;
+     } else { // local mode
+       // command like dfs
+@@ -1044,7 +1070,6 @@ public String cliToBeelineCmd(String cmd) {
+     }
+   }
+ 
+-
+   /**
+    * Dispatch the specified line to the appropriate {@link CommandHandler}.
+    *
+@@ -1067,6 +1092,10 @@ boolean dispatch(String line) {
+       return true;
+     }
+ 
++    if(isSourceCMD(line)){
++      return sourceFile(line);
++    }
++
+     line = line.trim();
+ 
+     // save it to the current script, if any
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 0b6e4d9..ec57687 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -1164,7 +1164,6 @@ public boolean list(String line) {
+     return true;
+   }
+ 
+-
+   public boolean all(String line) {
+     int index = beeLine.getDatabaseConnections().getIndex();
+     boolean success = true;
+diff --git a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+index cc0b598..6cbb030 100644
+--- a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
++++ b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+@@ -36,10 +36,15 @@
+ 
+ public class TestHiveCli {
+   private static final Log LOG = LogFactory.getLog(TestHiveCli.class.getName());
+-
+-  final static String CMD = "create database if not exists test;\ncreate table if not exists test" +
+-      ".testTbl(a " +
+-      "" + "string, b string);\n";
++  private static final int ERRNO_OK = 0;
++  private static final int ERRNO_ARGS = 1;
++  private static final int ERRNO_OTHER = 2;
++
++  private final static String SOURCE_CONTEXT =
++      "create table if not exists test.testSrcTbl(a string, b string);";
++  final static String CMD =
++      "create database if not exists test;\ncreate table if not exists test.testTbl(a string, b "
++          + "string);\n";
+   private HiveCli cli;
+   private OutputStream os;
+   private PrintStream ps;
+@@ -65,53 +70,53 @@ private void executeCMD(String[] args, String input, int retCode) {
+     }
+   }
+ 
+-  private void verifyCMD(String CMD, String keywords, OutputStream os, String[] options, int
+-      retCode) {
++  private void verifyCMD(String CMD, String keywords, OutputStream os, String[] options,
++      int retCode) {
+     executeCMD(options, CMD, retCode);
+     String output = os.toString();
+     Assert.assertTrue(output.contains(keywords));
+   }
+ 
+-  @Test
+-  public void testInValidCmd() {
+-    verifyCMD("!lss\n", "Failed to execute lss", errS, null, 0);
++  @Test public void testInValidCmd() {
++    verifyCMD("!lss\n", "Failed to execute lss", errS, null, ERRNO_OK);
++  }
++
++  @Test public void testHelp() {
++    verifyCMD(null, "usage: hive", os, new String[] { "-H" }, ERRNO_ARGS);
+   }
+ 
+-  @Test
+-  public void testHelp() {
+-    verifyCMD(null, "usage: hive", os, new String[]{"-H"}, 1);
++  @Test public void testInvalidDatabaseOptions() {
++    verifyCMD("\nshow tables\nquit\n", "Database does not exist: invalidDB", errS,
++        new String[] { "--database", "invalidDB" }, ERRNO_OK);
+   }
+ 
+-  @Test
+-  public void testInvalidDatabaseOptions() {
+-    verifyCMD("\nshow tables\nquit\n", "Database does not exist: invalidDB", errS, new
+-        String[]{"--database", "invalidDB"}, 0);
++  @Test public void testDatabaseOptions() {
++    verifyCMD("\nshow tables;\nquit;", "testTbl", os, new String[] { "--database", "test" },
++        ERRNO_OK);
+   }
+ 
+-  @Test
+-  public void testDatabaseOptions() {
+-    verifyCMD("\nshow tables;\nquit;", "testTbl", os, new String[]{"--database", "test"}, 0);
++  @Test public void testSourceCmd() {
++    File f = generateTmpFile(SOURCE_CONTEXT);
++    verifyCMD("source " + f.getPath() + "\n" + "desc testSrcTbl\n" + "quit\n", "col_name", os,
++        new String[] { "--database", "test" }, ERRNO_OK);
+   }
+ 
+-  @Test
+-  public void testSqlFromCmd() {
+-    verifyCMD(null, "", os, new String[]{"-e", "show databases;"}, 0);
++  @Test public void testSqlFromCmd() {
++    verifyCMD(null, "", os, new String[] { "-e", "show databases;" }, ERRNO_OK);
+   }
+ 
+-  @Test
+-  public void testSqlFromCmdWithDBName() {
+-    verifyCMD(null, "testTbl", os, new String[]{"-e", "show tables;", "--database", "test"}, 0);
++  @Test public void testSqlFromCmdWithDBName() {
++    verifyCMD(null, "testTbl", os, new String[] { "-e", "show tables;", "--database", "test" },
++        ERRNO_OK);
+   }
+ 
+-  @Test
+-  public void testInvalidOptions() {
+-    verifyCMD(null, "The '-e' and '-f' options cannot be specified simultaneously", errS, new
+-        String[]{"-e", "show tables;", "-f", "path/to/file"}, 1);
++  @Test public void testInvalidOptions() {
++    verifyCMD(null, "The '-e' and '-f' options cannot be specified simultaneously", errS,
++        new String[] { "-e", "show tables;", "-f", "path/to/file" }, ERRNO_ARGS);
+   }
+ 
+-  @Test
+-  public void testInvalidOptions2() {
+-    verifyCMD(null, "Unrecognized option: -k", errS, new String[]{"-k"}, 1);
++  @Test public void testInvalidOptions2() {
++    verifyCMD(null, "Unrecognized option: -k", errS, new String[] { "-k" }, ERRNO_ARGS);
+   }
+ 
+   private void redirectOutputStream() {
+@@ -124,30 +129,36 @@ private void redirectOutputStream() {
+     System.setErr(errPs);
+   }
+ 
+-  private void initFileFromFile() {
++  private void initFromFile() {
++    tmp = generateTmpFile(CMD);
++    if (tmp == null) {
++      Assert.fail("Fail to create the initial file");
++    }
++    executeCMD(new String[] { "-f", "\"" + tmp.getAbsolutePath() + "\"" }, null, 0);
++  }
++
++  private File generateTmpFile(String context) {
++    File file = null;
+     BufferedWriter bw = null;
+     try {
+-      // create a tmp file
+-      tmp = File.createTempFile("test", ".sql");
+-      bw = new BufferedWriter(new FileWriter(tmp));
+-      bw.write(CMD);
++      file = File.createTempFile("test", ".sql");
++      bw = new BufferedWriter(new FileWriter(file));
++      bw.write(context);
+     } catch (IOException e) {
+       LOG.error("Failed to write tmp file due to the exception: " + e);
+     } finally {
+       IOUtils.closeQuietly(bw);
+     }
+-    executeCMD(new String[]{"-f", "\"" + tmp.getAbsolutePath() + "\""}, null, 0);
++    return file;
+   }
+ 
+-  @Before
+-  public void setup() {
++  @Before public void setup() {
+     cli = new HiveCli();
+     redirectOutputStream();
+-    initFileFromFile();
++    initFromFile();
+   }
+ 
+-  @After
+-  public void tearDown() {
++  @After public void tearDown() {
+     tmp.delete();
+   }
+ }
+-- 
+1.7.9.5
+

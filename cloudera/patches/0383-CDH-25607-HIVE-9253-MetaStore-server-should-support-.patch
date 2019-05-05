@@ -1,0 +1,728 @@
+From 92d4009837e74d0723f76231eb9e087401b6b988 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Thu, 5 Nov 2015 10:29:25 -0600
+Subject: [PATCH 0383/1164] CDH-25607: HIVE-9253: MetaStore server should
+ support timeout for long running requests
+
+Change-Id: I32b3b222010329ba5e0727d85cd3ab588cbaa72d
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    3 +-
+ .../org/apache/hadoop/hive/metastore/Deadline.java |  176 ++++++++++++++++++++
+ .../hadoop/hive/metastore/DeadlineException.java   |   29 ++++
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   17 ++
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |    4 +-
+ .../hadoop/hive/metastore/RetryingHMSHandler.java  |   26 ++-
+ .../hive/metastore/SessionPropertiesListener.java  |   44 +++++
+ .../apache/hadoop/hive/metastore/TestDeadline.java |  127 ++++++++++++++
+ .../hive/metastore/TestHiveMetaStoreTimeout.java   |  143 ++++++++++++++++
+ 9 files changed, 561 insertions(+), 8 deletions(-)
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/Deadline.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/DeadlineException.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/SessionPropertiesListener.java
+ create mode 100644 metastore/src/test/org/apache/hadoop/hive/metastore/TestDeadline.java
+ create mode 100644 metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStoreTimeout.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 145a2b6..023688d 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -175,7 +175,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+    */
+   public static final HiveConf.ConfVars[] metaConfVars = {
+       HiveConf.ConfVars.METASTORE_TRY_DIRECT_SQL,
+-      HiveConf.ConfVars.METASTORE_TRY_DIRECT_SQL_DDL
++      HiveConf.ConfVars.METASTORE_TRY_DIRECT_SQL_DDL,
++      HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT
+   };
+ 
+   static {
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/Deadline.java b/metastore/src/java/org/apache/hadoop/hive/metastore/Deadline.java
+new file mode 100644
+index 0000000..c27d3b9
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/Deadline.java
+@@ -0,0 +1,176 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.metastore.api.MetaException;
++
++/**
++ * This class is used to monitor long running methods in a thread.
++ * It is recommended to use it as a ThreadLocal variable.
++ */
++public class Deadline {
++  private static final Log LOG = LogFactory.getLog(Deadline.class.getName());
++
++  /**
++   * its value is init from conf, and could be reset from client.
++   */
++  private long timeout;
++
++  /**
++   * it is reset before executing a method
++   */
++  private long startTime = -1;
++
++  /**
++   * The name of public methods in HMSHandler
++   */
++  private String method;
++
++  private Deadline(long timeout) {
++    this.timeout = timeout;
++  }
++
++  /**
++   * Deadline object per thread.
++   */
++  private static final ThreadLocal<Deadline> DEADLINE_THREAD_LOCAL = new
++      ThreadLocal<Deadline>() {
++        @Override
++        protected synchronized Deadline initialValue() {
++          return null;
++        }
++      };
++
++  static void setCurrentDeadline(Deadline deadline) {
++    DEADLINE_THREAD_LOCAL.set(deadline);
++  }
++
++  static Deadline getCurrentDeadline() {
++    return DEADLINE_THREAD_LOCAL.get();
++  }
++
++  static void removeCurrentDeadline() {
++    DEADLINE_THREAD_LOCAL.remove();
++  }
++
++  /**
++   * register a Deadline threadlocal object to current thread.
++   * @param timeout
++   */
++  public static void registerIfNot(long timeout) {
++    if (getCurrentDeadline() == null) {
++      setCurrentDeadline(new Deadline(timeout));
++    }
++  }
++
++  /**
++   * reset the timeout value of this timer.
++   * @param timeout
++   */
++  public static void resetTimeout(long timeout) throws MetaException {
++    if (timeout <= 0) {
++      throw newMetaException(new DeadlineException("The reset timeout value should be " +
++          "larger than 0: " + timeout));
++    }
++    Deadline deadline = getCurrentDeadline();
++    if (deadline != null) {
++      deadline.timeout = timeout;
++    } else {
++      throw newMetaException(new DeadlineException("The threadlocal Deadline is null," +
++          " please register it firstly."));
++    }
++  }
++
++  /**
++   * start the timer before a method is invoked.
++   * @param method
++   */
++  public static void startTimer(String method) throws MetaException {
++    Deadline deadline = getCurrentDeadline();
++    if (deadline != null) {
++      deadline.startTime = System.currentTimeMillis();
++      deadline.method = method;
++    } else {
++      throw newMetaException(new DeadlineException("The threadlocal Deadline is null," +
++          " please register it firstly."));
++    }
++  }
++
++  /**
++   * end the time after a method is done.
++   */
++  public static void stopTimer() throws MetaException {
++    Deadline deadline = getCurrentDeadline();
++    if (deadline != null) {
++      deadline.startTime = -1;
++      deadline.method = null;
++    } else {
++      throw newMetaException(new DeadlineException("The threadlocal Deadline is null," +
++          " please register it firstly."));
++    }
++  }
++
++  /**
++   * remove the registered Deadline threadlocal object from current thread.
++   */
++  public static void clear() {
++    removeCurrentDeadline();
++  }
++
++  /**
++   * Check whether the long running method timeout.
++   * @throws DeadlineException when the method timeout
++   */
++  public static void checkTimeout() throws MetaException {
++    Deadline deadline = getCurrentDeadline();
++    if (deadline != null) {
++      deadline.check();
++    } else {
++      throw newMetaException(new DeadlineException("The threadlocal Deadline is null," +
++          " please register it first."));
++    }
++  }
++
++  private void check() throws MetaException{
++    try {
++      if (startTime < 0) {
++        throw new DeadlineException("Should execute startTimer() method before " +
++            "checkTimeout. Error happens in method: " + method);
++      }
++      if (startTime + timeout < System.currentTimeMillis()) {
++        throw new DeadlineException("Timeout when executing method: " + method);
++      }
++    } catch (DeadlineException e) {
++      throw newMetaException(e);
++    }
++  }
++
++  /**
++   * convert DeadlineException to MetaException
++   * @param e
++   * @return
++   */
++  private static MetaException newMetaException(DeadlineException e) {
++    MetaException metaException = new MetaException(e.getMessage());
++    metaException.initCause(e);
++    return metaException;
++  }
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/DeadlineException.java b/metastore/src/java/org/apache/hadoop/hive/metastore/DeadlineException.java
+new file mode 100644
+index 0000000..bfff89d
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/DeadlineException.java
+@@ -0,0 +1,29 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++/**
++ * Thrown when a long running method timeout is checked.
++ */
++public class DeadlineException extends Exception {
++
++  public DeadlineException(String message) {
++    super(message);
++  }
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 576e1de..1af959c 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -203,6 +203,7 @@
+ 
+ import com.facebook.fb303.FacebookBase;
+ import com.facebook.fb303.fb_status;
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Splitter;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableListMultimap;
+@@ -250,6 +251,12 @@
+   // embedded metastore or a remote one
+   private static boolean isMetaStoreRemote = false;
+ 
++  // Used for testing to simulate method timeout.
++  @VisibleForTesting
++  static boolean TEST_TIMEOUT_ENABLED = false;
++  @VisibleForTesting
++  static long TEST_TIMEOUT_VALUE = -1;
++
+   /** A fixed date format to be used for hive partition column values. */
+   public static final ThreadLocal<DateFormat> PARTITION_DATE_FORMAT =
+        new ThreadLocal<DateFormat>() {
+@@ -484,6 +491,7 @@ public void init() throws MetaException {
+           hiveConf.getVar(HiveConf.ConfVars.METASTORE_PRE_EVENT_LISTENERS));
+       listeners = MetaStoreUtils.getMetaStoreListeners(MetaStoreEventListener.class, hiveConf,
+           hiveConf.getVar(HiveConf.ConfVars.METASTORE_EVENT_LISTENERS));
++      listeners.add(new SessionPropertiesListener(hiveConf));
+       endFunctionListeners = MetaStoreUtils.getMetaStoreListeners(
+           MetaStoreEndFunctionListener.class, hiveConf,
+           hiveConf.getVar(HiveConf.ConfVars.METASTORE_END_FUNCTION_LISTENERS));
+@@ -901,6 +909,15 @@ public void create_database(final Database db)
+           // expected
+         }
+ 
++        if (TEST_TIMEOUT_ENABLED) {
++          try {
++            Thread.sleep(TEST_TIMEOUT_VALUE);
++          } catch (InterruptedException e) {
++            // do nothing
++          }
++          Deadline.checkTimeout();
++        }
++
+         create_database_core(getMS(), db);
+         success = true;
+       } catch (Exception e) {
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index 28252f1..2c9f7d8 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -32,7 +32,6 @@
+ import java.util.Map;
+ import java.util.TreeMap;
+ 
+-import javax.jdo.JDODataStoreException;
+ import javax.jdo.PersistenceManager;
+ import javax.jdo.Query;
+ import javax.jdo.Transaction;
+@@ -41,7 +40,6 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.derby.iapi.error.StandardException;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+@@ -528,6 +526,7 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+     @SuppressWarnings("unchecked")
+     List<Object[]> sqlResult = executeWithArray(query, null, queryText);
+     long queryTime = doTrace ? System.nanoTime() : 0;
++    Deadline.checkTimeout();
+ 
+     // Read all the fields and create partitions, SDs and serdes.
+     TreeMap<Long, Partition> partitions = new TreeMap<Long, Partition>();
+@@ -616,6 +615,7 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+       serde.setSerializationLib((String)fields[13]);
+       serdeSb.append(serdeId).append(",");
+       sd.setSerdeInfo(serde);
++      Deadline.checkTimeout();
+     }
+     query.closeAll();
+     timingTrace(doTrace, queryText, start, queryTime);
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
+index 1d28435..76c698c 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
+@@ -117,6 +117,10 @@ public Result invokeInternal(final Object proxy, final Method method, final Obje
+         HiveConf.ConfVars.HMSHANDLERINTERVAL, TimeUnit.MILLISECONDS);
+     int retryLimit = HiveConf.getIntVar(origConf,
+         HiveConf.ConfVars.HMSHANDLERATTEMPTS);
++    long timeout = HiveConf.getTimeVar(origConf,
++        HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT, TimeUnit.MILLISECONDS);
++
++    Deadline.registerIfNot(timeout);
+ 
+     if (reloadConf) {
+       MetaStoreInit.updateConnectionURL(origConf, getActiveConf(),
+@@ -130,7 +134,9 @@ public Result invokeInternal(final Object proxy, final Method method, final Obje
+         if (reloadConf || gotNewConnectUrl) {
+           baseHandler.setConf(getActiveConf());
+         }
++        Deadline.startTimer(method.getName());
+         Object object = method.invoke(baseHandler, args);
++        Deadline.stopTimer();
+         return new Result(object, retryCount);
+       } catch (javax.jdo.JDOException e) {
+         caughtException = e;
+@@ -164,11 +170,21 @@ public Result invokeInternal(final Object proxy, final Method method, final Obje
+             LOG.error(ExceptionUtils.getStackTrace(e.getCause()));
+           }
+           throw e.getCause();
+-        } else if (e.getCause() instanceof MetaException && e.getCause().getCause() != null
+-            && (e.getCause().getCause() instanceof javax.jdo.JDOException || 
+-            	e.getCause().getCause() instanceof NucleusException)) {
+-          // The JDOException or the Nucleus Exception may be wrapped further in a MetaException
+-          caughtException = e.getCause().getCause();
++        } else if (e.getCause() instanceof MetaException && e.getCause().getCause() != null) {
++          if (e.getCause().getCause() instanceof javax.jdo.JDOException ||
++              e.getCause().getCause() instanceof NucleusException) {
++            // The JDOException or the Nucleus Exception may be wrapped further in a MetaException
++            caughtException = e.getCause().getCause();
++          } else if (e.getCause().getCause() instanceof DeadlineException) {
++            // The Deadline Exception needs no retry and be thrown immediately.
++            Deadline.clear();
++            LOG.error("Error happens in method " + method.getName() + ": " +
++                ExceptionUtils.getStackTrace(e.getCause()));
++            throw e.getCause();
++          } else {
++            LOG.error(ExceptionUtils.getStackTrace(e.getCause()));
++            throw e.getCause();
++          }
+         } else {
+           LOG.error(ExceptionUtils.getStackTrace(e.getCause()));
+           throw e.getCause();
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/SessionPropertiesListener.java b/metastore/src/java/org/apache/hadoop/hive/metastore/SessionPropertiesListener.java
+new file mode 100644
+index 0000000..d16cab0
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/SessionPropertiesListener.java
+@@ -0,0 +1,44 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.hive.metastore.events.ConfigChangeEvent;
++
++import java.util.concurrent.TimeUnit;
++
++/**
++ * It handles the changed properties in the change event.
++ */
++public class SessionPropertiesListener extends MetaStoreEventListener {
++
++  public SessionPropertiesListener(Configuration configuration) {
++    super(configuration);
++  }
++
++  @Override
++  public void onConfigChange(ConfigChangeEvent changeEvent) throws MetaException {
++      if (changeEvent.getKey().equals(HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT.varname)) {
++        Deadline.resetTimeout(HiveConf.toTime(changeEvent.getNewValue(), TimeUnit.SECONDS,
++            TimeUnit.MILLISECONDS));
++      }
++  }
++}
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestDeadline.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestDeadline.java
+new file mode 100644
+index 0000000..ea11ed5
+--- /dev/null
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestDeadline.java
+@@ -0,0 +1,127 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.junit.Assert;
++import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Test the Deadline class used for long running requests.
++ */
++public class TestDeadline {
++
++  private static final Logger LOG = LoggerFactory.getLogger(TestDeadline.class);
++  private long timeout = 1000;
++  private long resetTimeout = 200;
++  private long duration = 500;
++  private boolean isFailed;
++  private String errorMsg;
++
++  @Test
++  public void testDeadline() throws Exception {
++    isFailed = false;
++    errorMsg = "";
++
++    Thread threadTimeout = new Thread(createRunnable());
++    threadTimeout.setDaemon(true);
++    threadTimeout.start();
++    threadTimeout.join(60000);
++
++    if (isFailed) {
++      Assert.fail(errorMsg);
++    }
++  }
++
++  private Runnable createRunnable() {
++    return new Runnable() {
++      @Override
++      public void run() {
++        Deadline.registerIfNot(timeout);
++        try {
++          // normal
++          start();
++          try {
++            Deadline.checkTimeout();
++          } catch (MetaException e) {
++            failInThread("should not timeout", e);
++            return;
++          }
++          Deadline.stopTimer();
++
++          // normal. Check stopTimer() works.
++          start();
++          try {
++            Deadline.checkTimeout();
++          } catch (MetaException e) {
++            failInThread("should not timeout", e);
++            return;
++          }
++          Deadline.stopTimer();
++
++          // reset
++          Deadline.resetTimeout(resetTimeout);
++
++          // timeout
++          start();
++          try {
++            Deadline.checkTimeout();
++            failInThread("should timeout.", null);
++            return;
++          } catch (MetaException e) {
++            if (e.getCause() instanceof DeadlineException) {
++              Deadline.clear();
++            } else {
++              failInThread("new MetaException failed.", e);
++              return;
++            }
++          }
++          if (Deadline.getCurrentDeadline() != null) {
++            failInThread("the threadlocal object should be removed after timeout.", null);
++          }
++        } catch (MetaException e) {
++          failInThread("error happens in start, end, or reset. Check the exception.", e);
++        }
++      }
++    };
++  }
++
++  private void start() throws MetaException {
++    Deadline.startTimer("test");
++    try {
++      Thread.sleep(duration);
++    } catch (InterruptedException e) {
++      failInThread("Odd. Sleeping thread is interrupted.", e);
++    }
++  }
++
++  private void failInThread(String msg, Exception e) {
++    isFailed = true;
++
++    if (e != null) {
++      LOG.error(msg, e);
++      errorMsg = msg + ": " + e.getMessage();
++    } else {
++      LOG.error(msg);
++      errorMsg = msg;
++    }
++  }
++}
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStoreTimeout.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStoreTimeout.java
+new file mode 100644
+index 0000000..9c30689
+--- /dev/null
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStoreTimeout.java
+@@ -0,0 +1,143 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import java.util.concurrent.TimeUnit;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.api.Database;
++import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.util.StringUtils;
++import org.junit.AfterClass;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * Test long running request timeout functionality in MetaStore Server
++ * HiveMetaStore.HMSHandler.create_database() is used to simulate a long running method.
++ */
++public class TestHiveMetaStoreTimeout {
++  protected static HiveMetaStoreClient client;
++  protected static HiveConf hiveConf;
++  protected static Warehouse warehouse;
++
++  @BeforeClass
++  public static void setUp() throws Exception {
++    HiveMetaStore.TEST_TIMEOUT_ENABLED = true;
++    hiveConf = new HiveConf(TestHiveMetaStoreTimeout.class);
++    hiveConf.setBoolean(HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS.varname, true);
++    hiveConf.set(HiveConf.ConfVars.METASTORE_EXPRESSION_PROXY_CLASS.varname,
++        MockPartitionExpressionForMetastore.class.getCanonicalName());
++    hiveConf.setTimeVar(HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT, 10 * 1000,
++        TimeUnit.MILLISECONDS);
++    warehouse = new Warehouse(hiveConf);
++    try {
++      client = new HiveMetaStoreClient(hiveConf, null);
++    } catch (Throwable e) {
++      System.err.println("Unable to open the metastore");
++      System.err.println(StringUtils.stringifyException(e));
++      throw e;
++    }
++  }
++
++  @AfterClass
++  public static void tearDown() throws Exception {
++    HiveMetaStore.TEST_TIMEOUT_ENABLED = false;
++    try {
++      client.close();
++    } catch (Throwable e) {
++      System.err.println("Unable to close metastore");
++      System.err.println(StringUtils.stringifyException(e));
++      throw e;
++    }
++  }
++
++  @Test
++  public void testNoTimeout() throws Exception {
++    HiveMetaStore.TEST_TIMEOUT_VALUE = 5 * 1000;
++
++    String dbName = "db";
++    client.dropDatabase(dbName, true, true);
++
++    Database db = new Database();
++    db.setName(dbName);
++    try {
++      client.createDatabase(db);
++    } catch (MetaException e) {
++      Assert.fail("should not throw timeout exception: " + e.getMessage());
++    }
++
++    client.dropDatabase(dbName, true, true);
++  }
++
++  @Test
++  public void testTimeout() throws Exception {
++    HiveMetaStore.TEST_TIMEOUT_VALUE = 15 * 1000;
++
++    String dbName = "db";
++    client.dropDatabase(dbName, true, true);
++
++    Database db = new Database();
++    db.setName(dbName);
++    try {
++      client.createDatabase(db);
++      Assert.fail("should throw timeout exception.");
++    } catch (MetaException e) {
++      Assert.assertTrue("unexpected MetaException", e.getMessage().contains("Timeout when " +
++          "executing method: create_database"));
++    }
++
++    // restore
++    HiveMetaStore.TEST_TIMEOUT_VALUE = 5 * 1000;
++  }
++
++  @Test
++  public void testResetTimeout() throws Exception {
++    HiveMetaStore.TEST_TIMEOUT_VALUE = 5 * 1000;
++    String dbName = "db";
++
++    // no timeout before reset
++    client.dropDatabase(dbName, true, true);
++    Database db = new Database();
++    db.setName(dbName);
++    try {
++      client.createDatabase(db);
++    } catch (MetaException e) {
++      Assert.fail("should not throw timeout exception: " + e.getMessage());
++    }
++    client.dropDatabase(dbName, true, true);
++
++    // reset
++    client.setMetaConf(HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT.varname, "3s");
++
++    // timeout after reset
++    try {
++      client.createDatabase(db);
++      Assert.fail("should throw timeout exception.");
++    } catch (MetaException e) {
++      Assert.assertTrue("unexpected MetaException", e.getMessage().contains("Timeout when " +
++          "executing method: create_database"));
++    }
++
++    // restore
++    client.dropDatabase(dbName, true, true);
++    client.setMetaConf(HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT.varname, "10s");
++  }
++}
+\ No newline at end of file
+-- 
+1.7.9.5
+

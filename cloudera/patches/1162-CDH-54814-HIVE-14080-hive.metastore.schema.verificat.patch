@@ -1,0 +1,168 @@
+From f8443130597fb74b42ff2cc1526116485ddee40e Mon Sep 17 00:00:00 2001
+From: Thejas Nair <thejas@hortonworks.com>
+Date: Mon, 4 Jul 2016 12:46:42 -0700
+Subject: [PATCH 1162/1164] CDH-54814 : HIVE-14080 :
+ hive.metastore.schema.verification should check
+ for schema compatiblity (Thejas M Nair, reviewed
+ by Sushanth Sowmyan)
+
+Change-Id: I0c7be2a6ae1437356d4045be5c2d8d15d79e8210
+---
+ .../hive/metastore/TestMetastoreVersion.java       |   23 +++++++++
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |   17 +++---
+ .../hive/metastore/TestMetaStoreSchemaInfo.java    |   54 ++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 8 deletions(-)
+ create mode 100644 metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaInfo.java
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+index 417f801..8b7e0e6 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+@@ -141,6 +141,7 @@ public void testVersionMatching () throws Exception {
+     driver = new Driver(hiveConf);
+     driver.run("show tables");
+ 
++    ObjectStore.setSchemaVerified(false);
+     hiveConf.setBoolVar(HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION, true);
+     setVersion(hiveConf, metastoreSchemaInfo.getHiveSchemaVersion());
+     driver = new Driver(hiveConf);
+@@ -159,12 +160,34 @@ public void testVersionMisMatch () throws Exception {
+     driver = new Driver(hiveConf);
+     driver.run("show tables");
+ 
++    ObjectStore.setSchemaVerified(false);
+     System.setProperty(HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION.toString(), "true");
+     hiveConf = new HiveConf(this.getClass());
+     setVersion(hiveConf, "fooVersion");
+     SessionState.start(new CliSessionState(hiveConf));
+     driver = new Driver(hiveConf);
+     CommandProcessorResponse proc = driver.run("show tables");
++    assertTrue(proc.getResponseCode() != 0);
++  }
++
++  /**
++   * Store higher version in metastore and verify that hive works with the compatible
++   * version
++   * @throws Exception
++   */
++  public void testVersionCompatibility () throws Exception {
++    System.setProperty(HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION.toString(), "false");
++    hiveConf = new HiveConf(this.getClass());
++    SessionState.start(new CliSessionState(hiveConf));
++    driver = new Driver(hiveConf);
++    driver.run("show tables");
++
++    System.setProperty(HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION.toString(), "true");
++    hiveConf = new HiveConf(this.getClass());
++    setVersion(hiveConf, "3.9000.0");
++    SessionState.start(new CliSessionState(hiveConf));
++    driver = new Driver(hiveConf);
++    CommandProcessorResponse proc = driver.run("show tables");
+     assertEquals(0, proc.getResponseCode());
+   }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index 8e6ff05..689724a 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -7277,11 +7277,13 @@ private synchronized void checkSchema() throws MetaException {
+     boolean strictValidation =
+       HiveConf.getBoolVar(getConf(), HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION);
+     // read the schema version stored in metastore db
+-    String schemaVer = getMetaStoreSchemaVersion();
++    String dbSchemaVer = getMetaStoreSchemaVersion();
+     // version of schema for this version of hive
+     IMetaStoreSchemaInfo metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(getConf());
++    // version of schema for this version of hive
+     String hiveSchemaVer = metastoreSchemaInfo.getHiveSchemaVersion();
+-    if (schemaVer == null) {
++
++    if (dbSchemaVer == null) {
+       if (strictValidation) {
+         throw new MetaException("Version information not found in metastore. ");
+       } else {
+@@ -7294,16 +7296,15 @@ private synchronized void checkSchema() throws MetaException {
+       }
+     } else {
+       // metastore schema version is different than Hive distribution needs
+-      if (schemaVer.equalsIgnoreCase(hiveSchemaVer)) {
+-        LOG.debug("Found expected HMS version of " + schemaVer);
++      if (metastoreSchemaInfo.isVersionCompatible(hiveSchemaVer, dbSchemaVer)) {
++        LOG.debug("Found expected HMS version of " + dbSchemaVer);
+       } else {
+         if (strictValidation) {
+-          throw new MetaException("Hive Schema version "
+-              + hiveSchemaVer +
+-              " does not match metastore's schema version " + schemaVer +
++          throw new MetaException("Hive Schema version " + hiveSchemaVer +
++              " does not match metastore's schema version " + dbSchemaVer +
+               " Metastore is not upgraded or corrupt");
+         } else {
+-          LOG.error("Version information found in metastore differs " + schemaVer +
++          LOG.error("Version information found in metastore differs " + dbSchemaVer +
+               " from expected schema version " + hiveSchemaVer +
+               ". Schema verififcation is disabled " +
+               HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION + " so setting version.");
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaInfo.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaInfo.java
+new file mode 100644
+index 0000000..38d85ed
+--- /dev/null
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaInfo.java
+@@ -0,0 +1,54 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Assert;
++import org.junit.Test;
++
++/**
++ * Test MetaStoreSchemaInfo
++ */
++public class TestMetaStoreSchemaInfo {
++
++  @Test
++  public void testIsVersionCompatible() throws Exception {
++    // first argument is hiveVersion, it is compatible if 2nd argument - dbVersion is
++    // greater than or equal to it
++    // check the compatible case
++    HiveConf conf = new HiveConf(TestMetaStoreSchemaInfo.class);
++    conf.setVar(HiveConf.ConfVars.METASTORE_SCHEMA_INFO_CLASS,
++      "org.apache.hadoop.hive.metastore.MetaStoreSchemaInfo");
++    IMetaStoreSchemaInfo metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(conf);
++    Assert.assertTrue(metastoreSchemaInfo.isVersionCompatible("0.0.1", "0.0.1"));
++    Assert.assertTrue(metastoreSchemaInfo.isVersionCompatible("0.0.1", "0.0.2"));
++    Assert.assertTrue(metastoreSchemaInfo.isVersionCompatible("1.0.2", "2.0.1"));
++    Assert.assertTrue(metastoreSchemaInfo.isVersionCompatible("0.0.9", "9.0.0"));
++
++    // check equivalent versions, should be compatible
++    Assert.assertTrue(metastoreSchemaInfo.isVersionCompatible("0.13.0", "0.13.1"));
++    Assert.assertTrue(metastoreSchemaInfo.isVersionCompatible("0.13.1", "0.13.0"));
++
++    // check incompatible versions
++    Assert.assertFalse(metastoreSchemaInfo.isVersionCompatible("0.1.1", "0.1.0"));
++    Assert.assertFalse(metastoreSchemaInfo.isVersionCompatible("4.0.1", "0.1.0"));
++
++  }
++
++}
+-- 
+1.7.9.5
+

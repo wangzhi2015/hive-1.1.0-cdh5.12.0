@@ -1,0 +1,605 @@
+From df81f2f954abaadfef1bcdaf7b0bbb7ec1e1c465 Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xzhang@Cloudera.com>
+Date: Thu, 14 May 2015 21:33:44 -0700
+Subject: [PATCH 0472/1164] CDH-36481: HIVE-10623: Implement hive cli options
+ using beeline functionality (Ferdinand via Xuefu)
+
+Change-Id: I094c1bf14f05ac7b83e40c8d89ad4489880527e2
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |  139 +++++++++++++++++-
+ .../hive/beeline/cli/CliOptionsProcessor.java      |  104 +++++++++++++
+ .../java/org/apache/hive/beeline/cli/HiveCli.java  |   40 +++++
+ .../org/apache/hive/beeline/cli/TestHiveCli.java   |  153 ++++++++++++++++++++
+ beeline/src/test/resources/hive-site.xml           |   37 +++++
+ 5 files changed, 466 insertions(+), 7 deletions(-)
+ create mode 100644 beeline/src/java/org/apache/hive/beeline/cli/CliOptionsProcessor.java
+ create mode 100644 beeline/src/java/org/apache/hive/beeline/cli/HiveCli.java
+ create mode 100644 beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+ create mode 100644 beeline/src/test/resources/hive-site.xml
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index adb5171..05b789c 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -89,6 +89,7 @@
+ import org.apache.commons.cli.Options;
+ import org.apache.commons.cli.ParseException;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hive.beeline.cli.CliOptionsProcessor;
+ 
+ /**
+  * A console SQL shell with command completion.
+@@ -127,8 +128,10 @@
+   private ConsoleReader consoleReader;
+   private List<String> batch = null;
+   private final Reflector reflector;
++  private String dbName = null;
+ 
+   private History history;
++  private boolean isBeeLine = true;
+ 
+   private static final Options options = new Options();
+ 
+@@ -487,10 +490,14 @@ public static void mainWithInputRedirection(String[] args, InputStream inputStre
+ 
+ 
+   public BeeLine() {
++    this(true);
++  }
++
++  public BeeLine(boolean isBeeLine) {
+     beeLineCommandCompleter = new BeeLineCommandCompleter(BeeLineCommandCompleter.getCompleters
+         (this));
+     reflector = new Reflector(this);
+-
++    this.isBeeLine = isBeeLine;
+     // attempt to dynamically load signal handler
+     /* TODO disable signal handler
+     try {
+@@ -504,7 +511,6 @@ public BeeLine() {
+     */
+   }
+ 
+-
+   DatabaseConnection getDatabaseConnection() {
+     return getDatabaseConnections().current();
+   }
+@@ -629,7 +635,63 @@ protected void processOption(final String arg, final ListIterator iter) throws
+         super.processOption(arg, iter);
+       }
+     }
++  }
++
++  int initArgsFromCliVars(String[] args) {
++    List<String> commands = Collections.emptyList();
++
++    CliOptionsProcessor optionsProcessor = new CliOptionsProcessor();
++    if (!optionsProcessor.process(args)) {
++      return 1;
++    }
++    CommandLine commandLine = optionsProcessor.getCommandLine();
++
++
++    Properties confProps = commandLine.getOptionProperties("hiveconf");
++    for (String propKey : confProps.stringPropertyNames()) {
++      getOpts().getHiveConfVariables().put(propKey, confProps.getProperty(propKey));
++    }
++
++    Properties hiveVars = commandLine.getOptionProperties("define");
++    for (String propKey : hiveVars.stringPropertyNames()) {
++      getOpts().getHiveConfVariables().put(propKey, hiveVars.getProperty(propKey));
++    }
++
++    Properties hiveVars2 = commandLine.getOptionProperties("hivevar");
++    for (String propKey : hiveVars2.stringPropertyNames()) {
++      getOpts().getHiveConfVariables().put(propKey, hiveVars2.getProperty(propKey));
++    }
++
++    getOpts().setScriptFile(commandLine.getOptionValue("f"));
++
++    dbName = commandLine.getOptionValue("database");
++    getOpts().setVerbose(Boolean.valueOf(commandLine.getOptionValue("verbose")));
++    getOpts().setSilent(Boolean.valueOf(commandLine.getOptionValue("slient")));
++
++    int code = 0;
++    if (commandLine.getOptionValues("e") != null) {
++      commands = Arrays.asList(commandLine.getOptionValues("e"));
++    }
+ 
++    if (!commands.isEmpty() && getOpts().getScriptFile() != null) {
++      System.err.println("The '-e' and '-f' options cannot be specified simultaneously");
++      optionsProcessor.printCliUsage();
++      return 1;
++    }
++
++    if (!commands.isEmpty()) {
++      embeddedConnect();
++      connectDBInEmbededMode();
++      for (Iterator<String> i = commands.iterator(); i.hasNext(); ) {
++        String command = i.next().toString();
++        debug(loc("executing-command", command));
++        if (!dispatch(command)) {
++          code++;
++        }
++      }
++      exit = true; // execute and exit
++    }
++    return code;
+   }
+ 
+   int initArgs(String[] args) {
+@@ -683,7 +745,6 @@ int initArgs(String[] args) {
+       commands = Arrays.asList(cl.getOptionValues('e'));
+     }
+ 
+-
+     // TODO: temporary disable this for easier debugging
+     /*
+     if (url == null) {
+@@ -760,9 +821,15 @@ public int begin(String[] args, InputStream inputStream) throws IOException {
+     }
+ 
+     try {
+-      int code = initArgs(args);
+-      if (code != 0) {
+-        return code;
++      if (isBeeLine) {
++        int code = initArgs(args);
++        if (code != 0) {
++          return code;
++        }
++      } else {
++        int code = initArgsFromCliVars(args);
++        if (code != 0)
++          return code;
+       }
+ 
+       if (getOpts().getScriptFile() != null) {
+@@ -793,6 +860,33 @@ int runInit() {
+     return ERRNO_OK;
+   }
+ 
++  private int embeddedConnect() {
++    if (!dispatch("!connect " + BEELINE_DEFAULT_JDBC_URL + " '' ''")) {
++      return ERRNO_OTHER;
++    } else {
++      return ERRNO_OK;
++    }
++  }
++
++  private int connectDBInEmbededMode() {
++    if (dbName != null && !dbName.isEmpty()) {
++      if (!dispatch("use " + dbName + ";")) {
++        return ERRNO_OTHER;
++      }
++    }
++    return ERRNO_OK;
++  }
++
++  public int defaultConnect(boolean exitOnError) {
++    if (embeddedConnect() != ERRNO_OK && exitOnError) {
++      return ERRNO_OTHER;
++    }
++    if (connectDBInEmbededMode() != ERRNO_OK && exitOnError) {
++      return ERRNO_OTHER;
++    }
++    return ERRNO_OK;
++  }
++
+   private int executeFile(String fileName) {
+     FileInputStream initStream = null;
+     try {
+@@ -810,13 +904,20 @@ private int executeFile(String fileName) {
+ 
+   private int execute(ConsoleReader reader, boolean exitOnError) {
+     String line;
++    if (!isBeeLine) {
++      if (defaultConnect(exitOnError) != ERRNO_OK && exitOnError) {
++        return ERRNO_OTHER;
++      }
++    }
+     while (!exit) {
+       try {
+         // Execute one instruction; terminate on executing a script if there is an error
+         // in silent mode, prevent the query and prompt being echoed back to terminal
+         line = (getOpts().isSilent() && getOpts().getScriptFile() != null) ?
+                  reader.readLine(null, ConsoleReader.NULL_MASK) : reader.readLine(getPrompt());
+-
++        if (!isBeeLine) {
++          line = cliToBeelineCmd(line);
++        }
+         if (!dispatch(line) && exitOnError) {
+           return ERRNO_OTHER;
+         }
+@@ -919,6 +1020,30 @@ void usage() {
+     output(loc("cmd-usage"));
+   }
+ 
++  private String[] tokenizeCmd(String cmd) {
++    return cmd.split("\\s+");
++  }
++
++  public String cliToBeelineCmd(String cmd) {
++    if (cmd == null)
++      return null;
++    String cmd_trimmed = cmd.trim();
++    String[] tokens = tokenizeCmd(cmd_trimmed);
++
++    if (cmd_trimmed.equalsIgnoreCase("quit") || cmd_trimmed.equalsIgnoreCase("exit")) {
++      return null;
++    } else if (tokens[0].equalsIgnoreCase("source")) {
++      //TODO
++      return cmd;
++    } else if (cmd_trimmed.startsWith("!")) {
++      String shell_cmd = cmd_trimmed.substring(1);
++      return "!sh " + shell_cmd;
++    } else { // local mode
++      // command like dfs
++      return cmd;
++    }
++  }
++
+ 
+   /**
+    * Dispatch the specified line to the appropriate {@link CommandHandler}.
+diff --git a/beeline/src/java/org/apache/hive/beeline/cli/CliOptionsProcessor.java b/beeline/src/java/org/apache/hive/beeline/cli/CliOptionsProcessor.java
+new file mode 100644
+index 0000000..61c5ab6
+--- /dev/null
++++ b/beeline/src/java/org/apache/hive/beeline/cli/CliOptionsProcessor.java
+@@ -0,0 +1,104 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.beeline.cli;
++
++import org.apache.commons.cli.CommandLine;
++import org.apache.commons.cli.GnuParser;
++import org.apache.commons.cli.HelpFormatter;
++import org.apache.commons.cli.Option;
++import org.apache.commons.cli.OptionBuilder;
++import org.apache.commons.cli.Options;
++import org.apache.commons.cli.ParseException;
++
++/**
++ * This class is used for parsing the options of Hive Cli
++ */
++public class CliOptionsProcessor {
++  private final Options options = new Options();
++  private org.apache.commons.cli.CommandLine commandLine;
++
++  public CliOptionsProcessor() {
++    // -database database
++    options.addOption(OptionBuilder.hasArg().withArgName("databasename").withLongOpt("database")
++        .withDescription("Specify the database to use").create());
++
++    // -e 'quoted-query-string'
++    options.addOption(OptionBuilder.hasArg().withArgName("quoted-query-string").withDescription
++        ("SQL from command line").create('e'));
++
++    // -f <query-file>
++    options.addOption(OptionBuilder.hasArg().withArgName("filename").withDescription("SQL from " +
++        "files").create('f'));
++
++    // -i <init-query-file>
++    options.addOption(OptionBuilder.hasArg().withArgName("filename").withDescription
++        ("Initialization SQL file").create('i'));
++
++    // -hiveconf x=y
++    options.addOption(OptionBuilder.withValueSeparator().hasArgs(2).withArgName("property=value")
++        .withLongOpt("hiveconf").withDescription("Use value for given property").create());
++
++    // Substitution option -d, --define
++    options.addOption(OptionBuilder.withValueSeparator().hasArgs(2).withArgName("key=value")
++        .withLongOpt("define").withDescription("Variable subsitution to apply to hive commands. e" +
++            ".g. -d A=B or --define A=B").create('d'));
++
++    // Substitution option --hivevar
++    options.addOption(OptionBuilder.withValueSeparator().hasArgs(2).withArgName("key=value")
++        .withLongOpt("hivevar").withDescription("Variable subsitution to apply to hive commands. " +
++            "e.g. --hivevar A=B").create());
++
++    // [-S|--silent]
++    options.addOption(new Option("S", "silent", false, "Silent mode in interactive shell"));
++
++    // [-v|--verbose]
++    options.addOption(new Option("v", "verbose", false, "Verbose mode (echo executed SQL to the "
++        + "console)"));
++
++    // [-H|--help]
++    options.addOption(new Option("H", "help", false, "Print help information"));
++  }
++
++  public boolean process(String []argv){
++    try {
++      commandLine = new GnuParser().parse(options, argv);
++
++      if(commandLine.hasOption("help")){
++        printCliUsage();
++        return false;
++      }
++    } catch (ParseException e) {
++      System.err.println(e.getMessage());
++      printCliUsage();
++      return false;
++    }
++    return true;
++  }
++
++  public void printCliUsage() {
++    new HelpFormatter().printHelp("hive", options);
++  }
++
++  public CommandLine getCommandLine() {
++    return commandLine;
++  }
++
++  public void setCommandLine(CommandLine commandLine) {
++    this.commandLine = commandLine;
++  }
++}
+diff --git a/beeline/src/java/org/apache/hive/beeline/cli/HiveCli.java b/beeline/src/java/org/apache/hive/beeline/cli/HiveCli.java
+new file mode 100644
+index 0000000..e0de3e6
+--- /dev/null
++++ b/beeline/src/java/org/apache/hive/beeline/cli/HiveCli.java
+@@ -0,0 +1,40 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.beeline.cli;
++
++import org.apache.hive.beeline.BeeLine;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++public class HiveCli {
++  private BeeLine beeLine;
++
++  public static void main(String[] args) throws IOException {
++    int status = new HiveCli().runWithArgs(args, null);
++    System.exit(status);
++  }
++
++  public int runWithArgs(String[] cmd, InputStream inputStream) throws IOException {
++    beeLine = new BeeLine(false);
++    return beeLine.begin(cmd, inputStream);
++  }
++}
+diff --git a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+new file mode 100644
+index 0000000..cc0b598
+--- /dev/null
++++ b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+@@ -0,0 +1,153 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.beeline.cli;
++
++import junit.framework.Assert;
++import org.apache.commons.io.IOUtils;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.BufferedWriter;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileWriter;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.PrintStream;
++
++public class TestHiveCli {
++  private static final Log LOG = LogFactory.getLog(TestHiveCli.class.getName());
++
++  final static String CMD = "create database if not exists test;\ncreate table if not exists test" +
++      ".testTbl(a " +
++      "" + "string, b string);\n";
++  private HiveCli cli;
++  private OutputStream os;
++  private PrintStream ps;
++  private OutputStream errS;
++  private PrintStream errPs;
++  private File tmp = null;
++
++  private void executeCMD(String[] args, String input, int retCode) {
++    InputStream inputStream = null;
++    int ret = 0;
++    try {
++      if (input != null) {
++        inputStream = IOUtils.toInputStream(input);
++      }
++      ret = cli.runWithArgs(args, inputStream);
++    } catch (IOException e) {
++      LOG.error("Failed to execute command due to the error: " + e);
++    } finally {
++      if (retCode != ret) {
++        LOG.error("Failed due to the error:" + errS.toString());
++        Assert.fail("Supported return code is " + retCode + " while the actual is " + ret);
++      }
++    }
++  }
++
++  private void verifyCMD(String CMD, String keywords, OutputStream os, String[] options, int
++      retCode) {
++    executeCMD(options, CMD, retCode);
++    String output = os.toString();
++    Assert.assertTrue(output.contains(keywords));
++  }
++
++  @Test
++  public void testInValidCmd() {
++    verifyCMD("!lss\n", "Failed to execute lss", errS, null, 0);
++  }
++
++  @Test
++  public void testHelp() {
++    verifyCMD(null, "usage: hive", os, new String[]{"-H"}, 1);
++  }
++
++  @Test
++  public void testInvalidDatabaseOptions() {
++    verifyCMD("\nshow tables\nquit\n", "Database does not exist: invalidDB", errS, new
++        String[]{"--database", "invalidDB"}, 0);
++  }
++
++  @Test
++  public void testDatabaseOptions() {
++    verifyCMD("\nshow tables;\nquit;", "testTbl", os, new String[]{"--database", "test"}, 0);
++  }
++
++  @Test
++  public void testSqlFromCmd() {
++    verifyCMD(null, "", os, new String[]{"-e", "show databases;"}, 0);
++  }
++
++  @Test
++  public void testSqlFromCmdWithDBName() {
++    verifyCMD(null, "testTbl", os, new String[]{"-e", "show tables;", "--database", "test"}, 0);
++  }
++
++  @Test
++  public void testInvalidOptions() {
++    verifyCMD(null, "The '-e' and '-f' options cannot be specified simultaneously", errS, new
++        String[]{"-e", "show tables;", "-f", "path/to/file"}, 1);
++  }
++
++  @Test
++  public void testInvalidOptions2() {
++    verifyCMD(null, "Unrecognized option: -k", errS, new String[]{"-k"}, 1);
++  }
++
++  private void redirectOutputStream() {
++    // Setup output stream to redirect output to
++    os = new ByteArrayOutputStream();
++    ps = new PrintStream(os);
++    errS = new ByteArrayOutputStream();
++    errPs = new PrintStream(errS);
++    System.setOut(ps);
++    System.setErr(errPs);
++  }
++
++  private void initFileFromFile() {
++    BufferedWriter bw = null;
++    try {
++      // create a tmp file
++      tmp = File.createTempFile("test", ".sql");
++      bw = new BufferedWriter(new FileWriter(tmp));
++      bw.write(CMD);
++    } catch (IOException e) {
++      LOG.error("Failed to write tmp file due to the exception: " + e);
++    } finally {
++      IOUtils.closeQuietly(bw);
++    }
++    executeCMD(new String[]{"-f", "\"" + tmp.getAbsolutePath() + "\""}, null, 0);
++  }
++
++  @Before
++  public void setup() {
++    cli = new HiveCli();
++    redirectOutputStream();
++    initFileFromFile();
++  }
++
++  @After
++  public void tearDown() {
++    tmp.delete();
++  }
++}
+diff --git a/beeline/src/test/resources/hive-site.xml b/beeline/src/test/resources/hive-site.xml
+new file mode 100644
+index 0000000..d2df03c
+--- /dev/null
++++ b/beeline/src/test/resources/hive-site.xml
+@@ -0,0 +1,37 @@
++<?xml version="1.0"?>
++<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
++<!--
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++-->
++
++<configuration>
++  <property>
++    <name>hive.in.test</name>
++    <value>true</value>
++    <description>Internal marker for test. Used for masking env-dependent values</description>
++  </property>
++  <property>
++    <name>javax.jdo.option.ConnectionURL</name>
++    <value>jdbc:derby:;databaseName=${test.tmp.dir}/metastore_db;create=true</value>
++    <description>JDBC connect string for a JDBC metastore</description>
++  </property>
++  <property>
++    <!--  this should eventually be deprecated since the metastore should supply this -->
++    <name>hive.metastore.warehouse.dir</name>
++    <value>${test.tmp.dir}/warehouse</value>
++    <description></description>
++  </property>
++</configuration>
+-- 
+1.7.9.5
+

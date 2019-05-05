@@ -1,0 +1,128 @@
+From a553154e9efa296dc970d7db96d49bc58a872bb4 Mon Sep 17 00:00:00 2001
+From: Gopal V <gopalv@apache.org>
+Date: Tue, 13 Oct 2015 15:23:58 -0700
+Subject: [PATCH 0953/1164] CDH-49555: HIVE-11882: Fetch optimizer should stop
+ source files traversal once it exceeds the
+ hive.fetch.task.conversion.threshold (Illya
+ Yalovyy, via Gopal V)
+
+(cherry picked from commit 1b9114f8c4ca0f3d5f956b00d36ed7a80efb35ec)
+
+Change-Id: Ic765a7a2c8d4792beb5929b1e7cd9e200c5f818d
+---
+ .../hive/ql/optimizer/SimpleFetchOptimizer.java    |    8 ++-
+ .../apache/hadoop/hive/ql/parse/SplitSample.java   |    4 ++
+ .../hadoop/hive/ql/parse/TestSplitSample.java      |   60 ++++++++++++++++++++
+ 3 files changed, 69 insertions(+), 3 deletions(-)
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/parse/TestSplitSample.java
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
+index 8e9b7a3..7fcf5f6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
+@@ -412,11 +412,10 @@ private long getInputLength(ParseContext pctx, long remaining) throws Exception
+       if (splitSample != null && splitSample.getTotalLength() != null) {
+         return splitSample.getTotalLength();
+       }
+-      long length = calculateLength(pctx, remaining);
+       if (splitSample != null) {
+-        return splitSample.getTargetSize(length);
++        return splitSample.getTargetSize(calculateLength(pctx, splitSample.estimateSourceSize(remaining)));
+       }
+-      return length;
++      return calculateLength(pctx, remaining);
+     }
+ 
+     private long calculateLength(ParseContext pctx, long remaining) throws Exception {
+@@ -441,6 +440,9 @@ private long calculateLength(ParseContext pctx, long remaining) throws Exception
+       for (Partition partition : partsList.getNotDeniedPartns()) {
+         Path path = partition.getDataLocation();
+         total += getFileLength(jobConf, path, partition.getInputFormatClass());
++        if (total > remaining) {
++          break;
++        }
+       }
+       return total;
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SplitSample.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SplitSample.java
+index 551d209..2b07635 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SplitSample.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SplitSample.java
+@@ -102,4 +102,8 @@ public void setSeedNum(int seedNum) {
+   public long getTargetSize(long totalSize) {
+     return totalLength != null ? totalLength : (long) (totalSize * percent / 100D);
+   }
++
++  public long estimateSourceSize(long targetSize) {
++    return percent != null ? Math.round(targetSize * 100D / percent) : targetSize;
++  }
+ }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/parse/TestSplitSample.java b/ql/src/test/org/apache/hadoop/hive/ql/parse/TestSplitSample.java
+new file mode 100644
+index 0000000..121d9ec
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/parse/TestSplitSample.java
+@@ -0,0 +1,60 @@
++/*
++ * Copyright 2015 The Apache Software Foundation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.parse;
++
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class TestSplitSample {
++
++  private static final int SEED_NUM = 123;
++  private static final double PERCENT = 2.0;
++  private static final long TOTAL_LENGTH = 1000L;
++  private static final int ROW_COUNT = 5;
++  private SplitSample splitSample;
++
++  @Test
++  public void testGetTargetSizeTotalLength() {
++    splitSample = new SplitSample(TOTAL_LENGTH, SEED_NUM);
++    assertEquals(TOTAL_LENGTH, splitSample.getTargetSize(1000));
++    assertEquals(TOTAL_LENGTH, splitSample.getTargetSize(100));
++  }
++
++  @Test
++  public void testGetTargetSizePercent() {
++    splitSample = new SplitSample(PERCENT, SEED_NUM);
++    assertEquals(20, splitSample.getTargetSize(1000));
++  }
++
++  @Test
++  public void testEstimateSourceSizeTotalLength() {
++    splitSample = new SplitSample(TOTAL_LENGTH, SEED_NUM);
++    assertEquals(10, splitSample.estimateSourceSize(10));
++  }
++
++  @Test
++  public void testEstimateSourceSizeRowCount() {
++    splitSample = new SplitSample(ROW_COUNT);
++    assertEquals(123, splitSample.estimateSourceSize(123));
++  }
++
++  @Test
++  public void testEstimateSourceSizePercent() {
++    splitSample = new SplitSample(PERCENT, SEED_NUM);
++    assertEquals(500, splitSample.estimateSourceSize(10));
++  }
++}
+-- 
+1.7.9.5
+

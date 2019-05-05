@@ -1,0 +1,352 @@
+From a0c8b406c8d13430c7db53bb68dccfeb62956ce9 Mon Sep 17 00:00:00 2001
+From: Rajesh Balamohan <rbalamohan at apache dot org>
+Date: Mon, 11 Jul 2016 06:20:00 -0800
+Subject: [PATCH 0945/1164] CDH-47888: HIVE-14204 : Optimize loading dynamic
+ partitions (Rajesh Balamohan via Ashutosh
+ Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+(cherry picked from commit d297b51087da908c81aa7a04263a00b3420c4d70)
+
+Change-Id: I89b1cdf9847cafd6aa518407fcee048244c9af2e
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    2 +
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |    3 +-
+ .../metastore/SynchronizedMetaStoreClient.java     |   90 ++++++++++++
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |  149 ++++++++++++++------
+ 4 files changed, 199 insertions(+), 45 deletions(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/metastore/SynchronizedMetaStoreClient.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index e69817d..bf9552a 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1970,6 +1970,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_MOVE_FILES_THREAD_COUNT("hive.mv.files.thread", 15, "Number of threads"
+          + " used to move files in move task. Set it to 0 to disable multi-threaded file moves. This parameter is also used by"
+          + " MSCK to check tables."),
++    HIVE_LOAD_DYNAMIC_PARTITIONS_THREAD_COUNT("hive.load.dynamic.partitions.thread", 15,
++        "Number of threads used to load dynamic partitions."),
+     // If this is set all move tasks at the end of a multi-insert query will only begin once all
+     // outputs are ready
+     HIVE_MULTI_INSERT_MOVE_TASKS_SHARE_DEPENDENCIES(
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index d312f66..76171a5 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -2127,7 +2127,8 @@ private Collection getPartitionPsQueryResults(String dbName, String tableName,
+     List<FieldSchema> partCols = table.getPartitionKeys();
+     int numPartKeys = partCols.size();
+     if (part_vals.size() > numPartKeys) {
+-      throw new MetaException("Incorrect number of partition values");
++      throw new MetaException("Incorrect number of partition values."
++          + " numPartKeys=" + numPartKeys + ", part_val=" + part_vals.size());
+     }
+     partCols = partCols.subList(0, part_vals.size());
+     // Construct a pattern of the form: partKey=partVal/partKey2=partVal2/...
+diff --git a/ql/src/java/org/apache/hadoop/hive/metastore/SynchronizedMetaStoreClient.java b/ql/src/java/org/apache/hadoop/hive/metastore/SynchronizedMetaStoreClient.java
+new file mode 100644
+index 0000000..19a97ab
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/metastore/SynchronizedMetaStoreClient.java
+@@ -0,0 +1,90 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * <p>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p>
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.hadoop.hive.common.ValidTxnList;
++import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
++import org.apache.hadoop.hive.metastore.api.LockRequest;
++import org.apache.hadoop.hive.metastore.api.LockResponse;
++import org.apache.hadoop.hive.metastore.api.Partition;
++import org.apache.hadoop.hive.metastore.api.ShowLocksRequest;
++import org.apache.hadoop.hive.metastore.api.ShowLocksResponse;
++import org.apache.thrift.TException;
++
++
++/**
++ * Synchronized MetaStoreClient wrapper
++ */
++public final class SynchronizedMetaStoreClient {
++
++  private final IMetaStoreClient client;
++
++  public SynchronizedMetaStoreClient(IMetaStoreClient client) {
++    this.client = client;
++  }
++
++  public synchronized long openTxn(String user) throws TException {
++    return client.openTxn(user);
++  }
++
++  public synchronized void commitTxn(long txnid) throws TException {
++    client.commitTxn(txnid);
++  }
++
++  public synchronized void rollbackTxn(long txnid) throws TException {
++    client.rollbackTxn(txnid);
++  }
++
++  public synchronized void heartbeat(long txnid, long lockid) throws TException {
++    client.heartbeat(txnid, lockid);
++  }
++
++  public synchronized ValidTxnList getValidTxns(long currentTxn) throws TException {
++    return client.getValidTxns(currentTxn);
++  }
++
++  public synchronized LockResponse lock(LockRequest request) throws TException {
++    return client.lock(request);
++  }
++
++  public synchronized Partition add_partition(Partition partition) throws TException {
++    return client.add_partition(partition);
++  }
++
++  public synchronized void alter_partition(String dbName, String tblName,
++      Partition newPart, EnvironmentContext environmentContext) throws TException {
++    client.alter_partition(dbName, tblName, newPart);
++  }
++
++  public synchronized LockResponse checkLock(long lockid) throws TException {
++    return client.checkLock(lockid);
++  }
++
++  public synchronized void unlock(long lockid) throws TException {
++    client.unlock(lockid);
++  }
++
++  public synchronized ShowLocksResponse showLocks() throws TException {
++    return client.showLocks();
++  }
++
++  public synchronized void close() {
++    client.close();
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index a52ef76..9e3623f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -50,10 +50,14 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
++
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.commons.io.FilenameUtils;
++
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -1417,9 +1421,11 @@ public Partition loadPartition(Path loadPath, Table tbl,
+       Map<String, String> partSpec, boolean replace, boolean holdDDLTime,
+       boolean inheritTableSpecs, boolean isSkewedStoreAsSubdir,
+       boolean isSrcLocal, boolean isAcid) throws HiveException {
++
+     Path tblDataLocationPath =  tbl.getDataLocation();
+     Partition newTPart = null;
+     try {
++      Partition oldPart = getPartition(tbl, partSpec, false);
+       /**
+        * Move files before creating the partition since down stream processes
+        * check for existence of partition in metadata before accessing the data.
+@@ -1427,12 +1433,7 @@ public Partition loadPartition(Path loadPath, Table tbl,
+        * processes might move forward with partial data
+        */
+ 
+-      Partition oldPart = getPartition(tbl, partSpec, false);
+-      Path oldPartPath = null;
+-      if(oldPart != null) {
+-        oldPartPath = oldPart.getDataLocation();
+-      }
+-
++      Path oldPartPath = (oldPart != null) ? oldPart.getDataLocation() : null;
+       Path newPartPath = null;
+ 
+       if (inheritTableSpecs) {
+@@ -1587,6 +1588,43 @@ private void constructOneLBLocationMap(FileStatus fSta,
+     return skewedColValueLocationMaps;
+   }
+ 
++  /**
++   * Get the valid partitions from the path
++   * @param numDP number of dynamic partitions
++   * @param loadPath
++   * @return Set of valid partitions
++   * @throws HiveException
++   */
++  private Set<Path> getValidPartitionsInPath(int numDP, Path loadPath) throws HiveException {
++    Set<Path> validPartitions = new HashSet<Path>();
++    try {
++      FileSystem fs = loadPath.getFileSystem(conf);
++      FileStatus[] leafStatus = HiveStatsUtils.getFileStatusRecurse(loadPath, numDP, fs);
++      // Check for empty partitions
++      for (FileStatus s : leafStatus) {
++        if (!s.isDirectory()) {
++          throw new HiveException("partition " + s.getPath() + " is not a directory!");
++        }
++        validPartitions.add(s.getPath());
++      }
++    } catch (IOException e) {
++      throw new HiveException(e);
++    }
++
++    int partsToLoad = validPartitions.size();
++    if (partsToLoad == 0) {
++      LOG.warn("No partition is generated by dynamic partitioning");
++    }
++
++    if (partsToLoad > conf.getIntVar(HiveConf.ConfVars.DYNAMICPARTITIONMAXPARTS)) {
++      throw new HiveException("Number of dynamic partitions created is " + partsToLoad
++          + ", which is more than "
++          + conf.getIntVar(HiveConf.ConfVars.DYNAMICPARTITIONMAXPARTS)
++          +". To solve this try to set " + HiveConf.ConfVars.DYNAMICPARTITIONMAXPARTS.varname
++          + " to at least " + partsToLoad + '.');
++    }
++    return validPartitions;
++  }
+ 
+   /**
+    * Given a source directory name of the load path, load all dynamically generated partitions
+@@ -1605,56 +1643,79 @@ private void constructOneLBLocationMap(FileStatus fSta,
+    * @throws JSONException
+    */
+   public Map<Map<String, String>, Partition> loadDynamicPartitions(Path loadPath,
+-      String tableName, Map<String, String> partSpec, boolean replace,
+-      int numDP, boolean holdDDLTime, boolean listBucketingEnabled, boolean isAcid)
++      String tableName, Map<String, String> partSpec, final boolean replace,
++      int numDP, final boolean holdDDLTime, final boolean listBucketingEnabled, final boolean isAcid)
+       throws HiveException {
+ 
+-    Set<Path> validPartitions = new HashSet<Path>();
+-    try {
+-      Map<Map<String, String>, Partition> partitionsMap = new
+-          LinkedHashMap<Map<String, String>, Partition>();
++    final Map<Map<String, String>, Partition> partitionsMap =
++        Collections.synchronizedMap(new LinkedHashMap<Map<String, String>, Partition>());
+ 
+-      FileSystem fs = loadPath.getFileSystem(conf);
+-      FileStatus[] leafStatus = HiveStatsUtils.getFileStatusRecurse(loadPath, numDP, fs);
+-      // Check for empty partitions
+-      for (FileStatus s : leafStatus) {
+-        validPartitions.add(s.getPath());
+-      }
++    int poolSize = conf.getInt(ConfVars.HIVE_LOAD_DYNAMIC_PARTITIONS_THREAD_COUNT.varname, 1);
++    final ExecutorService pool = Executors.newFixedThreadPool(poolSize,
++            new ThreadFactoryBuilder()
++                .setDaemon(true)
++                .setNameFormat("load-dynamic-partitions-%d")
++                .build());
+ 
+-      if (validPartitions.size() == 0) {
+-        LOG.warn("No partition is generated by dynamic partitioning");
+-      }
++    // Get all valid partition paths and existing partitions for them (if any)
++    final Table tbl = getTable(tableName);
++    final Set<Path> validPartitions = getValidPartitionsInPath(numDP, loadPath);
+ 
+-      if (validPartitions.size() > conf.getIntVar(HiveConf.ConfVars.DYNAMICPARTITIONMAXPARTS)) {
+-        throw new HiveException("Number of dynamic partitions created is " + validPartitions.size()
+-            + ", which is more than "
+-            + conf.getIntVar(HiveConf.ConfVars.DYNAMICPARTITIONMAXPARTS)
+-            +". To solve this try to set " + HiveConf.ConfVars.DYNAMICPARTITIONMAXPARTS.varname
+-            + " to at least " + validPartitions.size() + '.');
+-      }
++    final int partsToLoad = validPartitions.size();
+ 
+-      Table tbl = getTable(tableName);
++    final SessionState parentSession = SessionState.get();
++
++    final List<Future<Void>> futures = Lists.newLinkedList();
++    try {
+       // for each dynamically created DP directory, construct a full partition spec
+       // and load the partition based on that
+-      Iterator<Path> iter = validPartitions.iterator();
+-      while (iter.hasNext()) {
+-        // get the dynamically created directory
+-        Path partPath = iter.next();
+-        assert fs.getFileStatus(partPath).isDir():
+-          "partitions " + partPath + " is not a directory !";
+-
++      for(final Path partPath : validPartitions) {
+         // generate a full partition specification
+-        LinkedHashMap<String, String> fullPartSpec = new LinkedHashMap<String, String>(partSpec);
++        final LinkedHashMap<String, String> fullPartSpec = Maps.newLinkedHashMap(partSpec);
+         Warehouse.makeSpecFromName(fullPartSpec, partPath);
+-        Partition newPartition = loadPartition(partPath, tbl, fullPartSpec, replace,
+-            holdDDLTime, true, listBucketingEnabled, false, isAcid);
+-        partitionsMap.put(fullPartSpec, newPartition);
+-        LOG.info("New loading path = " + partPath + " with partSpec " + fullPartSpec);
++        futures.add(pool.submit(new Callable<Void>() {
++          @Override
++          public Void call() throws Exception {
++            try {
++              // move file would require session details (needCopy() invokes SessionState.get)
++              SessionState.setCurrentSessionState(parentSession);
++              LOG.info("New loading path = " + partPath + " with partSpec " + fullPartSpec);
++
++              // load the partition
++              Partition newPartition = loadPartition(partPath, tbl, fullPartSpec, replace, holdDDLTime, true,
++                      listBucketingEnabled, false, isAcid);
++              partitionsMap.put(fullPartSpec, newPartition);
++              return null;
++            } catch (Exception t) {
++              LOG.error("Exception when loading partition with parameters "
++                  + " partPath=" + partPath + ", "
++                  + " table=" + tbl.getTableName() + ", "
++                  + " partSpec=" + fullPartSpec + ", "
++                  + " replace=" + replace + ", "
++                  + " listBucketingEnabled=" + listBucketingEnabled + ", "
++                  + " isAcid=" + isAcid, t);
++              throw t;
++            }
++          }
++        }));
+       }
+-      return partitionsMap;
+-    } catch (IOException e) {
+-      throw new HiveException(e);
++      pool.shutdown();
++      LOG.debug("Number of partitions to be added is " + futures.size());
++
++      for (Future future : futures) {
++        future.get();
++      }
++    } catch (InterruptedException | ExecutionException e) {
++      LOG.debug("Cancelling " + futures.size() + " dynamic loading tasks");
++      //cancel other futures
++      for (Future future : futures) {
++        future.cancel(true);
++      }
++      throw new HiveException("Exception when loading "
++          + partsToLoad + " in table " + tbl.getTableName()
++          + " with loadPath=" + loadPath, e);
+     }
++    return partitionsMap;
+   }
+ 
+   /**
+-- 
+1.7.9.5
+

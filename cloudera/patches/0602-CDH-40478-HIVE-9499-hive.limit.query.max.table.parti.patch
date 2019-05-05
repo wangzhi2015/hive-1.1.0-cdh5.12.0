@@ -1,0 +1,71 @@
+From ac32ca76f08719afda7e5dba94e525f90a44d594 Mon Sep 17 00:00:00 2001
+From: Navis Ryu <navis@apache.org>
+Date: Sun, 8 Feb 2015 17:57:00 -0800
+Subject: [PATCH 0602/1164] CDH-40478 : HIVE-9499 :
+ hive.limit.query.max.table.partition makes
+ queries fail on non-partitioned tables (Navis via
+ Ashutosh Chauhan)
+
+(cherry picked from commit a71edcf6a5672452a8e00c2bad4f20cffced26d9)
+
+Change-Id: I90cdaf9dbc5ca4d08344bfa635cb4f9cb54c3b97
+---
+ .../stats/annotation/StatsRulesProcFactory.java    |    3 +--
+ .../apache/hadoop/hive/ql/parse/ParseContext.java  |    5 +++++
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |    8 ++++++--
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/stats/annotation/StatsRulesProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/stats/annotation/StatsRulesProcFactory.java
+index 571c050..3be13ca 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/stats/annotation/StatsRulesProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/stats/annotation/StatsRulesProcFactory.java
+@@ -101,8 +101,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+         Object... nodeOutputs) throws SemanticException {
+       TableScanOperator tsop = (TableScanOperator) nd;
+       AnnotateStatsProcCtx aspCtx = (AnnotateStatsProcCtx) procCtx;
+-      PrunedPartitionList partList =
+-          aspCtx.getParseContext().getPrunedPartitions(tsop.getName(), tsop);
++      PrunedPartitionList partList = aspCtx.getParseContext().getPrunedPartitions(tsop);
+       Table table = tsop.getConf().getTableMetadata();
+ 
+       try {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java
+index dda4f75..5cf4d53 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java
+@@ -498,6 +498,11 @@ public void setFetchTask(FetchTask fetchTask) {
+     this.fetchTask = fetchTask;
+   }
+ 
++  public PrunedPartitionList getPrunedPartitions(TableScanOperator ts)
++      throws SemanticException {
++    return getPrunedPartitions(ts.getConf().getAlias(), ts);
++  }
++
+   public PrunedPartitionList getPrunedPartitions(String alias, TableScanOperator ts)
+       throws SemanticException {
+     PrunedPartitionList partsList = opToPartList.get(ts);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 32e29fc..06c79ce 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -10135,10 +10135,14 @@ private void enforceScanLimits(ParseContext pCtx, FetchTask fTask)
+         // check whether any of them break the limit
+         for (Operator<?> topOp : topOps.values()) {
+           if (topOp instanceof TableScanOperator) {
+-            if (((TableScanDesc)topOp.getConf()).getIsMetadataOnly()) {
++            TableScanOperator tsOp = (TableScanOperator) topOp;
++            if (tsOp.getConf().getIsMetadataOnly()) {
++              continue;
++            }
++            PrunedPartitionList parts = pCtx.getPrunedPartitions(tsOp);
++            if (!parts.getSourceTable().isPartitioned()) {
+               continue;
+             }
+-            PrunedPartitionList parts = pCtx.getOpToPartList().get(topOp);
+             if (parts.getPartitions().size() > scanLimit) {
+               throw new SemanticException(ErrorMsg.PARTITION_SCAN_LIMIT_EXCEEDED, ""
+                   + parts.getPartitions().size(), "" + parts.getSourceTable().getTableName(), ""
+-- 
+1.7.9.5
+

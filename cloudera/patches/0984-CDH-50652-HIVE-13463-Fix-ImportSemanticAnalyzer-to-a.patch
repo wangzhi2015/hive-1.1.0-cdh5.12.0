@@ -1,0 +1,96 @@
+From 728e9d6377b96a16cf13c93fd39002c74cc0427b Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Tue, 26 Apr 2016 15:17:57 -0700
+Subject: [PATCH 0984/1164] CDH-50652: HIVE-13463 : Fix ImportSemanticAnalyzer
+ to allow for different src/dst filesystems (Zach
+ York, reviewed by Sergey Shelukhin)
+
+(cherry picked from commit 85ffd22af8ab460f545b137aff0592984aa4b4f7)
+
+Change-Id: I7dfe03ebbd2f6a5ac9a29eb74ee7d5a135c3cb40
+---
+ .../hive/ql/parse/ImportSemanticAnalyzer.java      |   25 ++++++++++++--------
+ 1 file changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java
+index 1061cb0..0be56d1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java
+@@ -317,9 +317,9 @@ private CreateTableDesc getBaseCreateTableDescFromTable(String dbName,
+     return tblDesc;
+   }
+ 
+-  private Task<?> loadTable(URI fromURI, Table table, boolean replace) {
++  private Task<?> loadTable(URI fromURI, Table table, boolean replace, Path tgtPath) {
+     Path dataPath = new Path(fromURI.toString(), "data");
+-    Path tmpPath = ctx.getExternalTmpPath(new Path(fromURI));
++    Path tmpPath = ctx.getExternalTmpPath(tgtPath);
+     Task<?> copyTask = TaskFactory.get(new CopyWork(dataPath,
+        tmpPath, false), conf);
+     LoadTableDesc loadTableWork = new LoadTableDesc(tmpPath,
+@@ -389,7 +389,8 @@ private CreateTableDesc getBaseCreateTableDescFromTable(String dbName,
+       LOG.debug("adding dependent CopyWork/AddPart/MoveWork for partition "
+           + partSpecToString(partSpec.getPartSpec())
+           + " with source location: " + srcLocation);
+-      Path tmpPath = ctx.getExternalTmpPath(new Path(fromURI));
++      Path tgtLocation = new Path(partSpec.getLocation());
++      Path tmpPath = ctx.getExternalTmpPath(tgtLocation);
+       Task<?> copyTask = TaskFactory.get(new CopyWork(new Path(srcLocation),
+           tmpPath, false), conf);
+       Task<?> addPartTask = TaskFactory.get(new DDLWork(getInputs(),
+@@ -430,7 +431,8 @@ private void fixLocationInPartSpec(
+       tgtPath = new Path(tblDesc.getLocation(),
+           Warehouse.makePartPath(partSpec.getPartSpec()));
+     }
+-    checkTargetLocationEmpty(fs, tgtPath, replicationSpec);
++    FileSystem tgtFs = FileSystem.get(tgtPath.toUri(), conf);
++    checkTargetLocationEmpty(tgtFs, tgtPath, replicationSpec);
+     partSpec.setLocation(tgtPath.toString());
+   }
+ 
+@@ -706,8 +708,10 @@ private void createRegularImportTasks(
+       } else {
+         LOG.debug("table non-partitioned");
+         // ensure if destination is not empty only for regular import
+-        checkTargetLocationEmpty(fs, new Path(table.getDataLocation().toString()), replicationSpec);
+-        loadTable(fromURI, table, false);
++        Path tgtPath = new Path(table.getDataLocation().toString());
++        FileSystem tgtFs = FileSystem.get(tgtPath.toUri(), conf);
++        checkTargetLocationEmpty(tgtFs, tgtPath, replicationSpec);
++        loadTable(fromURI, table, false, tgtPath);
+       }
+       // Set this to read because we can't overwrite any existing partitions
+       outputs.add(new WriteEntity(table, WriteEntity.WriteType.DDL_NO_LOCK));
+@@ -736,8 +740,9 @@ private void createRegularImportTasks(
+           } else {
+             tablePath = wh.getTablePath(parentDb, tblDesc.getTableName());
+           }
+-          checkTargetLocationEmpty(fs, tablePath, replicationSpec);
+-          t.addDependentTask(loadTable(fromURI, table, false));
++          FileSystem tgtFs = FileSystem.get(tablePath.toUri(), conf);
++          checkTargetLocationEmpty(tgtFs, tablePath, replicationSpec);
++          t.addDependentTask(loadTable(fromURI, table, false, tablePath));
+         }
+       }
+       rootTasks.add(t);
+@@ -808,7 +813,7 @@ private void createReplImportTasks(
+           }
+         } else {
+           LOG.debug("adding dependent CopyWork/MoveWork for table");
+-          t.addDependentTask(loadTable(fromURI, table, true));
++          t.addDependentTask(loadTable(fromURI, table, true, new Path(tblDesc.getLocation())));
+         }
+       }
+       if (dr == null){
+@@ -863,7 +868,7 @@ private void createReplImportTasks(
+           return; // silently return, table is newer than our replacement.
+         }
+         if (!replicationSpec.isMetadataOnly()) {
+-          loadTable(fromURI, table, true); // repl-imports are replace-into
++          loadTable(fromURI, table, true, new Path(fromURI)); // repl-imports are replace-into
+         } else {
+           rootTasks.add(alterTableTask(tblDesc));
+         }
+-- 
+1.7.9.5
+

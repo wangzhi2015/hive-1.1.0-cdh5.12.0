@@ -1,0 +1,108 @@
+From 7a3d9bcffd16167749e42ee7d123132fa0dff7a2 Mon Sep 17 00:00:00 2001
+From: Marta Kuczora <kuczoram@cloudera.com>
+Date: Wed, 24 May 2017 16:25:09 +0200
+Subject: [PATCH 1146/1164] CLOUDERA-BUILD: CDH-53892: Clean up the S3 bucket
+ after the q tests are finished
+
+Also cleaned up the exception handling in the AbstractCoreBlobstoreCliDriver
+
+Change-Id: I1e351c925857e43f59b0de7c55ccb3c76ac6b517
+---
+ .../control/AbstractCoreBlobstoreCliDriver.java    |   47 +++++++-------------
+ .../hive/cli/control/HdfsBlobstoreCliDriver.java   |    2 +-
+ 2 files changed, 17 insertions(+), 32 deletions(-)
+
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java
+index 3b339c0..5bca8fe 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java
+@@ -25,7 +25,6 @@
+ import java.util.Calendar;
+ import java.util.Map;
+ 
+-import org.apache.hadoop.hive.cli.control.AbstractCliConfig.MetastoreType;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveVariableSource;
+ import org.apache.hadoop.hive.conf.VariableSubstitution;
+@@ -50,30 +49,24 @@ public AbstractCoreBlobstoreCliDriver(AbstractCliConfig testCliConfig) {
+ 
+   @Override
+   @BeforeClass
+-  public void beforeClass() {
++  public void beforeClass() throws Exception {
+     MiniClusterType miniMR = cliConfig.getClusterType();
+     String hiveConfDir = cliConfig.getHiveConfDir();
+     String initScript = cliConfig.getInitScript();
+     String cleanupScript = cliConfig.getCleanupScript();
+-    try {
+-      String hadoopVer = cliConfig.getHadoopVersion();
+-      qt = new QTestUtil((cliConfig.getResultsDir()), (cliConfig.getLogDir()), miniMR,
+-          hiveConfDir, hadoopVer, initScript, cleanupScript);
+-
+-      if (Strings.isNullOrEmpty(qt.getConf().get(HCONF_TEST_BLOBSTORE_PATH))) {
+-        fail(String.format("%s must be set. Try setting in blobstore-conf.xml", HCONF_TEST_BLOBSTORE_PATH));
+-      }
++    String hadoopVer = cliConfig.getHadoopVersion();
++    qt = new QTestUtil((cliConfig.getResultsDir()), (cliConfig.getLogDir()), miniMR, hiveConfDir,
++        hadoopVer, initScript, cleanupScript);
+ 
+-      // do a one time initialization
+-      setupUniqueTestPath();
+-      qt.cleanUp();
+-      qt.createSources();
+-    } catch (Exception e) {
+-      System.err.println("Exception: " + e.getMessage());
+-      e.printStackTrace();
+-      System.err.flush();
+-      throw new RuntimeException("Unexpected exception in static initialization",e);
++    if (Strings.isNullOrEmpty(qt.getConf().get(HCONF_TEST_BLOBSTORE_PATH))) {
++      fail(String.format("%s must be set. Try setting in blobstore-conf.xml",
++          HCONF_TEST_BLOBSTORE_PATH));
+     }
++
++    // do a one time initialization
++    setupUniqueTestPath();
++    qt.cleanUp();
++    qt.createSources();
+   }
+ 
+   @Override
+@@ -105,18 +98,10 @@ public void tearDown() {
+   @Override
+   @AfterClass
+   public void shutdown() throws Exception {
+-    try {
+-      qt.shutdown();
+-      if (System.getenv(QTestUtil.QTEST_LEAVE_FILES) == null) {
+-        String rmUniquePathCommand = String.format("dfs -rmdir ${hiveconf:%s};", HCONF_TEST_BLOBSTORE_PATH_UNIQUE);
+-        qt.executeAdhocCommand(rmUniquePathCommand);
+-      }
+-    } catch (Exception e) {
+-      System.err.println("Exception: " + e.getMessage());
+-      e.printStackTrace();
+-      System.err.flush();
+-      fail("Unexpected exception in shutdown");
+-    }
++    qt.shutdown();
++    String rmUniquePathCommand =
++        String.format("dfs -rm -r ${hiveconf:%s};", HCONF_TEST_BLOBSTORE_PATH_UNIQUE);
++    qt.executeAdhocCommand(rmUniquePathCommand);
+   }
+ 
+   static String debugHint = "\nSee ./itests/hive-blobstore/target/tmp/log/hive.log, "
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/HdfsBlobstoreCliDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/HdfsBlobstoreCliDriver.java
+index 989a134..c47f98d 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/HdfsBlobstoreCliDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/HdfsBlobstoreCliDriver.java
+@@ -33,7 +33,7 @@ public HdfsBlobstoreCliDriver(AbstractCliConfig testCliConfig) {
+ 
+   @Override
+   @BeforeClass
+-  public void beforeClass() {
++  public void beforeClass() throws Exception {
+     super.beforeClass();
+   }
+ 
+-- 
+1.7.9.5
+

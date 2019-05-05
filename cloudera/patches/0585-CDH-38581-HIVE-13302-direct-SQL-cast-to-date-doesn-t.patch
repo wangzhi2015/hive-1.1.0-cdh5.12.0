@@ -1,0 +1,82 @@
+From f1b4cca38b16227693dbeb257bf3a8d39fffa474 Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Tue, 22 Mar 2016 15:20:02 -0700
+Subject: [PATCH 0585/1164] CDH-38581 : HIVE-13302 : direct SQL: cast to date
+ doesn't work on Oracle (Sergey Shelukhin,
+ reviewed by Sushanth Sowmyan)
+
+(cherry picked from commit e3ca81ea7552193f9e4ec7c83cd220856f64d7ac)
+
+Change-Id: I236b1d71a36d4ac1131d6d42b526a8dd091aa2ea
+---
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |   19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index 2ac4703..2655e1c 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -384,7 +384,7 @@ public Database getDatabase(String dbName) throws MetaException{
+     // Derby and Oracle do not interpret filters ANSI-properly in some cases and need a workaround.
+     boolean dbHasJoinCastBug = (dbType == DB.DERBY || dbType == DB.ORACLE);
+     String sqlFilter = PartitionFilterGenerator.generateSqlFilter(
+-        table, tree, params, joins, dbHasJoinCastBug, defaultPartName);
++        table, tree, params, joins, dbHasJoinCastBug, defaultPartName, dbType);
+     if (sqlFilter == null) {
+       return null; // Cannot make SQL filter to push down.
+     }
+@@ -906,15 +906,17 @@ private static String trimCommaList(StringBuilder sb) {
+     private final List<String> joins;
+     private final boolean dbHasJoinCastBug;
+     private final String defaultPartName;
++    private final DB dbType;
+ 
+     private PartitionFilterGenerator(Table table, List<Object> params, List<String> joins,
+-        boolean dbHasJoinCastBug, String defaultPartName) {
++        boolean dbHasJoinCastBug, String defaultPartName, DB dbType) {
+       this.table = table;
+       this.params = params;
+       this.joins = joins;
+       this.dbHasJoinCastBug = dbHasJoinCastBug;
+       this.filterBuffer = new FilterBuilder(false);
+       this.defaultPartName = defaultPartName;
++      this.dbType = dbType;
+     }
+ 
+     /**
+@@ -924,15 +926,15 @@ private PartitionFilterGenerator(Table table, List<Object> params, List<String>
+      * @param joins the joins necessary for the resulting expression
+      * @return the string representation of the expression tree
+      */
+-    private static String generateSqlFilter(Table table, ExpressionTree tree,
+-        List<Object> params, List<String> joins, boolean dbHasJoinCastBug, String defaultPartName)
++    private static String generateSqlFilter(Table table, ExpressionTree tree, List<Object> params,
++        List<String> joins, boolean dbHasJoinCastBug, String defaultPartName, DB dbType)
+             throws MetaException {
+       assert table != null;
+       if (tree.getRoot() == null) {
+         return "";
+       }
+       PartitionFilterGenerator visitor = new PartitionFilterGenerator(
+-          table, params, joins, dbHasJoinCastBug, defaultPartName);
++          table, params, joins, dbHasJoinCastBug, defaultPartName, dbType);
+       tree.accept(visitor);
+       if (visitor.filterBuffer.hasError()) {
+         LOG.info("Unable to push down SQL filter: " + visitor.filterBuffer.getErrorMessage());
+@@ -1068,7 +1070,12 @@ public void visit(LeafNode node) throws MetaException {
+         if (colType == FilterType.Integral) {
+           tableValue = "cast(" + tableValue + " as decimal(21,0))";
+         } else if (colType == FilterType.Date) {
+-          tableValue = "cast(" + tableValue + " as date)";
++          if (dbType == DB.ORACLE) {
++            // Oracle requires special treatment... as usual.
++            tableValue = "TO_DATE(" + tableValue + ", 'YYYY-MM-DD')";
++          } else {
++            tableValue = "cast(" + tableValue + " as date)";
++          }
+         }
+ 
+         // Workaround for HIVE_DEFAULT_PARTITION - ignore it like JDO does, for now.
+-- 
+1.7.9.5
+

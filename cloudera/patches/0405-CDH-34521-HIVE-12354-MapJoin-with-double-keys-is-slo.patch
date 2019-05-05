@@ -1,0 +1,114 @@
+From 650f2a2ccac3b335540cfa51e925e40e93e0284f Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Mon, 9 Nov 2015 16:32:31 -0800
+Subject: [PATCH 0405/1164] CDH-34521: HIVE-12354 : MapJoin with double keys
+ is slow on MR (Sergey Shelukhin, reviewed by
+ Prasanth Jayachandran)
+
+Change-Id: I3e503207e9e88cd2c833b11ffae45778c12a3ca9
+---
+ .../hadoop/hive/ql/exec/KeyWrapperFactory.java     |   17 +------------
+ .../hive/ql/exec/persistence/MapJoinKeyObject.java |    6 ++---
+ .../objectinspector/ObjectInspectorUtils.java      |   26 ++++++++++++++++++++
+ 3 files changed, 29 insertions(+), 20 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/KeyWrapperFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/KeyWrapperFactory.java
+index 22bd951..3d8f0e9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/KeyWrapperFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/KeyWrapperFactory.java
+@@ -104,22 +104,7 @@ public boolean equals(Object obj) {
+ 
+     @Override
+     public void setHashKey() {
+-      if (keys == null) {
+-        hashcode = 0;
+-      } else {
+-        hashcode = 1;
+-        for (Object element : keys) {
+-          hashcode = 31 * hashcode;
+-          if(element != null) {
+-            if(element instanceof LazyDouble) {
+-              long v = Double.doubleToLongBits(((LazyDouble)element).getWritableObject().get());
+-              hashcode = hashcode + (int) (v ^ (v >>> 32));
+-            } else {
+-              hashcode = hashcode + element.hashCode();
+-            }
+-          }
+-        }
+-      }
++      hashcode = ObjectInspectorUtils.writableArrayHashCode(keys);
+     }
+ 
+     @Override
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinKeyObject.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinKeyObject.java
+index e1fd6d3..7592f9e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinKeyObject.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinKeyObject.java
+@@ -78,11 +78,9 @@ public boolean hasAnyNulls(int fieldCount, boolean[] nullsafes) {
+ 
+   @Override
+   public int hashCode() {
+-    final int prime = 31;
+-    int result = 1;
+-    result = prime * result + Arrays.hashCode(key);
+-    return result;
++    return ObjectInspectorUtils.writableArrayHashCode(key);
+   }
++
+   @Override
+   public boolean equals(Object obj) {
+     if (this == obj)
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java
+index b92b1ff..c328d90 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.hive.serde2.io.HiveDecimalWritable;
+ import org.apache.hadoop.hive.serde2.io.HiveVarcharWritable;
+ import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.lazy.LazyDouble;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector.Category;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.AbstractPrimitiveWritableObjectInspector;
+@@ -71,6 +72,7 @@
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.WritableStringObjectInspector;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+ import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.DoubleWritable;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.util.StringUtils;
+ 
+@@ -98,6 +100,30 @@
+   }
+ 
+   /**
++   * Calculates the hash code for array of Objects that contains writables. This is used
++   * to work around the buggy Hadoop DoubleWritable hashCode implementation. This should
++   * only be used for process-local hash codes; don't replace stored hash codes like bucketing.
++   */
++  public static int writableArrayHashCode(Object[] keys) {
++    if (keys == null) return 0;
++    int hashcode = 1;
++    for (Object element : keys) {
++      hashcode = 31 * hashcode;
++      if (element == null) continue;
++      if (element instanceof LazyDouble) {
++        long v = Double.doubleToLongBits(((LazyDouble)element).getWritableObject().get());
++        hashcode = hashcode + (int) (v ^ (v >>> 32));
++      } else if (element instanceof DoubleWritable){
++        long v = Double.doubleToLongBits(((DoubleWritable)element).get());
++        hashcode = hashcode + (int) (v ^ (v >>> 32));
++      } else {
++        hashcode = hashcode + element.hashCode();
++      }
++    }
++    return hashcode;
++  }
++
++  /**
+    * Ensures that an ObjectInspector is Writable.
+    */
+   public static ObjectInspector getWritableObjectInspector(ObjectInspector oi) {
+-- 
+1.7.9.5
+

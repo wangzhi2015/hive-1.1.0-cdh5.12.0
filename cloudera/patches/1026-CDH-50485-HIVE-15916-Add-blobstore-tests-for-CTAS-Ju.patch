@@ -1,0 +1,1561 @@
+From dc3ca4e369f61153ea665afd6c2faa43f9e79a95 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Juan=20Rodr=C3=ADguez=20Hortal=C3=A1?= <hortala@amazon.com>
+Date: Thu, 2 Mar 2017 12:46:09 -0600
+Subject: [PATCH 1026/1164] =?UTF-8?q?CDH-50485:=20HIVE-15916:=20Add=20blobst?=
+ =?UTF-8?q?ore=20tests=20for=20CTAS=20(Juan=20Rodr=C3=ADguez=20Hortal=C3=A1,?=
+ =?UTF-8?q?=20reviewed=20by=20Sergio=20Pena,=20Sahil=20Takiar,=20Thomas=20Po?=
+ =?UTF-8?q?epping)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit dfcf9e3da0b9ebe86acb40104c61998c04541508)
+
+Change-Id: I4e8219c9f70e71227c4699818b57d750640fe2a1
+---
+ data/files/3col_data.txt                           |    7 +
+ .../src/test/queries/clientpositive/ctas.q         |   30 -
+ .../clientpositive/ctas_blobstore_to_blobstore.q   |   27 +
+ .../clientpositive/ctas_blobstore_to_hdfs.q        |   25 +
+ .../clientpositive/ctas_hdfs_to_blobstore.q        |   26 +
+ .../src/test/results/clientpositive/ctas.q.out     |  970 --------------------
+ .../ctas_blobstore_to_blobstore.q.out              |  131 +++
+ .../clientpositive/ctas_blobstore_to_hdfs.q.out    |  123 +++
+ .../clientpositive/ctas_hdfs_to_blobstore.q.out    |  127 +++
+ 9 files changed, 466 insertions(+), 1000 deletions(-)
+ create mode 100644 data/files/3col_data.txt
+ delete mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/ctas.q
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_blobstore.q
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_hdfs.q
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/ctas_hdfs_to_blobstore.q
+ delete mode 100644 itests/hive-blobstore/src/test/results/clientpositive/ctas.q.out
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_blobstore.q.out
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_hdfs.q.out
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/ctas_hdfs_to_blobstore.q.out
+
+diff --git a/data/files/3col_data.txt b/data/files/3col_data.txt
+new file mode 100644
+index 0000000..81e49cf
+--- /dev/null
++++ b/data/files/3col_data.txt
+@@ -0,0 +1,7 @@
++1 abc 10.5
++2 def 11.5
++3 ajss 90.23232
++4 djns 89.02002
++5 random 2.99
++6 data 3.002
++7 ne 71.9084
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/ctas.q b/itests/hive-blobstore/src/test/queries/clientpositive/ctas.q
+deleted file mode 100644
+index 07b2224..0000000
+--- a/itests/hive-blobstore/src/test/queries/clientpositive/ctas.q
++++ /dev/null
+@@ -1,30 +0,0 @@
+-DROP TABLE IF EXISTS ctas_blobstore_table_src;
+-CREATE TABLE ctas_blobstore_table_src (col int) LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_table_src/';
+-INSERT INTO TABLE ctas_blobstore_table_src VALUES (1), (2), (3);
+-
+-DROP TABLE IF EXISTS ctas_hdfs_table_src;
+-CREATE TABLE ctas_hdfs_table_src (col int);
+-INSERT INTO TABLE ctas_hdfs_table_src VALUES (1), (2), (3);
+-
+--- Test select from a Blobstore and write to HDFS
+-DROP TABLE IF EXISTS ctas_hdfs_table_dst;
+-EXPLAIN EXTENDED CREATE TABLE ctas_hdfs_table_dst AS SELECT * FROM ctas_blobstore_table_src;
+-CREATE TABLE ctas_hdfs_table_dst AS SELECT * FROM ctas_blobstore_table_src;
+-SELECT * FROM ctas_hdfs_table_dst;
+-
+--- Test select from HDFS and write to a Blobstore
+-DROP TABLE IF EXISTS ctas_blobstore_table_dst;
+-EXPLAIN EXTENDED CREATE TABLE ctas_blobstore_table_dst LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_table_dst/' AS SELECT * FROM ctas_hdfs_table_src;
+-CREATE TABLE ctas_blobstore_table_dst AS SELECT * FROM ctas_hdfs_table_src;
+-SELECT * FROM ctas_blobstore_table_dst;
+-
+--- Test select from a Blobstore and write to a Blobstore
+-DROP TABLE IF EXISTS ctas_blobstore_table_dst;
+-EXPLAIN EXTENDED CREATE TABLE ctas_blobstore_table_dst LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_table_dst/' AS SELECT * FROM ctas_blobstore_table_src;
+-CREATE TABLE ctas_blobstore_table_dst AS SELECT * FROM ctas_blobstore_table_src;
+-SELECT * FROM ctas_blobstore_table_dst;
+-
+-DROP TABLE ctas_blobstore_table_dst;
+-DROP TABLE ctas_hdfs_table_dst;
+-DROP TABLE ctas_blobstore_table_src;
+-DROP TABLE ctas_hdfs_table_src;
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_blobstore.q b/itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_blobstore.q
+new file mode 100644
+index 0000000..68d758f
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_blobstore.q
+@@ -0,0 +1,27 @@
++-- Check we can create a table located in a blobstore
++-- with CTAS from a table in a blobstore
++
++DROP TABLE IF EXISTS blobstore_source;
++CREATE TABLE blobstore_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_to_blobstore/blobstore_source/';
++LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE blobstore_source;
++
++DROP TABLE IF EXISTS blobstore_target;
++CREATE TABLE blobstore_target 
++LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_to_blobstore/blobstore_target/'
++AS SELECT * FROM blobstore_source;
++
++DROP DATABASE IF EXISTS target_db;
++CREATE DATABASE target_db 
++LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_to_blobstore/target_db';
++CREATE TABLE target_db.blobstore_target
++AS SELECT * FROM blobstore_source;
++
++SELECT * FROM blobstore_source;
++SELECT * FROM blobstore_target;
++SELECT * FROM target_db.blobstore_target;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_hdfs.q b/itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_hdfs.q
+new file mode 100644
+index 0000000..3c08f4c
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/ctas_blobstore_to_hdfs.q
+@@ -0,0 +1,25 @@
++-- Check we can create a table located in HDFS
++-- with CTAS from a table a blobstore
++
++DROP TABLE IF EXISTS blobstore_source;
++CREATE TABLE blobstore_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_blobstore_to_hdfs/blobstore_source/';
++LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE blobstore_source;
++
++DROP TABLE IF EXISTS hdfs_target;
++CREATE TABLE hdfs_target 
++AS SELECT * FROM blobstore_source;
++
++DROP DATABASE IF EXISTS target_db;
++CREATE DATABASE target_db;
++CREATE TABLE target_db.hdfs_target
++AS SELECT * FROM blobstore_source;
++
++SELECT * FROM blobstore_source;
++SELECT * FROM hdfs_target;
++SELECT * FROM target_db.hdfs_target;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/ctas_hdfs_to_blobstore.q b/itests/hive-blobstore/src/test/queries/clientpositive/ctas_hdfs_to_blobstore.q
+new file mode 100644
+index 0000000..8809f1f
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/ctas_hdfs_to_blobstore.q
+@@ -0,0 +1,26 @@
++-- Check we can create a table located in a blobstore
++-- with CTAS from a table in HDFS
++
++DROP TABLE IF EXISTS hdfs_source;
++CREATE TABLE hdfs_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n';
++LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE hdfs_source;
++
++DROP TABLE IF EXISTS blobstore_target;
++CREATE TABLE blobstore_target 
++LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_hdfs_to_blobstore/blobstore_target/'
++AS SELECT * FROM hdfs_source;
++
++DROP DATABASE IF EXISTS target_db;
++CREATE DATABASE target_db 
++LOCATION '${hiveconf:test.blobstore.path.unique}/ctas_hdfs_to_blobstore/target_db';
++CREATE TABLE target_db.blobstore_target
++AS SELECT * FROM hdfs_source;
++
++SELECT * FROM hdfs_source;
++SELECT * FROM blobstore_target;
++SELECT * FROM target_db.blobstore_target;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/ctas.q.out b/itests/hive-blobstore/src/test/results/clientpositive/ctas.q.out
+deleted file mode 100644
+index 44fa5fa..0000000
+--- a/itests/hive-blobstore/src/test/results/clientpositive/ctas.q.out
++++ /dev/null
+@@ -1,970 +0,0 @@
+-PREHOOK: query: DROP TABLE IF EXISTS ctas_blobstore_table_src
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: DROP TABLE IF EXISTS ctas_blobstore_table_src
+-POSTHOOK: type: DROPTABLE
+-#### A masked pattern was here ####
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_table_src
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@ctas_blobstore_table_src
+-#### A masked pattern was here ####
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_table_src
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@ctas_blobstore_table_src
+-PREHOOK: query: INSERT INTO TABLE ctas_blobstore_table_src VALUES (1), (2), (3)
+-PREHOOK: type: QUERY
+-PREHOOK: Output: default@ctas_blobstore_table_src
+-POSTHOOK: query: INSERT INTO TABLE ctas_blobstore_table_src VALUES (1), (2), (3)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Output: default@ctas_blobstore_table_src
+-PREHOOK: query: DROP TABLE IF EXISTS ctas_hdfs_table_src
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: DROP TABLE IF EXISTS ctas_hdfs_table_src
+-POSTHOOK: type: DROPTABLE
+-PREHOOK: query: CREATE TABLE ctas_hdfs_table_src (col int)
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@ctas_hdfs_table_src
+-POSTHOOK: query: CREATE TABLE ctas_hdfs_table_src (col int)
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@ctas_hdfs_table_src
+-PREHOOK: query: INSERT INTO TABLE ctas_hdfs_table_src VALUES (1), (2), (3)
+-PREHOOK: type: QUERY
+-PREHOOK: Output: default@ctas_hdfs_table_src
+-POSTHOOK: query: INSERT INTO TABLE ctas_hdfs_table_src VALUES (1), (2), (3)
+-POSTHOOK: type: QUERY
+-POSTHOOK: Output: default@ctas_hdfs_table_src
+-POSTHOOK: Lineage: ctas_hdfs_table_src.col EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+-PREHOOK: query: -- Test select from a Blobstore and write to HDFS
+-DROP TABLE IF EXISTS ctas_hdfs_table_dst
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: -- Test select from a Blobstore and write to HDFS
+-DROP TABLE IF EXISTS ctas_hdfs_table_dst
+-POSTHOOK: type: DROPTABLE
+-PREHOOK: query: EXPLAIN EXTENDED CREATE TABLE ctas_hdfs_table_dst AS SELECT * FROM ctas_blobstore_table_src
+-PREHOOK: type: CREATETABLE_AS_SELECT
+-POSTHOOK: query: EXPLAIN EXTENDED CREATE TABLE ctas_hdfs_table_dst AS SELECT * FROM ctas_blobstore_table_src
+-POSTHOOK: type: CREATETABLE_AS_SELECT
+-ABSTRACT SYNTAX TREE:
+-  
+-TOK_CREATETABLE
+-   TOK_TABNAME
+-      ctas_hdfs_table_dst
+-   TOK_LIKETABLE
+-   TOK_QUERY
+-      TOK_FROM
+-         TOK_TABREF
+-            TOK_TABNAME
+-               default
+-               ctas_blobstore_table_src
+-            ctas_blobstore_table_src
+-      TOK_INSERT
+-         TOK_DESTINATION
+-            TOK_DIR
+-               TOK_TMP_FILE
+-         TOK_SELECT
+-            TOK_SELEXPR
+-               .
+-                  TOK_TABLE_OR_COL
+-                     ctas_blobstore_table_src
+-                  col
+-               ctas_blobstore_table_src.col
+-
+-
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+-  Stage-4
+-  Stage-0 depends on stages: Stage-4, Stage-3, Stage-6
+-  Stage-8 depends on stages: Stage-0
+-  Stage-2 depends on stages: Stage-8
+-  Stage-3
+-  Stage-5
+-  Stage-6 depends on stages: Stage-5
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: ctas_blobstore_table_src
+-            Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-            GatherStats: false
+-            Select Operator
+-              expressions: col (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-              File Output Operator
+-                compressed: false
+-                GlobalTableId: 1
+-#### A masked pattern was here ####
+-                NumFilesPerFileSink: 1
+-                Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-#### A masked pattern was here ####
+-                table:
+-                    input format: org.apache.hadoop.mapred.TextInputFormat
+-                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                    properties:
+-                      columns col
+-                      columns.types int
+-                      name default.ctas_hdfs_table_dst
+-                      serialization.format 1
+-                      serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    name: default.ctas_hdfs_table_dst
+-                TotalFiles: 1
+-                GatherStats: true
+-                MultiFileSpray: false
+-      Path -> Alias:
+-        ### test.blobstore.path ###/ctas_blobstore_table_src [ctas_blobstore_table_src]
+-      Path -> Partition:
+-        ### test.blobstore.path ###/ctas_blobstore_table_src 
+-          Partition
+-            base file name: ctas_blobstore_table_src
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              COLUMN_STATS_ACCURATE true
+-              bucket_count -1
+-              columns col
+-              columns.comments 
+-              columns.types int
+-#### A masked pattern was here ####
+-              location ### test.blobstore.path ###/ctas_blobstore_table_src
+-              name default.ctas_blobstore_table_src
+-              numFiles 0
+-              numRows 3
+-              rawDataSize 3
+-              serialization.ddl struct ctas_blobstore_table_src { i32 col}
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 0
+-#### A masked pattern was here ####
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                COLUMN_STATS_ACCURATE true
+-                bucket_count -1
+-                columns col
+-                columns.comments 
+-                columns.types int
+-#### A masked pattern was here ####
+-                location ### test.blobstore.path ###/ctas_blobstore_table_src
+-                name default.ctas_blobstore_table_src
+-                numFiles 0
+-                numRows 3
+-                rawDataSize 3
+-                serialization.ddl struct ctas_blobstore_table_src { i32 col}
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 0
+-#### A masked pattern was here ####
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_blobstore_table_src
+-            name: default.ctas_blobstore_table_src
+-      Truncated Path -> Alias:
+-        ### test.blobstore.path ###/ctas_blobstore_table_src [ctas_blobstore_table_src]
+-
+-  Stage: Stage-7
+-    Conditional Operator
+-
+-  Stage: Stage-4
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-#### A masked pattern was here ####
+-
+-  Stage: Stage-0
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-#### A masked pattern was here ####
+-
+-  Stage: Stage-8
+-      Create Table Operator:
+-        Create Table
+-          columns: col int
+-          input format: org.apache.hadoop.mapred.TextInputFormat
+-          output format: org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat
+-          serde name: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          name: default.ctas_hdfs_table_dst
+-
+-  Stage: Stage-2
+-    Stats-Aggr Operator
+-#### A masked pattern was here ####
+-
+-  Stage: Stage-3
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            GatherStats: false
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
+-#### A masked pattern was here ####
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.TextInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                  properties:
+-                    columns col
+-                    columns.types int
+-                    name default.ctas_hdfs_table_dst
+-                    serialization.format 1
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  name: default.ctas_hdfs_table_dst
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
+-      Path -> Alias:
+-#### A masked pattern was here ####
+-      Path -> Partition:
+-#### A masked pattern was here ####
+-          Partition
+-            base file name: -ext-10004
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              columns col
+-              columns.types int
+-              name default.ctas_hdfs_table_dst
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                columns col
+-                columns.types int
+-                name default.ctas_hdfs_table_dst
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_hdfs_table_dst
+-            name: default.ctas_hdfs_table_dst
+-      Truncated Path -> Alias:
+-#### A masked pattern was here ####
+-
+-  Stage: Stage-5
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            GatherStats: false
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
+-#### A masked pattern was here ####
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.TextInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                  properties:
+-                    columns col
+-                    columns.types int
+-                    name default.ctas_hdfs_table_dst
+-                    serialization.format 1
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  name: default.ctas_hdfs_table_dst
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
+-      Path -> Alias:
+-#### A masked pattern was here ####
+-      Path -> Partition:
+-#### A masked pattern was here ####
+-          Partition
+-            base file name: -ext-10004
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              columns col
+-              columns.types int
+-              name default.ctas_hdfs_table_dst
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                columns col
+-                columns.types int
+-                name default.ctas_hdfs_table_dst
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_hdfs_table_dst
+-            name: default.ctas_hdfs_table_dst
+-      Truncated Path -> Alias:
+-#### A masked pattern was here ####
+-
+-  Stage: Stage-6
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-#### A masked pattern was here ####
+-
+-PREHOOK: query: CREATE TABLE ctas_hdfs_table_dst AS SELECT * FROM ctas_blobstore_table_src
+-PREHOOK: type: CREATETABLE_AS_SELECT
+-PREHOOK: Input: default@ctas_blobstore_table_src
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@ctas_hdfs_table_dst
+-POSTHOOK: query: CREATE TABLE ctas_hdfs_table_dst AS SELECT * FROM ctas_blobstore_table_src
+-POSTHOOK: type: CREATETABLE_AS_SELECT
+-POSTHOOK: Input: default@ctas_blobstore_table_src
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@ctas_hdfs_table_dst
+-PREHOOK: query: SELECT * FROM ctas_hdfs_table_dst
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@ctas_hdfs_table_dst
+-#### A masked pattern was here ####
+-POSTHOOK: query: SELECT * FROM ctas_hdfs_table_dst
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@ctas_hdfs_table_dst
+-#### A masked pattern was here ####
+-1
+-2
+-3
+-PREHOOK: query: -- Test select from HDFS and write to a Blobstore
+-DROP TABLE IF EXISTS ctas_blobstore_table_dst
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: -- Test select from HDFS and write to a Blobstore
+-DROP TABLE IF EXISTS ctas_blobstore_table_dst
+-POSTHOOK: type: DROPTABLE
+-#### A masked pattern was here ####
+-PREHOOK: type: CREATETABLE_AS_SELECT
+-#### A masked pattern was here ####
+-POSTHOOK: type: CREATETABLE_AS_SELECT
+-ABSTRACT SYNTAX TREE:
+-  
+-TOK_CREATETABLE
+-   TOK_TABNAME
+-      ctas_blobstore_table_dst
+-   TOK_LIKETABLE
+-   TOK_TABLELOCATION
+-      '### test.blobstore.path ###/ctas_blobstore_table_dst/'
+-   TOK_QUERY
+-      TOK_FROM
+-         TOK_TABREF
+-            TOK_TABNAME
+-               default
+-               ctas_hdfs_table_src
+-            ctas_hdfs_table_src
+-      TOK_INSERT
+-         TOK_DESTINATION
+-            TOK_DIR
+-               TOK_TMP_FILE
+-         TOK_SELECT
+-            TOK_SELEXPR
+-               .
+-                  TOK_TABLE_OR_COL
+-                     ctas_hdfs_table_src
+-                  col
+-               ctas_hdfs_table_src.col
+-
+-
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+-  Stage-4
+-  Stage-8 depends on stages: Stage-0, Stage-4
+-  Stage-2 depends on stages: Stage-8
+-  Stage-3
+-  Stage-0 depends on stages: Stage-3, Stage-6
+-  Stage-5
+-  Stage-6 depends on stages: Stage-5
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: ctas_hdfs_table_src
+-            Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-            GatherStats: false
+-            Select Operator
+-              expressions: col (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-              File Output Operator
+-                compressed: false
+-                GlobalTableId: 1
+-                directory: ### BLOBSTORE_STAGING_PATH ###
+-                NumFilesPerFileSink: 1
+-                Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-                Stats Publishing Key Prefix: ### BLOBSTORE_STAGING_PATH ###
+-                table:
+-                    input format: org.apache.hadoop.mapred.TextInputFormat
+-                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                    properties:
+-                      columns col
+-                      columns.types int
+-                      name default.ctas_blobstore_table_dst
+-                      serialization.format 1
+-                      serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    name: default.ctas_blobstore_table_dst
+-                TotalFiles: 1
+-                GatherStats: true
+-                MultiFileSpray: false
+-      Path -> Alias:
+-#### A masked pattern was here ####
+-      Path -> Partition:
+-#### A masked pattern was here ####
+-          Partition
+-            base file name: ctas_hdfs_table_src
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              COLUMN_STATS_ACCURATE true
+-              bucket_count -1
+-              columns col
+-              columns.comments 
+-              columns.types int
+-#### A masked pattern was here ####
+-              name default.ctas_hdfs_table_src
+-              numFiles 1
+-              numRows 3
+-              rawDataSize 3
+-              serialization.ddl struct ctas_hdfs_table_src { i32 col}
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 6
+-#### A masked pattern was here ####
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                COLUMN_STATS_ACCURATE true
+-                bucket_count -1
+-                columns col
+-                columns.comments 
+-                columns.types int
+-#### A masked pattern was here ####
+-                name default.ctas_hdfs_table_src
+-                numFiles 1
+-                numRows 3
+-                rawDataSize 3
+-                serialization.ddl struct ctas_hdfs_table_src { i32 col}
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 6
+-#### A masked pattern was here ####
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_hdfs_table_src
+-            name: default.ctas_hdfs_table_src
+-      Truncated Path -> Alias:
+-        /ctas_hdfs_table_src [ctas_hdfs_table_src]
+-
+-  Stage: Stage-7
+-    Conditional Operator
+-
+-  Stage: Stage-4
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/ctas_blobstore_table_dst
+-
+-  Stage: Stage-8
+-      Create Table Operator:
+-        Create Table
+-          columns: col int
+-          input format: org.apache.hadoop.mapred.TextInputFormat
+-          location: ### test.blobstore.path ###/ctas_blobstore_table_dst/
+-          output format: org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat
+-          serde name: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          name: default.ctas_blobstore_table_dst
+-
+-  Stage: Stage-2
+-    Stats-Aggr Operator
+-      Stats Aggregation Key Prefix: ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-3
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            GatherStats: false
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
+-              directory: ### BLOBSTORE_STAGING_PATH ###
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.TextInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                  properties:
+-                    columns col
+-                    columns.types int
+-                    name default.ctas_blobstore_table_dst
+-                    serialization.format 1
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  name: default.ctas_blobstore_table_dst
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
+-      Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-      Path -> Partition:
+-        ### BLOBSTORE_STAGING_PATH ###
+-          Partition
+-            base file name: -ext-10004
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              columns col
+-              columns.types int
+-              name default.ctas_blobstore_table_dst
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                columns col
+-                columns.types int
+-                name default.ctas_blobstore_table_dst
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_blobstore_table_dst
+-            name: default.ctas_blobstore_table_dst
+-      Truncated Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-0
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/ctas_blobstore_table_dst
+-
+-  Stage: Stage-5
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            GatherStats: false
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
+-              directory: ### BLOBSTORE_STAGING_PATH ###
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.TextInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                  properties:
+-                    columns col
+-                    columns.types int
+-                    name default.ctas_blobstore_table_dst
+-                    serialization.format 1
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  name: default.ctas_blobstore_table_dst
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
+-      Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-      Path -> Partition:
+-        ### BLOBSTORE_STAGING_PATH ###
+-          Partition
+-            base file name: -ext-10004
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              columns col
+-              columns.types int
+-              name default.ctas_blobstore_table_dst
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                columns col
+-                columns.types int
+-                name default.ctas_blobstore_table_dst
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_blobstore_table_dst
+-            name: default.ctas_blobstore_table_dst
+-      Truncated Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-6
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### BLOBSTORE_STAGING_PATH ###
+-
+-PREHOOK: query: CREATE TABLE ctas_blobstore_table_dst AS SELECT * FROM ctas_hdfs_table_src
+-PREHOOK: type: CREATETABLE_AS_SELECT
+-PREHOOK: Input: default@ctas_hdfs_table_src
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@ctas_blobstore_table_dst
+-POSTHOOK: query: CREATE TABLE ctas_blobstore_table_dst AS SELECT * FROM ctas_hdfs_table_src
+-POSTHOOK: type: CREATETABLE_AS_SELECT
+-POSTHOOK: Input: default@ctas_hdfs_table_src
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@ctas_blobstore_table_dst
+-PREHOOK: query: SELECT * FROM ctas_blobstore_table_dst
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@ctas_blobstore_table_dst
+-#### A masked pattern was here ####
+-POSTHOOK: query: SELECT * FROM ctas_blobstore_table_dst
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@ctas_blobstore_table_dst
+-#### A masked pattern was here ####
+-1
+-2
+-3
+-PREHOOK: query: -- Test select from a Blobstore and write to a Blobstore
+-DROP TABLE IF EXISTS ctas_blobstore_table_dst
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@ctas_blobstore_table_dst
+-PREHOOK: Output: default@ctas_blobstore_table_dst
+-POSTHOOK: query: -- Test select from a Blobstore and write to a Blobstore
+-DROP TABLE IF EXISTS ctas_blobstore_table_dst
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@ctas_blobstore_table_dst
+-POSTHOOK: Output: default@ctas_blobstore_table_dst
+-#### A masked pattern was here ####
+-PREHOOK: type: CREATETABLE_AS_SELECT
+-#### A masked pattern was here ####
+-POSTHOOK: type: CREATETABLE_AS_SELECT
+-ABSTRACT SYNTAX TREE:
+-  
+-TOK_CREATETABLE
+-   TOK_TABNAME
+-      ctas_blobstore_table_dst
+-   TOK_LIKETABLE
+-   TOK_TABLELOCATION
+-      '### test.blobstore.path ###/ctas_blobstore_table_dst/'
+-   TOK_QUERY
+-      TOK_FROM
+-         TOK_TABREF
+-            TOK_TABNAME
+-               default
+-               ctas_blobstore_table_src
+-            ctas_blobstore_table_src
+-      TOK_INSERT
+-         TOK_DESTINATION
+-            TOK_DIR
+-               TOK_TMP_FILE
+-         TOK_SELECT
+-            TOK_SELEXPR
+-               .
+-                  TOK_TABLE_OR_COL
+-                     ctas_blobstore_table_src
+-                  col
+-               ctas_blobstore_table_src.col
+-
+-
+-STAGE DEPENDENCIES:
+-  Stage-1 is a root stage
+-  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+-  Stage-4
+-  Stage-8 depends on stages: Stage-0, Stage-4
+-  Stage-2 depends on stages: Stage-8
+-  Stage-3
+-  Stage-0 depends on stages: Stage-3, Stage-6
+-  Stage-5
+-  Stage-6 depends on stages: Stage-5
+-
+-STAGE PLANS:
+-  Stage: Stage-1
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            alias: ctas_blobstore_table_src
+-            Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-            GatherStats: false
+-            Select Operator
+-              expressions: col (type: int)
+-              outputColumnNames: _col0
+-              Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-              File Output Operator
+-                compressed: false
+-                GlobalTableId: 1
+-                directory: ### BLOBSTORE_STAGING_PATH ###
+-                NumFilesPerFileSink: 1
+-                Statistics: Num rows: 3 Data size: 3 Basic stats: COMPLETE Column stats: NONE
+-                Stats Publishing Key Prefix: ### BLOBSTORE_STAGING_PATH ###
+-                table:
+-                    input format: org.apache.hadoop.mapred.TextInputFormat
+-                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                    properties:
+-                      columns col
+-                      columns.types int
+-                      name default.ctas_blobstore_table_dst
+-                      serialization.format 1
+-                      serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    name: default.ctas_blobstore_table_dst
+-                TotalFiles: 1
+-                GatherStats: true
+-                MultiFileSpray: false
+-      Path -> Alias:
+-        ### test.blobstore.path ###/ctas_blobstore_table_src [ctas_blobstore_table_src]
+-      Path -> Partition:
+-        ### test.blobstore.path ###/ctas_blobstore_table_src 
+-          Partition
+-            base file name: ctas_blobstore_table_src
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              COLUMN_STATS_ACCURATE true
+-              bucket_count -1
+-              columns col
+-              columns.comments 
+-              columns.types int
+-#### A masked pattern was here ####
+-              location ### test.blobstore.path ###/ctas_blobstore_table_src
+-              name default.ctas_blobstore_table_src
+-              numFiles 0
+-              numRows 3
+-              rawDataSize 3
+-              serialization.ddl struct ctas_blobstore_table_src { i32 col}
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 0
+-#### A masked pattern was here ####
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                COLUMN_STATS_ACCURATE true
+-                bucket_count -1
+-                columns col
+-                columns.comments 
+-                columns.types int
+-#### A masked pattern was here ####
+-                location ### test.blobstore.path ###/ctas_blobstore_table_src
+-                name default.ctas_blobstore_table_src
+-                numFiles 0
+-                numRows 3
+-                rawDataSize 3
+-                serialization.ddl struct ctas_blobstore_table_src { i32 col}
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 0
+-#### A masked pattern was here ####
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_blobstore_table_src
+-            name: default.ctas_blobstore_table_src
+-      Truncated Path -> Alias:
+-        ### test.blobstore.path ###/ctas_blobstore_table_src [ctas_blobstore_table_src]
+-
+-  Stage: Stage-7
+-    Conditional Operator
+-
+-  Stage: Stage-4
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/ctas_blobstore_table_dst
+-
+-  Stage: Stage-8
+-      Create Table Operator:
+-        Create Table
+-          columns: col int
+-          input format: org.apache.hadoop.mapred.TextInputFormat
+-          location: ### test.blobstore.path ###/ctas_blobstore_table_dst/
+-          output format: org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat
+-          serde name: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          name: default.ctas_blobstore_table_dst
+-
+-  Stage: Stage-2
+-    Stats-Aggr Operator
+-      Stats Aggregation Key Prefix: ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-3
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            GatherStats: false
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
+-              directory: ### BLOBSTORE_STAGING_PATH ###
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.TextInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                  properties:
+-                    columns col
+-                    columns.types int
+-                    name default.ctas_blobstore_table_dst
+-                    serialization.format 1
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  name: default.ctas_blobstore_table_dst
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
+-      Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-      Path -> Partition:
+-        ### BLOBSTORE_STAGING_PATH ###
+-          Partition
+-            base file name: -ext-10004
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              columns col
+-              columns.types int
+-              name default.ctas_blobstore_table_dst
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                columns col
+-                columns.types int
+-                name default.ctas_blobstore_table_dst
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_blobstore_table_dst
+-            name: default.ctas_blobstore_table_dst
+-      Truncated Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-0
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/ctas_blobstore_table_dst
+-
+-  Stage: Stage-5
+-    Map Reduce
+-      Map Operator Tree:
+-          TableScan
+-            GatherStats: false
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
+-              directory: ### BLOBSTORE_STAGING_PATH ###
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.TextInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-                  properties:
+-                    columns col
+-                    columns.types int
+-                    name default.ctas_blobstore_table_dst
+-                    serialization.format 1
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                  name: default.ctas_blobstore_table_dst
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
+-      Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-      Path -> Partition:
+-        ### BLOBSTORE_STAGING_PATH ###
+-          Partition
+-            base file name: -ext-10004
+-            input format: org.apache.hadoop.mapred.TextInputFormat
+-            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-            properties:
+-              columns col
+-              columns.types int
+-              name default.ctas_blobstore_table_dst
+-              serialization.format 1
+-              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-          
+-              input format: org.apache.hadoop.mapred.TextInputFormat
+-              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+-              properties:
+-                columns col
+-                columns.types int
+-                name default.ctas_blobstore_table_dst
+-                serialization.format 1
+-                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.ctas_blobstore_table_dst
+-            name: default.ctas_blobstore_table_dst
+-      Truncated Path -> Alias:
+-        ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-6
+-    Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### BLOBSTORE_STAGING_PATH ###
+-
+-PREHOOK: query: CREATE TABLE ctas_blobstore_table_dst AS SELECT * FROM ctas_blobstore_table_src
+-PREHOOK: type: CREATETABLE_AS_SELECT
+-PREHOOK: Input: default@ctas_blobstore_table_src
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@ctas_blobstore_table_dst
+-POSTHOOK: query: CREATE TABLE ctas_blobstore_table_dst AS SELECT * FROM ctas_blobstore_table_src
+-POSTHOOK: type: CREATETABLE_AS_SELECT
+-POSTHOOK: Input: default@ctas_blobstore_table_src
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@ctas_blobstore_table_dst
+-PREHOOK: query: SELECT * FROM ctas_blobstore_table_dst
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@ctas_blobstore_table_dst
+-#### A masked pattern was here ####
+-POSTHOOK: query: SELECT * FROM ctas_blobstore_table_dst
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@ctas_blobstore_table_dst
+-#### A masked pattern was here ####
+-1
+-2
+-3
+-PREHOOK: query: DROP TABLE ctas_blobstore_table_dst
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@ctas_blobstore_table_dst
+-PREHOOK: Output: default@ctas_blobstore_table_dst
+-POSTHOOK: query: DROP TABLE ctas_blobstore_table_dst
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@ctas_blobstore_table_dst
+-POSTHOOK: Output: default@ctas_blobstore_table_dst
+-PREHOOK: query: DROP TABLE ctas_hdfs_table_dst
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@ctas_hdfs_table_dst
+-PREHOOK: Output: default@ctas_hdfs_table_dst
+-POSTHOOK: query: DROP TABLE ctas_hdfs_table_dst
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@ctas_hdfs_table_dst
+-POSTHOOK: Output: default@ctas_hdfs_table_dst
+-PREHOOK: query: DROP TABLE ctas_blobstore_table_src
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@ctas_blobstore_table_src
+-PREHOOK: Output: default@ctas_blobstore_table_src
+-POSTHOOK: query: DROP TABLE ctas_blobstore_table_src
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@ctas_blobstore_table_src
+-POSTHOOK: Output: default@ctas_blobstore_table_src
+-PREHOOK: query: DROP TABLE ctas_hdfs_table_src
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@ctas_hdfs_table_src
+-PREHOOK: Output: default@ctas_hdfs_table_src
+-POSTHOOK: query: DROP TABLE ctas_hdfs_table_src
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@ctas_hdfs_table_src
+-POSTHOOK: Output: default@ctas_hdfs_table_src
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_blobstore.q.out b/itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_blobstore.q.out
+new file mode 100644
+index 0000000..1fa3186
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_blobstore.q.out
+@@ -0,0 +1,131 @@
++PREHOOK: query: -- Check we can create a table located in a blobstore
++-- with CTAS from a table in a blobstore
++
++DROP TABLE IF EXISTS blobstore_source
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: -- Check we can create a table located in a blobstore
++-- with CTAS from a table in a blobstore
++
++DROP TABLE IF EXISTS blobstore_source
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE blobstore_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_to_blobstore/blobstore_source
++PREHOOK: Output: database:default
++PREHOOK: Output: default@blobstore_source
++POSTHOOK: query: CREATE TABLE blobstore_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_to_blobstore/blobstore_source
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@blobstore_source
++PREHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE blobstore_source
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@blobstore_source
++POSTHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE blobstore_source
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@blobstore_source
++PREHOOK: query: DROP TABLE IF EXISTS blobstore_target
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS blobstore_target
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE blobstore_target 
++#### A masked pattern was here ####
++AS SELECT * FROM blobstore_source
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@blobstore_source
++PREHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_to_blobstore/blobstore_target
++PREHOOK: Output: database:default
++PREHOOK: Output: default@blobstore_target
++POSTHOOK: query: CREATE TABLE blobstore_target 
++#### A masked pattern was here ####
++AS SELECT * FROM blobstore_source
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@blobstore_source
++POSTHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_to_blobstore/blobstore_target
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@blobstore_target
++PREHOOK: query: DROP DATABASE IF EXISTS target_db
++PREHOOK: type: DROPDATABASE
++POSTHOOK: query: DROP DATABASE IF EXISTS target_db
++POSTHOOK: type: DROPDATABASE
++PREHOOK: query: CREATE DATABASE target_db 
++#### A masked pattern was here ####
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:target_db
++PREHOOK: Output: ### test.blobstore.path ###/ctas_blobstore_to_blobstore/target_db
++POSTHOOK: query: CREATE DATABASE target_db 
++#### A masked pattern was here ####
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:target_db
++POSTHOOK: Output: ### test.blobstore.path ###/ctas_blobstore_to_blobstore/target_db
++PREHOOK: query: CREATE TABLE target_db.blobstore_target
++AS SELECT * FROM blobstore_source
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@blobstore_source
++PREHOOK: Output: database:target_db
++PREHOOK: Output: target_db@blobstore_target
++POSTHOOK: query: CREATE TABLE target_db.blobstore_target
++AS SELECT * FROM blobstore_source
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@blobstore_source
++POSTHOOK: Output: database:target_db
++POSTHOOK: Output: target_db@blobstore_target
++PREHOOK: query: SELECT * FROM blobstore_source
++PREHOOK: type: QUERY
++PREHOOK: Input: default@blobstore_source
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM blobstore_source
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@blobstore_source
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
++PREHOOK: query: SELECT * FROM blobstore_target
++PREHOOK: type: QUERY
++PREHOOK: Input: default@blobstore_target
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM blobstore_target
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@blobstore_target
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
++PREHOOK: query: SELECT * FROM target_db.blobstore_target
++PREHOOK: type: QUERY
++PREHOOK: Input: target_db@blobstore_target
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM target_db.blobstore_target
++POSTHOOK: type: QUERY
++POSTHOOK: Input: target_db@blobstore_target
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_hdfs.q.out b/itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_hdfs.q.out
+new file mode 100644
+index 0000000..276338d
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/ctas_blobstore_to_hdfs.q.out
+@@ -0,0 +1,123 @@
++PREHOOK: query: -- Check we can create a table located in HDFS
++-- with CTAS from a table a blobstore
++
++DROP TABLE IF EXISTS blobstore_source
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: -- Check we can create a table located in HDFS
++-- with CTAS from a table a blobstore
++
++DROP TABLE IF EXISTS blobstore_source
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE blobstore_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_to_hdfs/blobstore_source
++PREHOOK: Output: database:default
++PREHOOK: Output: default@blobstore_source
++POSTHOOK: query: CREATE TABLE blobstore_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/ctas_blobstore_to_hdfs/blobstore_source
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@blobstore_source
++PREHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE blobstore_source
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@blobstore_source
++POSTHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE blobstore_source
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@blobstore_source
++PREHOOK: query: DROP TABLE IF EXISTS hdfs_target
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS hdfs_target
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE hdfs_target 
++AS SELECT * FROM blobstore_source
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@blobstore_source
++PREHOOK: Output: database:default
++PREHOOK: Output: default@hdfs_target
++POSTHOOK: query: CREATE TABLE hdfs_target 
++AS SELECT * FROM blobstore_source
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@blobstore_source
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@hdfs_target
++PREHOOK: query: DROP DATABASE IF EXISTS target_db
++PREHOOK: type: DROPDATABASE
++POSTHOOK: query: DROP DATABASE IF EXISTS target_db
++POSTHOOK: type: DROPDATABASE
++PREHOOK: query: CREATE DATABASE target_db
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:target_db
++POSTHOOK: query: CREATE DATABASE target_db
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:target_db
++PREHOOK: query: CREATE TABLE target_db.hdfs_target
++AS SELECT * FROM blobstore_source
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@blobstore_source
++PREHOOK: Output: database:target_db
++PREHOOK: Output: target_db@hdfs_target
++POSTHOOK: query: CREATE TABLE target_db.hdfs_target
++AS SELECT * FROM blobstore_source
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@blobstore_source
++POSTHOOK: Output: database:target_db
++POSTHOOK: Output: target_db@hdfs_target
++PREHOOK: query: SELECT * FROM blobstore_source
++PREHOOK: type: QUERY
++PREHOOK: Input: default@blobstore_source
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM blobstore_source
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@blobstore_source
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
++PREHOOK: query: SELECT * FROM hdfs_target
++PREHOOK: type: QUERY
++PREHOOK: Input: default@hdfs_target
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM hdfs_target
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@hdfs_target
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
++PREHOOK: query: SELECT * FROM target_db.hdfs_target
++PREHOOK: type: QUERY
++PREHOOK: Input: target_db@hdfs_target
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM target_db.hdfs_target
++POSTHOOK: type: QUERY
++POSTHOOK: Input: target_db@hdfs_target
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/ctas_hdfs_to_blobstore.q.out b/itests/hive-blobstore/src/test/results/clientpositive/ctas_hdfs_to_blobstore.q.out
+new file mode 100644
+index 0000000..e2cc602
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/ctas_hdfs_to_blobstore.q.out
+@@ -0,0 +1,127 @@
++PREHOOK: query: -- Check we can create a table located in a blobstore
++-- with CTAS from a table in HDFS
++
++DROP TABLE IF EXISTS hdfs_source
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: -- Check we can create a table located in a blobstore
++-- with CTAS from a table in HDFS
++
++DROP TABLE IF EXISTS hdfs_source
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE hdfs_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@hdfs_source
++POSTHOOK: query: CREATE TABLE hdfs_source(a string, b string, c double)
++ROW FORMAT DELIMITED 
++FIELDS TERMINATED BY ' '
++COLLECTION ITEMS TERMINATED BY '\t'
++LINES TERMINATED BY '\n'
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@hdfs_source
++PREHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE hdfs_source
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@hdfs_source
++POSTHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/3col_data.txt' 
++INTO TABLE hdfs_source
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@hdfs_source
++PREHOOK: query: DROP TABLE IF EXISTS blobstore_target
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS blobstore_target
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE blobstore_target 
++#### A masked pattern was here ####
++AS SELECT * FROM hdfs_source
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@hdfs_source
++PREHOOK: Input: ### test.blobstore.path ###/ctas_hdfs_to_blobstore/blobstore_target
++PREHOOK: Output: database:default
++PREHOOK: Output: default@blobstore_target
++POSTHOOK: query: CREATE TABLE blobstore_target 
++#### A masked pattern was here ####
++AS SELECT * FROM hdfs_source
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@hdfs_source
++POSTHOOK: Input: ### test.blobstore.path ###/ctas_hdfs_to_blobstore/blobstore_target
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@blobstore_target
++PREHOOK: query: DROP DATABASE IF EXISTS target_db
++PREHOOK: type: DROPDATABASE
++POSTHOOK: query: DROP DATABASE IF EXISTS target_db
++POSTHOOK: type: DROPDATABASE
++PREHOOK: query: CREATE DATABASE target_db 
++#### A masked pattern was here ####
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:target_db
++PREHOOK: Output: ### test.blobstore.path ###/ctas_hdfs_to_blobstore/target_db
++POSTHOOK: query: CREATE DATABASE target_db 
++#### A masked pattern was here ####
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:target_db
++POSTHOOK: Output: ### test.blobstore.path ###/ctas_hdfs_to_blobstore/target_db
++PREHOOK: query: CREATE TABLE target_db.blobstore_target
++AS SELECT * FROM hdfs_source
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@hdfs_source
++PREHOOK: Output: database:target_db
++PREHOOK: Output: target_db@blobstore_target
++POSTHOOK: query: CREATE TABLE target_db.blobstore_target
++AS SELECT * FROM hdfs_source
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@hdfs_source
++POSTHOOK: Output: database:target_db
++POSTHOOK: Output: target_db@blobstore_target
++PREHOOK: query: SELECT * FROM hdfs_source
++PREHOOK: type: QUERY
++PREHOOK: Input: default@hdfs_source
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM hdfs_source
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@hdfs_source
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
++PREHOOK: query: SELECT * FROM blobstore_target
++PREHOOK: type: QUERY
++PREHOOK: Input: default@blobstore_target
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM blobstore_target
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@blobstore_target
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
++PREHOOK: query: SELECT * FROM target_db.blobstore_target
++PREHOOK: type: QUERY
++PREHOOK: Input: target_db@blobstore_target
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM target_db.blobstore_target
++POSTHOOK: type: QUERY
++POSTHOOK: Input: target_db@blobstore_target
++#### A masked pattern was here ####
++1	abc	10.5
++2	def	11.5
++3	ajss	90.23232
++4	djns	89.02002
++5	random	2.99
++6	data	3.002
++7	ne	71.9084
+-- 
+1.7.9.5
+

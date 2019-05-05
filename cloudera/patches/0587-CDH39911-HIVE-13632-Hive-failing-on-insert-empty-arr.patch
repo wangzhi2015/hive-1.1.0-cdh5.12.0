@@ -1,0 +1,350 @@
+From 7fdf243ae5beb0be269a5c6796202994506a7e2a Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Thu, 28 Apr 2016 14:52:16 -0400
+Subject: [PATCH 0587/1164] CDH39911 HIVE-13632: Hive failing on insert empty
+ array into parquet table. (Yongzhi Chen, reviewed
+ by Sergio Pena)
+
+Change-Id: I3d4876560a82a1d2f883c5aca70cff6395529efc
+---
+ .../parquet/serde/AbstractParquetMapInspector.java |    4 +-
+ .../parquet/serde/ParquetHiveArrayInspector.java   |    4 +-
+ .../ql/io/parquet/write/DataWritableWriter.java    |   67 ++++++++-------
+ .../hive/ql/io/parquet/TestDataWritableWriter.java |   29 +++++++
+ .../serde/TestAbstractParquetMapInspector.java     |    4 +-
+ .../serde/TestParquetHiveArrayInspector.java       |    4 +-
+ .../parquet_array_map_emptynullvals.q              |   20 +++++
+ .../parquet_array_map_emptynullvals.q.out          |   87 ++++++++++++++++++++
+ 8 files changed, 180 insertions(+), 39 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/parquet_array_map_emptynullvals.q
+ create mode 100644 ql/src/test/results/clientpositive/parquet_array_map_emptynullvals.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/AbstractParquetMapInspector.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/AbstractParquetMapInspector.java
+index 49bf1c5..e80206e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/AbstractParquetMapInspector.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/AbstractParquetMapInspector.java
+@@ -60,7 +60,7 @@ public ObjectInspector getMapValueObjectInspector() {
+ 
+     if (data instanceof ArrayWritable) {
+       final Writable[] mapArray = ((ArrayWritable) data).get();
+-      if (mapArray == null || mapArray.length == 0) {
++      if (mapArray == null) {
+         return null;
+       }
+ 
+@@ -90,7 +90,7 @@ public int getMapSize(final Object data) {
+     if (data instanceof ArrayWritable) {
+       final Writable[] mapArray = ((ArrayWritable) data).get();
+ 
+-      if (mapArray == null || mapArray.length == 0) {
++      if (mapArray == null) {
+         return -1;
+       } else {
+         return mapArray.length;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveArrayInspector.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveArrayInspector.java
+index 05e92b5..55614a3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveArrayInspector.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveArrayInspector.java
+@@ -83,7 +83,7 @@ public int getListLength(final Object data) {
+ 
+     if (data instanceof ArrayWritable) {
+       final Writable[] array = ((ArrayWritable) data).get();
+-      if (array == null || array.length == 0) {
++      if (array == null) {
+         return -1;
+       }
+ 
+@@ -105,7 +105,7 @@ public int getListLength(final Object data) {
+ 
+     if (data instanceof ArrayWritable) {
+       final Writable[] array = ((ArrayWritable) data).get();
+-      if (array == null || array.length == 0) {
++      if (array == null) {
+         return null;
+       }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/write/DataWritableWriter.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/write/DataWritableWriter.java
+index ba44fec..454685f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/write/DataWritableWriter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/write/DataWritableWriter.java
+@@ -254,21 +254,24 @@ public ListDataWriter(ListObjectInspector inspector, GroupType groupType) {
+     @Override
+     public void write(Object value) {
+       recordConsumer.startGroup();
+-      recordConsumer.startField(repeatedGroupName, 0);
+-
+       int listLength = inspector.getListLength(value);
+-      for (int i = 0; i < listLength; i++) {
+-        Object element = inspector.getListElement(value, i);
+-        recordConsumer.startGroup();
+-        if (element != null) {
+-          recordConsumer.startField(elementName, 0);
+-          elementWriter.write(element);
+-          recordConsumer.endField(elementName, 0);
++
++      if (listLength > 0) {
++        recordConsumer.startField(repeatedGroupName, 0);
++
++        for (int i = 0; i < listLength; i++) {
++          Object element = inspector.getListElement(value, i);
++          recordConsumer.startGroup();
++          if (element != null) {
++            recordConsumer.startField(elementName, 0);
++            elementWriter.write(element);
++            recordConsumer.endField(elementName, 0);
++          }
++          recordConsumer.endGroup();
+         }
+-        recordConsumer.endGroup();
+-      }
+ 
+-      recordConsumer.endField(repeatedGroupName, 0);
++        recordConsumer.endField(repeatedGroupName, 0);
++      }
+       recordConsumer.endGroup();
+     }
+   }
+@@ -302,30 +305,32 @@ public MapDataWriter(MapObjectInspector inspector, GroupType groupType) {
+     @Override
+     public void write(Object value) {
+       recordConsumer.startGroup();
+-      recordConsumer.startField(repeatedGroupName, 0);
+ 
+       Map<?, ?> mapValues = inspector.getMap(value);
+-      for (Map.Entry<?, ?> keyValue : mapValues.entrySet()) {
+-        recordConsumer.startGroup();
+-        if (keyValue != null) {
+-          // write key element
+-          Object keyElement = keyValue.getKey();
+-          recordConsumer.startField(keyName, 0);
+-          keyWriter.write(keyElement);
+-          recordConsumer.endField(keyName, 0);
+-
+-          // write value element
+-          Object valueElement = keyValue.getValue();
+-          if (valueElement != null) {
+-            recordConsumer.startField(valueName, 1);
+-            valueWriter.write(valueElement);
+-            recordConsumer.endField(valueName, 1);
++      if (mapValues != null && mapValues.size() > 0) {
++        recordConsumer.startField(repeatedGroupName, 0);
++        for (Map.Entry<?, ?> keyValue : mapValues.entrySet()) {
++          recordConsumer.startGroup();
++          if (keyValue != null) {
++            // write key element
++            Object keyElement = keyValue.getKey();
++            recordConsumer.startField(keyName, 0);
++            keyWriter.write(keyElement);
++            recordConsumer.endField(keyName, 0);
++
++            // write value element
++            Object valueElement = keyValue.getValue();
++            if (valueElement != null) {
++              recordConsumer.startField(valueName, 1);
++              valueWriter.write(valueElement);
++              recordConsumer.endField(valueName, 1);
++            }
+           }
++          recordConsumer.endGroup();
+         }
+-        recordConsumer.endGroup();
+-      }
+ 
+-      recordConsumer.endField(repeatedGroupName, 0);
++        recordConsumer.endField(repeatedGroupName, 0);
++      }
+       recordConsumer.endGroup();
+     }
+   }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestDataWritableWriter.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestDataWritableWriter.java
+index 73425e3..d9bbfa2 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestDataWritableWriter.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestDataWritableWriter.java
+@@ -411,6 +411,35 @@ public void testMapType() throws Exception {
+   }
+ 
+   @Test
++  public void testEmptyArrays() throws Exception {
++    String columnNames = "arrayCol";
++    String columnTypes = "array<int>";
++
++    String fileSchema = "message hive_schema {\n"
++        + "  optional group arrayCol (LIST) {\n"
++        + "    repeated group array {\n"
++        + "      optional int32 array_element;\n"
++        + "    }\n"
++        + "  }\n"
++        + "}\n";
++
++    ArrayWritable hiveRecord = createGroup(
++       new ArrayWritable(Writable.class) // Empty array
++    );
++
++   // Write record to Parquet format
++    writeParquetRecord(fileSchema, getParquetWritable(columnNames, columnTypes, hiveRecord));
++
++    // Verify record was written correctly to Parquet
++    startMessage();
++      startField("arrayCol", 0);
++        startGroup();
++        endGroup();
++      endField("arrayCol", 0);
++    endMessage();
++  }
++
++  @Test
+   public void testArrayOfArrays() throws Exception {
+     String columnNames = "array_of_arrays";
+     String columnTypes = "array<array<int>>";
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestAbstractParquetMapInspector.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestAbstractParquetMapInspector.java
+index f5d9cb4..6af8c53 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestAbstractParquetMapInspector.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestAbstractParquetMapInspector.java
+@@ -62,8 +62,8 @@ public void testNullContainer() {
+   @Test
+   public void testEmptyContainer() {
+     final ArrayWritable map = new ArrayWritable(ArrayWritable.class, new ArrayWritable[0]);
+-    assertEquals("Wrong size", -1, inspector.getMapSize(map));
+-    assertNull("Should be null", inspector.getMap(map));
++    assertEquals("Wrong size", 0, inspector.getMapSize(map));
++    assertNotNull("Should not be null", inspector.getMap(map));
+   }
+ 
+   @Test
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestParquetHiveArrayInspector.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestParquetHiveArrayInspector.java
+index 0ce654d..9e0c1ff 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestParquetHiveArrayInspector.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/serde/TestParquetHiveArrayInspector.java
+@@ -51,8 +51,8 @@ public void testNullContainer() {
+   @Test
+   public void testEmptyContainer() {
+     final ArrayWritable list = new ArrayWritable(ArrayWritable.class, new ArrayWritable[0]);
+-    assertEquals("Wrong size", -1, inspector.getListLength(list));
+-    assertNull("Should be null", inspector.getList(list));
++    assertEquals("Wrong size", 0, inspector.getListLength(list));
++    assertNotNull("Should not be null", inspector.getList(list));
+     assertNull("Should be null", inspector.getListElement(list, 0));
+   }
+ 
+diff --git a/ql/src/test/queries/clientpositive/parquet_array_map_emptynullvals.q b/ql/src/test/queries/clientpositive/parquet_array_map_emptynullvals.q
+new file mode 100644
+index 0000000..eeae5cf
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/parquet_array_map_emptynullvals.q
+@@ -0,0 +1,20 @@
++drop table if exists testSets;
++drop table if exists testSets2;
++create table testSets (
++key string,
++arrayValues array<string>,
++mapValues map<string,string>)
++stored as parquet;
++
++insert into table testSets select 'abcd', array(), map() from src limit 1;
++
++create table testSets2 (
++key string,
++arrayValues array<string>,
++mapValues map<string,string>)
++stored as parquet;
++insert into table testSets2 select * from testSets;
++select * from testSets2;
++drop table testSets;
++drop table testSets2;
++
+diff --git a/ql/src/test/results/clientpositive/parquet_array_map_emptynullvals.q.out b/ql/src/test/results/clientpositive/parquet_array_map_emptynullvals.q.out
+new file mode 100644
+index 0000000..4608607
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/parquet_array_map_emptynullvals.q.out
+@@ -0,0 +1,87 @@
++PREHOOK: query: drop table if exists testSets
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists testSets
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists testSets2
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists testSets2
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: create table testSets (
++key string,
++arrayValues array<string>,
++mapValues map<string,string>)
++stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@testSets
++POSTHOOK: query: create table testSets (
++key string,
++arrayValues array<string>,
++mapValues map<string,string>)
++stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@testSets
++PREHOOK: query: insert into table testSets select 'abcd', array(), map() from src limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@testsets
++POSTHOOK: query: insert into table testSets select 'abcd', array(), map() from src limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@testsets
++POSTHOOK: Lineage: testsets.arrayvalues EXPRESSION []
++POSTHOOK: Lineage: testsets.key SIMPLE []
++POSTHOOK: Lineage: testsets.mapvalues EXPRESSION []
++PREHOOK: query: create table testSets2 (
++key string,
++arrayValues array<string>,
++mapValues map<string,string>)
++stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@testSets2
++POSTHOOK: query: create table testSets2 (
++key string,
++arrayValues array<string>,
++mapValues map<string,string>)
++stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@testSets2
++PREHOOK: query: insert into table testSets2 select * from testSets
++PREHOOK: type: QUERY
++PREHOOK: Input: default@testsets
++PREHOOK: Output: default@testsets2
++POSTHOOK: query: insert into table testSets2 select * from testSets
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@testsets
++POSTHOOK: Output: default@testsets2
++POSTHOOK: Lineage: testsets2.arrayvalues SIMPLE [(testsets)testsets.FieldSchema(name:arrayvalues, type:array<string>, comment:null), ]
++POSTHOOK: Lineage: testsets2.key SIMPLE [(testsets)testsets.FieldSchema(name:key, type:string, comment:null), ]
++POSTHOOK: Lineage: testsets2.mapvalues SIMPLE [(testsets)testsets.FieldSchema(name:mapvalues, type:map<string,string>, comment:null), ]
++PREHOOK: query: select * from testSets2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@testsets2
++#### A masked pattern was here ####
++POSTHOOK: query: select * from testSets2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@testsets2
++#### A masked pattern was here ####
++abcd	[]	{}
++PREHOOK: query: drop table testSets
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@testsets
++PREHOOK: Output: default@testsets
++POSTHOOK: query: drop table testSets
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@testsets
++POSTHOOK: Output: default@testsets
++PREHOOK: query: drop table testSets2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@testsets2
++PREHOOK: Output: default@testsets2
++POSTHOOK: query: drop table testSets2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@testsets2
++POSTHOOK: Output: default@testsets2
+-- 
+1.7.9.5
+

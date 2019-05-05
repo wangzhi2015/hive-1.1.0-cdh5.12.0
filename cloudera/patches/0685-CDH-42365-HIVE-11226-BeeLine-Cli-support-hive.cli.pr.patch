@@ -1,0 +1,156 @@
+From 648c6ab11275fb28bb6386b90f81991703684ec7 Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Mon, 13 Jul 2015 21:51:32 -0400
+Subject: [PATCH 0685/1164] CDH-42365 : HIVE-11226 BeeLine-Cli: support
+ hive.cli.prompt in new CLI (Ferdinand Xu,
+ reviewed by Xuefu Zhang)
+
+Change-Id: I7ce812600e3fe3cce0b93c1b1c148e176de8c919
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |   25 ++++++++++++++++----
+ .../java/org/apache/hive/beeline/BeeLineOpts.java  |    6 ++++-
+ .../src/java/org/apache/hive/beeline/Commands.java |   11 ++++++++-
+ .../org/apache/hive/beeline/cli/TestHiveCli.java   |    8 ++++++-
+ 4 files changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index 5b9e11f..9eff2b4 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -87,6 +87,7 @@
+ import org.apache.commons.cli.OptionBuilder;
+ import org.apache.commons.cli.Options;
+ import org.apache.commons.cli.ParseException;
++import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hive.beeline.cli.CliOptionsProcessor;
+ import org.apache.thrift.transport.TTransportException;
+@@ -1128,7 +1129,7 @@ boolean dispatch(String line) {
+       boolean needsUpdate = isConfNeedsUpdate(line);
+       boolean res = commands.sql(line, getOpts().getEntireLineAsCommand());
+       if (needsUpdate) {
+-        getOpts().setHiveConf(getCommands().getHiveConf(true));
++        getOpts().setHiveConf(getCommands().getHiveConf(false));
+       }
+       return res;
+     }
+@@ -1400,19 +1401,35 @@ void showWarnings(SQLWarning warn) {
+     }
+   }
+ 
+-
+   String getPrompt() {
++    if (isBeeLine) {
++      return getPromptForBeeline();
++    } else {
++      return getPromptForCli();
++    }
++  }
++
++  String getPromptForCli() {
++    String prompt;
++    // read prompt configuration and substitute variables.
++    HiveConf conf = getCommands().getHiveConf(true);
++    prompt = conf.getVar(HiveConf.ConfVars.CLIPROMPT);
++    prompt = getCommands().substituteVariables(conf, prompt);
++    return prompt + "> ";
++  }
++
++  String getPromptForBeeline() {
+     if (getDatabaseConnection() == null || getDatabaseConnection().getUrl() == null) {
+       return "beeline> ";
+     } else {
+       String printClosed = getDatabaseConnection().isClosed() ? " (closed)" : "";
+-      return getPrompt(getDatabaseConnections().getIndex()
++      return getPromptForBeeline(getDatabaseConnections().getIndex()
+           + ": " + getDatabaseConnection().getUrl()) + printClosed + "> ";
+     }
+   }
+ 
+ 
+-  static String getPrompt(String url) {
++  static String getPromptForBeeline(String url) {
+     if (url == null || url.length() == 0) {
+       url = "beeline";
+     }
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java b/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java
+index a308960..b0cc3ee 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java
+@@ -118,7 +118,7 @@ public BeeLineOpts(BeeLine beeLine, Properties props) {
+ 
+   public String[] possibleSettingValues() {
+     List<String> vals = new LinkedList<String>();
+-    vals.addAll(Arrays.asList(new String[] {"yes", "no"}));
++    vals.addAll(Arrays.asList(new String[] { "yes", "no" }));
+     return vals.toArray(new String[vals.size()]);
+   }
+ 
+@@ -547,5 +547,9 @@ public void setHelpAsked(boolean helpAsked) {
+   public boolean isHelpAsked() {
+     return helpAsked;
+   }
++
++  public HiveConf getConf() {
++    return conf;
++  }
+ }
+ 
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 08fdcdc..efe8f31 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -741,6 +741,15 @@ public boolean sql(String line) {
+    * @return the hive configuration from server side
+    */
+   public HiveConf getHiveConf(boolean call) {
++    HiveConf hiveConf = beeLine.getOpts().getConf();
++    if (hiveConf != null && call) {
++      return hiveConf;
++    } else {
++      return getHiveConfHelper(call);
++    }
++  }
++
++  public HiveConf getHiveConfHelper(boolean call) {
+     HiveConf conf = new HiveConf();
+     BufferedRows rows = getConfInternal(call);
+     while (rows != null && rows.hasNext()) {
+@@ -1019,7 +1028,7 @@ public boolean sql(String line, boolean entireLineAsCommand) {
+     return execute(line, false, entireLineAsCommand);
+   }
+ 
+-  private String substituteVariables(HiveConf conf, String line) {
++  public String substituteVariables(HiveConf conf, String line) {
+     if (!beeLine.isBeeLine()) {
+       // Substitution is only supported in non-beeline mode.
+       return new VariableSubstitution(new HiveVariableSource() {
+diff --git a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+index fa94c89..fc8ed0c 100644
+--- a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
++++ b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+@@ -78,7 +78,8 @@ private void verifyCMD(String CMD, String keywords, OutputStream os, String[] op
+       int retCode) {
+     executeCMD(options, CMD, retCode);
+     String output = os.toString();
+-    Assert.assertTrue("The expected keyword doesn't occur in the output: " + output,
++    LOG.debug(output);
++    Assert.assertTrue("The expected keyword " + keywords + "doesn't occur in the output: " + output,
+         output.contains(keywords));
+   }
+ 
+@@ -88,6 +89,11 @@ public void testInValidCmd() {
+   }
+ 
+   @Test
++  public void testSetPromptValue() {
++    verifyCMD("set hive.cli.prompt=MYCLI;SHOW\nTABLES;", "MYCLI> ", os, null, ERRNO_OK);
++  }
++
++  @Test
+   public void testHelp() {
+     verifyCMD(null, "usage: hive", os, new String[] { "-H" }, ERRNO_ARGS);
+   }
+-- 
+1.7.9.5
+

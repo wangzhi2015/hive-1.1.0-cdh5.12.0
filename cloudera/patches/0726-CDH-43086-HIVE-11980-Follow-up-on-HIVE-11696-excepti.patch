@@ -1,0 +1,191 @@
+From e8dc78c0f09a0396526fdbb16adb50099d7e6e2f Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Fri, 2 Oct 2015 12:54:08 -0700
+Subject: [PATCH 0726/1164] CDH-43086 HIVE-11980 : Follow up on HIVE-11696,
+ exception is thrown from CTAS from the table with
+ table-level serde is Parquet while
+ partition-level serde is JSON (Aihua Xu via
+ Szehon)
+
+Change-Id: If8915f85ba5209aaf47601d9e6dfbf86bb70729a
+---
+ data/files/sample2.json                            |    2 +
+ .../serde/ArrayWritableObjectInspector.java        |    7 ++
+ .../parquet_mixed_partition_formats2.q             |   31 ++++++
+ .../parquet_mixed_partition_formats2.q.out         |   99 ++++++++++++++++++++
+ 4 files changed, 139 insertions(+)
+ create mode 100644 data/files/sample2.json
+ create mode 100644 ql/src/test/queries/clientpositive/parquet_mixed_partition_formats2.q
+ create mode 100644 ql/src/test/results/clientpositive/parquet_mixed_partition_formats2.q.out
+
+diff --git a/data/files/sample2.json b/data/files/sample2.json
+new file mode 100644
+index 0000000..4e1802f
+--- /dev/null
++++ b/data/files/sample2.json
+@@ -0,0 +1,2 @@
++{"id": 1, "reports": [2,3], "address": {"country": 1, "state": 1}}
++{"id": 2, "reports": [], "address": {"country": 1, "state": 2}}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java
+index bb066af..3f5d12b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java
+@@ -169,6 +169,13 @@ public StructField getStructFieldRef(final String name) {
+       return new ArrayList<Object>(Arrays.asList(arrWritable));
+     }
+ 
++    //since setStructFieldData and create return a list, getStructFieldData should be able to
++    //handle list data. This is required when table serde is ParquetHiveSerDe and partition serde
++    //is something else.
++    if (data instanceof List) {
++      return ((List) data);
++    }
++
+     throw new UnsupportedOperationException("Cannot inspect " + data.getClass().getCanonicalName());
+   }
+ 
+diff --git a/ql/src/test/queries/clientpositive/parquet_mixed_partition_formats2.q b/ql/src/test/queries/clientpositive/parquet_mixed_partition_formats2.q
+new file mode 100644
+index 0000000..e0b21d1
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/parquet_mixed_partition_formats2.q
+@@ -0,0 +1,31 @@
++add jar ${system:maven.local.repository}/org/apache/hive/hcatalog/hive-hcatalog-core/${system:hive.version}/hive-hcatalog-core-${system:hive.version}.jar;
++
++CREATE TABLE parquet_table_json_partition (
++id bigint COMMENT 'from deserializer',
++address struct<country:bigint,state:bigint> COMMENT 'from deserializer',
++reports array<bigint> COMMENT 'from deserializer')
++PARTITIONED BY (
++ts string)
++ROW FORMAT SERDE
++'org.apache.hive.hcatalog.data.JsonSerDe'
++STORED AS INPUTFORMAT
++'org.apache.hadoop.mapred.TextInputFormat'
++OUTPUTFORMAT
++'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat';
++
++LOAD DATA LOCAL INPATH '../../data/files/sample2.json' INTO TABLE parquet_table_json_partition PARTITION(ts='20150101');
++
++SELECT * FROM parquet_table_json_partition LIMIT 100;
++
++ALTER TABLE parquet_table_json_partition
++  SET FILEFORMAT INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
++                 OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
++                 SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe';
++
++SELECT * FROM parquet_table_json_partition LIMIT 100;
++
++CREATE TABLE new_table AS SELECT * FROM parquet_table_json_partition LIMIT 100;
++
++SELECT * FROM new_table;
++
++
+diff --git a/ql/src/test/results/clientpositive/parquet_mixed_partition_formats2.q.out b/ql/src/test/results/clientpositive/parquet_mixed_partition_formats2.q.out
+new file mode 100644
+index 0000000..c4d7197
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/parquet_mixed_partition_formats2.q.out
+@@ -0,0 +1,99 @@
++PREHOOK: query: CREATE TABLE parquet_table_json_partition (
++id bigint COMMENT 'from deserializer',
++address struct<country:bigint,state:bigint> COMMENT 'from deserializer',
++reports array<bigint> COMMENT 'from deserializer')
++PARTITIONED BY (
++ts string)
++ROW FORMAT SERDE
++'org.apache.hive.hcatalog.data.JsonSerDe'
++STORED AS INPUTFORMAT
++'org.apache.hadoop.mapred.TextInputFormat'
++OUTPUTFORMAT
++'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@parquet_table_json_partition
++POSTHOOK: query: CREATE TABLE parquet_table_json_partition (
++id bigint COMMENT 'from deserializer',
++address struct<country:bigint,state:bigint> COMMENT 'from deserializer',
++reports array<bigint> COMMENT 'from deserializer')
++PARTITIONED BY (
++ts string)
++ROW FORMAT SERDE
++'org.apache.hive.hcatalog.data.JsonSerDe'
++STORED AS INPUTFORMAT
++'org.apache.hadoop.mapred.TextInputFormat'
++OUTPUTFORMAT
++'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@parquet_table_json_partition
++PREHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/sample2.json' INTO TABLE parquet_table_json_partition PARTITION(ts='20150101')
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@parquet_table_json_partition
++POSTHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/sample2.json' INTO TABLE parquet_table_json_partition PARTITION(ts='20150101')
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@parquet_table_json_partition
++POSTHOOK: Output: default@parquet_table_json_partition@ts=20150101
++PREHOOK: query: SELECT * FROM parquet_table_json_partition LIMIT 100
++PREHOOK: type: QUERY
++PREHOOK: Input: default@parquet_table_json_partition
++PREHOOK: Input: default@parquet_table_json_partition@ts=20150101
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM parquet_table_json_partition LIMIT 100
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@parquet_table_json_partition
++POSTHOOK: Input: default@parquet_table_json_partition@ts=20150101
++#### A masked pattern was here ####
++1	{"country":1,"state":1}	[2,3]	20150101
++2	{"country":1,"state":2}	[]	20150101
++PREHOOK: query: ALTER TABLE parquet_table_json_partition
++  SET FILEFORMAT INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
++                 OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
++                 SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
++PREHOOK: type: ALTERTABLE_FILEFORMAT
++PREHOOK: Input: default@parquet_table_json_partition
++PREHOOK: Output: default@parquet_table_json_partition
++POSTHOOK: query: ALTER TABLE parquet_table_json_partition
++  SET FILEFORMAT INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
++                 OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
++                 SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
++POSTHOOK: type: ALTERTABLE_FILEFORMAT
++POSTHOOK: Input: default@parquet_table_json_partition
++POSTHOOK: Output: default@parquet_table_json_partition
++PREHOOK: query: SELECT * FROM parquet_table_json_partition LIMIT 100
++PREHOOK: type: QUERY
++PREHOOK: Input: default@parquet_table_json_partition
++PREHOOK: Input: default@parquet_table_json_partition@ts=20150101
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM parquet_table_json_partition LIMIT 100
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@parquet_table_json_partition
++POSTHOOK: Input: default@parquet_table_json_partition@ts=20150101
++#### A masked pattern was here ####
++1	{"country":1,"state":1}	[2,3]	20150101
++2	{"country":1,"state":2}	[]	20150101
++PREHOOK: query: CREATE TABLE new_table AS SELECT * FROM parquet_table_json_partition LIMIT 100
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@parquet_table_json_partition
++PREHOOK: Input: default@parquet_table_json_partition@ts=20150101
++PREHOOK: Output: database:default
++PREHOOK: Output: default@new_table
++POSTHOOK: query: CREATE TABLE new_table AS SELECT * FROM parquet_table_json_partition LIMIT 100
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@parquet_table_json_partition
++POSTHOOK: Input: default@parquet_table_json_partition@ts=20150101
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@new_table
++PREHOOK: query: SELECT * FROM new_table
++PREHOOK: type: QUERY
++PREHOOK: Input: default@new_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM new_table
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@new_table
++#### A masked pattern was here ####
++2	{"country":1,"state":2}	[]	20150101
++1	{"country":1,"state":1}	[2,3]	20150101
+-- 
+1.7.9.5
+

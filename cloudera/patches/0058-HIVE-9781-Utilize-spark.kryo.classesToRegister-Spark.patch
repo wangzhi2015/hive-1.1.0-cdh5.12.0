@@ -1,0 +1,86 @@
+From f93fb113e226c26f5036b4e79f3baca987fc1994 Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xuefu@apache.org>
+Date: Fri, 27 Feb 2015 18:24:46 +0000
+Subject: [PATCH 0058/1164] HIVE-9781: Utilize spark.kryo.classesToRegister
+ [Spark Branch] (Jimmy via Xuefu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/branches/spark@1662775 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   25 ++++++++++++++++++++
+ .../hadoop/hive/ql/exec/spark/KryoSerializer.java  |    4 ++--
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 404fbef..0013f18 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -83,6 +83,7 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.lang.WordUtils;
+ import org.apache.commons.lang3.StringEscapeUtils;
++import org.apache.commons.lang3.tuple.Pair;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -151,6 +152,8 @@
+ import org.apache.hadoop.hive.ql.plan.PlanUtils;
+ import org.apache.hadoop.hive.ql.plan.PlanUtils.ExpressionTypes;
+ import org.apache.hadoop.hive.ql.plan.ReduceWork;
++import org.apache.hadoop.hive.ql.plan.SparkEdgeProperty;
++import org.apache.hadoop.hive.ql.plan.SparkWork;
+ import org.apache.hadoop.hive.ql.plan.TableDesc;
+ import org.apache.hadoop.hive.ql.plan.api.Adjacency;
+ import org.apache.hadoop.hive.ql.plan.api.Graph;
+@@ -1091,6 +1094,28 @@ protected static void removeField(Kryo kryo, Class type, String fieldName) {
+     fld.removeField(fieldName);
+     kryo.register(type, fld);
+   }
++
++  public static ThreadLocal<Kryo> sparkSerializationKryo = new ThreadLocal<Kryo>() {
++    @Override
++    protected synchronized Kryo initialValue() {
++      Kryo kryo = new Kryo();
++      kryo.setClassLoader(Thread.currentThread().getContextClassLoader());
++      kryo.register(java.sql.Date.class, new SqlDateSerializer());
++      kryo.register(java.sql.Timestamp.class, new TimestampSerializer());
++      kryo.register(Path.class, new PathSerializer());
++      kryo.setInstantiatorStrategy(new StdInstantiatorStrategy());
++      removeField(kryo, Operator.class, "colExprMap");
++      removeField(kryo, ColumnInfo.class, "objectInspector");
++      kryo.register(SparkEdgeProperty.class);
++      kryo.register(MapWork.class);
++      kryo.register(ReduceWork.class);
++      kryo.register(SparkWork.class);
++      kryo.register(TableDesc.class);
++      kryo.register(Pair.class);
++      return kryo;
++    };
++  };
++
+   private static ThreadLocal<Kryo> cloningQueryPlanKryo = new ThreadLocal<Kryo>() {
+     @Override
+     protected synchronized Kryo initialValue() {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java
+index 76a4fd1..ff9fb85 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java
+@@ -39,14 +39,14 @@
+     ByteArrayOutputStream stream = new ByteArrayOutputStream();
+     Output output = new Output(stream);
+ 
+-    Utilities.runtimeSerializationKryo.get().writeObject(output, object);
++    Utilities.sparkSerializationKryo.get().writeObject(output, object);
+ 
+     output.close(); // close() also calls flush()
+     return stream.toByteArray();
+   }
+ 
+   public static <T> T deserialize(byte[] buffer, Class<T> clazz) {
+-    return Utilities.runtimeSerializationKryo.get().readObject(
++    return Utilities.sparkSerializationKryo.get().readObject(
+         new Input(new ByteArrayInputStream(buffer)), clazz);
+   }
+ 
+-- 
+1.7.9.5
+

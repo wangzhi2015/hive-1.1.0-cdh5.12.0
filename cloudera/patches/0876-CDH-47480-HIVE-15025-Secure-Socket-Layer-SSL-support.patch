@@ -1,0 +1,1028 @@
+From fd101b20dae9d46cce795176df877165954cadeb Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Fri, 21 Oct 2016 13:58:08 -0400
+Subject: [PATCH 0876/1164] CDH-47480: HIVE-15025: Secure-Socket-Layer (SSL)
+ support for HMS (Aihua Xu, reviewed by Chaoyu
+ Tang)
+
+(cherry picked from commit 2f40ac3aa423af827c1978c9be977a7b2ce5e5c8)
+
+Change-Id: I3a1a7110409254d994eb66bfd095a81ca55b8c1a
+---
+ .../hadoop/hive/common/auth/HiveAuthUtils.java     |  125 ++++++++++++++++++++
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   13 ++
+ data/files/keystore.jks                            |  Bin 2248 -> 2206 bytes
+ data/files/keystore_exampledotcom.jks              |  Bin 0 -> 2222 bytes
+ data/files/truststore.jks                          |  Bin 958 -> 1816 bytes
+ .../java/org/apache/hive/jdbc/miniHS2/MiniHS2.java |   13 +-
+ .../test/java/org/apache/hive/jdbc/TestSSL.java    |   88 ++++++++++++--
+ .../cli/thrift/TestThriftHttpCLIService.java       |    4 +-
+ .../java/org/apache/hive/jdbc/HiveConnection.java  |   39 +++---
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   35 +++++-
+ .../hadoop/hive/metastore/HiveMetaStoreClient.java |   43 ++++++-
+ .../hive/metastore/TServerSocketKeepAlive.java     |    4 +-
+ .../apache/hive/service/auth/HiveAuthFactory.java  |   78 ------------
+ .../service/cli/thrift/ThriftBinaryCLIService.java |    5 +-
+ 14 files changed, 320 insertions(+), 127 deletions(-)
+ create mode 100644 common/src/java/org/apache/hadoop/hive/common/auth/HiveAuthUtils.java
+ create mode 100644 data/files/keystore_exampledotcom.jks
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/auth/HiveAuthUtils.java b/common/src/java/org/apache/hadoop/hive/common/auth/HiveAuthUtils.java
+new file mode 100644
+index 0000000..b4dac4b
+--- /dev/null
++++ b/common/src/java/org/apache/hadoop/hive/common/auth/HiveAuthUtils.java
+@@ -0,0 +1,125 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.common.auth;
++
++import java.net.InetSocketAddress;
++import java.net.UnknownHostException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import javax.net.ssl.SSLParameters;
++import javax.net.ssl.SSLServerSocket;
++import javax.net.ssl.SSLSocket;
++
++import org.apache.thrift.transport.TSSLTransportFactory;
++import org.apache.thrift.transport.TServerSocket;
++import org.apache.thrift.transport.TSocket;
++import org.apache.thrift.transport.TTransport;
++import org.apache.thrift.transport.TTransportException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * This class helps in some aspects of authentication. It creates the proper Thrift classes for the
++ * given configuration as well as helps with authenticating requests.
++ */
++public class HiveAuthUtils {
++  private static final Logger LOG = LoggerFactory.getLogger(HiveAuthUtils.class);
++
++  public static TTransport getSocketTransport(String host, int port, int loginTimeout) {
++    return new TSocket(host, port, loginTimeout);
++  }
++
++  public static TTransport getSSLSocket(String host, int port, int loginTimeout)
++    throws TTransportException {
++    // The underlying SSLSocket object is bound to host:port with the given SO_TIMEOUT
++    TSocket tSSLSocket = TSSLTransportFactory.getClientSocket(host, port, loginTimeout);
++    return getSSLSocketWithHttps(tSSLSocket);
++  }
++
++  public static TTransport getSSLSocket(String host, int port, int loginTimeout,
++    String trustStorePath, String trustStorePassWord) throws TTransportException {
++    TSSLTransportFactory.TSSLTransportParameters params =
++      new TSSLTransportFactory.TSSLTransportParameters();
++    params.setTrustStore(trustStorePath, trustStorePassWord);
++    params.requireClientAuth(true);
++    // The underlying SSLSocket object is bound to host:port with the given SO_TIMEOUT and
++    // SSLContext created with the given params
++    TSocket tSSLSocket = TSSLTransportFactory.getClientSocket(host, port, loginTimeout, params);
++    return getSSLSocketWithHttps(tSSLSocket);
++  }
++
++  // Using endpoint identification algorithm as HTTPS enables us to do
++  // CNAMEs/subjectAltName verification
++  private static TSocket getSSLSocketWithHttps(TSocket tSSLSocket) throws TTransportException {
++    SSLSocket sslSocket = (SSLSocket) tSSLSocket.getSocket();
++    SSLParameters sslParams = sslSocket.getSSLParameters();
++    sslParams.setEndpointIdentificationAlgorithm("HTTPS");
++    sslSocket.setSSLParameters(sslParams);
++    return new TSocket(sslSocket);
++  }
++
++  public static TServerSocket getServerSocket(String hiveHost, int portNum)
++    throws TTransportException {
++    InetSocketAddress serverAddress;
++    if (hiveHost == null || hiveHost.isEmpty()) {
++      // Wildcard bind
++      serverAddress = new InetSocketAddress(portNum);
++    } else {
++      serverAddress = new InetSocketAddress(hiveHost, portNum);
++    }
++    return new TServerSocket(serverAddress);
++  }
++
++  public static TServerSocket getServerSSLSocket(String hiveHost, int portNum, String keyStorePath,
++      String keyStorePassWord, List<String> sslVersionBlacklist) throws TTransportException,
++      UnknownHostException {
++    TSSLTransportFactory.TSSLTransportParameters params =
++        new TSSLTransportFactory.TSSLTransportParameters();
++    params.setKeyStore(keyStorePath, keyStorePassWord);
++    InetSocketAddress serverAddress;
++    if (hiveHost == null || hiveHost.isEmpty()) {
++      // Wildcard bind
++      serverAddress = new InetSocketAddress(portNum);
++    } else {
++      serverAddress = new InetSocketAddress(hiveHost, portNum);
++    }
++    TServerSocket thriftServerSocket =
++        TSSLTransportFactory.getServerSocket(portNum, 0, serverAddress.getAddress(), params);
++    if (thriftServerSocket.getServerSocket() instanceof SSLServerSocket) {
++      List<String> sslVersionBlacklistLocal = new ArrayList<String>();
++      for (String sslVersion : sslVersionBlacklist) {
++        sslVersionBlacklistLocal.add(sslVersion.trim().toLowerCase());
++      }
++      SSLServerSocket sslServerSocket = (SSLServerSocket) thriftServerSocket.getServerSocket();
++      List<String> enabledProtocols = new ArrayList<String>();
++      for (String protocol : sslServerSocket.getEnabledProtocols()) {
++        if (sslVersionBlacklistLocal.contains(protocol.toLowerCase())) {
++          LOG.debug("Disabling SSL Protocol: " + protocol);
++        } else {
++          enabledProtocols.add(protocol);
++        }
++      }
++      sslServerSocket.setEnabledProtocols(enabledProtocols.toArray(new String[0]));
++      LOG.info("SSL Server Socket Enabled Protocols: "
++          + Arrays.toString(sslServerSocket.getEnabledProtocols()));
++    }
++    return thriftServerSocket;
++  }
++}
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 3da052c..cdd9df6 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -618,6 +618,19 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+       "Enable a metadata count at metastore startup for metrics."),
+     FIRE_EVENTS_FOR_DML("hive.metastore.dml.events", false, "If true, the metastore will be asked" +
+         " to fire events for DML operations"),
++
++    // Metastore SSL settings
++    HIVE_METASTORE_USE_SSL("hive.metastore.use.SSL", false,
++        "Set this to true for using SSL encryption in HMS server."),
++    HIVE_METASTORE_SSL_KEYSTORE_PATH("hive.metastore.keystore.path", "",
++        "Metastore SSL certificate keystore location."),
++    HIVE_METASTORE_SSL_KEYSTORE_PASSWORD("hive.metastore.keystore.password", "",
++        "Metastore SSL certificate keystore password."),
++    HIVE_METASTORE_SSL_TRUSTSTORE_PATH("hive.metastore.truststore.path", "",
++        "Metastore SSL certificate keystore location."),
++    HIVE_METASTORE_SSL_TRUSTSTORE_PASSWORD("hive.metastore.truststore.password", "",
++        "Metastore SSL certificate keystore password."),
++
+     // Parameters for exporting metadata on table drop (requires the use of the)
+     // org.apache.hadoop.hive.ql.parse.MetaDataExportListener preevent listener
+     METADATA_EXPORT_LOCATION("hive.metadata.export.location", "",
+diff --git a/data/files/keystore.jks b/data/files/keystore.jks
+index 469d8a543a4d2a94535996ceee2a24891699b1cc..8f35af0df2c8cbd838af8c404d809a09f3645fcd 100644
+GIT binary patch
+literal 2206
+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
+
+literal 2248
+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
+Js_3iE{{opy;Gh5i
+
+diff --git a/data/files/keystore_exampledotcom.jks b/data/files/keystore_exampledotcom.jks
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d33aadf0da0d9b40f96ae8d10f18b3bf39b7447
+GIT binary patch
+literal 2222
+zcmcJQ=Tno37RK`?As`_jC80?Rp+t&_6h#545seBGSfopd6bV6rpoo-!bOdQZLJd^~
+zktKjiaY2xBDWY782r9TJgd#<Xv_<FcjQ_y>@O=24IWuQYndj`z@6LljAn?9`UxJfw
+zxKR9j$m(uX%6`n!NK#fF1mc3==+HeJKa5ue20($sU_k)j0zv6ePA(5SNZ3e2g7jim
+zy#LzrBb4j{H5y|ccz)I(12gF#arr!{m-Jq=COF#AL7$d@G3^<a+`N5f%(Xs<GJdMZ
+zvPPpL$?>rY`nFy^yDqR(@&b4NA5oH!&-jO_M3?H7$3~0|ijSl=#`{NJ%CMF_Yr93$
+zAUi9nOh{qS|4UB|Si;=tqclq?zyg{H)K;I-YnNbeNiR#I1ELD;RYrSSwO+)e40~&p
+zOnlvGvM3)nSJ;|<d*tng&!YXgR+Y&?xV+LPnQ>}XBJKMMshL+WSDzr`JruY*ycYF3
+z#_L(AP|B+mvr2PWIdtxorHkBYH-z0cB5T#0UASE8JBpco9=1Fv@tNKm8>!=WAU%;4
+zO|^q0-I*@Oyf=#B$)@*DedbPKj?&|7;F9qJsD#01&?{m}@e5Q{FYe(08;WFbLlDoq
+zA3O&{1TvH}5vRZ377RPId~EJVr3jJltfeQD3(mecfV><|8xBs(YowLW512C6D?QnL
+zG4=7Vt)%wHB`Nj@vJ%E4)*-(fM&YY@{-&s6F45?D!YALRf}3qy@fL;TPu#wrx|uiA
+zJ+14WRc_v*Np)DNoOS7{&q@L%r0rtw$=91>i!S;5ugEhGT_AdjDUegY^BRWi)VxP7
+zuX3Y(Zz^Fu>Z~`Lv=y-jnym{Nr0gP=ZW;0x_3eQBhOFv!z%)E>idEiXlFJ1XbmW^+
+z8ek8WDu*7yH2StQhe;$&78^=g<p_22->na^I$>odu4ChxzQS)mc)mE{Daz_Dl0bf2
+zVpuxxmxaJhR^-d(!M?hOs5_GZO0|Mpj=qSo*SgCpHWIsXv;2*;G`2&bglq<i>-v8P
+zEd&E|Q%;592Vs#vdC;73fhx(tC(JHx>6b`9z-K)k6%LwdMa6Z6%%2dc5UH!GO~3!l
+zZoIb?wX>65DuWBFCy8X83}y&_NT08JsNT3VYSCrFk98ag%fNzAkCOdkm3^YHAbmCr
+z%}s0avOsIombB4q*=P<c{{t~SO8-trB2j0^=|s8TUbC87)B5Fa>B7gOMLlHWA7DAr
+z5@xc@m|=OL7vB=d6Baa$Jf9H|A|jWwx^C}~FJ#cFH)A_DTtL4(MtD`w3X?WzM>6bf
+z{YLw1axjyO-i20!7J{9ux(UImP-n`yqZeD|_0<R*OQ`Lz(}lw;+>`G<DZX0m?8>Kd
+zFtF2219S$u&4Llk0&RCUnr;?1=&(4)Gv>zZv^)#;ZgFG^uO6$UTrN55;n_Ko3^`Rv
+zlnA(i>Rh&uu2Z&}2W$9I5;C3L7~_H4aedjZ+xg6b`&iu4qdCf#e0}kU<Pi`($Wvrr
+z#C9Unv))8BJf5j}zcIfqfI{t7drld1AA{)aJ@M`;&>wi*Ka#QX_vp6FJ65n*Bzcjr
+zx7{P2<rP<X;kK6=tWcWw+y#55A?0(d#IY9qB^N1j%sb4H-67Fq(4KJtTa_&KN=*Bv
+z^xSZ?z@NuoioF!7h4#;tR-_nCsbaIn0n|W8y;4%(qRJj0_U-Yuxr<;u9fObfxx6*c
+z<=Se=iI2FetD$())t&Zur*F_n^`)tA&Y3_^bz)(o71h<Us&-25Xy3I#A*vpsu~{kg
+z4bjF)+p)beH%nEfp)^sywMIAl{ZeR@DreQ2Wq;!HG%MgsFvn&4FqLM*Ea}tu<&RvK
+z)U|LrAP~eEM~B$s=wRal2p9l^p+w^05*z|{;Bd5A^g03n;9MY_6CRE`0E1XVVZvZ*
+z(!anX3^q3W7r2GNBm$lf$NMvlR~TZrPY4|RC&7iGW?nQhUJQr&i4b9dpr9c2-~1UT
+zEsDTv<M4RRqj*hiEls;$sEOD3AO7F#(*gAFE$_bs2ptdr;phM_m<|A-k+p8eujB~r
+zS&jS=+i<gfsj<i1Tm75|!9z6;0wV;l>siGGldUBMeI0FNd7+{Q4~gA2PuJT0_Wk{r
+zbtCtg8Q|}eZ929+golp(Xu$x>2bzNM$!%Qj<*}HPE*p#bUur<AaiV+AYpsBq#J0jm
+zj>lB?-XwC)xMotd?<?nYR>G_+5vt1U9^)qqL+>)Xon6P#i^mIy(f(lhs@)<lrn7?Y
+zsJtrkzafH(-f)3d!|!B~9p5nzr5mHOCL@f#yHRQnxu0Dxd^FQu)rPsBI$t!<q-#CK
+zb<N8uAY!uD$n|w<C$C%B%F;%fNd>kMRFr|Z(ka_=@7)E9Qx#XA$blgM2q==n$>5~+
+zHz>sqML|V)6yz}JH1l)Dk}J0s%AiNeZW-VGeTe&avp+-tgtQhdSX+<nWcs@y4*roJ
+zdQt>Ti!_B!Pee|OT#DSuDV^v}Ubsr-G=$bGXL>XxGuAFP)%Z|Wq^9kNx>Q4TabmWB
+zS5JuULA?~QGavc3(_Kjt^@yVz*RQOq&OwZuKm0|$hm}+BZ3e~j>LZ*KNSm6A_mK2*
+z(jC8z?i1|;0feVEkA#XX8_EV`?BwkH#x={W>tH+&Y!gx@+e}fVLQF+gFveA!k}aaq
+zY!rD;H5H1;J}n)UQ#Y9htyNoV9NCUZ>J39ER)}{xRL8Z)W~x!DpGtkv!$*iIHfiWE
+z+Gne@LOg6cr*C&md^Bw^M;kC+A*Bp1YPe11i+Xr9taMl*_E19JXH2nOeRvnAslL<y
+E0H$WX&Hw-a
+
+literal 0
+HcmV?d00001
+
+diff --git a/data/files/truststore.jks b/data/files/truststore.jks
+index 9c5d703fba6c8c23bf6ee8f431d6d0fc35bf9ee1..03dd2a3368369b6cf29f32a615f23ae0cf9e523b 100644
+GIT binary patch
+literal 1816
+zcmezO_TO6u1_mZL=1#3h%q_@C)l1ILWnf?oa*|nioPjk$&(y$@fq^;Rpoux!poz(O
+z0W%XL6BCQKx7JbvUN%mxHjlRNyo`+8tPBQmhTI06Y|No7Y{E>T!7vVoFq5+*jKeO>
+z6zpcmW55Mc#wE<`2;}h^aD#Z<!Ym${WvPY|24WyCvoL>odAS~vqYUK4c@51B3=K_;
+z3{A{TO`^bD6GLMtm*)02F)AT@nUR%&xrvdV!Jvtei>Zl`k>SR-Q?V~n8_ixB&%Y7b
+z;Bj8|_PSHQ&%a(-b!~GD{|z^$BrmmhF26sj+F6>3u2`s+&Jn!j$lE5<e;>ZydH&rg
+z<>gDpr`AU-BhR?4iaoC+SQ50-M6j#>2y4oU4i)RfAMfp+Z)VWx6#u_#YY5}!o+Ara
+z$C_*Zztr>EGih4B*-VW&C)TosuI1Iy*mA~s!@Fy@rk#pUx~ufwVu5#CF_ZH8e~U9`
+z$E)VuRMwe&wMI}ai<|$D<JVM?zj?RQ)hlkka=9`6TwjasD)ya43s=89y8ejD%t>z-
+zU)*aGdYiQ{Gp?lZ(OIXY3zJT8CD(uc_+zrm8qGZni>LCYolrP9@s?kJ{hI6zicHLm
+z42+8v4de}EfiWn{$0Eie!lA0DGNsJl$65Mw^}FRP`pc`G`;Y?>m~Mc9$jBfXD!$;`
+z_l^^@i<5Z;!sgdmi!hZnyRtmH*ZfQ*qWSNfW%o|?zst^ly}NF^#<cXk{nNh%?%kY|
+z`&sr`l($X3qn@PqEdI<hH8uja6C^wz@cfyQ6fCu!*XT!4+83QS%+CAnA4r|3si=2$
+zA43<H9dDd!@K2NX6GfX=1h*FaIAwM8Vu{<1@YO;~f_5*zC?BO5RdCm2Md&s*j+K$!
+z6CNFL6<a1WTWwL5N|I#mED_^<PR%|#lUR6Xxy!Z8+4g82%U0cQdv5$`?>$@3tF}h+
+zM9jv{qaD+9b2sjgeQs;mD5193*mC;OSL;n{(j!kit37`2f$MI6C5P$9L}eWUjgueG
+z7f;UwXG6}M{N%)(jQrvfa0V2Ve2U0`!N3gY56pn(&<tp5u>TTTKpI5AvKd7gP{=?4
+zk^vFULC$){21b@hSr5#mq0NLc-L{9nO#NfTeSf*xweJ?2l^Xx2NGdIK#~ugoNdnV<
+zY})EEHzU~QvDB%e(16ZD0o8vQT}SS{mioZhW_IJ7;I!p3r<_<fmCY&c_~aKN=b0Kh
+z@v-5m@|l*BJ-54WZR>iU8u;{!5J$05g>B9*BY`uDGnd*i3yXz)XFQN^Tddfh>%RHH
+z{!(jyySL67>ctvm_xiHLmL`9^<g8kE(d2yOPSJ-;7cMTS&8mHHxTmAUh3&P#*4dLx
+zgZ}R5J9xCw@{ZR0==X-wcMdGwFyr7=*GDq5w!N@zFqO&S+adhr=AYo>-2JbvE|)yW
+zd~t!yqf3bjb0jC*SInQYa?RE&5`p=(efxN2UR}hN>5SH$|9ITHp64;g#LH)Q^u67(
+zsqi~mS^;Oe9Ff^=ihhTFO#H>Xzm@w&?D_Z8YA@8Jn!e@L4lMXSx5hSE!}Ij*_M2Ds
+zbRG`#E}O(|cc4gTPf}-!12fmoBkwdK?0s`j@Eo_j+4JPrb?!e)CroY3=zJ|Wqf9le
+z;?ClE+h6lI?VT-fkbR<s@U1!Tu3!5ywcaGN;F*H)w`uO?-F(8rT!mj_4ZIxdt}(hr
+z%d=ZNJ0`=_z9=WJ=**F64+5ue4q`m?$GAn>)%kFP@ew5<_89#IvpSAQZCovD+O>Sj
+zFDHStMQl}#g>v%B>x)d%+k@0)g7-*2TchT0mU}u!TmO9HF2RRk)gl}TpFdVlZQU}@
+qCZb@v&)t^YTqoAty^^Q0F?;=jg|b$1cegW|?2@1K?Vsqx1TO%Bq>*R<
+
+literal 958
+zcmezO_TO6u1_mY|W(3n58JT6NSt&`$Kmo_cw>h&JSR?dI4J;WLm}?E1m@5sMm=YH-
+zGchtTu|(`Q<22x9<J4;NX#38~$jHsgV31=dV8F-59LmBb%pRJTotIyp2NU7I5Mf7%
+z@B<A3>f#b+b1X<q&PX-nHQ)vba0|0|03Bo~Vju+KG7ED<<P|`o1`6W5hQ@{lM#cuF
+zCg#S5Q4;({hK9xlmPVFP0Xn;<iBSnTKp0sWn41{+84Q{jxtN+585#CW^64*|``tXJ
+zZhq9Bol2j)g4Kegj*A`VU4Hx9JeJk^+?T~}JUa4y>MYS;eE$kI*1xT_?4P^!=i2W-
+zyJjwX`0LZ`EpGo)7W*$232|(3Zb(~yXS2qJB_2{OndQnS9>`7C+Rb<*ihs?Glec*?
+zd{;DWY~Z+j`K5>9`Mpt27qumo4?RA+W4mU-?xp=3{(KI6Jb8M^F4e71SJt@{ueqnY
+zCc^K>uCq5P)8GGpw$W?nD%RC`6Am?n@jqO()9~5bo-?mIm@B^QjFE1(3uc;-AotQF
+z*nLmO%oQI6Ec3P=o02kP^Xb!}$9UJ2Fs$kce03oA@HZ#sDg1%A4OQc9q!PVU9Qs-c
+z(qx&K85tNCD;mff$O2<imXAe@Ma1IctWIv%DHh9SwDotN*>G2LJL^K^Km?{LU?4Iw
+z2>&Vxlqi|Ipv+tTNYSaf{TVS?&61f~-_AZ_`)*r#ab~g?kD>aJ7T4&HR^P2mTfaFx
+ztJk@c7^?dwYxkOE-*>NgXJ8vM-Ni&~zr}z5Hn;wMd7sWXNoJ*|$~GKZ=^OpIdDFtr
+zO$X{MR?M2hI6bP~&x=>pA+vAqsbfJt_p0-Lhl<HL6j--Do$Y3Cy)WbLw5o;Y|4hH6
+zX7~N&ln1|O2x+Ryd0f8xv0eT3xi_~&+I{;A?{1A+mRzs-XIo!>w9L8EnSGOvrrqy3
+zuGOiU*<9}OezjzQn~R*M#z|54jGYR*S6W|u-j(%s(gE?cSE{VHzp@ElcOWOn@!THU
+i+jZwF3Yv86jpP{Duj5kx`QB$`i><QrQ7dtWk9z<h!)<^7
+
+diff --git a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+index 8f0c667..5502f9b 100644
+--- a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
++++ b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+@@ -52,10 +52,10 @@
+   private static final String driverName = "org.apache.hive.jdbc.HiveDriver";
+   private static final FsPermission FULL_PERM = new FsPermission((short)00777);
+   private static final FsPermission WRITE_ALL_PERM = new FsPermission((short)00733);
++  private static final String tmpDir = System.getProperty("test.tmp.dir");
+   private HiveServer2 hiveServer2 = null;
+   private final File baseDir;
+   private final Path baseDfsDir;
+-  private static final AtomicLong hs2Counter = new AtomicLong();
+   private MiniMrShim mr;
+   private MiniDFSShim dfs;
+   private FileSystem localFS;
+@@ -169,7 +169,7 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+     this.serverPrincipal = serverPrincipal;
+     this.serverKeytab = serverKeytab;
+     this.isMetastoreRemote = isMetastoreRemote;
+-    baseDir = Files.createTempDir();
++    baseDir = new File(tmpDir + "/local_base");
+     localFS = FileSystem.getLocal(hiveConf);
+     FileSystem fs;
+     if (useMiniMR) {
+@@ -189,9 +189,9 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+       hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB, serverKeytab);
+       hiveConf.setVar(ConfVars.HIVE_SERVER2_AUTHENTICATION, authType);
+     }
+-    String metaStoreURL =  "jdbc:derby:" + baseDir.getAbsolutePath() + File.separator + "test_metastore-" +
+-        hs2Counter.incrementAndGet() + ";create=true";
+-
++    String metaStoreURL =
++        "jdbc:derby:;databaseName=" + baseDir.getAbsolutePath() + File.separator
++            + "test_metastore;create=true";
+     fs.mkdirs(baseDfsDir);
+     Path wareHouseDir = new Path(baseDfsDir, "warehouse");
+     // Create warehouse with 777, so that user impersonation has no issues.
+@@ -264,6 +264,9 @@ public void stop() {
+     } catch (IOException e) {
+       // Ignore errors cleaning up miniMR
+     }
++  }
++
++  public void cleanup() {
+     FileUtils.deleteQuietly(baseDir);
+   }
+ 
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java
+index 8912cee..e4c48fa 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hive.jdbc;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ import java.io.File;
+@@ -46,9 +47,10 @@
+ 
+ public class TestSSL {
+   private static final Logger LOG = LoggerFactory.getLogger(TestSSL.class);
+-  private static final String KEY_STORE_NAME = "keystore.jks";
++  private static final String LOCALHOST_KEY_STORE_NAME = "keystore.jks";
++  private static final String EXAMPLEDOTCOM_KEY_STORE_NAME = "keystore_exampledotcom.jks";
+   private static final String TRUST_STORE_NAME = "truststore.jks";
+-  private static final String KEY_STORE_PASSWORD = "HiveJdbc";
++  private static final String KEY_STORE_TRUST_STORE_PASSWORD = "HiveJdbc";
+   private static final String JAVA_TRUST_STORE_PROP = "javax.net.ssl.trustStore";
+   private static final String JAVA_TRUST_STORE_PASS_PROP = "javax.net.ssl.trustStorePassword";
+   private static final String HS2_BINARY_MODE = "binary";
+@@ -63,7 +65,7 @@
+   private String dataFileDir = conf.get("test.data.files");
+   private Map<String, String> confOverlay;
+   private final String SSL_CONN_PARAMS = ";ssl=true;sslTrustStore=" + URLEncoder.encode(dataFileDir + File.separator +
+-      TRUST_STORE_NAME) + ";trustStorePassword=" + KEY_STORE_PASSWORD;
++      TRUST_STORE_NAME) + ";trustStorePassword=" + KEY_STORE_TRUST_STORE_PASSWORD;
+ 
+   @BeforeClass
+   public static void beforeTest() throws Exception {
+@@ -124,7 +126,7 @@ public void testSSLVersion() throws Exception {
+     // make SSL connection
+     hs2Conn = DriverManager.getConnection(miniHS2.getJdbcURL() + ";ssl=true;sslTrustStore=" +
+         dataFileDir + File.separator + TRUST_STORE_NAME + ";trustStorePassword=" +
+-        KEY_STORE_PASSWORD, System.getProperty("user.name"), "bar");
++        KEY_STORE_TRUST_STORE_PASSWORD, System.getProperty("user.name"), "bar");
+     hs2Conn.close();
+     Assert.assertEquals("Expected exit code of 1", 1,
+       execCommand("openssl s_client -connect " + miniHS2.getHost() + ":" + miniHS2.getBinaryPort()
+@@ -141,7 +143,7 @@ public void testSSLVersion() throws Exception {
+     try {
+       hs2Conn = DriverManager.getConnection(miniHS2.getJdbcURL() +
+           ";ssl=true;sslTrustStore=" + dataFileDir + File.separator +
+-          TRUST_STORE_NAME + ";trustStorePassword=" + KEY_STORE_PASSWORD +
++          TRUST_STORE_NAME + ";trustStorePassword=" + KEY_STORE_TRUST_STORE_PASSWORD +
+           "?hive.server2.transport.mode=" + HS2_HTTP_MODE +
+           ";hive.server2.thrift.http.path=" + HS2_HTTP_ENDPOINT,
+           System.getProperty("user.name"), "bar");
+@@ -181,7 +183,7 @@ public void testInvalidConfig() throws Exception {
+     }
+ 
+     System.setProperty(JAVA_TRUST_STORE_PROP, dataFileDir + File.separator + TRUST_STORE_NAME );
+-    System.setProperty(JAVA_TRUST_STORE_PASS_PROP, KEY_STORE_PASSWORD);
++    System.setProperty(JAVA_TRUST_STORE_PASS_PROP, KEY_STORE_TRUST_STORE_PASSWORD);
+     try {
+       hs2Conn = DriverManager.getConnection(miniHS2.getJdbcURL() + ";ssl=true",
+           System.getProperty("user.name"), "bar");
+@@ -291,7 +293,7 @@ public void testSSLConnectionWithProperty() throws Exception {
+     miniHS2.start(confOverlay);
+ 
+     System.setProperty(JAVA_TRUST_STORE_PROP, dataFileDir + File.separator + TRUST_STORE_NAME );
+-    System.setProperty(JAVA_TRUST_STORE_PASS_PROP, KEY_STORE_PASSWORD);
++    System.setProperty(JAVA_TRUST_STORE_PASS_PROP, KEY_STORE_TRUST_STORE_PASSWORD);
+     // make SSL connection
+     hs2Conn = DriverManager.getConnection(miniHS2.getJdbcURL() + ";ssl=true",
+         System.getProperty("user.name"), "bar");
+@@ -375,6 +377,62 @@ public void testSSLFetchHttp() throws Exception {
+     hs2Conn.close();
+   }
+ 
++  /**
++   * Test HMS server with SSL
++   * @throws Exception
++   */
++  @Test
++  public void testMetastoreWithSSL() throws Exception {
++    setMetastoreSslConf(conf);
++    setSslConfOverlay(confOverlay);
++    // Test in http mode
++    setHttpConfOverlay(confOverlay);
++    // Frankeinstein backport for CDH-47480. Removed cleanupLocalDirOnStartup(false)
++    miniHS2 = new MiniHS2.Builder().withRemoteMetastore().withConf(conf).build();
++    miniHS2.start(confOverlay);
++
++    String tableName = "sslTab";
++    Path dataFilePath = new Path(dataFileDir, "kv1.txt");
++
++    // make SSL connection
++    hs2Conn = DriverManager.getConnection(miniHS2.getJdbcURL("default", SSL_CONN_PARAMS),
++        System.getProperty("user.name"), "bar");
++
++    // Set up test data
++    setupTestTableWithData(tableName, dataFilePath, hs2Conn);
++    Statement stmt = hs2Conn.createStatement();
++    ResultSet res = stmt.executeQuery("SELECT * FROM " + tableName);
++    int rowCount = 0;
++    while (res.next()) {
++      ++rowCount;
++      assertEquals("val_" + res.getInt(1), res.getString(2));
++    }
++    // read result over SSL
++    assertEquals(500, rowCount);
++
++    hs2Conn.close();
++  }
++
++  /**
++   * Verify the HS2 can't connect to HMS if the certificate doesn't match
++   * @throws Exception
++   */
++  @Test
++  public void testMetastoreConnectionWrongCertCN() throws Exception {
++    setMetastoreSslConf(conf);
++    conf.setVar(ConfVars.HIVE_METASTORE_SSL_KEYSTORE_PATH,
++        dataFileDir + File.separator +  EXAMPLEDOTCOM_KEY_STORE_NAME);
++    // Frankeinstein backport for CDH-47480. Removed cleanupLocalDirOnStartup(false)
++    miniHS2 = new MiniHS2.Builder().withRemoteMetastore().withConf(conf).build();
++    try {
++      miniHS2.start(confOverlay);
++    } catch (java.net.ConnectException e) {
++      assertTrue(e.toString().contains("Connection refused"));
++    }
++
++    miniHS2.stop();
++  }
++
+   private void setupTestTableWithData(String tableName, Path dataFilePath,
+       Connection hs2Conn) throws Exception {
+     Statement stmt = hs2Conn.createStatement();
+@@ -393,9 +451,21 @@ private void setupTestTableWithData(String tableName, Path dataFilePath,
+   private void setSslConfOverlay(Map<String, String> confOverlay) {
+     confOverlay.put(ConfVars.HIVE_SERVER2_USE_SSL.varname, "true");
+     confOverlay.put(ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PATH.varname,
+-        dataFileDir + File.separator +  KEY_STORE_NAME);
++        dataFileDir + File.separator +  LOCALHOST_KEY_STORE_NAME);
+     confOverlay.put(ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname,
+-        KEY_STORE_PASSWORD);
++        KEY_STORE_TRUST_STORE_PASSWORD);
++  }
++
++  private void setMetastoreSslConf(HiveConf conf) {
++    conf.setBoolVar(ConfVars.HIVE_METASTORE_USE_SSL, true);
++    conf.setVar(ConfVars.HIVE_METASTORE_SSL_KEYSTORE_PATH,
++        dataFileDir + File.separator +  LOCALHOST_KEY_STORE_NAME);
++    conf.setVar(ConfVars.HIVE_METASTORE_SSL_KEYSTORE_PASSWORD,
++        KEY_STORE_TRUST_STORE_PASSWORD);
++    conf.setVar(ConfVars.HIVE_METASTORE_SSL_TRUSTSTORE_PATH,
++        dataFileDir + File.separator +  TRUST_STORE_NAME);
++    conf.setVar(ConfVars.HIVE_METASTORE_SSL_TRUSTSTORE_PASSWORD,
++        KEY_STORE_TRUST_STORE_PASSWORD);
+   }
+ 
+   private void clearSslConfOverlay(Map<String, String> confOverlay) {
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/thrift/TestThriftHttpCLIService.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/thrift/TestThriftHttpCLIService.java
+index 3e913da..ef092a7 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/thrift/TestThriftHttpCLIService.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/thrift/TestThriftHttpCLIService.java
+@@ -21,9 +21,9 @@
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
++import org.apache.hadoop.hive.common.auth.HiveAuthUtils;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hive.jdbc.HttpBasicAuthInterceptor;
+-import org.apache.hive.service.auth.HiveAuthFactory;
+ import org.apache.hive.service.auth.HiveAuthFactory.AuthTypes;
+ import org.apache.http.impl.client.DefaultHttpClient;
+ import org.apache.thrift.protocol.TBinaryProtocol;
+@@ -152,7 +152,7 @@ private void testOpenSessionExpectedException(TCLIService.Client client) {
+   }
+ 
+   private TTransport getRawBinaryTransport() throws Exception {
+-    return HiveAuthFactory.getSocketTransport(host, port, 0);
++    return HiveAuthUtils.getSocketTransport(host, port, 0);
+   }
+ 
+   private static TTransport getHttpTransport() throws Exception {
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+index ac644c6..dcf5d90 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+@@ -18,6 +18,23 @@
+ 
+ package org.apache.hive.jdbc;
+ 
++import org.apache.hadoop.hive.common.auth.HiveAuthUtils;
++import org.apache.hive.jdbc.Utils.JdbcConnectionParams;
++import org.apache.hive.service.auth.HiveAuthFactory;
++import org.apache.hive.service.auth.KerberosSaslHelper;
++import org.apache.hive.service.auth.PlainSaslHelper;
++import org.apache.hive.service.auth.SaslQOP;
++import org.apache.hive.service.cli.thrift.EmbeddedThriftBinaryCLIService;
++import org.apache.http.HttpRequestInterceptor;
++import org.apache.thrift.TException;
++import org.apache.thrift.protocol.TBinaryProtocol;
++import org.apache.thrift.transport.THttpClient;
++import org.apache.thrift.transport.TTransport;
++import org.apache.thrift.transport.TTransportException;
++
++import javax.security.sasl.Sasl;
++import javax.security.sasl.SaslException;
++
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.lang.reflect.InvocationHandler;
+@@ -51,19 +68,9 @@
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.TimeUnit;
+ 
+-import javax.security.sasl.Sasl;
+-import javax.security.sasl.SaslException;
+-
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.shims.ShimLoader;
+-import org.apache.hive.jdbc.Utils.JdbcConnectionParams;
+-import org.apache.hive.service.auth.HiveAuthFactory;
+-import org.apache.hive.service.auth.KerberosSaslHelper;
+-import org.apache.hive.service.auth.PlainSaslHelper;
+-import org.apache.hive.service.auth.SaslQOP;
+-import org.apache.hive.service.cli.thrift.EmbeddedThriftBinaryCLIService;
+ import org.apache.hive.service.cli.thrift.TCLIService;
+ import org.apache.hive.service.cli.thrift.TCancelDelegationTokenReq;
+ import org.apache.hive.service.cli.thrift.TCancelDelegationTokenResp;
+@@ -76,15 +83,9 @@
+ import org.apache.hive.service.cli.thrift.TRenewDelegationTokenReq;
+ import org.apache.hive.service.cli.thrift.TRenewDelegationTokenResp;
+ import org.apache.hive.service.cli.thrift.TSessionHandle;
+-import org.apache.http.HttpRequestInterceptor;
+ import org.apache.http.conn.scheme.Scheme;
+ import org.apache.http.conn.ssl.SSLSocketFactory;
+ import org.apache.http.impl.client.DefaultHttpClient;
+-import org.apache.thrift.TException;
+-import org.apache.thrift.protocol.TBinaryProtocol;
+-import org.apache.thrift.transport.THttpClient;
+-import org.apache.thrift.transport.TTransport;
+-import org.apache.thrift.transport.TTransportException;
+ 
+ /**
+  * HiveConnection.
+@@ -365,14 +366,14 @@ private TTransport createUnderlyingTransport() throws TTransportException {
+         JdbcConnectionParams.SSL_TRUST_STORE_PASSWORD);
+ 
+       if (sslTrustStore == null || sslTrustStore.isEmpty()) {
+-        transport = HiveAuthFactory.getSSLSocket(host, port, loginTimeout);
++        transport = HiveAuthUtils.getSSLSocket(host, port, loginTimeout);
+       } else {
+-        transport = HiveAuthFactory.getSSLSocket(host, port, loginTimeout,
++        transport = HiveAuthUtils.getSSLSocket(host, port, loginTimeout,
+             sslTrustStore, sslTrustStorePassword);
+       }
+     } else {
+       // get non-SSL socket transport
+-      transport = HiveAuthFactory.getSocketTransport(host, port, loginTimeout);
++      transport = HiveAuthUtils.getSocketTransport(host, port, loginTimeout);
+     }
+     return transport;
+   }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 3766d56..0a2cf8a 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -38,6 +38,7 @@
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.JvmPauseMonitor;
+ import org.apache.hadoop.hive.common.LogUtils;
++import org.apache.hadoop.hive.common.auth.HiveAuthUtils;
+ import org.apache.hadoop.hive.common.LogUtils.LogInitializationException;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
+ import org.apache.hadoop.hive.common.classification.InterfaceStability;
+@@ -205,7 +206,6 @@
+ import org.apache.thrift.server.TThreadPoolServer;
+ import org.apache.thrift.transport.TFramedTransport;
+ import org.apache.thrift.transport.TServerSocket;
+-import org.apache.thrift.transport.TServerTransport;
+ import org.apache.thrift.transport.TTransport;
+ import org.apache.thrift.transport.TTransportFactory;
+ 
+@@ -6363,11 +6363,9 @@ public static void startMetaStore(int port, HadoopThriftAuthBridge bridge,
+       boolean tcpKeepAlive = conf.getBoolVar(HiveConf.ConfVars.METASTORE_TCP_KEEP_ALIVE);
+       boolean useFramedTransport = conf.getBoolVar(ConfVars.METASTORE_USE_THRIFT_FRAMED_TRANSPORT);
+       boolean useCompactProtocol = conf.getBoolVar(ConfVars.METASTORE_USE_THRIFT_COMPACT_PROTOCOL);
++      boolean useSSL = conf.getBoolVar(ConfVars.HIVE_METASTORE_USE_SSL);
+       useSasl = conf.getBoolVar(HiveConf.ConfVars.METASTORE_USE_THRIFT_SASL);
+ 
+-      TServerTransport serverTransport = tcpKeepAlive ?
+-          new TServerSocketKeepAlive(port) : new TServerSocket(port);
+-
+       TProcessor processor;
+       TTransportFactory transFactory;
+       final TProtocolFactory protocolFactory;
+@@ -6382,6 +6380,8 @@ public static void startMetaStore(int port, HadoopThriftAuthBridge bridge,
+       HMSHandler baseHandler = new HiveMetaStore.HMSHandler("new db based metaserver", conf,
+           false);
+       IHMSHandler handler = newRetryingHMSHandler(baseHandler, conf);
++      TServerSocket serverSocket  = null;
++
+       if (useSasl) {
+         // we are in secure mode.
+         if (useFramedTransport) {
+@@ -6396,6 +6396,8 @@ public static void startMetaStore(int port, HadoopThriftAuthBridge bridge,
+                 MetaStoreUtils.getMetaStoreSaslProperties(conf));
+         processor = saslServer.wrapProcessor(
+           new ThriftHiveMetastore.Processor<IHMSHandler>(handler));
++        serverSocket = HiveAuthUtils.getServerSocket(null, port);
++
+         LOG.info("Starting DB backed MetaStore Server in Secure Mode");
+       } else {
+         // we are in unsecure mode.
+@@ -6413,9 +6415,32 @@ public static void startMetaStore(int port, HadoopThriftAuthBridge bridge,
+           processor = new TSetIpAddressProcessor<IHMSHandler>(handler);
+           LOG.info("Starting DB backed MetaStore Server");
+         }
++
++        // enable SSL support for HMS
++        List<String> sslVersionBlacklist = new ArrayList<String>();
++        for (String sslVersion : conf.getVar(ConfVars.HIVE_SSL_PROTOCOL_BLACKLIST).split(",")) {
++          sslVersionBlacklist.add(sslVersion);
++        }
++        if (!useSSL) {
++          serverSocket = HiveAuthUtils.getServerSocket(null, port);
++        } else {
++          String keyStorePath = conf.getVar(ConfVars.HIVE_METASTORE_SSL_KEYSTORE_PATH).trim();
++          if (keyStorePath.isEmpty()) {
++            throw new IllegalArgumentException(ConfVars.HIVE_METASTORE_SSL_KEYSTORE_PASSWORD.varname
++                + " Not configured for SSL connection");
++          }
++          String keyStorePassword = ShimLoader.getHadoopShims().getPassword(conf,
++              HiveConf.ConfVars.HIVE_METASTORE_SSL_KEYSTORE_PASSWORD.varname);
++          serverSocket = HiveAuthUtils.getServerSSLSocket(null, port, keyStorePath,
++              keyStorePassword, sslVersionBlacklist);
++        }
++      }
++
++      if (tcpKeepAlive) {
++        serverSocket = new TServerSocketKeepAlive(serverSocket);
+       }
+ 
+-      TThreadPoolServer.Args args = new TThreadPoolServer.Args(serverTransport)
++      TThreadPoolServer.Args args = new TThreadPoolServer.Args(serverSocket)
+           .processor(processor)
+           .transportFactory(transFactory)
+           .protocolFactory(protocolFactory)
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+index 3bb0807..f2c00e8 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+@@ -48,6 +48,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.common.ObjectPair;
+ import org.apache.hadoop.hive.common.ValidTxnList;
++import org.apache.hadoop.hive.common.auth.HiveAuthUtils;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience.Public;
+ import org.apache.hadoop.hive.common.classification.InterfaceStability.Unstable;
+@@ -146,6 +147,7 @@
+ import org.apache.thrift.protocol.TCompactProtocol;
+ import org.apache.thrift.protocol.TProtocol;
+ import org.apache.thrift.transport.TFramedTransport;
++import org.apache.thrift.transport.TSSLTransportFactory;
+ import org.apache.thrift.transport.TSocket;
+ import org.apache.thrift.transport.TTransport;
+ import org.apache.thrift.transport.TTransportException;
+@@ -375,6 +377,7 @@ public void renamePartition(final String dbname, final String name, final List<S
+   private void open() throws MetaException {
+     isConnected = false;
+     TTransportException tte = null;
++    boolean useSSL = conf.getBoolVar(ConfVars.HIVE_METASTORE_USE_SSL);
+     boolean useSasl = conf.getBoolVar(ConfVars.METASTORE_USE_THRIFT_SASL);
+     boolean useFramedTransport = conf.getBoolVar(ConfVars.METASTORE_USE_THRIFT_FRAMED_TRANSPORT);
+     boolean useCompactProtocol = conf.getBoolVar(ConfVars.METASTORE_USE_THRIFT_COMPACT_PROTOCOL);
+@@ -384,8 +387,8 @@ private void open() throws MetaException {
+     for (int attempt = 0; !isConnected && attempt < retries; ++attempt) {
+       for (URI store : metastoreUris) {
+         LOG.info("Trying to connect to metastore with URI " + store);
++
+         try {
+-          transport = new TSocket(store.getHost(), store.getPort(), clientSocketTimeout);
+           if (useSasl) {
+             // Wrap thrift connection with SASL for secure connection.
+             try {
+@@ -400,6 +403,8 @@ private void open() throws MetaException {
+               String tokenSig = conf.get("hive.metastore.token.signature");
+               // tokenSig could be null
+               tokenStrForm = Utils.getTokenStrForm(tokenSig);
++              transport = new TSocket(store.getHost(), store.getPort(), clientSocketTimeout);
++
+               if(tokenStrForm != null) {
+                 // authenticate using delegation tokens via the "DIGEST" mechanism
+                 transport = authBridge.createClientTransport(null, store.getHost(),
+@@ -416,9 +421,35 @@ private void open() throws MetaException {
+               LOG.error("Couldn't create client transport", ioe);
+               throw new MetaException(ioe.toString());
+             }
+-          } else if (useFramedTransport) {
+-            transport = new TFramedTransport(transport);
++          } else {
++            if (useSSL) {
++              try {
++                String trustStorePath = conf.getVar(ConfVars.HIVE_METASTORE_SSL_TRUSTSTORE_PATH).trim();
++                if (trustStorePath.isEmpty()) {
++                  throw new IllegalArgumentException(ConfVars.HIVE_METASTORE_SSL_TRUSTSTORE_PATH.varname
++                      + " Not configured for SSL connection");
++                }
++                String trustStorePassword = ShimLoader.getHadoopShims().getPassword(conf,
++                    HiveConf.ConfVars.HIVE_METASTORE_SSL_TRUSTSTORE_PASSWORD.varname);
++
++                // Create an SSL socket and connect
++                transport = HiveAuthUtils.getSSLSocket(store.getHost(), store.getPort(), clientSocketTimeout, trustStorePath, trustStorePassword );
++                LOG.info("Opened an SSL connection to metastore, current connections: " + connCount.incrementAndGet());
++              } catch(IOException e) {
++                throw new IllegalArgumentException(e);
++              } catch(TTransportException e) {
++                tte = e;
++                throw new MetaException(e.toString());
++              }
++            } else {
++              transport = new TSocket(store.getHost(), store.getPort(), clientSocketTimeout);
++            }
++
++            if (useFramedTransport) {
++              transport = new TFramedTransport(transport);
++            }
+           }
++
+           final TProtocol protocol;
+           if (useCompactProtocol) {
+             protocol = new TCompactProtocol(transport);
+@@ -427,8 +458,10 @@ private void open() throws MetaException {
+           }
+           client = new ThriftHiveMetastore.Client(protocol);
+           try {
+-            transport.open();
+-            LOG.info("Opened a connection to metastore, current connections: " + connCount.incrementAndGet());
++            if (!transport.isOpen()) {
++              transport.open();
++              LOG.info("Opened a connection to metastore, current connections: " + connCount.incrementAndGet());
++            }
+             isConnected = true;
+           } catch (TTransportException e) {
+             tte = e;
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/TServerSocketKeepAlive.java b/metastore/src/java/org/apache/hadoop/hive/metastore/TServerSocketKeepAlive.java
+index 9ac18dc..95bd76e 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/TServerSocketKeepAlive.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/TServerSocketKeepAlive.java
+@@ -30,8 +30,8 @@
+  *
+  */
+ public class TServerSocketKeepAlive extends TServerSocket {
+-  public TServerSocketKeepAlive(int port) throws TTransportException {
+-    super(port, 0);
++  public TServerSocketKeepAlive(TServerSocket serverSocket) throws TTransportException {
++    super(serverSocket.getServerSocket());
+   }
+ 
+   @Override
+diff --git a/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java b/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
+index d14f95c..cc92c23 100644
+--- a/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
++++ b/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
+@@ -20,20 +20,12 @@
+ import static org.apache.hadoop.fs.CommonConfigurationKeys.HADOOP_SECURITY_AUTHENTICATION;
+ 
+ import java.io.IOException;
+-import java.net.InetSocketAddress;
+-import java.net.UnknownHostException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.HashMap;
+-import java.util.List;
+ import java.util.Map;
+-
+-import javax.net.ssl.SSLServerSocket;
+ import javax.security.auth.login.LoginException;
+ import javax.security.sasl.AuthenticationException;
+ import javax.security.sasl.Sasl;
+ 
+-import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.HiveMetaStore;
+@@ -51,11 +43,7 @@
+ import org.apache.hive.service.cli.HiveSQLException;
+ import org.apache.hive.service.cli.thrift.ThriftCLIService;
+ import org.apache.thrift.TProcessorFactory;
+-import org.apache.thrift.transport.TSSLTransportFactory;
+ import org.apache.thrift.transport.TSaslServerTransport;
+-import org.apache.thrift.transport.TServerSocket;
+-import org.apache.thrift.transport.TSocket;
+-import org.apache.thrift.transport.TTransport;
+ import org.apache.thrift.transport.TTransportException;
+ import org.apache.thrift.transport.TTransportFactory;
+ import org.slf4j.Logger;
+@@ -254,72 +242,6 @@ public static UserGroupInformation loginFromSpnegoKeytabAndReturnUGI(HiveConf hi
+     }
+   }
+ 
+-  public static TTransport getSocketTransport(String host, int port, int loginTimeout) {
+-    return new TSocket(host, port, loginTimeout);
+-  }
+-
+-  public static TTransport getSSLSocket(String host, int port, int loginTimeout)
+-    throws TTransportException {
+-    return TSSLTransportFactory.getClientSocket(host, port, loginTimeout);
+-  }
+-
+-  public static TTransport getSSLSocket(String host, int port, int loginTimeout,
+-    String trustStorePath, String trustStorePassWord) throws TTransportException {
+-    TSSLTransportFactory.TSSLTransportParameters params =
+-      new TSSLTransportFactory.TSSLTransportParameters();
+-    params.setTrustStore(trustStorePath, trustStorePassWord);
+-    params.requireClientAuth(true);
+-    return TSSLTransportFactory.getClientSocket(host, port, loginTimeout, params);
+-  }
+-
+-  public static TServerSocket getServerSocket(String hiveHost, int portNum)
+-    throws TTransportException {
+-    InetSocketAddress serverAddress;
+-    if (hiveHost == null || hiveHost.isEmpty()) {
+-      // Wildcard bind
+-      serverAddress = new InetSocketAddress(portNum);
+-    } else {
+-      serverAddress = new InetSocketAddress(hiveHost, portNum);
+-    }
+-    return new TServerSocket(serverAddress);
+-  }
+-
+-  public static TServerSocket getServerSSLSocket(String hiveHost, int portNum, String keyStorePath,
+-      String keyStorePassWord, List<String> sslVersionBlacklist) throws TTransportException,
+-      UnknownHostException {
+-    TSSLTransportFactory.TSSLTransportParameters params =
+-        new TSSLTransportFactory.TSSLTransportParameters();
+-    params.setKeyStore(keyStorePath, keyStorePassWord);
+-    InetSocketAddress serverAddress;
+-    if (hiveHost == null || hiveHost.isEmpty()) {
+-      // Wildcard bind
+-      serverAddress = new InetSocketAddress(portNum);
+-    } else {
+-      serverAddress = new InetSocketAddress(hiveHost, portNum);
+-    }
+-    TServerSocket thriftServerSocket =
+-        TSSLTransportFactory.getServerSocket(portNum, 0, serverAddress.getAddress(), params);
+-    if (thriftServerSocket.getServerSocket() instanceof SSLServerSocket) {
+-      List<String> sslVersionBlacklistLocal = new ArrayList<String>();
+-      for (String sslVersion : sslVersionBlacklist) {
+-        sslVersionBlacklistLocal.add(sslVersion.trim().toLowerCase());
+-      }
+-      SSLServerSocket sslServerSocket = (SSLServerSocket) thriftServerSocket.getServerSocket();
+-      List<String> enabledProtocols = new ArrayList<String>();
+-      for (String protocol : sslServerSocket.getEnabledProtocols()) {
+-        if (sslVersionBlacklistLocal.contains(protocol.toLowerCase())) {
+-          LOG.debug("Disabling SSL Protocol: " + protocol);
+-        } else {
+-          enabledProtocols.add(protocol);
+-        }
+-      }
+-      sslServerSocket.setEnabledProtocols(enabledProtocols.toArray(new String[0]));
+-      LOG.info("SSL Server Socket Enabled Protocols: "
+-          + Arrays.toString(sslServerSocket.getEnabledProtocols()));
+-    }
+-    return thriftServerSocket;
+-  }
+-
+   // retrieve delegation token for the given user
+   public String getDelegationToken(String owner, String renewer) throws HiveSQLException {
+     if (saslServer == null) {
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftBinaryCLIService.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftBinaryCLIService.java
+index 200d9c2..3880f22 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftBinaryCLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftBinaryCLIService.java
+@@ -25,6 +25,7 @@
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ 
++import org.apache.hadoop.hive.common.auth.HiveAuthUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+@@ -63,7 +64,7 @@ public void run() {
+         sslVersionBlacklist.add(sslVersion);
+       }
+       if (!hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_USE_SSL)) {
+-        serverSocket = HiveAuthFactory.getServerSocket(hiveHost, portNum);
++        serverSocket = HiveAuthUtils.getServerSocket(hiveHost, portNum);
+       } else {
+         String keyStorePath = hiveConf.getVar(ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PATH).trim();
+         if (keyStorePath.isEmpty()) {
+@@ -72,7 +73,7 @@ public void run() {
+         }
+         String keyStorePassword = ShimLoader.getHadoopShims().getPassword(hiveConf,
+             HiveConf.ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname);
+-        serverSocket = HiveAuthFactory.getServerSSLSocket(hiveHost, portNum, keyStorePath,
++        serverSocket = HiveAuthUtils.getServerSSLSocket(hiveHost, portNum, keyStorePath,
+             keyStorePassword, sslVersionBlacklist);
+       }
+ 
+-- 
+1.7.9.5
+

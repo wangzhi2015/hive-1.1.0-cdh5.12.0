@@ -1,0 +1,191 @@
+From 7583aa47bc3f312753056538c5ab5cd8f5fb7edd Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Fri, 6 Feb 2015 01:38:26 +0000
+Subject: [PATCH 0132/1164] HIVE-9143: select user(), current_user()
+ (Alexander Pivovarov via Jason Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1657735 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    1 +
+ .../hive/ql/udf/generic/GenericUDFCurrentUser.java |   80 ++++++++++++++++++++
+ .../test/queries/clientpositive/udf_current_user.q |    5 ++
+ .../results/clientpositive/show_functions.q.out    |    2 +
+ .../results/clientpositive/udf_current_user.q.out  |   22 ++++++
+ .../java/org/apache/hadoop/hive/shims/Utils.java   |    1 -
+ 6 files changed, 110 insertions(+), 1 deletion(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentUser.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_current_user.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_current_user.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index bfb4dc2..29fc99b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -306,6 +306,7 @@
+     registerGenericUDF("current_database", UDFCurrentDB.class);
+     registerGenericUDF("current_date", GenericUDFCurrentDate.class);
+     registerGenericUDF("current_timestamp", GenericUDFCurrentTimestamp.class);
++    registerGenericUDF("current_user", GenericUDFCurrentUser.class);
+ 
+     registerGenericUDF("isnull", GenericUDFOPNull.class);
+     registerGenericUDF("isnotnull", GenericUDFOPNotNull.class);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentUser.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentUser.java
+new file mode 100644
+index 0000000..4a1514b
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCurrentUser.java
+@@ -0,0 +1,80 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.udf.UDFType;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.io.Text;
++
++@UDFType(deterministic = true)
++@Description(name = "current_user", value = "_FUNC_() - Returns current user name", extended = "SessionState UserFromAuthenticator")
++public class GenericUDFCurrentUser extends GenericUDF {
++  protected Text currentUser;
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    if (arguments.length != 0) {
++      throw new UDFArgumentLengthException(
++          "The function CURRENT_USER does not take any arguments, but found " + arguments.length);
++    }
++
++    if (currentUser == null) {
++      String sessUserFromAuth = SessionState.getUserFromAuthenticator();
++      if (sessUserFromAuth != null) {
++        currentUser = new Text(sessUserFromAuth);
++      }
++    }
++
++    return PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    return currentUser;
++  }
++
++  public Text getCurrentUser() {
++    return currentUser;
++  }
++
++  public void setCurrentUser(Text currentUser) {
++    this.currentUser = currentUser;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return "CURRENT_USER()";
++  }
++
++  @Override
++  public void copyToNewInstance(Object newInstance) throws UDFArgumentException {
++    super.copyToNewInstance(newInstance);
++    // Need to preserve currentUser
++    GenericUDFCurrentUser other = (GenericUDFCurrentUser) newInstance;
++    if (this.currentUser != null) {
++      other.currentUser = new Text(this.currentUser);
++    }
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_current_user.q b/ql/src/test/queries/clientpositive/udf_current_user.q
+new file mode 100644
+index 0000000..f86ff10
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_current_user.q
+@@ -0,0 +1,5 @@
++DESCRIBE FUNCTION current_user;
++DESCRIBE FUNCTION EXTENDED current_user;
++
++select current_user()
++FROM src tablesample (1 rows);
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index e21b54b..d79106f 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -54,6 +54,7 @@ cume_dist
+ current_database
+ current_date
+ current_timestamp
++current_user
+ date_add
+ date_sub
+ datediff
+@@ -232,6 +233,7 @@ cume_dist
+ current_database
+ current_date
+ current_timestamp
++current_user
+ PREHOOK: query: SHOW FUNCTIONS '.*e$'
+ PREHOOK: type: SHOWFUNCTIONS
+ POSTHOOK: query: SHOW FUNCTIONS '.*e$'
+diff --git a/ql/src/test/results/clientpositive/udf_current_user.q.out b/ql/src/test/results/clientpositive/udf_current_user.q.out
+new file mode 100644
+index 0000000..8262462
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_current_user.q.out
+@@ -0,0 +1,22 @@
++PREHOOK: query: DESCRIBE FUNCTION current_user
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION current_user
++POSTHOOK: type: DESCFUNCTION
++current_user() - Returns current user name
++PREHOOK: query: DESCRIBE FUNCTION EXTENDED current_user
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION EXTENDED current_user
++POSTHOOK: type: DESCFUNCTION
++current_user() - Returns current user name
++SessionState UserFromAuthenticator
++PREHOOK: query: select current_user()
++FROM src tablesample (1 rows)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select current_user()
++FROM src tablesample (1 rows)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++hive_test_user
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/Utils.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/Utils.java
+index c851dc2..b898343 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/Utils.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/Utils.java
+@@ -26,7 +26,6 @@
+ import javax.security.auth.login.LoginException;
+ import javax.security.auth.login.AppConfigurationEntry.LoginModuleControlFlag;
+ 
+-import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.thrift.DelegationTokenIdentifier;
+ import org.apache.hadoop.hive.thrift.DelegationTokenSelector;
+ import org.apache.hadoop.io.Text;
+-- 
+1.7.9.5
+

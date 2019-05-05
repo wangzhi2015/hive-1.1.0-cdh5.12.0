@@ -1,0 +1,150 @@
+From 27f1bcc74134340a1d0f363f7899555f96c98c48 Mon Sep 17 00:00:00 2001
+From: Rui Li <rui.li@intel.com>
+Date: Wed, 24 Jun 2015 15:58:55 +0800
+Subject: [PATCH 0397/1164] CDH-34679: HIVE-10999: Upgrade Spark dependency to
+ 1.4 [Spark Branch] (Rui reviewed by Chengxiang &
+ Xuefu)
+
+Conflicts:
+	pom.xml
+	ql/pom.xml
+
+Change-Id: I0cfaa92c42f7556cfce6a3a0a675b619085e9a75
+---
+ ql/pom.xml                                         |    5 +++++
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |    1 +
+ .../hadoop/hive/ql/exec/spark/KryoSerializer.java  |    4 ++++
+ .../hive/ql/exec/spark/RemoteHiveSparkClient.java  |    1 +
+ spark-client/pom.xml                               |    5 +++++
+ .../hive/spark/client/SparkClientUtilities.java    |   13 ++++++++-----
+ .../apache/hive/spark/client/TestSparkClient.java  |    4 ++--
+ 7 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/ql/pom.xml b/ql/pom.xml
+index 8cc45cb..4c1ed9e 100644
+--- a/ql/pom.xml
++++ b/ql/pom.xml
+@@ -470,6 +470,11 @@
+       <version>${hadoop-23.version}</version>
+       <optional>true</optional>
+     </dependency>
++    <dependency>
++      <groupId>com.sun.jersey</groupId>
++      <artifactId>jersey-servlet</artifactId>
++      <scope>test</scope>
++    </dependency>
+   </dependencies>
+ 
+   <profiles>
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index ccfb874..bf3c0be 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -377,6 +377,7 @@ private static BaseWork getBaseWork(Configuration conf, String name) {
+           ClassLoader loader = Thread.currentThread().getContextClassLoader();
+           ClassLoader newLoader = addToClassPath(loader, addedJars.split(";"));
+           Thread.currentThread().setContextClassLoader(newLoader);
++          runtimeSerializationKryo.get().setClassLoader(newLoader);
+         }
+       }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java
+index ff9fb85..f1d7368 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/KryoSerializer.java
+@@ -80,4 +80,8 @@ public static JobConf deserializeJobConf(byte[] buffer) {
+     return conf;
+   }
+ 
++  public static void setClassLoader(ClassLoader classLoader) {
++    Utilities.sparkSerializationKryo.get().setClassLoader(classLoader);
++  }
++
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+index 2ef8163..2e8d1d3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+@@ -298,6 +298,7 @@ public Serializable call(JobContext jc) throws Exception {
+       Set<String> addedJars = jc.getAddedJars();
+       if (addedJars != null && !addedJars.isEmpty()) {
+         SparkClientUtilities.addToClassPath(addedJars, localJobConf, jc.getLocalTmpDir());
++        KryoSerializer.setClassLoader(Thread.currentThread().getContextClassLoader());
+         localJobConf.set(Utilities.HIVE_ADDED_JARS, StringUtils.join(addedJars, ";"));
+       }
+ 
+diff --git a/spark-client/pom.xml b/spark-client/pom.xml
+index 9a1caa9..aa0d80c 100644
+--- a/spark-client/pom.xml
++++ b/spark-client/pom.xml
+@@ -69,6 +69,11 @@
+       <artifactId>mockito-all</artifactId>
+       <scope>test</scope>
+     </dependency>
++    <dependency>
++      <groupId>com.sun.jersey</groupId>
++      <artifactId>jersey-servlet</artifactId>
++      <scope>test</scope>
++    </dependency>
+   </dependencies>
+ 
+   <build>
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java
+index b079ee2..589436d 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java
+@@ -43,21 +43,24 @@
+    */
+   public static void addToClassPath(Set<String> newPaths, Configuration conf, File localTmpDir)
+       throws Exception {
+-    ClassLoader cloader = Thread.currentThread().getContextClassLoader();
+-    URLClassLoader loader = (URLClassLoader) cloader;
++    URLClassLoader loader = (URLClassLoader) Thread.currentThread().getContextClassLoader();
+     List<URL> curPath = Lists.newArrayList(loader.getURLs());
+ 
++    boolean newPathAdded = false;
+     for (String newPath : newPaths) {
+       URL newUrl = urlFromPathString(newPath, conf, localTmpDir);
+       if (newUrl != null && !curPath.contains(newUrl)) {
+         curPath.add(newUrl);
+         LOG.info("Added jar[" + newUrl + "] to classpath.");
++        newPathAdded = true;
+       }
+     }
+ 
+-    URLClassLoader newLoader =
+-        new URLClassLoader(curPath.toArray(new URL[curPath.size()]), loader);
+-    Thread.currentThread().setContextClassLoader(newLoader);
++    if (newPathAdded) {
++      URLClassLoader newLoader =
++          new URLClassLoader(curPath.toArray(new URL[curPath.size()]), loader);
++      Thread.currentThread().setContextClassLoader(newLoader);
++    }
+   }
+ 
+   /**
+diff --git a/spark-client/src/test/java/org/apache/hive/spark/client/TestSparkClient.java b/spark-client/src/test/java/org/apache/hive/spark/client/TestSparkClient.java
+index ebf9d99..0020c20 100644
+--- a/spark-client/src/test/java/org/apache/hive/spark/client/TestSparkClient.java
++++ b/spark-client/src/test/java/org/apache/hive/spark/client/TestSparkClient.java
+@@ -168,7 +168,7 @@ public void call(SparkClient client) throws Exception {
+         future.get(TIMEOUT, TimeUnit.SECONDS);
+         MetricsCollection metrics = future.getMetrics();
+         assertEquals(1, metrics.getJobIds().size());
+-        assertTrue(metrics.getAllMetrics().executorRunTime > 0L);
++        assertTrue(metrics.getAllMetrics().executorRunTime >= 0L);
+         verify(listener).onSparkJobStarted(same(future),
+           eq(metrics.getJobIds().iterator().next()));
+ 
+@@ -179,7 +179,7 @@ public void call(SparkClient client) throws Exception {
+         MetricsCollection metrics2 = future2.getMetrics();
+         assertEquals(1, metrics2.getJobIds().size());
+         assertFalse(Objects.equal(metrics.getJobIds(), metrics2.getJobIds()));
+-        assertTrue(metrics2.getAllMetrics().executorRunTime > 0L);
++        assertTrue(metrics2.getAllMetrics().executorRunTime >= 0L);
+         verify(listener2).onSparkJobStarted(same(future2),
+           eq(metrics2.getJobIds().iterator().next()));
+       }
+-- 
+1.7.9.5
+

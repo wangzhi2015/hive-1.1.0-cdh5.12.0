@@ -1,0 +1,2244 @@
+From de400114a288aea58c52ed163512848d66793c7b Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Tue, 4 Apr 2017 09:42:06 -0500
+Subject: [PATCH 1059/1164] HIVE-16164: Provide mechanism for passing HMS
+ notification ID between transactional and
+ non-transactional listeners. (Sergio Pena,
+ reviewed by Mohit Sabharwal, Alexander Kolbasov)
+
+Change-Id: Id436b6707e2b4c8c0562efa9003115b24230cd9b
+---
+ .../hcatalog/listener/DbNotificationListener.java  |   45 +-
+ .../listener/MetaStoreEventListenerConstants.java  |   33 ++
+ .../listener/TestDbNotificationListener.java       |  215 ++++++++-
+ .../hadoop/hive/metastore/HiveAlterHandler.java    |   52 +-
+ .../hadoop/hive/metastore/HiveMetaStore.java       |  507 +++++++++++---------
+ .../hive/metastore/MetaStoreListenerNotifier.java  |  224 +++++++++
+ .../hive/metastore/events/ListenerEvent.java       |  106 ++++
+ .../hive/metastore/messaging/EventMessage.java     |  106 ++++
+ .../hive/metastore/messaging/MessageFactory.java   |   42 ++
+ .../hadoop/hive/metastore/TestObjectStore.java     |   50 ++
+ 10 files changed, 1107 insertions(+), 273 deletions(-)
+ create mode 100644 hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/MetaStoreEventListenerConstants.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreListenerNotifier.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/messaging/EventMessage.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/messaging/MessageFactory.java
+
+diff --git a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
+index 9718944..e6bdf28 100644
+--- a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
++++ b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
+@@ -50,6 +50,7 @@
+ import org.apache.hadoop.hive.metastore.events.LoadPartitionDoneEvent;
+ import org.apache.hive.hcatalog.common.HCatConstants;
+ import org.apache.hive.hcatalog.messaging.MessageFactory;
++import org.apache.hadoop.hive.metastore.events.ListenerEvent;
+ 
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -121,7 +122,7 @@ public void onCreateTable (CreateTableEvent tableEvent) throws MetaException {
+         HCatConstants.HCAT_CREATE_TABLE_EVENT, msgFactory.buildCreateTableMessage(t).toString());
+     event.setDbName(t.getDbName());
+     event.setTableName(t.getTableName());
+-    enqueue(event);
++    enqueue(event, tableEvent);
+   }
+ 
+   /**
+@@ -134,7 +135,7 @@ public void onDropTable (DropTableEvent tableEvent)  throws MetaException {
+         HCatConstants.HCAT_DROP_TABLE_EVENT, msgFactory.buildDropTableMessage(t).toString());
+     event.setDbName(t.getDbName());
+     event.setTableName(t.getTableName());
+-    enqueue(event);
++    enqueue(event, tableEvent);
+   }
+ 
+   /**
+@@ -149,7 +150,7 @@ public void onAlterTable (AlterTableEvent tableEvent) throws MetaException {
+         msgFactory.buildAlterTableMessage(before, after).toString());
+     event.setDbName(after.getDbName());
+     event.setTableName(after.getTableName());
+-    enqueue(event);
++    enqueue(event, tableEvent);
+   }
+ 
+   /**
+@@ -164,7 +165,7 @@ public void onAddPartition (AddPartitionEvent partitionEvent)
+         msgFactory.buildAddPartitionMessage(t, partitionEvent.getPartitions()).toString());
+     event.setDbName(t.getDbName());
+     event.setTableName(t.getTableName());
+-    enqueue(event);
++    enqueue(event, partitionEvent);
+   }
+ 
+   /**
+@@ -178,7 +179,7 @@ public void onDropPartition (DropPartitionEvent partitionEvent)  throws MetaExce
+         msgFactory.buildDropPartitionMessage(t, partitionEvent.getPartition()).toString());
+     event.setDbName(t.getDbName());
+     event.setTableName(t.getTableName());
+-    enqueue(event);
++    enqueue(event, partitionEvent);
+   }
+ 
+   /**
+@@ -193,7 +194,7 @@ public void onAlterPartition (AlterPartitionEvent partitionEvent)  throws MetaEx
+         msgFactory.buildAlterPartitionMessage(partitionEvent.getTable(),before, after).toString());
+       event.setDbName(before.getDbName());
+       event.setTableName(before.getTableName());
+-      enqueue(event);
++      enqueue(event, partitionEvent);
+   }
+ 
+   /**
+@@ -206,7 +207,7 @@ public void onCreateDatabase (CreateDatabaseEvent dbEvent) throws MetaException
+         HCatConstants.HCAT_CREATE_DATABASE_EVENT,
+         msgFactory.buildCreateDatabaseMessage(db).toString());
+     event.setDbName(db.getName());
+-    enqueue(event);
++    enqueue(event, dbEvent);
+   }
+ 
+   /**
+@@ -219,7 +220,7 @@ public void onDropDatabase (DropDatabaseEvent dbEvent) throws MetaException {
+         HCatConstants.HCAT_DROP_DATABASE_EVENT,
+         msgFactory.buildDropDatabaseMessage(db).toString());
+     event.setDbName(db.getName());
+-    enqueue(event);
++    enqueue(event, dbEvent);
+   }
+ 
+   /**
+@@ -232,7 +233,7 @@ public void onCreateFunction (CreateFunctionEvent fnEvent) throws MetaException
+         HCatConstants.HCAT_CREATE_FUNCTION_EVENT,
+         msgFactory.buildCreateFunctionMessage(fn).toString());
+     event.setDbName(fn.getDbName());
+-    enqueue(event);
++    enqueue(event, fnEvent);
+   }
+ 
+   /**
+@@ -245,7 +246,7 @@ public void onDropFunction (DropFunctionEvent fnEvent) throws MetaException {
+         HCatConstants.HCAT_DROP_FUNCTION_EVENT,
+         msgFactory.buildDropFunctionMessage(fn).toString());
+     event.setDbName(fn.getDbName());
+-    enqueue(event);
++    enqueue(event, fnEvent);
+   }
+ 
+   /**
+@@ -258,7 +259,7 @@ public void onAddIndex (AddIndexEvent indexEvent) throws MetaException {
+         HCatConstants.HCAT_CREATE_INDEX_EVENT,
+         msgFactory.buildCreateIndexMessage(index).toString());
+     event.setDbName(index.getDbName());
+-    enqueue(event);
++    enqueue(event, indexEvent);
+   }
+ 
+   /**
+@@ -271,7 +272,7 @@ public void onDropIndex (DropIndexEvent indexEvent) throws MetaException {
+         HCatConstants.HCAT_DROP_INDEX_EVENT,
+         msgFactory.buildDropIndexMessage(index).toString());
+     event.setDbName(index.getDbName());
+-    enqueue(event);
++    enqueue(event, indexEvent);
+   }
+ 
+   /**
+@@ -285,7 +286,7 @@ public void onAlterIndex (AlterIndexEvent indexEvent)  throws MetaException {
+         HCatConstants.HCAT_ALTER_INDEX_EVENT,
+         msgFactory.buildAlterIndexMessage(before, after).toString());
+     event.setDbName(before.getDbName());
+-    enqueue(event);
++    enqueue(event, indexEvent);
+   }
+ 
+   @Override
+@@ -295,7 +296,7 @@ public void onInsert(InsertEvent insertEvent) throws MetaException {
+             insertEvent.getPartitionKeyValues(), insertEvent.getFiles()).toString());
+     event.setDbName(insertEvent.getDb());
+     event.setTableName(insertEvent.getTable());
+-    enqueue(event);
++    enqueue(event, insertEvent);
+   }
+ 
+   /**
+@@ -319,12 +320,26 @@ private int now() {
+     return (int)millis;
+   }
+ 
+-  private void enqueue(NotificationEvent event) {
++  /**
++   * Process this notification by adding it to metastore DB.
++   *
++   * @param event NotificationEvent is the object written to the metastore DB.
++   * @param listenerEvent ListenerEvent (from which NotificationEvent was based) used only to set the
++   *                      DB_NOTIFICATION_EVENT_ID_KEY_NAME for future reference by other listeners.
++   */
++  private void enqueue(NotificationEvent event, ListenerEvent listenerEvent) {
+     synchronized(NOTIFICATION_TBL_LOCK) {
+       LOG.debug("DbNotificationListener: Processing : " + event.getEventId() +
+           " : " + event.getMessage());
+       HiveMetaStore.HMSHandler.getRawStore().addNotificationEvent(event);
+     }
++
++      // Set the DB_NOTIFICATION_EVENT_ID for future reference by other listeners.
++      if (event.isSetEventId()) {
++        listenerEvent.putParameter(
++            MetaStoreEventListenerConstants.DB_NOTIFICATION_EVENT_ID_KEY_NAME,
++            Long.toString(event.getEventId()));
++      }
+   }
+ 
+   private static class CleanerThread extends Thread {
+diff --git a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/MetaStoreEventListenerConstants.java b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/MetaStoreEventListenerConstants.java
+new file mode 100644
+index 0000000..a4f2d59
+--- /dev/null
++++ b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/MetaStoreEventListenerConstants.java
+@@ -0,0 +1,33 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.hcatalog.listener;
++
++/**
++ * Keeps a list of reserved keys used by Hive listeners when updating the ListenerEvent
++ * parameters.
++ */
++public class MetaStoreEventListenerConstants {
++  /*
++   * DbNotificationListener keys reserved for updating ListenerEvent parameters.
++   *
++   * DB_NOTIFICATION_EVENT_ID_KEY_NAME This key will have the event identifier that DbNotificationListener
++   *                                   processed during an event. This event identifier might be shared
++   *                                   across other MetaStoreEventListener implementations.
++   */
++  public static final String DB_NOTIFICATION_EVENT_ID_KEY_NAME = "DB_NOTIFICATION_EVENT_ID_KEY_NAME";
++}
+\ No newline at end of file
+diff --git a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+index 44d2c4d..5977845 100644
+--- a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
++++ b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+@@ -19,9 +19,16 @@
+ package org.apache.hive.hcatalog.listener;
+ 
+ import static junit.framework.Assert.assertEquals;
+-import static junit.framework.Assert.assertNull;
+-import static junit.framework.Assert.assertTrue;
+-import static junit.framework.Assert.fail;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Stack;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -32,6 +39,7 @@
+ import org.apache.hadoop.hive.metastore.api.PrincipalType;
+ import org.apache.hadoop.hive.metastore.api.ResourceType;
+ import org.apache.hadoop.hive.metastore.api.ResourceUri;
++import org.apache.hive.hcatalog.messaging.*;
+ import org.apache.htrace.fasterxml.jackson.core.JsonFactory;
+ import org.apache.htrace.fasterxml.jackson.core.JsonParser;
+ import org.apache.htrace.fasterxml.jackson.databind.JsonNode;
+@@ -40,16 +48,18 @@
+ import org.apache.thrift.TDeserializer;
+ import org.apache.thrift.protocol.TJSONProtocol;
+ import com.google.common.collect.ImmutableMap;
+-import com.google.common.collect.Lists;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.cli.CliSessionState;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
++import org.apache.hadoop.hive.metastore.MetaStoreEventListener;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.metastore.api.FireEventRequest;
+ import org.apache.hadoop.hive.metastore.api.FireEventRequestData;
+ import org.apache.hadoop.hive.metastore.api.InsertEventRequestData;
++import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.api.NotificationEvent;
+ import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+@@ -59,16 +69,28 @@
+ import org.apache.hadoop.hive.ql.Driver;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hive.hcatalog.common.HCatConstants;
++import org.apache.hadoop.hive.metastore.events.AddIndexEvent;
++import org.apache.hadoop.hive.metastore.events.AddPartitionEvent;
++import org.apache.hadoop.hive.metastore.events.AlterIndexEvent;
++import org.apache.hadoop.hive.metastore.events.AlterPartitionEvent;
++import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
++import org.apache.hadoop.hive.metastore.events.CreateDatabaseEvent;
++import org.apache.hadoop.hive.metastore.events.CreateFunctionEvent;
++import org.apache.hadoop.hive.metastore.events.CreateTableEvent;
++import org.apache.hadoop.hive.metastore.events.DropDatabaseEvent;
++import org.apache.hadoop.hive.metastore.events.DropFunctionEvent;
++import org.apache.hadoop.hive.metastore.events.DropIndexEvent;
++import org.apache.hadoop.hive.metastore.events.DropPartitionEvent;
++import org.apache.hadoop.hive.metastore.events.DropTableEvent;
++import org.apache.hadoop.hive.metastore.events.InsertEvent;
++import org.apache.hadoop.hive.metastore.events.ListenerEvent;
++import org.apache.hadoop.hive.metastore.messaging.EventMessage.EventType;
++import org.apache.hive.hcatalog.data.Pair;
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.HashMap;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
+ 
+ public class TestDbNotificationListener {
+   private static final Log LOG = LogFactory.getLog(TestDbNotificationListener.class.getName());
+@@ -76,15 +98,110 @@
+   private static Map<String, String> emptyParameters = new HashMap<String, String>();
+   private static IMetaStoreClient msClient;
+   private static Driver driver;
++  private static MessageDeserializer md = null;
+   private int startTime;
+   private long firstEventId;
+ 
++  /* This class is used to verify that HiveMetaStore calls the non-transactional listeners with the
++    * current event ID set by the DbNotificationListener class */
++  public static class MockMetaStoreEventListener extends MetaStoreEventListener {
++    private static Stack<Pair<EventType, String>> eventsIds = new Stack<>();
++
++    private static void pushEventId(EventType eventType, final ListenerEvent event) {
++      if (event.getStatus()) {
++        Map<String, String> parameters = event.getParameters();
++        if (parameters.containsKey(MetaStoreEventListenerConstants.DB_NOTIFICATION_EVENT_ID_KEY_NAME)) {
++          Pair<EventType, String> pair =
++              new Pair<>(eventType, parameters.get(MetaStoreEventListenerConstants.DB_NOTIFICATION_EVENT_ID_KEY_NAME));
++          eventsIds.push(pair);
++        }
++      }
++    }
++
++    public static void popAndVerifyLastEventId(EventType eventType, long id) {
++      if (!eventsIds.isEmpty()) {
++        Pair<EventType, String> pair = eventsIds.pop();
++
++        assertEquals("Last event type does not match.", eventType, pair.first);
++        assertEquals("Last event ID does not match.", Long.toString(id), pair.second);
++      } else {
++        assertTrue("List of events is empty.",false);
++      }
++    }
++
++    public static void clearEvents() {
++      eventsIds.clear();
++    }
++
++    public MockMetaStoreEventListener(Configuration config) {
++      super(config);
++    }
++
++    public void onCreateTable (CreateTableEvent tableEvent) throws MetaException {
++      pushEventId(EventType.CREATE_TABLE, tableEvent);
++    }
++
++    public void onDropTable (DropTableEvent tableEvent)  throws MetaException {
++      pushEventId(EventType.DROP_TABLE, tableEvent);
++    }
++
++    public void onAlterTable (AlterTableEvent tableEvent) throws MetaException {
++      pushEventId(EventType.ALTER_TABLE, tableEvent);
++    }
++
++    public void onAddPartition (AddPartitionEvent partitionEvent) throws MetaException {
++      pushEventId(EventType.ADD_PARTITION, partitionEvent);
++    }
++
++    public void onDropPartition (DropPartitionEvent partitionEvent)  throws MetaException {
++      pushEventId(EventType.DROP_PARTITION, partitionEvent);
++    }
++
++    public void onAlterPartition (AlterPartitionEvent partitionEvent)  throws MetaException {
++      pushEventId(EventType.ALTER_PARTITION, partitionEvent);
++    }
++
++    public void onCreateDatabase (CreateDatabaseEvent dbEvent) throws MetaException {
++      pushEventId(EventType.CREATE_DATABASE, dbEvent);
++    }
++
++    public void onDropDatabase (DropDatabaseEvent dbEvent) throws MetaException {
++      pushEventId(EventType.DROP_DATABASE, dbEvent);
++    }
++
++    public void onAddIndex(AddIndexEvent indexEvent) throws MetaException {
++      pushEventId(EventType.CREATE_INDEX, indexEvent);
++    }
++
++    public void onDropIndex(DropIndexEvent indexEvent) throws MetaException {
++      pushEventId(EventType.DROP_INDEX, indexEvent);
++    }
++
++    public void onAlterIndex(AlterIndexEvent indexEvent) throws MetaException {
++      pushEventId(EventType.ALTER_INDEX, indexEvent);
++    }
++
++    public void onCreateFunction (CreateFunctionEvent fnEvent) throws MetaException {
++      pushEventId(EventType.CREATE_FUNCTION, fnEvent);
++    }
++
++    public void onDropFunction (DropFunctionEvent fnEvent) throws MetaException {
++      pushEventId(EventType.DROP_FUNCTION, fnEvent);
++    }
++
++    public void onInsert(InsertEvent insertEvent) throws MetaException {
++      pushEventId(EventType.INSERT, insertEvent);
++    }
++  }
++
++  @SuppressWarnings("rawtypes")
+   @BeforeClass
+   public static void connectToMetastore() throws Exception {
+     HiveConf conf = new HiveConf();
+     conf.setVar(HiveConf.ConfVars.METASTORE_TRANSACTIONAL_EVENT_LISTENERS,
+         DbNotificationListener.class.getName());
+-    conf.setVar(HiveConf.ConfVars.METASTORE_EVENT_DB_LISTENER_TTL, String.valueOf(EVENTS_TTL)+"s");
++    conf.setVar(HiveConf.ConfVars.METASTORE_EVENT_LISTENERS, MockMetaStoreEventListener.class.getName());
++    conf.setVar(HiveConf.ConfVars.METASTORE_EVENT_DB_LISTENER_TTL, String.valueOf(EVENTS_TTL) + "s");
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+     conf.setBoolVar(HiveConf.ConfVars.FIRE_EVENTS_FOR_DML, true);
+     conf.setVar(HiveConf.ConfVars.DYNAMICPARTITIONINGMODE, "nonstrict");
+@@ -93,6 +210,7 @@ public static void connectToMetastore() throws Exception {
+     SessionState.start(new CliSessionState(conf));
+     msClient = new HiveMetaStoreClient(conf);
+     driver = new Driver(conf);
++    md = MessageFactory.getInstance().getDeserializer();
+   }
+ 
+   @Before
+@@ -105,6 +223,12 @@ public void setup() throws Exception {
+     DummyRawStoreFailEvent.setEventSucceed(true);
+   }
+ 
++  @After
++  public void tearDown() {
++    MockMetaStoreEventListener.clearEvents();
++  }
++
++
+   @Test
+   public void createDatabase() throws Exception {
+     Database db = new Database("mydb", "no description", "file:/tmp", emptyParameters);
+@@ -122,6 +246,9 @@ public void createDatabase() throws Exception {
+     assertTrue(event.getMessage().matches("\\{\"eventType\":\"CREATE_DATABASE\",\"server\":\"\"," +
+         "\"servicePrincipal\":\"\",\"db\":\"mydb\",\"timestamp\":[0-9]+}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_DATABASE, firstEventId + 1);
++
+     DummyRawStoreFailEvent.setEventSucceed(false);
+     db = new Database("mydb2", "no description", "file:/tmp", emptyParameters);
+     try {
+@@ -152,6 +279,10 @@ public void dropDatabase() throws Exception {
+     assertTrue(event.getMessage().matches("\\{\"eventType\":\"DROP_DATABASE\",\"server\":\"\"," +
+         "\"servicePrincipal\":\"\",\"db\":\"dropdb\",\"timestamp\":[0-9]+}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.DROP_DATABASE, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_DATABASE, firstEventId + 1);
++
+     db = new Database("dropdb", "no description", "file:/tmp", emptyParameters);
+     msClient.createDatabase(db);
+     DummyRawStoreFailEvent.setEventSucceed(false);
+@@ -188,6 +319,9 @@ public void createTable() throws Exception {
+     assertTrue(event.getMessage().matches("\\{\"eventType\":\"CREATE_TABLE\",\"server\":\"\"," +
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":\"mytable\",\"timestamp\":[0-9]+}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     table = new Table("mytable2", "default", "me", startTime, startTime, 0, sd, null,
+         emptyParameters, null, null, null);
+     DummyRawStoreFailEvent.setEventSucceed(false);
+@@ -230,6 +364,9 @@ public void alterTable() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":\"alttable\"," +
+         "\"timestamp\":[0-9]+}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     DummyRawStoreFailEvent.setEventSucceed(false);
+     try {
+       msClient.alter_table("default", "alttable", table);
+@@ -266,6 +403,10 @@ public void dropTable() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
+         "\"droptable\",\"timestamp\":[0-9]+}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.DROP_TABLE, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     table = new Table("droptable2", "default", "me", startTime, startTime, 0, sd, null,
+         emptyParameters, null, null, null);
+     msClient.createTable(table);
+@@ -310,6 +451,10 @@ public void addPartition() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
+         "\"addparttable\",\"timestamp\":[0-9]+,\"partitions\":\\[\\{\"ds\":\"today\"}]}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ADD_PARTITION, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     partition = new Partition(Arrays.asList("tomorrow"), "default", "tableDoesNotExist",
+         startTime, startTime, sd, emptyParameters);
+     DummyRawStoreFailEvent.setEventSucceed(false);
+@@ -357,6 +502,10 @@ public void alterPartition() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":\"alterparttable\"," +
+         "\"timestamp\":[0-9]+,\"keyValues\":\\{\"ds\":\"today\"}}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ADD_PARTITION, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     DummyRawStoreFailEvent.setEventSucceed(false);
+     try {
+       msClient.alter_partition("default", "alterparttable", newPart);
+@@ -400,6 +549,11 @@ public void dropPartition() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
+         "\"dropparttable\",\"timestamp\":[0-9]+,\"partitions\":\\[\\{\"ds\":\"today\"}]}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.DROP_PARTITION, firstEventId + 3);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ADD_PARTITION, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     partition = new Partition(Arrays.asList("tomorrow"), "default", "dropPartTable",
+         startTime, startTime, sd, emptyParameters);
+       msClient.add_partition(partition);
+@@ -480,6 +634,12 @@ public void exchangePartition() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
+         "\"tab1\",\"timestamp\":[0-9]+,\"partitions\":\\[\\{\"part\":\"1\"}]}"));
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.DROP_PARTITION, firstEventId + 5);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ADD_PARTITION, firstEventId + 4);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ADD_PARTITION, firstEventId + 3);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
+   }
+ 
+   @Test
+@@ -510,6 +670,9 @@ public void createFunction() throws Exception {
+     assertEquals(ResourceType.JAR, funcObj.getResourceUris().get(0).getResourceType());
+     assertEquals(funcResource, funcObj.getResourceUris().get(0).getUri());
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_FUNCTION, firstEventId + 1);
++
+     DummyRawStoreFailEvent.setEventSucceed(false);
+     func = new Function("createFunction2", dbName, "o.a.h.h.myfunc2", "me", PrincipalType.USER,
+         startTime, FunctionType.JAVA, Arrays.asList(new ResourceUri(ResourceType.JAR,
+@@ -553,6 +716,10 @@ public void dropFunction() throws Exception {
+     assertEquals(ResourceType.JAR, funcObj.getResourceUris().get(0).getResourceType());
+     assertEquals(funcResource, funcObj.getResourceUris().get(0).getUri());
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.DROP_FUNCTION, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_FUNCTION, firstEventId + 1);
++
+     func = new Function("dropfunctiontest2", dbName, "o.a.h.h.dropFunctionTest2", "me",
+         PrincipalType.USER,  startTime, FunctionType.JAVA, Arrays.asList(
+         new ResourceUri(ResourceType.JAR, "file:/tmp/somewhere2")));
+@@ -603,6 +770,11 @@ public void createIndex() throws Exception {
+     assertEquals(tableName, indexObj.getOrigTableName());
+     assertEquals(indexTableName, indexObj.getIndexTableName());
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_INDEX, firstEventId + 3);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     DummyRawStoreFailEvent.setEventSucceed(false);
+     index = new Index("createIndexTable2", null, "default", tableName, startTime, startTime,
+         "createIndexTable2__createIndexTable2__", sd, emptyParameters, false);
+@@ -654,6 +826,12 @@ public void dropIndex() throws Exception {
+     assertEquals(tableName.toLowerCase(), indexObj.getOrigTableName());
+     assertEquals(indexTableName.toLowerCase(), indexObj.getIndexTableName());
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.DROP_INDEX, firstEventId + 4);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_INDEX, firstEventId + 3);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     index = new Index("dropIndexTable2", null, "default", tableName, startTime, startTime,
+         "dropIndexTable__dropIndexTable2__", sd, emptyParameters, false);
+     Table indexTable2 = new Table("dropIndexTable__dropIndexTable2__", dbName, "me", startTime,
+@@ -709,6 +887,12 @@ public void alterIndex() throws Exception {
+     assertEquals(indexTableName, indexObj.getIndexTableName());
+     assertTrue(indexObj.getCreateTime() < indexObj.getLastAccessTime());
+ 
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ALTER_INDEX, firstEventId + 4);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_INDEX, firstEventId + 3);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
++
+     DummyRawStoreFailEvent.setEventSucceed(false);
+     try {
+       msClient.alter_index(dbName, tableName, indexName, newIndex);
+@@ -754,6 +938,10 @@ public void insertTable() throws Exception {
+         "\"servicePrincipal\":\"\",\"db\":\"default\",\"table\":" +
+         "\"insertTable\",\"timestamp\":[0-9]+,\"files\":\\[\"/warehouse/mytable/b1\"]," +
+         "\"partKeyVals\":\\{},\"partitionKeyValues\":\\{}}"));
++
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.INSERT, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
+   }
+ 
+   @Test
+@@ -797,6 +985,11 @@ public void insertPartition() throws Exception {
+         "\"insertPartition\",\"timestamp\":[0-9]+," +
+         "\"files\":\\[\"/warehouse/mytable/today/b1\"],\"partKeyVals\":\\{\"ds\":\"today\"}," +
+         "\"partitionKeyValues\":\\{\"ds\":\"today\"}}"));
++
++    // Verify the eventID was passed to the non-transactional listener
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.INSERT, firstEventId + 3);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.ADD_PARTITION, firstEventId + 2);
++    MockMetaStoreEventListener.popAndVerifyLastEventId(EventType.CREATE_TABLE, firstEventId + 1);
+   }
+ 
+   @Test
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java
+index 245ab56..afa8d41 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java
+@@ -29,6 +29,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.metastore.events.AlterPartitionEvent;
+ import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
++import org.apache.hadoop.hive.metastore.messaging.EventMessage;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -245,11 +246,10 @@ public void alterTable(RawStore msdb, Warehouse wh, String dbname,
+       }
+ 
+       alterTableUpdateTableColumnStats(msdb, oldt, newt);
+-      if (transactionalListeners != null && transactionalListeners.size() > 0) {
+-        AlterTableEvent alterTableEvent = new AlterTableEvent(oldt, newt, true, handler);
+-        for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-          transactionalListener.onAlterTable(alterTableEvent);
+-        }
++      if (transactionalListeners != null && !transactionalListeners.isEmpty()) {
++        MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                              EventMessage.EventType.ALTER_TABLE,
++                                              new AlterTableEvent(oldt, newt, true, handler));
+       }
+       // commit the changes
+       success = msdb.commitTransaction();
+@@ -381,12 +381,12 @@ public Partition alterPartition(final RawStore msdb, Warehouse wh, final String
+ 
+         updatePartColumnStats(msdb, dbname, name, new_part.getValues(), new_part);
+         msdb.alterPartition(dbname, name, new_part.getValues(), new_part);
+-        if (transactionalListeners != null && transactionalListeners.size() > 0) {
+-          AlterPartitionEvent alterPartitionEvent =
+-              new AlterPartitionEvent(oldPart, new_part, tbl, true, handler);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onAlterPartition(alterPartitionEvent);
+-          }
++        if (transactionalListeners != null && !transactionalListeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                EventMessage.EventType.ALTER_PARTITION,
++                                                new AlterPartitionEvent(oldPart, new_part, tbl, true, handler));
++
++
+         }
+         success = msdb.commitTransaction();
+       } catch (InvalidObjectException e) {
+@@ -500,12 +500,10 @@ public Partition alterPartition(final RawStore msdb, Warehouse wh, final String
+         }
+       }
+ 
+-      if (transactionalListeners != null && transactionalListeners.size() > 0) {
+-        AlterPartitionEvent alterPartitionEvent =
+-            new AlterPartitionEvent(oldPart, new_part, tbl, true, handler);
+-        for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-          transactionalListener.onAlterPartition(alterPartitionEvent);
+-        }
++      if (transactionalListeners != null && !transactionalListeners.isEmpty()) {
++        MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                              EventMessage.EventType.ALTER_PARTITION,
++                                              new AlterPartitionEvent(oldPart, new_part, tbl, true, handler));
+       }
+ 
+       success = msdb.commitTransaction();
+@@ -534,12 +532,10 @@ public Partition alterPartition(final RawStore msdb, Warehouse wh, final String
+           try {
+             msdb.openTransaction();
+             msdb.alterPartition(dbname, name, new_part.getValues(), oldPart);
+-            if (transactionalListeners != null && transactionalListeners.size() > 0) {
+-              AlterPartitionEvent alterPartitionEvent =
+-                  new AlterPartitionEvent(new_part, oldPart, tbl, true, handler);
+-              for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-                transactionalListener.onAlterPartition(alterPartitionEvent);
+-              }
++            if (transactionalListeners != null && !transactionalListeners.isEmpty()) {
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventMessage.EventType.ALTER_PARTITION,
++                                                    new AlterPartitionEvent(new_part, oldPart, tbl, success, handler));
+             }
+ 
+             revertMetaDataTransaction = msdb.commitTransaction();
+@@ -617,12 +613,10 @@ public Partition alterPartition(final RawStore msdb, Warehouse wh, final String
+               "when invoking MetaStoreEventListener for alterPartitions event.");
+         }
+ 
+-        if (transactionalListeners != null && transactionalListeners.size() > 0) {
+-          AlterPartitionEvent alterPartitionEvent =
+-              new AlterPartitionEvent(oldPart, newPart, tbl, true, handler);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onAlterPartition(alterPartitionEvent);
+-          }
++        if (transactionalListeners != null && !transactionalListeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                EventMessage.EventType.ALTER_PARTITION,
++                                                new AlterPartitionEvent(oldPart, newPart, tbl, true, handler));
+         }
+       }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index b52e18a..41dfbbf 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -182,6 +182,7 @@
+ import org.apache.hadoop.hive.metastore.model.MRoleMap;
+ import org.apache.hadoop.hive.metastore.model.MTableColumnPrivilege;
+ import org.apache.hadoop.hive.metastore.model.MTablePrivilege;
++import org.apache.hadoop.hive.metastore.messaging.EventMessage.EventType;
+ import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
+ import org.apache.hadoop.hive.metastore.txn.TxnHandler;
+ import org.apache.hadoop.hive.serde2.Deserializer;
+@@ -924,6 +925,7 @@ private void create_database_core(RawStore ms, final Database db)
+       Path dbPath = new Path(db.getLocationUri());
+       boolean success = false;
+       boolean madeDir = false;
++      Map<String, String> transactionalListenersResponses = Collections.emptyMap();
+       try {
+         firePreEvent(new PreCreateDatabaseEvent(db, this));
+         if (!wh.isDir(dbPath)) {
+@@ -936,11 +938,12 @@ private void create_database_core(RawStore ms, final Database db)
+ 
+         ms.openTransaction();
+         ms.createDatabase(db);
+-        if (transactionalListeners.size() > 0) {
+-          CreateDatabaseEvent cde = new CreateDatabaseEvent(db, true, this);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onCreateDatabase(cde);
+-          }
++
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenersResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.CREATE_DATABASE,
++                                                    new CreateDatabaseEvent(db, true, this));
+         }
+ 
+         success = ms.commitTransaction();
+@@ -951,8 +954,13 @@ private void create_database_core(RawStore ms, final Database db)
+             wh.deleteDir(dbPath, true);
+           }
+         }
+-        for (MetaStoreEventListener listener : listeners) {
+-          listener.onCreateDatabase(new CreateDatabaseEvent(db, success, this));
++
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.CREATE_DATABASE,
++                                                new CreateDatabaseEvent(db, success, this),
++                                                null,
++                                                transactionalListenersResponses);
+         }
+       }
+     }
+@@ -1067,6 +1075,7 @@ private void drop_database_core(RawStore ms,
+       Database db = null;
+       List<Path> tablePaths = new ArrayList<Path>();
+       List<Path> partitionPaths = new ArrayList<Path>();
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         db = ms.getDatabase(name);
+@@ -1149,12 +1158,13 @@ private void drop_database_core(RawStore ms,
+         }
+ 
+         if (ms.dropDatabase(name)) {
+-          if (transactionalListeners.size() > 0) {
+-            DropDatabaseEvent dde = new DropDatabaseEvent(db, true, this);
+-            for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-              transactionalListener.onDropDatabase(dde);
+-            }
++          if (!transactionalListeners.isEmpty()) {
++            transactionalListenerResponses =
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.DROP_DATABASE,
++                                                      new DropDatabaseEvent(db, true, this));
+           }
++
+           success = ms.commitTransaction();
+         }
+       } finally {
+@@ -1176,8 +1186,13 @@ private void drop_database_core(RawStore ms,
+           }
+           // it is not a terrible thing even if the data is not deleted
+         }
+-        for (MetaStoreEventListener listener : listeners) {
+-          listener.onDropDatabase(new DropDatabaseEvent(db, success, this));
++
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.DROP_DATABASE,
++                                                new DropDatabaseEvent(db, success, this),
++                                                null,
++                                                transactionalListenerResponses);
+         }
+       }
+     }
+@@ -1435,6 +1450,7 @@ private void create_table_core(final RawStore ms, final Table tbl,
+         }
+       }
+ 
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       Path tblPath = null;
+       boolean success = false, madeDir = false;
+       try {
+@@ -1495,12 +1511,12 @@ private void create_table_core(final RawStore ms, final Table tbl,
+         }
+ 
+         ms.createTable(tbl);
+-        if (transactionalListeners.size() > 0) {
+-          CreateTableEvent createTableEvent = new CreateTableEvent(tbl, true, this);
+-          createTableEvent.setEnvironmentContext(envContext);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onCreateTable(createTableEvent);
+-          }
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.CREATE_TABLE,
++                                                    new CreateTableEvent(tbl, true, this),
++                                                    envContext);
+         }
+ 
+         success = ms.commitTransaction();
+@@ -1511,11 +1527,13 @@ private void create_table_core(final RawStore ms, final Table tbl,
+             wh.deleteDir(tblPath, true);
+           }
+         }
+-        for (MetaStoreEventListener listener : listeners) {
+-          CreateTableEvent createTableEvent =
+-              new CreateTableEvent(tbl, success, this);
+-          createTableEvent.setEnvironmentContext(envContext);
+-          listener.onCreateTable(createTableEvent);
++
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.CREATE_TABLE,
++                                                new CreateTableEvent(tbl, success, this),
++                                                envContext,
++                                                transactionalListenerResponses);
+         }
+       }
+     }
+@@ -1570,6 +1588,7 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+       List<Path> partPaths = null;
+       Table tbl = null;
+       boolean ifPurge = false;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         // drop any partitions
+@@ -1623,12 +1642,12 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+           throw new MetaException(indexName == null ? "Unable to drop table " + tableName:
+               "Unable to drop index table " + tableName + " for index " + indexName);
+         } else {
+-          if (transactionalListeners.size() > 0) {
+-            DropTableEvent dropTableEvent = new DropTableEvent(tbl, true, deleteData, this);
+-            dropTableEvent.setEnvironmentContext(envContext);
+-            for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-              transactionalListener.onDropTable(dropTableEvent);
+-            }
++          if (!transactionalListeners.isEmpty()) {
++            transactionalListenerResponses =
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.DROP_TABLE,
++                                                      new DropTableEvent(tbl, deleteData, true, this),
++                                                      envContext);
+           }
+           success = ms.commitTransaction();
+         }
+@@ -1643,10 +1662,13 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+           deleteTableData(tblPath, ifPurge);
+           // ok even if the data is not deleted
+         }
+-        for (MetaStoreEventListener listener : listeners) {
+-          DropTableEvent dropTableEvent = new DropTableEvent(tbl, success, deleteData, this);
+-          dropTableEvent.setEnvironmentContext(envContext);
+-          listener.onDropTable(dropTableEvent);
++
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.DROP_TABLE,
++                                                new DropTableEvent(tbl, deleteData, success, this),
++                                                envContext,
++                                                transactionalListenerResponses);
+         }
+       }
+       return success;
+@@ -2057,6 +2079,7 @@ private Partition append_partition_common(RawStore ms, String dbName, String tab
+       boolean success = false, madeDir = false;
+       Path partLocation = null;
+       Table tbl = null;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         part.setDbName(dbName);
+@@ -2113,12 +2136,12 @@ private Partition append_partition_common(RawStore ms, String dbName, String tab
+         }
+ 
+         if (ms.addPartition(part)) {
+-          if (transactionalListeners.size() > 0) {
+-            AddPartitionEvent addPartitionEvent = new AddPartitionEvent(tbl, part, true, this);
+-            addPartitionEvent.setEnvironmentContext(envContext);
+-            for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-              transactionalListener.onAddPartition(addPartitionEvent);
+-            }
++          if (!transactionalListeners.isEmpty()) {
++            transactionalListenerResponses =
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.ADD_PARTITION,
++                                                      new AddPartitionEvent(tbl, part, true, this),
++                                                      envContext);
+           }
+ 
+           success = ms.commitTransaction();
+@@ -2131,11 +2154,12 @@ private Partition append_partition_common(RawStore ms, String dbName, String tab
+           }
+         }
+ 
+-        for (MetaStoreEventListener listener : listeners) {
+-          AddPartitionEvent addPartitionEvent =
+-              new AddPartitionEvent(tbl, part, success, this);
+-          addPartitionEvent.setEnvironmentContext(envContext);
+-          listener.onAddPartition(addPartitionEvent);
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ADD_PARTITION,
++                                                new AddPartitionEvent(tbl, part, success, this),
++                                                envContext,
++                                                transactionalListenerResponses);
+         }
+       }
+       return part;
+@@ -2276,6 +2300,8 @@ public boolean equals(Object obj) {
+       final List<Partition> result = new ArrayList<Partition>();
+       final List<Partition> existingParts = new ArrayList<Partition>();;
+       Table tbl = null;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
++
+       try {
+         ms.openTransaction();
+         tbl = ms.getTable(dbName, tblName);
+@@ -2360,7 +2386,14 @@ public Object run() throws Exception {
+         success = false;
+         // Notification is generated for newly created partitions only. The subset of partitions
+         // that already exist (existingParts), will not generate notifications.
+-        fireMetaStoreAddPartitionEventTransactional(tbl, result, null, true);
++
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.ADD_PARTITION,
++                                                    new AddPartitionEvent(tbl, result, true, this));
++        }
++
+         success = ms.commitTransaction();
+       } finally {
+         if (!success) {
+@@ -2371,12 +2404,26 @@ public Object run() throws Exception {
+               wh.deleteDir(new Path(e.getKey().partition.getSd().getLocation()), true);
+             }
+           }
+-          fireMetaStoreAddPartitionEvent(tbl, parts, null, false);
++
++          if (!listeners.isEmpty()) {
++            MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                  EventType.ADD_PARTITION,
++                                                  new AddPartitionEvent(tbl, parts, false, this));
++          }
+         } else {
+-          fireMetaStoreAddPartitionEvent(tbl, result, null, true);
+-          if (existingParts != null) {
+-            // The request has succeeded but we failed to add these partitions.
+-            fireMetaStoreAddPartitionEvent(tbl, existingParts, null, false);
++          if (!listeners.isEmpty()) {
++            MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                  EventType.ADD_PARTITION,
++                                                  new AddPartitionEvent(tbl, result, true, this),
++                                                  null,
++                                                  transactionalListenerResponses);
++
++            if (!existingParts.isEmpty()) {
++              // The request has succeeded but we failed to add these partitions.
++              MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                    EventType.ADD_PARTITION,
++                                                    new AddPartitionEvent(tbl, existingParts, false, this));
++            }
+           }
+         }
+       }
+@@ -2463,6 +2510,7 @@ private int add_partitions_pspec_core(
+       final PartitionSpecProxy.PartitionIterator partitionIterator = partitionSpecProxy
+           .getPartitionIterator();
+       Table tbl = null;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         tbl = ms.getTable(dbName, tblName);
+@@ -2538,7 +2586,14 @@ public Object run() throws Exception {
+         success = ms.addPartitions(dbName, tblName, partitionSpecProxy, ifNotExists);
+         //setting success to false to make sure that if the listener fails, rollback happens.
+         success = false;
+-        fireMetaStoreAddPartitionEventTransactional(tbl, partitionSpecProxy, null, true);
++
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.ADD_PARTITION,
++                                                    new AddPartitionEvent(tbl, partitionSpecProxy, true, this));
++        }
++
+         success = ms.commitTransaction();
+         return addedPartitions.size();
+       } finally {
+@@ -2551,7 +2606,14 @@ public Object run() throws Exception {
+             }
+           }
+         }
+-        fireMetaStoreAddPartitionEvent(tbl, partitionSpecProxy, null, true);
++
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ADD_PARTITION,
++                                                new AddPartitionEvent(tbl, partitionSpecProxy, true, this),
++                                                null,
++                                                transactionalListenerResponses);
++        }
+       }
+     }
+ 
+@@ -2656,6 +2718,7 @@ private Partition add_partition_core(final RawStore ms,
+         throws InvalidObjectException, AlreadyExistsException, MetaException, TException {
+       boolean success = false;
+       Table tbl = null;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         tbl = ms.getTable(part.getDbName(), part.getTableName());
+@@ -2680,7 +2743,16 @@ private Partition add_partition_core(final RawStore ms,
+ 
+         // Setting success to false to make sure that if the listener fails, rollback happens.
+         success = false;
+-        fireMetaStoreAddPartitionEventTransactional(tbl, Arrays.asList(part), envContext, true);
++
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.ADD_PARTITION,
++                                                    new AddPartitionEvent(tbl, Arrays.asList(part), true, this),
++                                                    envContext);
++
++        }
++
+         // we proceed only if we'd actually succeeded anyway, otherwise,
+         // we'd have thrown an exception
+         success = ms.commitTransaction();
+@@ -2688,64 +2760,19 @@ private Partition add_partition_core(final RawStore ms,
+         if (!success) {
+           ms.rollbackTransaction();
+         }
+-        fireMetaStoreAddPartitionEvent(tbl, Arrays.asList(part), envContext, success);
+-      }
+-      return part;
+-    }
+-
+-    private void fireMetaStoreAddPartitionEvent(final Table tbl,
+-        final List<Partition> parts, final EnvironmentContext envContext, boolean success)
+-          throws MetaException {
+-      if (tbl != null && parts != null && !parts.isEmpty()) {
+-        AddPartitionEvent addPartitionEvent =
+-            new AddPartitionEvent(tbl, parts, success, this);
+-        addPartitionEvent.setEnvironmentContext(envContext);
+-        for (MetaStoreEventListener listener : listeners) {
+-          listener.onAddPartition(addPartitionEvent);
+-        }
+-      }
+-    }
+-
+-    private void fireMetaStoreAddPartitionEvent(final Table tbl,
+-        final PartitionSpecProxy partitionSpec, final EnvironmentContext envContext, boolean success)
+-          throws MetaException {
+-      if (tbl != null && partitionSpec != null) {
+-        AddPartitionEvent addPartitionEvent =
+-            new AddPartitionEvent(tbl, partitionSpec, success, this);
+-        addPartitionEvent.setEnvironmentContext(envContext);
+-        for (MetaStoreEventListener listener : listeners) {
+-          listener.onAddPartition(addPartitionEvent);
+-        }
+-      }
+-    }
+ 
+-    private void fireMetaStoreAddPartitionEventTransactional(final Table tbl,
+-          final List<Partition> parts, final EnvironmentContext envContext, boolean success)
+-            throws MetaException {
+-      if (tbl != null && parts != null && !parts.isEmpty()) {
+-        AddPartitionEvent addPartitionEvent =
+-                new AddPartitionEvent(tbl, parts, success, this);
+-        addPartitionEvent.setEnvironmentContext(envContext);
+-        for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-          transactionalListener.onAddPartition(addPartitionEvent);
+-        }
+-      }
+-    }
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ADD_PARTITION,
++                                                new AddPartitionEvent(tbl, Arrays.asList(part), success, this),
++                                                envContext,
++                                                transactionalListenerResponses);
+ 
+-    private void fireMetaStoreAddPartitionEventTransactional(final Table tbl,
+-          final PartitionSpecProxy partitionSpec, final EnvironmentContext envContext, boolean success)
+-            throws MetaException {
+-      if (tbl != null && partitionSpec != null) {
+-        AddPartitionEvent addPartitionEvent =
+-                new AddPartitionEvent(tbl, partitionSpec, success, this);
+-        addPartitionEvent.setEnvironmentContext(envContext);
+-        for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-          transactionalListener.onAddPartition(addPartitionEvent);
+         }
+       }
++      return part;
+     }
+ 
+-
+     @Override
+     public Partition add_partition(final Partition part)
+         throws InvalidObjectException, AlreadyExistsException, MetaException {
+@@ -2828,6 +2855,11 @@ public Partition exchange_partition(Map<String, String> partitionSpecs,
+       Path destPath = new Path(destinationTable.getSd().getLocation(),
+           Warehouse.makePartName(partitionKeysPresent, partValsPresent));
+       List<Partition> destPartitions = new ArrayList<Partition>();
++
++      Map<String, String> transactionalListenerResponsesForAddPartition = Collections.emptyMap();
++      List<Map<String, String>> transactionalListenerResponsesForDropPartition =
++          Lists.newArrayListWithCapacity(partitionsToExchange.size());
++
+       try {
+         for (Partition partition: partitionsToExchange) {
+           Partition destPartition = new Partition(partition);
+@@ -2855,8 +2887,22 @@ public Partition exchange_partition(Map<String, String> partitionSpecs,
+ 
+         // Setting success to false to make sure that if the listener fails, rollback happens.
+         success = false;
+-        fireMetaStoreExchangePartitionEvent(sourceTable, partitionsToExchange,
+-            destinationTable, destPartitions, transactionalListeners, true);
++
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponsesForAddPartition =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.ADD_PARTITION,
++                                                    new AddPartitionEvent(destinationTable, destPartitions, true, this));
++
++          for (Partition partition : partitionsToExchange) {
++            DropPartitionEvent dropPartitionEvent =
++                new DropPartitionEvent(sourceTable, partition, true, true, this);
++            transactionalListenerResponsesForDropPartition.add(
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.DROP_PARTITION,
++                                                      dropPartitionEvent));
++          }
++        }
+ 
+         success = ms.commitTransaction();
+         return destPartitions;
+@@ -2866,34 +2912,31 @@ public Partition exchange_partition(Map<String, String> partitionSpecs,
+           if (pathCreated) {
+             wh.renameDir(destPath, sourcePath);
+           }
+-
+-          fireMetaStoreExchangePartitionEvent(sourceTable, partitionsToExchange,
+-              destinationTable, destPartitions, listeners, success);
+         }
+-      }
+-    }
+ 
+-    private void fireMetaStoreExchangePartitionEvent(Table sourceTable,
+-        List<Partition> partitionsToExchange, Table destinationTable,
+-        List<Partition> destPartitions,
+-        List<MetaStoreEventListener> eventListeners,
+-        boolean status) throws MetaException {
+-      if (sourceTable != null && destinationTable != null
+-          && !CollectionUtils.isEmpty(partitionsToExchange)
+-          && !CollectionUtils.isEmpty(destPartitions)) {
+-        if (eventListeners.size() > 0) {
+-          AddPartitionEvent addPartitionEvent =
+-              new AddPartitionEvent(destinationTable, destPartitions, status, this);
+-          for (MetaStoreEventListener eventListener : eventListeners) {
+-            eventListener.onAddPartition(addPartitionEvent);
+-          }
++        if (!listeners.isEmpty()) {
++          AddPartitionEvent addPartitionEvent = new AddPartitionEvent(destinationTable, destPartitions, success, this);
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ADD_PARTITION,
++                                                addPartitionEvent,
++                                                null,
++                                                transactionalListenerResponsesForAddPartition);
+ 
++          i = 0;
+           for (Partition partition : partitionsToExchange) {
+             DropPartitionEvent dropPartitionEvent =
+-                new DropPartitionEvent(sourceTable, partition, true, status, this);
+-            for (MetaStoreEventListener eventListener : eventListeners) {
+-              eventListener.onDropPartition(dropPartitionEvent);
+-            }
++                new DropPartitionEvent(sourceTable, partition, success, true, this);
++            Map<String, String> parameters =
++                (transactionalListenerResponsesForDropPartition.size() > i)
++                    ? transactionalListenerResponsesForDropPartition.get(i)
++                    : null;
++
++            MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                  EventType.DROP_PARTITION,
++                                                  dropPartitionEvent,
++                                                  null,
++                                                  parameters);
++            i++;
+           }
+         }
+       }
+@@ -2911,6 +2954,7 @@ private boolean drop_partition_common(RawStore ms, String db_name, String tbl_na
+       Path archiveParentDir = null;
+       boolean mustPurge = false;
+       boolean isExternalTbl = false;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+ 
+       try {
+         ms.openTransaction();
+@@ -2943,13 +2987,13 @@ private boolean drop_partition_common(RawStore ms, String db_name, String tbl_na
+         if (!ms.dropPartition(db_name, tbl_name, part_vals)) {
+           throw new MetaException("Unable to drop partition");
+         } else {
+-          if (transactionalListeners.size() > 0) {
+-            DropPartitionEvent dropPartitionEvent =
+-                new DropPartitionEvent(tbl, part, true, deleteData, this);
+-            dropPartitionEvent.setEnvironmentContext(envContext);
+-            for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-              transactionalListener.onDropPartition(dropPartitionEvent);
+-            }
++          if (!transactionalListeners.isEmpty()) {
++
++            transactionalListenerResponses =
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.DROP_PARTITION,
++                                                      new DropPartitionEvent(tbl, part, true, deleteData, this),
++                                                      envContext);
+           }
+           success = ms.commitTransaction();
+         }
+@@ -2977,11 +3021,12 @@ private boolean drop_partition_common(RawStore ms, String db_name, String tbl_na
+             // ok even if the data is not deleted
+           }
+         }
+-        for (MetaStoreEventListener listener : listeners) {
+-          DropPartitionEvent dropPartitionEvent =
+-            new DropPartitionEvent(tbl, part, success, deleteData, this);
+-          dropPartitionEvent.setEnvironmentContext(envContext);
+-          listener.onDropPartition(dropPartitionEvent);
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.DROP_PARTITION,
++                                                new DropPartitionEvent(tbl, part, success, deleteData, this),
++                                                envContext,
++                                                transactionalListenerResponses);
+         }
+       }
+       return true;
+@@ -3043,6 +3088,8 @@ public DropPartitionsResult drop_partitions_req(
+       List<Partition> parts = null;
+       boolean mustPurge = false;
+       boolean isExternalTbl = false;
++      List<Map<String, String>> transactionalListenerResponses = Lists.newArrayList();
++
+       try {
+         // We need Partition-s for firing events and for result; DN needs MPartition-s to drop.
+         // Great... Maybe we could bypass fetching MPartitions by issuing direct SQL deletes.
+@@ -3127,14 +3174,13 @@ public DropPartitionsResult drop_partitions_req(
+         }
+ 
+         ms.dropPartitions(dbName, tblName, partNames);
+-        if (parts != null && transactionalListeners.size() > 0) {
++        if (parts != null && !transactionalListeners.isEmpty()) {
+           for (Partition part : parts) {
+-            DropPartitionEvent dropPartitionEvent =
+-                new DropPartitionEvent(tbl, part, true, deleteData, this);
+-            dropPartitionEvent.setEnvironmentContext(envContext);
+-            for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-              transactionalListener.onDropPartition(dropPartitionEvent);
+-            }
++            transactionalListenerResponses.add(
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.DROP_PARTITION,
++                                                      new DropPartitionEvent(tbl, part, true, deleteData, this),
++                                                      envContext));
+           }
+         }
+ 
+@@ -3168,12 +3214,19 @@ public DropPartitionsResult drop_partitions_req(
+           }
+         }
+         if (parts != null) {
+-          for (Partition part : parts) {
+-            for (MetaStoreEventListener listener : listeners) {
+-              DropPartitionEvent dropPartitionEvent =
+-                new DropPartitionEvent(tbl, part, success, deleteData, this);
+-              dropPartitionEvent.setEnvironmentContext(envContext);
+-              listener.onDropPartition(dropPartitionEvent);
++          int i = 0;
++          if (parts != null && !listeners.isEmpty()) {
++            for (Partition part : parts) {
++              Map<String, String> parameters =
++                  (!transactionalListenerResponses.isEmpty()) ? transactionalListenerResponses.get(i) : null;
++
++              MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                    EventType.DROP_PARTITION,
++                                                    new DropPartitionEvent(tbl, part, success, deleteData, this),
++                                                    envContext,
++                                                    parameters);
++
++              i++;
+             }
+           }
+         }
+@@ -3606,14 +3659,15 @@ private void rename_partition(final String db_name, final String tbl_name,
+         oldPart = alterHandler.alterPartition(getMS(), wh, db_name, tbl_name, part_vals, new_part, this);
+         // Only fetch the table if we actually have a listener
+         Table table = null;
+-        for (MetaStoreEventListener listener : listeners) {
++        if (!listeners.isEmpty()) {
+           if (table == null) {
+             table = getMS().getTable(db_name, tbl_name);
+           }
+-          AlterPartitionEvent alterPartitionEvent =
+-              new AlterPartitionEvent(oldPart, new_part, table, true, this);
+-          alterPartitionEvent.setEnvironmentContext(envContext);
+-          listener.onAlterPartition(alterPartitionEvent);
++
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ALTER_PARTITION,
++                                                new AlterPartitionEvent(oldPart, new_part, table, true, this),
++                                                envContext);
+         }
+       } catch (InvalidObjectException e) {
+         ex = e;
+@@ -3668,13 +3722,15 @@ public void alter_partitions(final String db_name, final String tbl_name,
+           else {
+             throw new InvalidOperationException("failed to alterpartitions");
+           }
+-          for (MetaStoreEventListener listener : listeners) {
+-            if (table == null) {
+-              table = getMS().getTable(db_name, tbl_name);
+-            }
+-            AlterPartitionEvent alterPartitionEvent =
+-                new AlterPartitionEvent(oldTmpPart, tmpPart, table, true, this);
+-            listener.onAlterPartition(alterPartitionEvent);
++
++          if (table == null) {
++            table = getMS().getTable(db_name, tbl_name);
++          }
++
++          if (!listeners.isEmpty()) {
++            MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                  EventType.ALTER_PARTITION,
++                                                  new AlterPartitionEvent(oldTmpPart, tmpPart, table, true, this));
+           }
+         }
+       } catch (InvalidObjectException e) {
+@@ -3711,16 +3767,17 @@ public void alter_index(final String dbname, final String base_table_name,
+       Exception ex = null;
+       Index oldIndex = null;
+       RawStore ms  = getMS();
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         oldIndex = get_index_by_name(dbname, base_table_name, index_name);
+         firePreEvent(new PreAlterIndexEvent(oldIndex, newIndex, this));
+         ms.alterIndex(dbname, base_table_name, index_name, newIndex);
+-        if (transactionalListeners.size() > 0) {
+-          AlterIndexEvent alterIndexEvent = new AlterIndexEvent(oldIndex, newIndex, true, this);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onAlterIndex(alterIndexEvent);
+-          }
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.ALTER_INDEX,
++                                                    new AlterIndexEvent(oldIndex, newIndex, true, this));
+         }
+ 
+         success = ms.commitTransaction();
+@@ -3742,9 +3799,13 @@ public void alter_index(final String dbname, final String base_table_name,
+         }
+ 
+         endFunction("alter_index", success, ex, base_table_name);
+-        for (MetaStoreEventListener listener : listeners) {
+-          AlterIndexEvent alterIndexEvent = new AlterIndexEvent(oldIndex, newIndex, success, this);
+-          listener.onAlterIndex(alterIndexEvent);
++
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ALTER_INDEX,
++                                                new AlterIndexEvent(oldIndex, newIndex, success, this),
++                                                null,
++                                                transactionalListenerResponses);
+         }
+       }
+     }
+@@ -3808,11 +3869,11 @@ private void alter_table_core(final String dbname, final String name, final Tabl
+         firePreEvent(new PreAlterTableEvent(oldt, newTable, this));
+         alterHandler.alterTable(getMS(), wh, dbname, name, newTable, cascade, this);
+         success = true;
+-        for (MetaStoreEventListener listener : listeners) {
+-          AlterTableEvent alterTableEvent =
+-              new AlterTableEvent(oldt, newTable, success, this);
+-          alterTableEvent.setEnvironmentContext(envContext);
+-          listener.onAlterTable(alterTableEvent);
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.ALTER_TABLE,
++                                                new AlterTableEvent(oldt, newTable, true, this),
++                                                envContext);
+         }
+       } catch (NoSuchObjectException e) {
+         // thrown when the table to be altered does not exist
+@@ -4354,6 +4415,7 @@ private Index add_index_core(final RawStore ms, final Index index, final Table i
+       boolean success = false, indexTableCreated = false;
+       String[] qualified =
+           MetaStoreUtils.getQualifiedName(index.getDbName(), index.getIndexTableName());
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         firePreEvent(new PreAddIndexEvent(index, this));
+@@ -4391,11 +4453,11 @@ private Index add_index_core(final RawStore ms, final Index index, final Table i
+         index.setCreateTime((int) time);
+         index.putToParameters(hive_metastoreConstants.DDL_TIME, Long.toString(time));
+         if (ms.addIndex(index)) {
+-          if (transactionalListeners.size() > 0) {
+-            AddIndexEvent addIndexEvent = new AddIndexEvent(index, true, this);
+-            for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-              transactionalListener.onAddIndex(addIndexEvent);
+-            }
++          if (!transactionalListeners.isEmpty()) {
++            transactionalListenerResponses =
++                MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                      EventType.CREATE_INDEX,
++                                                      new AddIndexEvent(index, true, this));
+           }
+         }
+ 
+@@ -4412,9 +4474,12 @@ private Index add_index_core(final RawStore ms, final Index index, final Table i
+           ms.rollbackTransaction();
+         }
+ 
+-        for (MetaStoreEventListener listener : listeners) {
+-          AddIndexEvent addIndexEvent = new AddIndexEvent(index, success, this);
+-          listener.onAddIndex(addIndexEvent);
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.CREATE_INDEX,
++                                                new AddIndexEvent(index, success, this),
++                                                null,
++                                                transactionalListenerResponses);
+         }
+       }
+     }
+@@ -4452,6 +4517,7 @@ private boolean drop_index_by_name_core(final RawStore ms,
+       Index index = null;
+       Path tblPath = null;
+       List<Path> partPaths = null;
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         // drop the underlying index table
+@@ -4484,11 +4550,11 @@ private boolean drop_index_by_name_core(final RawStore ms,
+           }
+         }
+ 
+-        if (transactionalListeners.size() > 0) {
+-          DropIndexEvent dropIndexEvent = new DropIndexEvent(index, true, this);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onDropIndex(dropIndexEvent);
+-          }
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.DROP_INDEX,
++                                                    new DropIndexEvent(index, true, this));
+         }
+ 
+         success = ms.commitTransaction();
+@@ -4501,11 +4567,12 @@ private boolean drop_index_by_name_core(final RawStore ms,
+           // ok even if the data is not deleted
+         }
+         // Skip the event listeners if the index is NULL
+-        if (index != null) {
+-          for (MetaStoreEventListener listener : listeners) {
+-            DropIndexEvent dropIndexEvent = new DropIndexEvent(index, success, this);
+-            listener.onDropIndex(dropIndexEvent);
+-          }
++        if (index != null && !listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.DROP_INDEX,
++                                                new DropIndexEvent(index, success, this),
++                                                null,
++                                                transactionalListenerResponses);
+         }
+       }
+       return success;
+@@ -5881,6 +5948,7 @@ public void create_function(Function func) throws AlreadyExistsException,
+       validateFunctionInfo(func);
+       boolean success = false;
+       RawStore ms = getMS();
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         Database db = ms.getDatabase(func.getDbName());
+@@ -5897,11 +5965,11 @@ public void create_function(Function func) throws AlreadyExistsException,
+         long time = System.currentTimeMillis() / 1000;
+         func.setCreateTime((int) time);
+         ms.createFunction(func);
+-        if (transactionalListeners.size() > 0) {
+-          CreateFunctionEvent createFunctionEvent = new CreateFunctionEvent(func, true, this);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onCreateFunction(createFunctionEvent);
+-          }
++        if (!transactionalListeners.isEmpty()) {
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.CREATE_FUNCTION,
++                                                    new CreateFunctionEvent(func, true, this));
+         }
+ 
+         success = ms.commitTransaction();
+@@ -5910,11 +5978,12 @@ public void create_function(Function func) throws AlreadyExistsException,
+           ms.rollbackTransaction();
+         }
+ 
+-        if (listeners.size() > 0) {
+-          CreateFunctionEvent createFunctionEvent = new CreateFunctionEvent(func, success, this);
+-          for (MetaStoreEventListener listener : listeners) {
+-            listener.onCreateFunction(createFunctionEvent);
+-          }
++        if (!listeners.isEmpty()) {
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.CREATE_FUNCTION,
++                                                new CreateFunctionEvent(func, success, this),
++                                                null,
++                                                transactionalListenerResponses);
+         }
+       }
+     }
+@@ -5926,6 +5995,7 @@ public void drop_function(String dbName, String funcName)
+       boolean success = false;
+       Function func = null;
+       RawStore ms = getMS();
++      Map<String, String> transactionalListenerResponses = Collections.emptyMap();
+       try {
+         ms.openTransaction();
+         func = ms.getFunction(dbName, funcName);
+@@ -5935,10 +6005,10 @@ public void drop_function(String dbName, String funcName)
+ 
+         ms.dropFunction(dbName, funcName);
+         if (transactionalListeners.size() > 0) {
+-          DropFunctionEvent dropFunctionEvent = new DropFunctionEvent(func, true, this);
+-          for (MetaStoreEventListener transactionalListener : transactionalListeners) {
+-            transactionalListener.onDropFunction(dropFunctionEvent);
+-          }
++          transactionalListenerResponses =
++              MetaStoreListenerNotifier.notifyEvent(transactionalListeners,
++                                                    EventType.DROP_FUNCTION,
++                                                    new DropFunctionEvent(func, true, this));
+         }
+ 
+         success = ms.commitTransaction();
+@@ -5948,10 +6018,11 @@ public void drop_function(String dbName, String funcName)
+         }
+ 
+         if (listeners.size() > 0) {
+-          DropFunctionEvent dropFunctionEvent = new DropFunctionEvent(func, success, this);
+-          for (MetaStoreEventListener listener : listeners) {
+-            listener.onDropFunction(dropFunctionEvent);
+-          }
++          MetaStoreListenerNotifier.notifyEvent(listeners,
++                                                EventType.DROP_FUNCTION,
++                                                new DropFunctionEvent(func, success, this),
++                                                null,
++                                                transactionalListenerResponses);
+         }
+       }
+     }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreListenerNotifier.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreListenerNotifier.java
+new file mode 100644
+index 0000000..20011cc
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreListenerNotifier.java
+@@ -0,0 +1,224 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import com.google.common.base.Preconditions;
++import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.Maps;
++import org.apache.hadoop.hive.common.classification.InterfaceAudience.Private;
++import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
++import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.hive.metastore.events.AddIndexEvent;
++import org.apache.hadoop.hive.metastore.events.AddPartitionEvent;
++import org.apache.hadoop.hive.metastore.events.AlterIndexEvent;
++import org.apache.hadoop.hive.metastore.events.AlterPartitionEvent;
++import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
++import org.apache.hadoop.hive.metastore.events.CreateDatabaseEvent;
++import org.apache.hadoop.hive.metastore.events.CreateFunctionEvent;
++import org.apache.hadoop.hive.metastore.events.CreateTableEvent;
++import org.apache.hadoop.hive.metastore.events.DropDatabaseEvent;
++import org.apache.hadoop.hive.metastore.events.DropFunctionEvent;
++import org.apache.hadoop.hive.metastore.events.DropIndexEvent;
++import org.apache.hadoop.hive.metastore.events.DropPartitionEvent;
++import org.apache.hadoop.hive.metastore.events.DropTableEvent;
++import org.apache.hadoop.hive.metastore.events.InsertEvent;
++import org.apache.hadoop.hive.metastore.events.ListenerEvent;
++
++import java.util.List;
++import java.util.Map;
++
++import static org.apache.hadoop.hive.metastore.messaging.EventMessage.EventType;
++
++/**
++ * This class is used to notify a list of listeners about specific MetaStore events.
++ */
++@Private
++public class MetaStoreListenerNotifier {
++  private interface EventNotifier {
++    void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException;
++  }
++
++  private static Map<EventType, EventNotifier> notificationEvents = Maps.newHashMap(
++      ImmutableMap.<EventType, EventNotifier>builder()
++          .put(EventType.CREATE_DATABASE, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onCreateDatabase((CreateDatabaseEvent)event);
++            }
++          })
++          .put(EventType.DROP_DATABASE, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onDropDatabase((DropDatabaseEvent)event);
++            }
++          })
++          .put(EventType.CREATE_TABLE, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onCreateTable((CreateTableEvent)event);
++            }
++          })
++          .put(EventType.DROP_TABLE, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onDropTable((DropTableEvent)event);
++            }
++          })
++          .put(EventType.ADD_PARTITION, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onAddPartition((AddPartitionEvent)event);
++            }
++          })
++          .put(EventType.DROP_PARTITION, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onDropPartition((DropPartitionEvent)event);
++            }
++          })
++          .put(EventType.ALTER_TABLE, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onAlterTable((AlterTableEvent)event);
++            }
++          })
++          .put(EventType.ALTER_PARTITION, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onAlterPartition((AlterPartitionEvent)event);
++            }
++          })
++          .put(EventType.INSERT, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onInsert((InsertEvent)event);
++            }
++          })
++          .put(EventType.CREATE_FUNCTION, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onCreateFunction((CreateFunctionEvent)event);
++            }
++          })
++          .put(EventType.DROP_FUNCTION, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onDropFunction((DropFunctionEvent)event);
++            }
++          })
++          .put(EventType.CREATE_INDEX, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onAddIndex((AddIndexEvent)event);
++            }
++          })
++          .put(EventType.DROP_INDEX, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onDropIndex((DropIndexEvent)event);
++            }
++          })
++          .put(EventType.ALTER_INDEX, new EventNotifier() {
++            @Override
++            public void notify(MetaStoreEventListener listener, ListenerEvent event) throws MetaException {
++              listener.onAlterIndex((AlterIndexEvent)event);
++            }
++          })
++          .build()
++  );
++
++  /**
++   * Notify a list of listeners about a specific metastore event. Each listener notified might update
++   * the (ListenerEvent) event by setting a parameter key/value pair. These updated parameters will
++   * be returned to the caller.
++   *
++   * @param listeners List of MetaStoreEventListener listeners.
++   * @param eventType Type of the notification event.
++   * @param event The ListenerEvent with information about the event.
++   * @return A list of key/value pair parameters that the listeners set. The returned object will return an empty
++   *         map if no parameters were updated or if no listeners were notified.
++   * @throws MetaException If an error occurred while calling the listeners.
++   */
++  public static Map<String, String> notifyEvent(List<MetaStoreEventListener> listeners,
++                                                EventType eventType,
++                                                ListenerEvent event) throws MetaException {
++
++    Preconditions.checkNotNull(listeners, "Listeners must not be null.");
++    Preconditions.checkNotNull(event, "The event must not be null.");
++
++    for (MetaStoreEventListener listener : listeners) {
++      notificationEvents.get(eventType).notify(listener, event);
++    }
++
++    // Each listener called above might set a different parameter on the event.
++    // This write permission is allowed on the listener side to avoid breaking compatibility if we change the API
++    // method calls.
++    return event.getParameters();
++  }
++
++  /**
++   * Notify a list of listeners about a specific metastore event. Each listener notified might update
++   * the (ListenerEvent) event by setting a parameter key/value pair. These updated parameters will
++   * be returned to the caller.
++   *
++   * @param listeners List of MetaStoreEventListener listeners.
++   * @param eventType Type of the notification event.
++   * @param event The ListenerEvent with information about the event.
++   * @param environmentContext An EnvironmentContext object with parameters sent by the HMS client.
++   * @return A list of key/value pair parameters that the listeners set. The returned object will return an empty
++   *         map if no parameters were updated or if no listeners were notified.
++   * @throws MetaException If an error occurred while calling the listeners.
++   */
++  public static Map<String, String> notifyEvent(List<MetaStoreEventListener> listeners,
++                                                EventType eventType,
++                                                ListenerEvent event,
++                                                EnvironmentContext environmentContext) throws MetaException {
++
++    Preconditions.checkNotNull(event, "The event must not be null.");
++
++    event.setEnvironmentContext(environmentContext);
++    return notifyEvent(listeners, eventType, event);
++  }
++
++  /**
++   * Notify a list of listeners about a specific metastore event. Each listener notified might update
++   * the (ListenerEvent) event by setting a parameter key/value pair. These updated parameters will
++   * be returned to the caller.
++   *
++   * @param listeners List of MetaStoreEventListener listeners.
++   * @param eventType Type of the notification event.
++   * @param event The ListenerEvent with information about the event.
++   * @param environmentContext An EnvironmentContext object with parameters sent by the HMS client.
++   * @param parameters A list of key/value pairs with the new parameters to add.
++   * @return A list of key/value pair parameters that the listeners set. The returned object will return an empty
++   *         map if no parameters were updated or if no listeners were notified.
++   * @throws MetaException If an error occurred while calling the listeners.
++   */
++  public static Map<String, String> notifyEvent(List<MetaStoreEventListener> listeners,
++                                                EventType eventType,
++                                                ListenerEvent event,
++                                                EnvironmentContext environmentContext,
++                                                Map<String, String> parameters) throws MetaException {
++
++    Preconditions.checkNotNull(event, "The event must not be null.");
++
++    event.putParameters(parameters);
++    return notifyEvent(listeners, eventType, event, environmentContext);
++  }
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/events/ListenerEvent.java b/metastore/src/java/org/apache/hadoop/hive/metastore/events/ListenerEvent.java
+index 62aeb8c..b741549 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/events/ListenerEvent.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/events/ListenerEvent.java
+@@ -21,10 +21,18 @@
+ import org.apache.hadoop.hive.metastore.HiveMetaStore.HMSHandler;
+ import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
+ 
++import javax.annotation.concurrent.NotThreadSafe;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++
+ /**
+  * Base class for all the events which are defined for metastore.
++ *
++ * This class is not thread-safe and not expected to be called in parallel.
+  */
+ 
++@NotThreadSafe
+ public abstract class ListenerEvent {
+ 
+   /**
+@@ -33,6 +41,26 @@
+   private final boolean status;
+   private final HMSHandler handler;
+ 
++  /**
++   * Key/value parameters used by listeners to store notifications results
++   * i.e. DbNotificationListener sets a DB_NOTIFICATION_EVENT_ID.
++   *
++   * NotThreadSafe: The parameters map is not expected to be access in parallel by Hive, so keep it thread-unsafe
++   * to avoid locking overhead.
++   */
++  private Map<String, String> parameters;
++
++  /** For performance concerns, it is preferable to cache the unmodifiable parameters variable that will be returned on the
++   * {@link #getParameters()} method. It is expected that {@link #putParameter(String, String)} is called less times
++   * than {@link #getParameters()}, so performance may be better by using this cache.
++   */
++  private Map<String, String> unmodifiableParameters;
++
++  // Listener parameters aren't expected to have many values. So far only
++  // DbNotificationListener will add a parameter; let's set a low initial capacity for now.
++  // If we find out many parameters are added, then we can adjust or remove this initial capacity.
++  private static final int PARAMETERS_INITIAL_CAPACITY = 1;
++
+   // Properties passed by the client, to be used in execution hooks.
+   private EnvironmentContext environmentContext = null;
+ 
+@@ -40,6 +68,8 @@ public ListenerEvent(boolean status, HMSHandler handler) {
+     super();
+     this.status = status;
+     this.handler = handler;
++    this.parameters = new HashMap<>(PARAMETERS_INITIAL_CAPACITY);
++    updateUnmodifiableParameters();
+   }
+ 
+   /**
+@@ -49,6 +79,12 @@ public boolean getStatus() {
+     return status;
+   }
+ 
++  /**
++   * Set the environment context of the event.
++   *
++   * @param environmentContext An EnvironmentContext object that contains environment parameters sent from
++   *                           the HMS client.
++   */
+   public void setEnvironmentContext(EnvironmentContext environmentContext) {
+     this.environmentContext = environmentContext;
+   }
+@@ -66,4 +102,74 @@ public EnvironmentContext getEnvironmentContext() {
+   public HMSHandler getHandler() {
+     return handler;
+   }
++
++  /**
++   * Return all parameters of the listener event. Parameters are read-only (unmodifiable map). If a new parameter
++   * must be added, please use the putParameter() method.
++   *
++   *
++   * @return A map object with all parameters.
++   */
++  public final Map<String, String> getParameters() {
++    return unmodifiableParameters;
++  }
++
++  /**
++   * Put a new parameter to the listener event.
++   *
++   * Overridden parameters is not allowed, and an exception may be thrown to avoid a mis-configuration
++   * between listeners setting the same parameters.
++   *
++   * @param name Name of the parameter.
++   * @param value Value of the parameter.
++   * @throws IllegalStateException if a parameter already exists.
++   */
++  public void putParameter(String name, String value) {
++    putParameterIfAbsent(name, value);
++    updateUnmodifiableParameters();
++  }
++
++  /**
++   * Put a new set the parameters to the listener event.
++   *
++   * Overridden parameters is not allowed, and an exception may be thrown to avoid a mis-configuration
++   * between listeners setting the same parameters.
++   *
++   * @param parameters A Map object with the a set of parameters.
++   * @throws IllegalStateException if a parameter already exists.
++   */
++  public void putParameters(final Map<String, String> parameters) {
++    if (parameters != null) {
++      for (Map.Entry<String, String> entry : parameters.entrySet()) {
++        putParameterIfAbsent(entry.getKey(), entry.getValue());
++      }
++
++      updateUnmodifiableParameters();
++    }
++  }
++
++  /**
++   * Put a parameter to the listener event only if the parameter is absent.
++   *
++   * Overridden parameters is not allowed, and an exception may be thrown to avoid a mis-configuration
++   * between listeners setting the same parameters.
++   *
++   * @param name Name of the parameter.
++   * @param value Value of the parameter.
++   * @throws IllegalStateException if a parameter already exists.
++   */
++  private void putParameterIfAbsent(String name, String value) {
++    if (parameters.containsKey(name)) {
++      throw new IllegalStateException("Invalid attempt to overwrite a read-only parameter: " + name);
++    }
++
++    parameters.put(name, value);
++  }
++
++  /**
++   * Keeps a cache of unmodifiable parameters returned by the getParameters() method.
++   */
++  private void updateUnmodifiableParameters() {
++    unmodifiableParameters = Collections.unmodifiableMap(parameters);
++  }
+ }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/messaging/EventMessage.java b/metastore/src/java/org/apache/hadoop/hive/metastore/messaging/EventMessage.java
+new file mode 100644
+index 0000000..b49ba10
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/messaging/EventMessage.java
+@@ -0,0 +1,106 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.hadoop.hive.metastore.messaging;
++
++/**
++ * Class representing messages emitted when Metastore operations are done.
++ * (E.g. Creation and deletion of databases, tables and partitions.)
++ */
++public abstract class EventMessage {
++
++  /**
++   * Enumeration of all supported types of Metastore operations.
++   */
++  public static enum EventType {
++
++    CREATE_DATABASE(MessageFactory.CREATE_DATABASE_EVENT),
++    DROP_DATABASE(MessageFactory.DROP_DATABASE_EVENT),
++    CREATE_TABLE(MessageFactory.CREATE_TABLE_EVENT),
++    DROP_TABLE(MessageFactory.DROP_TABLE_EVENT),
++    ADD_PARTITION(MessageFactory.ADD_PARTITION_EVENT),
++    DROP_PARTITION(MessageFactory.DROP_PARTITION_EVENT),
++    ALTER_TABLE(MessageFactory.ALTER_TABLE_EVENT),
++    ALTER_PARTITION(MessageFactory.ALTER_PARTITION_EVENT),
++    INSERT(MessageFactory.INSERT_EVENT),
++    CREATE_FUNCTION(MessageFactory.CREATE_FUNCTION_EVENT),
++    DROP_FUNCTION(MessageFactory.DROP_FUNCTION_EVENT),
++    CREATE_INDEX(MessageFactory.CREATE_INDEX_EVENT),
++    DROP_INDEX(MessageFactory.DROP_INDEX_EVENT),
++    ALTER_INDEX(MessageFactory.ALTER_INDEX_EVENT);
++
++    private String typeString;
++
++    EventType(String typeString) {
++      this.typeString = typeString;
++    }
++
++    @Override
++    public String toString() { return typeString; }
++  }
++
++  protected EventType eventType;
++
++  protected EventMessage(EventType eventType) {
++    this.eventType = eventType;
++  }
++
++  public EventType getEventType() {
++    return eventType;
++  }
++
++  /**
++   * Getter for HCatalog Server's URL.
++   * (This is where the event originates from.)
++   * @return HCatalog Server's URL (String).
++   */
++  public abstract String getServer();
++
++  /**
++   * Getter for the Kerberos principal of the HCatalog service.
++   * @return HCatalog Service Principal (String).
++   */
++  public abstract String getServicePrincipal();
++
++  /**
++   * Getter for the name of the Database on which the Metastore operation is done.
++   * @return Database-name (String).
++   */
++  public abstract String getDB();
++
++  /**
++   * Getter for the timestamp associated with the operation.
++   * @return Timestamp (Long - seconds since epoch).
++   */
++  public abstract Long   getTimestamp();
++
++  /**
++   * Class invariant. Checked after construction or deserialization.
++   */
++  public EventMessage checkValid() {
++    if (getServer() == null || getServicePrincipal() == null)
++      throw new IllegalStateException("Server-URL/Service-Principal shouldn't be null.");
++    if (getEventType() == null)
++      throw new IllegalStateException("Event-type unset.");
++    if (getDB() == null)
++      throw new IllegalArgumentException("DB-name unset.");
++
++    return this;
++  }
++}
+\ No newline at end of file
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/messaging/MessageFactory.java b/metastore/src/java/org/apache/hadoop/hive/metastore/messaging/MessageFactory.java
+new file mode 100644
+index 0000000..d12634d
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/messaging/MessageFactory.java
+@@ -0,0 +1,42 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.hadoop.hive.metastore.messaging;
++
++/**
++ * Abstract Factory for the construction of HCatalog message instances.
++ */
++public abstract class MessageFactory {
++
++  // Common name constants for event messages
++  public static final String ADD_PARTITION_EVENT = "ADD_PARTITION";
++  public static final String ALTER_PARTITION_EVENT = "ALTER_PARTITION";
++  public static final String DROP_PARTITION_EVENT = "DROP_PARTITION";
++  public static final String CREATE_TABLE_EVENT = "CREATE_TABLE";
++  public static final String ALTER_TABLE_EVENT = "ALTER_TABLE";
++  public static final String DROP_TABLE_EVENT = "DROP_TABLE";
++  public static final String CREATE_DATABASE_EVENT = "CREATE_DATABASE";
++  public static final String DROP_DATABASE_EVENT = "DROP_DATABASE";
++  public static final String INSERT_EVENT = "INSERT";
++  public static final String CREATE_FUNCTION_EVENT = "CREATE_FUNCTION";
++  public static final String DROP_FUNCTION_EVENT = "DROP_FUNCTION";
++  public static final String CREATE_INDEX_EVENT = "CREATE_INDEX";
++  public static final String DROP_INDEX_EVENT = "DROP_INDEX";
++  public static final String ALTER_INDEX_EVENT = "ALTER_INDEX";
++}
+\ No newline at end of file
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java
+index a39df06..5bc774f 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java
+@@ -27,12 +27,16 @@
+ import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
+ import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.metastore.api.Function;
+ import org.apache.hadoop.hive.metastore.api.InvalidInputException;
+ import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.hive.metastore.api.NotificationEvent;
++import org.apache.hadoop.hive.metastore.api.NotificationEventRequest;
++import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
+ import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.PrincipalType;
+@@ -40,6 +44,7 @@
+ import org.apache.hadoop.hive.metastore.api.SerDeInfo;
+ import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+ import org.apache.hadoop.hive.metastore.api.Table;
++import org.apache.hadoop.hive.metastore.messaging.EventMessage;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
+ import org.junit.After;
+@@ -91,6 +96,51 @@ public void tearDown() {
+   }
+ 
+   /**
++   * Test notification operations
++   */
++  @Test
++  public void testNotificationOps() throws InterruptedException {
++    final int NO_EVENT_ID = 0;
++    final int FIRST_EVENT_ID = 1;
++    final int SECOND_EVENT_ID = 2;
++
++    NotificationEvent event =
++        new NotificationEvent(0, 0, EventMessage.EventType.CREATE_DATABASE.toString(), "");
++    NotificationEventResponse eventResponse;
++    CurrentNotificationEventId eventId;
++
++    // Verify that there is no notifications available yet
++    eventId = objectStore.getCurrentNotificationEventId();
++    Assert.assertEquals(NO_EVENT_ID, eventId.getEventId());
++
++    // Verify that addNotificationEvent() updates the NotificationEvent with the new event ID
++    objectStore.addNotificationEvent(event);
++    Assert.assertEquals(FIRST_EVENT_ID, event.getEventId());
++    objectStore.addNotificationEvent(event);
++    Assert.assertEquals(SECOND_EVENT_ID, event.getEventId());
++
++    // Verify that objectStore fetches the latest notification event ID
++    eventId = objectStore.getCurrentNotificationEventId();
++    Assert.assertEquals(SECOND_EVENT_ID, eventId.getEventId());
++
++    // Verify that getNextNotification() returns all events
++    eventResponse = objectStore.getNextNotification(new NotificationEventRequest());
++    Assert.assertEquals(2, eventResponse.getEventsSize());
++    Assert.assertEquals(FIRST_EVENT_ID, eventResponse.getEvents().get(0).getEventId());
++    Assert.assertEquals(SECOND_EVENT_ID, eventResponse.getEvents().get(1).getEventId());
++    // Verify that getNextNotification(last) returns events after a specified event
++    eventResponse = objectStore.getNextNotification(new NotificationEventRequest(FIRST_EVENT_ID));
++    Assert.assertEquals(1, eventResponse.getEventsSize());
++    Assert.assertEquals(SECOND_EVENT_ID, eventResponse.getEvents().get(0).getEventId());
++
++    // Verify that cleanNotificationEvents() cleans up all old notifications
++    Thread.sleep(1);
++    objectStore.cleanNotificationEvents(1);
++    eventResponse = objectStore.getNextNotification(new NotificationEventRequest());
++    Assert.assertEquals(0, eventResponse.getEventsSize());
++  }
++
++  /**
+    * Test database operations
+    */
+   @Test
+-- 
+1.7.9.5
+

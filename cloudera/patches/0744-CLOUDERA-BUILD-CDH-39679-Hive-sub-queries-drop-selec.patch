@@ -1,0 +1,246 @@
+From 5ff65131a41822fdfd8520239b1ecd6456461216 Mon Sep 17 00:00:00 2001
+From: stakiar <stakiar@cloudera.com>
+Date: Tue, 30 Aug 2016 18:22:40 -0700
+Subject: [PATCH 0744/1164] CLOUDERA-BUILD: CDH-39679: Hive sub-queries drop
+ select expressions when alias = column name and
+ constant propagation occurs
+
+* Note this commit does not have a corresponding upstream issue
+* While HIVE-13602 does fix this bug upstream, the patch for the JIRA has too many irrelevant changes to the bug reported in CDH-39679
+* The JIRA has more details on why we decided to push this into CDH, rather than backporting the entire change
+* This fix is based on a portion of the patch available in HIVE-13602, specifically the portion relevant to ConstantPropagateProcFactory
+* The bug only occurs when the Hive query has a sub-query where the column name is aliased to its original name and a predicate in the WHERE clause triggers expression folding via the constant propagation rule in the RBO
+* More details on the fix can be found in the CDH JIRA
+
+Change-Id: I4b6d6286a9124883cf638a539e46f37dc691f22d
+---
+ .../hadoop/hive/ql/metadata/VirtualColumn.java     |   11 ++
+ .../ql/optimizer/ConstantPropagateProcFactory.java |    7 +
+ .../clientpositive/constantPropagateForSubQuery.q  |    3 +
+ .../constantPropagateForSubQuery.q.out             |  149 ++++++++++++++++++++
+ 4 files changed, 170 insertions(+)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/VirtualColumn.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/VirtualColumn.java
+index ecc5d92..afeb9f3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/VirtualColumn.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/VirtualColumn.java
+@@ -29,6 +29,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.exec.ColumnInfo;
+ import org.apache.hadoop.hive.ql.io.RecordIdentifier;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory;
+@@ -175,4 +176,14 @@ public static StructObjectInspector getVCSObjectInspector(List<VirtualColumn> vc
+     }
+     return ObjectInspectorFactory.getStandardStructObjectInspector(names, inspectors);
+   }
++
++  public static boolean isVirtualColumnBasedOnAlias(ColumnInfo column) {
++    // Not using method column.getIsVirtualCol() because partitioning columns
++    // are also treated as virtual columns in ColumnInfo.
++    if (column.getAlias() != null
++        && VirtualColumn.VIRTUAL_COLUMN_NAMES.contains(column.getAlias().toUpperCase())) {
++      return true;
++    }
++    return false;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java
+index ab71411..0689335 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java
+@@ -50,6 +50,7 @@
+ import org.apache.hadoop.hive.ql.lib.NodeProcessor;
+ import org.apache.hadoop.hive.ql.lib.NodeProcessorCtx;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.metadata.VirtualColumn;
+ import org.apache.hadoop.hive.ql.optimizer.ConstantPropagateProcCtx.ConstantPropagateOption;
+ import org.apache.hadoop.hive.ql.parse.SemanticException;
+ import org.apache.hadoop.hive.ql.plan.DynamicPartitionCtx;
+@@ -1059,6 +1060,12 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx ctx, Object..
+             }
+           }
+           colList.set(i, newCol);
++          if (newCol instanceof ExprNodeConstantDesc && op.getSchema() != null) {
++            ColumnInfo colInfo = op.getSchema().getSignature().get(i);
++            if (!VirtualColumn.isVirtualColumnBasedOnAlias(colInfo)) {
++              constants.put(colInfo, newCol);
++            }
++          }
+           if (columnExprMap != null) {
+             columnExprMap.put(columnNames.get(i), newCol);
+           }
+diff --git a/ql/src/test/queries/clientpositive/constantPropagateForSubQuery.q b/ql/src/test/queries/clientpositive/constantPropagateForSubQuery.q
+index 08855cb..365b5b7 100644
+--- a/ql/src/test/queries/clientpositive/constantPropagateForSubQuery.q
++++ b/ql/src/test/queries/clientpositive/constantPropagateForSubQuery.q
+@@ -4,3 +4,6 @@ explain extended
+  select * from (select a.key as ak, a.value as av, b.key as bk, b.value as bv from src a join src1 b where a.key = '429' ) c;
+ 
+  select * from (select a.key as ak, a.value as av, b.key as bk, b.value as bv from src a join src1 b where a.key = '429' ) c;
++
++explain extended select * from (select key-1 as key from srcbucket where key = 6) z;
++select * from (select key-1 as key from srcbucket where key = 6) z;
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/constantPropagateForSubQuery.q.out b/ql/src/test/results/clientpositive/constantPropagateForSubQuery.q.out
+index 4ac2416..9900469 100644
+--- a/ql/src/test/results/clientpositive/constantPropagateForSubQuery.q.out
++++ b/ql/src/test/results/clientpositive/constantPropagateForSubQuery.q.out
+@@ -308,3 +308,152 @@ POSTHOOK: Input: default@src1
+ 429	val_429	66	val_66
+ 429	val_429	98	val_98
+ 429	val_429	98	val_98
++PREHOOK: query: explain extended select * from (select key-1 as key from srcbucket where key = 6) z
++PREHOOK: type: QUERY
++POSTHOOK: query: explain extended select * from (select key-1 as key from srcbucket where key = 6) z
++POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_QUERY
++   TOK_FROM
++      TOK_SUBQUERY
++         TOK_QUERY
++            TOK_FROM
++               TOK_TABREF
++                  TOK_TABNAME
++                     srcbucket
++            TOK_INSERT
++               TOK_DESTINATION
++                  TOK_DIR
++                     TOK_TMP_FILE
++               TOK_SELECT
++                  TOK_SELEXPR
++                     -
++                        TOK_TABLE_OR_COL
++                           key
++                        1
++                     key
++               TOK_WHERE
++                  =
++                     TOK_TABLE_OR_COL
++                        key
++                     6
++         z
++   TOK_INSERT
++      TOK_DESTINATION
++         TOK_DIR
++            TOK_TMP_FILE
++      TOK_SELECT
++         TOK_SELEXPR
++            TOK_ALLCOLREF
++
++
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: srcbucket
++            Statistics: Num rows: 1000 Data size: 10603 Basic stats: COMPLETE Column stats: NONE
++            GatherStats: false
++            Filter Operator
++              isSamplingPred: false
++              predicate: (key = 6) (type: boolean)
++              Statistics: Num rows: 500 Data size: 5301 Basic stats: COMPLETE Column stats: NONE
++              Select Operator
++                expressions: 5 (type: int)
++                outputColumnNames: _col0
++                Statistics: Num rows: 500 Data size: 5301 Basic stats: COMPLETE Column stats: NONE
++                File Output Operator
++                  compressed: false
++                  GlobalTableId: 0
++#### A masked pattern was here ####
++                  NumFilesPerFileSink: 1
++                  Statistics: Num rows: 500 Data size: 5301 Basic stats: COMPLETE Column stats: NONE
++#### A masked pattern was here ####
++                  table:
++                      input format: org.apache.hadoop.mapred.TextInputFormat
++                      output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                      properties:
++                        columns _col0
++                        columns.types int
++                        escape.delim \
++                        hive.serialization.extend.additional.nesting.levels true
++                        serialization.format 1
++                        serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                      serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  TotalFiles: 1
++                  GatherStats: false
++                  MultiFileSpray: false
++      Path -> Alias:
++#### A masked pattern was here ####
++      Path -> Partition:
++#### A masked pattern was here ####
++          Partition
++            base file name: srcbucket
++            input format: org.apache.hadoop.mapred.TextInputFormat
++            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++            properties:
++              COLUMN_STATS_ACCURATE true
++              bucket_count 2
++              bucket_field_name key
++              columns key,value
++              columns.comments 
++              columns.types int:string
++#### A masked pattern was here ####
++              name default.srcbucket
++              numFiles 2
++              numRows 1000
++              rawDataSize 10603
++              serialization.ddl struct srcbucket { i32 key, string value}
++              serialization.format 1
++              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              totalSize 11603
++#### A masked pattern was here ####
++            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++          
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                COLUMN_STATS_ACCURATE true
++                bucket_count 2
++                bucket_field_name key
++                columns key,value
++                columns.comments 
++                columns.types int:string
++#### A masked pattern was here ####
++                name default.srcbucket
++                numFiles 2
++                numRows 1000
++                rawDataSize 10603
++                serialization.ddl struct srcbucket { i32 key, string value}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                totalSize 11603
++#### A masked pattern was here ####
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.srcbucket
++            name: default.srcbucket
++      Truncated Path -> Alias:
++        /srcbucket [$hdt$_0:srcbucket]
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: select * from (select key-1 as key from srcbucket where key = 6) z
++PREHOOK: type: QUERY
++PREHOOK: Input: default@srcbucket
++#### A masked pattern was here ####
++POSTHOOK: query: select * from (select key-1 as key from srcbucket where key = 6) z
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@srcbucket
++#### A masked pattern was here ####
++5
++5
+-- 
+1.7.9.5
+

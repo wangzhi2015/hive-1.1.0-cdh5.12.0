@@ -1,0 +1,108 @@
+From 75078182b9de9059d222f53ddcc0bd4709c0e583 Mon Sep 17 00:00:00 2001
+From: ctang <ctang@cloudera.com>
+Date: Sat, 23 Apr 2016 20:50:00 -0400
+Subject: [PATCH 0571/1164] CDH-32512 HIVE-13527: Using deprecated APIs in
+ HBase client causes zookeeper connection leaks
+ (Naveen Gangam via Chaoyu Tang)
+
+Change-Id: I44dc9feca74b0ccaf3114d21caec7739ffdca1c7
+---
+ .../hive/hbase/HiveHBaseTableInputFormat.java      |   33 ++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableInputFormat.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableInputFormat.java
+index a5bfb6d..791ab21 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableInputFormat.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HiveHBaseTableInputFormat.java
+@@ -29,6 +29,9 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Connection;
++import org.apache.hadoop.hbase.client.ConnectionFactory;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Result;
+ import org.apache.hadoop.hbase.client.Scan;
+@@ -85,6 +88,7 @@
+ 
+   static final Log LOG = LogFactory.getLog(HiveHBaseTableInputFormat.class);
+   private static final Object hbaseTableMonitor = new Object();
++  private Connection conn = null;
+ 
+   @Override
+   public RecordReader<ImmutableBytesWritable, ResultWritable> getRecordReader(
+@@ -95,7 +99,11 @@
+     HBaseSplit hbaseSplit = (HBaseSplit) split;
+     TableSplit tableSplit = hbaseSplit.getTableSplit();
+ 
+-    setHTable(HiveHBaseInputFormatUtil.getTable(jobConf));
++    if (conn == null) {
++      conn = ConnectionFactory.createConnection(HBaseConfiguration.create(jobConf));
++    }
++    initializeTable(conn, tableSplit.getTable());
++
+     setScan(HiveHBaseInputFormatUtil.getScan(jobConf));
+ 
+     Job job = new Job(jobConf);
+@@ -108,6 +116,10 @@
+       recordReader.initialize(tableSplit, tac);
+     } catch (InterruptedException e) {
+       closeTable(); // Free up the HTable connections
++      if (conn != null) {
++        conn.close();
++        conn = null;
++      }
+       throw new IOException("Failed to initialize RecordReader", e);
+     }
+ 
+@@ -117,6 +129,10 @@
+       public void close() throws IOException {
+         recordReader.close();
+         closeTable();
++        if (conn != null) {
++          conn.close();
++          conn = null;
++        }
+       }
+ 
+       @Override
+@@ -443,7 +459,12 @@ static IndexPredicateAnalyzer newIndexPredicateAnalyzer(
+     }
+ 
+     String hbaseTableName = jobConf.get(HBaseSerDe.HBASE_TABLE_NAME);
+-    setHTable(new HTable(HBaseConfiguration.create(jobConf), Bytes.toBytes(hbaseTableName)));
++    if (conn == null) {
++      conn = ConnectionFactory.createConnection(HBaseConfiguration.create(jobConf));
++    }
++    TableName tableName = TableName.valueOf(hbaseTableName);
++    initializeTable(conn, tableName);
++
+     String hbaseColumnsMapping = jobConf.get(HBaseSerDe.HBASE_COLUMNS_MAPPING);
+     boolean doColumnRegexMatching = jobConf.getBoolean(HBaseSerDe.HBASE_COLUMNS_REGEX_MATCHING, true);
+ 
+@@ -510,6 +531,10 @@ static IndexPredicateAnalyzer newIndexPredicateAnalyzer(
+       return results;
+     } finally {
+       closeTable();
++      if (conn != null) {
++        conn.close();
++        conn = null;
++      }
+     }
+   }
+ 
+@@ -517,6 +542,10 @@ static IndexPredicateAnalyzer newIndexPredicateAnalyzer(
+   protected void finalize() throws Throwable {
+     try {
+       closeTable();
++      if (conn != null) {
++        conn.close();
++        conn = null;
++      }
+     } finally {
+       super.finalize();
+     }
+-- 
+1.7.9.5
+

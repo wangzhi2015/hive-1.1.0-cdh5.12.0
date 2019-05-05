@@ -1,0 +1,395 @@
+From c902a871e7f4d3ebad4e939b11c10cbd56352258 Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Fri, 20 Feb 2015 01:16:08 +0000
+Subject: [PATCH 0313/1164] HIVE-9556: create UDF to calculate the Levenshtein
+ distance between two strings (Alexander Pivovarov
+ via Jason Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1661051 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    2 +-
+ .../hive/ql/udf/generic/GenericUDFLevenstein.java  |  128 ++++++++++++++++++++
+ .../ql/udf/generic/TestGenericUDFLevenshtein.java  |  112 +++++++++++++++++
+ .../test/queries/clientpositive/udf_levenshtein.q  |   14 +++
+ .../results/clientpositive/show_functions.q.out    |    1 +
+ .../results/clientpositive/udf_levenshtein.q.out   |   60 +++++++++
+ 6 files changed, 316 insertions(+), 1 deletion(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenstein.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_levenshtein.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_levenshtein.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 909f6ae..bfeb33c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -180,6 +180,7 @@
+     system.registerUDF("ascii", UDFAscii.class, false);
+     system.registerGenericUDF("lpad", GenericUDFLpad.class);
+     system.registerGenericUDF("rpad", GenericUDFRpad.class);
++    system.registerGenericUDF("levenshtein", GenericUDFLevenstein.class);
+ 
+     system.registerGenericUDF("size", GenericUDFSize.class);
+ 
+@@ -891,7 +892,6 @@ public static GenericUDAFEvaluator getGenericUDAFEvaluator(String name,
+     return udafEvaluator;
+   }
+ 
+-  @SuppressWarnings("deprecation")
+   public static GenericUDAFEvaluator getGenericWindowingEvaluator(String name,
+       List<ObjectInspector> argumentOIs, boolean isDistinct,
+       boolean isAllColumns) throws SemanticException {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenstein.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenstein.java
+new file mode 100644
+index 0000000..de41793
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenstein.java
+@@ -0,0 +1,128 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import org.apache.commons.lang3.StringUtils;
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping;
++import org.apache.hadoop.io.IntWritable;
++
++/**
++ * GenericUDFLevenstein.
++ *
++ * This function calculates the Levenshtein distance between two strings.
++ * Levenshtein distance is a string metric for measuring the difference between
++ * two sequences. Informally, the Levenshtein distance between two words is the
++ * minimum number of single-character edits (i.e. insertions, deletions or
++ * substitutions) required to change one word into the other. It is named after
++ * Vladimir Levenshtein, who considered this distance in 1965
++ *
++ */
++@Description(name = "levenshtein", value = "_FUNC_(str1, str2) - This function calculates the Levenshtein distance between two strings.",
++    extended = "Levenshtein distance is a string metric for measuring the difference between"
++    + " two sequences. Informally, the Levenshtein distance between two words is the"
++    + " minimum number of single-character edits (i.e. insertions, deletions or"
++    + " substitutions) required to change one word into the other. It is named after"
++    + " Vladimir Levenshtein, who considered this distance in 1965."
++    + "Example:\n "
++    + " > SELECT _FUNC_('kitten', 'sitting');\n 3")
++public class GenericUDFLevenstein extends GenericUDF {
++  private transient Converter[] textConverters = new Converter[2];
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[2];
++  private final IntWritable output = new IntWritable();
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    if (arguments.length != 2) {
++      throw new UDFArgumentLengthException(getFuncName() + " requires 2 arguments, got "
++          + arguments.length);
++    }
++    checkIfPrimitive(arguments, 0, "1st");
++    checkIfPrimitive(arguments, 1, "2nd");
++
++    checkIfStringGroup(arguments, 0, "1st");
++    checkIfStringGroup(arguments, 1, "2nd");
++
++    getStringConverter(arguments, 0, "1st");
++    getStringConverter(arguments, 1, "2nd");
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableIntObjectInspector;
++    return outputOI;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    Object obj0;
++    Object obj1;
++    if ((obj0 = arguments[0].get()) == null || (obj1 = arguments[1].get()) == null) {
++      return null;
++    }
++
++    String str0 = textConverters[0].convert(obj0).toString();
++    String str1 = textConverters[1].convert(obj1).toString();
++
++    int dist = StringUtils.getLevenshteinDistance(str0, str1);
++    output.set(dist);
++    return output;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  protected void checkIfPrimitive(ObjectInspector[] arguments, int i, String argOrder)
++      throws UDFArgumentTypeException {
++    ObjectInspector.Category oiCat = arguments[i].getCategory();
++    if (oiCat != ObjectInspector.Category.PRIMITIVE) {
++      throw new UDFArgumentTypeException(i, getFuncName() + " only takes primitive types as "
++          + argOrder + " argument, got " + oiCat);
++    }
++  }
++
++  protected void checkIfStringGroup(ObjectInspector[] arguments, int i, String argOrder)
++      throws UDFArgumentTypeException {
++    inputTypes[i] = ((PrimitiveObjectInspector) arguments[i]).getPrimitiveCategory();
++    if (PrimitiveObjectInspectorUtils.getPrimitiveGrouping(inputTypes[i]) != PrimitiveGrouping.STRING_GROUP) {
++      throw new UDFArgumentTypeException(i, getFuncName() + " only takes STRING_GROUP types as "
++          + argOrder + " argument, got " + inputTypes[i]);
++    }
++  }
++
++  protected void getStringConverter(ObjectInspector[] arguments, int i, String argOrder)
++      throws UDFArgumentTypeException {
++    textConverters[i] = ObjectInspectorConverters.getConverter(
++        (PrimitiveObjectInspector) arguments[i],
++        PrimitiveObjectInspectorFactory.writableStringObjectInspector);
++  }
++
++  protected String getFuncName() {
++    return "levenshtein";
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java
+new file mode 100644
+index 0000000..e674d9f
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java
+@@ -0,0 +1,112 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.io.IntWritable;
++import org.apache.hadoop.io.Text;
++
++public class TestGenericUDFLevenshtein extends TestCase {
++
++  public void testLevenstein() throws HiveException {
++    GenericUDFLevenstein udf = new GenericUDFLevenstein();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++    runAndVerify("kitten", "sitting", 3, udf);
++    runAndVerify("Test String1", "Test String2", 1, udf);
++    runAndVerify("Test String1", "test String2", 2, udf);
++
++    runAndVerify("Test String1", "", 12, udf);
++    runAndVerify("", "Test String2", 12, udf);
++
++    runAndVerify(null, "sitting", null, udf);
++    runAndVerify("kitten", null, null, udf);
++    runAndVerify(null, null, null, udf);
++  }
++
++  public void testLevensteinWrongType0() throws HiveException {
++    @SuppressWarnings("resource")
++    GenericUDFLevenstein udf = new GenericUDFLevenstein();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableIntObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    try {
++      udf.initialize(arguments);
++      assertTrue("levenshtein test. UDFArgumentTypeException is expected", false);
++    } catch (UDFArgumentTypeException e) {
++      assertEquals("levenshtein test",
++          "levenshtein only takes STRING_GROUP types as 1st argument, got INT", e.getMessage());
++    }
++  }
++
++  public void testLevensteinWrongType1() throws HiveException {
++    @SuppressWarnings("resource")
++    GenericUDFLevenstein udf = new GenericUDFLevenstein();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableHiveVarcharObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableFloatObjectInspector;
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    try {
++      udf.initialize(arguments);
++      assertTrue("levenshtein test. UDFArgumentTypeException is expected", false);
++    } catch (UDFArgumentTypeException e) {
++      assertEquals("levenshtein test",
++          "levenshtein only takes STRING_GROUP types as 2nd argument, got FLOAT", e.getMessage());
++    }
++  }
++
++  public void testLevensteinWrongLength() throws HiveException {
++    @SuppressWarnings("resource")
++    GenericUDFLevenstein udf = new GenericUDFLevenstein();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableHiveVarcharObjectInspector;
++    ObjectInspector[] arguments = { valueOI0 };
++
++    try {
++      udf.initialize(arguments);
++      assertTrue("levenshtein test. UDFArgumentLengthException is expected", false);
++    } catch (UDFArgumentLengthException e) {
++      assertEquals("levenshtein test", "levenshtein requires 2 arguments, got 1", e.getMessage());
++    }
++  }
++
++  private void runAndVerify(String str0, String str1, Integer expResult, GenericUDF udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(str0 != null ? new Text(str0) : null);
++    DeferredObject valueObj1 = new DeferredJavaObject(str1 != null ? new Text(str1) : null);
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    IntWritable output = (IntWritable) udf.evaluate(args);
++    if (expResult == null) {
++      assertNull("levenshtein test ", output);
++    } else {
++      assertNotNull("levenshtein test", output);
++      assertEquals("levenshtein test", expResult.intValue(), output.get());
++    }
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_levenshtein.q b/ql/src/test/queries/clientpositive/udf_levenshtein.q
+new file mode 100644
+index 0000000..1e16e81
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_levenshtein.q
+@@ -0,0 +1,14 @@
++DESCRIBE FUNCTION levenshtein;
++DESC FUNCTION EXTENDED levenshtein;
++
++explain select levenshtein('Test String1', 'Test String2');
++
++select
++levenshtein('kitten', 'sitting'),
++levenshtein('Test String1', 'Test String2'),
++levenshtein('Test String1', 'test String2'),
++levenshtein('', 'Test String2'),
++levenshtein('Test String1', ''),
++levenshtein(cast(null as string), 'Test String2'),
++levenshtein('Test String1', cast(null as string)),
++levenshtein(cast(null as string), cast(null as string));
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index a58f453..d4b0650 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -105,6 +105,7 @@ lcase
+ lead
+ least
+ length
++levenshtein
+ like
+ ln
+ locate
+diff --git a/ql/src/test/results/clientpositive/udf_levenshtein.q.out b/ql/src/test/results/clientpositive/udf_levenshtein.q.out
+new file mode 100644
+index 0000000..1a60822
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_levenshtein.q.out
+@@ -0,0 +1,60 @@
++PREHOOK: query: DESCRIBE FUNCTION levenshtein
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION levenshtein
++POSTHOOK: type: DESCFUNCTION
++levenshtein(str1, str2) - This function calculates the Levenshtein distance between two strings.
++PREHOOK: query: DESC FUNCTION EXTENDED levenshtein
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED levenshtein
++POSTHOOK: type: DESCFUNCTION
++levenshtein(str1, str2) - This function calculates the Levenshtein distance between two strings.
++Levenshtein distance is a string metric for measuring the difference between two sequences. Informally, the Levenshtein distance between two words is the minimum number of single-character edits (i.e. insertions, deletions or substitutions) required to change one word into the other. It is named after Vladimir Levenshtein, who considered this distance in 1965.Example:
++  > SELECT levenshtein('kitten', 'sitting');
++ 3
++PREHOOK: query: explain select levenshtein('Test String1', 'Test String2')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select levenshtein('Test String1', 'Test String2')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 1 (type: int)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++levenshtein('kitten', 'sitting'),
++levenshtein('Test String1', 'Test String2'),
++levenshtein('Test String1', 'test String2'),
++levenshtein('', 'Test String2'),
++levenshtein('Test String1', ''),
++levenshtein(cast(null as string), 'Test String2'),
++levenshtein('Test String1', cast(null as string)),
++levenshtein(cast(null as string), cast(null as string))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++levenshtein('kitten', 'sitting'),
++levenshtein('Test String1', 'Test String2'),
++levenshtein('Test String1', 'test String2'),
++levenshtein('', 'Test String2'),
++levenshtein('Test String1', ''),
++levenshtein(cast(null as string), 'Test String2'),
++levenshtein('Test String1', cast(null as string)),
++levenshtein(cast(null as string), cast(null as string))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++3	1	2	12	12	NULL	NULL	NULL
+-- 
+1.7.9.5
+

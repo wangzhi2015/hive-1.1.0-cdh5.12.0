@@ -1,0 +1,170 @@
+From 0e14ca05d26900b4525f8baf7dbf95cd0c0d2146 Mon Sep 17 00:00:00 2001
+From: Zsombor Klara <zsombor.klara@cloudera.com>
+Date: Tue, 16 May 2017 12:02:59 +0200
+Subject: [PATCH 1127/1164] Revert "CDH-52128: HIVE-16231: Parquet timestamp
+ may be stored differently since HIVE-12767 (Barna
+ Zsombor Klara, reviewed by Sergio Pena)"
+
+This reverts commit eddef4a0a371c8cd9f7affba0972e8fe919433f3.
+
+Reverting all 4 parquet timestamp fixes as the upstream community vetoed the sparkSQL part of the change
+
+Change-Id: I0a179d2e4e54e934bb8c16f2aef3fc26ec84fd87
+---
+ .../ql/io/parquet/MapredParquetOutputFormat.java   |   10 ++++++----
+ .../parquet/read/ParquetRecordReaderWrapper.java   |   13 ++++++++-----
+ .../ql/io/parquet/timestamp/NanoTimeUtils.java     |   15 +--------------
+ .../ql/io/parquet/timestamp/TestNanoTimeUtils.java |   13 -------------
+ .../clientpositive/parquet_int96_timestamp.q       |    2 +-
+ 5 files changed, 16 insertions(+), 37 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetOutputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetOutputFormat.java
+index c7784d8..95f22ba 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetOutputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetOutputFormat.java
+@@ -24,7 +24,6 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
+-import org.apache.hadoop.hive.ql.io.parquet.timestamp.NanoTimeUtils;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
+@@ -137,11 +136,14 @@ private TimeZone getParquetWriterTimeZone(Properties tableProperties) {
+     String timeZoneID =
+         tableProperties.getProperty(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY);
+     if (!Strings.isNullOrEmpty(timeZoneID)) {
+-
+-      NanoTimeUtils.validateTimeZone(timeZoneID);
++      if (!Arrays.asList(TimeZone.getAvailableIDs()).contains(timeZoneID)) {
++        throw new IllegalStateException("Unexpected timezone id found for parquet int96 conversion: " + timeZoneID);
++      }
+       return TimeZone.getTimeZone(timeZoneID);
+     }
+ 
+-    return TimeZone.getDefault();
++    // If no timezone is defined in table properties, then adjust timestamps using
++    // PARQUET_INT96_NO_ADJUSTMENT_ZONE timezone
++    return TimeZone.getTimeZone(ParquetTableUtils.PARQUET_INT96_NO_ADJUSTMENT_ZONE);
+   }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
+index fd9ed5b..4948e36 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
+@@ -15,6 +15,7 @@
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+ import java.util.TimeZone;
+ 
+@@ -27,7 +28,6 @@
+ import org.apache.hadoop.hive.ql.io.IOConstants;
+ import org.apache.hadoop.hive.ql.io.parquet.ProjectionPusher;
+ import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
+-import org.apache.hadoop.hive.ql.io.parquet.timestamp.NanoTimeUtils;
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory;
+ import org.apache.hadoop.hive.ql.plan.TableScanDesc;
+@@ -161,7 +161,7 @@ protected void setTimeZoneConversion(Configuration configuration, Path finalPath
+     boolean skipConversion = HiveConf.getBoolVar(configuration,
+         HiveConf.ConfVars.HIVE_PARQUET_TIMESTAMP_SKIP_CONVERSION);
+     FileMetaData fileMetaData = parquetMetadata.getFileMetaData();
+-    if (!Strings.nullToEmpty(fileMetaData.getCreatedBy()).startsWith("parquet-mr") &&
++    if (!Strings.nullToEmpty(fileMetaData.getCreatedBy()).startsWith("parquet-mr") ||
+         skipConversion) {
+       // Impala writes timestamp values using GMT only. We should not try to convert Impala
+       // files to other type of timezones.
+@@ -170,13 +170,16 @@ protected void setTimeZoneConversion(Configuration configuration, Path finalPath
+       // TABLE_PARQUET_INT96_TIMEZONE is a table property used to detect what timezone conversion
+       // to use when reading Parquet timestamps.
+       timeZoneID = configuration.get(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY,
+-          TimeZone.getDefault().getID());
++          ParquetTableUtils.PARQUET_INT96_NO_ADJUSTMENT_ZONE);
+ 
+-      NanoTimeUtils.validateTimeZone(timeZoneID);
++      if (!Arrays.asList(TimeZone.getAvailableIDs()).contains(timeZoneID)) {
++        throw new IllegalStateException("Unexpected timezone id found for parquet int96 conversion: " + timeZoneID);
++      }
+     }
+ 
+     // 'timeZoneID' should be valid, since we did not throw exception above
+-    configuration.set(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY,timeZoneID);
++    configuration.set(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY,
++        TimeZone.getTimeZone(timeZoneID).getID());
+   }
+ 
+   public FilterCompat.Filter setFilter(final JobConf conf, MessageType schema) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java
+index dbd6fb3..5dc8088 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java
+@@ -152,26 +152,13 @@ public static Timestamp getTimestamp(NanoTime nt, Calendar calendar) {
+ 
+     calendar.setTimeInMillis(utcCalendar.getTimeInMillis());
+ 
+-    Calendar adjusterCalendar = copyToCalendarWithTZ(calendar, getLocalCalendar());
++    Calendar adjusterCalendar = copyToCalendarWithTZ(calendar, Calendar.getInstance());
+ 
+     Timestamp ts = new Timestamp(adjusterCalendar.getTimeInMillis());
+     ts.setNanos((int) nanos);
+     return ts;
+   }
+ 
+-  /**
+-   * Check if the string id is a valid java TimeZone id.
+-   * TimeZone#getTimeZone will return "GMT" if the id cannot be understood.
+-   * @param timeZoneID
+-   */
+-  public static void validateTimeZone(String timeZoneID) {
+-    if (TimeZone.getTimeZone(timeZoneID).getID().equals("GMT")
+-        && !"GMT".equals(timeZoneID)) {
+-      throw new IllegalStateException(
+-          "Unexpected timezone id found for parquet int96 conversion: " + timeZoneID);
+-    }
+-  }
+-
+   private static Calendar copyToCalendarWithTZ(Calendar from, Calendar to) {
+     if(from.getTimeZone().getID().equals(to.getTimeZone().getID())) {
+       return from;
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java
+index 1e10dbf..37cf0e2 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java
+@@ -230,17 +230,4 @@ public void testCompareDeprecatedNanoTimeWithNewNanoTime() throws ParseException
+     Assert.assertEquals(newNTUTC.getJulianDay(), depNTUTC.getJulianDay());
+     Assert.assertEquals(newNTUTC.getTimeOfDayNanos(), depNTUTC.getTimeOfDayNanos());
+   }
+-
+-  @Test
+-  public void testTimeZoneValidationWithCorrectZoneId() {
+-    NanoTimeUtils.validateTimeZone("GMT");
+-    NanoTimeUtils.validateTimeZone("UTC");
+-    NanoTimeUtils.validateTimeZone("GMT+10");
+-    NanoTimeUtils.validateTimeZone("Europe/Budapest");
+-  }
+-
+-  @Test(expected = IllegalStateException.class)
+-  public void testTimeZoneValidationWithIncorrectZoneId() {
+-    NanoTimeUtils.validateTimeZone("UCC");
+-  }
+ }
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q b/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q
+index 6eadd1b..5de2c3f 100644
+--- a/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q
++++ b/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q
+@@ -2,7 +2,7 @@ create table dummy (id int);
+ insert into table dummy values (1);
+ 
+ set hive.parquet.mr.int96.enable.utc.write.zone=true;
+-set hive.parquet.timestamp.skip.conversion=true;
++set hive.parquet.timestamp.skip.conversion=false;
+ 
+ -- read/write timestamps using UTC as default write zone
+ create table timestamps (ts timestamp) stored as parquet;
+-- 
+1.7.9.5
+

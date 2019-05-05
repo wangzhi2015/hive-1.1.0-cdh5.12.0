@@ -1,0 +1,81 @@
+From e11fc1cf1cc8650e1943b9adf46b637fdfdd08ab Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xzhang@Cloudera.com>
+Date: Wed, 16 Dec 2015 08:31:27 -0800
+Subject: [PATCH 0461/1164] CDH-35585: HIVE-12538: After set spark related
+ config, SparkSession never get reused (Nemon Lou
+ via Xuefu)
+
+Conflicts:
+
+	common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
+
+Change-Id: I735dddb7a8ea21785de44545f90f796380d52aa7
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    4 +++-
+ .../org/apache/hadoop/hive/conf/TestHiveConf.java  |   14 ++++++++++++++
+ .../hadoop/hive/ql/exec/spark/SparkUtilities.java  |    6 +++++-
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 3497876..652db5c 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2354,7 +2354,9 @@ public void verifyAndSet(String name, String value) throws IllegalArgumentExcept
+       // When either name or value is null, the set method below will fail,
+       // and throw IllegalArgumentException
+       set(name, value);
+-      isSparkConfigUpdated = isSparkRelatedConfig(name);
++      if (isSparkRelatedConfig(name)) {
++        isSparkConfigUpdated = true;
++      }
+     }
+   }
+ 
+diff --git a/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java b/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
+index e9bde21..b753ea3 100644
+--- a/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
++++ b/common/src/test/org/apache/hadoop/hive/conf/TestHiveConf.java
+@@ -117,4 +117,18 @@ public void testUnitFor() throws Exception {
+     Assert.assertEquals(TimeUnit.NANOSECONDS, HiveConf.unitFor("ns", null));
+     Assert.assertEquals(TimeUnit.NANOSECONDS, HiveConf.unitFor("nsecs", null));
+   }
++
++  @Test
++  public void testSparkConfigUpdate(){
++    HiveConf conf = new HiveConf();
++    Assert.assertFalse(conf.getSparkConfigUpdated());
++
++    conf.verifyAndSet("spark.master", "yarn-cluster");
++    Assert.assertTrue(conf.getSparkConfigUpdated());
++    conf.verifyAndSet("hive.execution.engine", "spark");
++    Assert.assertTrue("Expected spark config updated.", conf.getSparkConfigUpdated());
++
++    conf.setSparkConfigUpdated(false);
++    Assert.assertFalse(conf.getSparkConfigUpdated());
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+index 2ae1743..2ac8654 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+@@ -111,12 +111,16 @@ public static boolean isDedicatedCluster(Configuration conf) {
+   public static SparkSession getSparkSession(HiveConf conf,
+       SparkSessionManager sparkSessionManager) throws HiveException {
+     SparkSession sparkSession = SessionState.get().getSparkSession();
++    HiveConf sessionConf = SessionState.get().getConf();
+ 
+     // Spark configurations are updated close the existing session
+-    if (conf.getSparkConfigUpdated()) {
++    // In case of async queries or confOverlay is not empty,
++    // sessionConf and conf are different objects
++    if (sessionConf.getSparkConfigUpdated() || conf.getSparkConfigUpdated()) {
+       sparkSessionManager.closeSession(sparkSession);
+       sparkSession =  null;
+       conf.setSparkConfigUpdated(false);
++      sessionConf.setSparkConfigUpdated(false);
+     }
+     sparkSession = sparkSessionManager.getSession(sparkSession, conf, true);
+     SessionState.get().setSparkSession(sparkSession);
+-- 
+1.7.9.5
+

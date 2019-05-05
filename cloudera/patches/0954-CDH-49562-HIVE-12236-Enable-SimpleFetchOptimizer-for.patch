@@ -1,0 +1,398 @@
+From 412eab5ec6fb8c987f49fae10421985c7d3e7b76 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Tue, 1 Dec 2015 15:48:42 -0800
+Subject: [PATCH 0954/1164] CDH-49562: HIVE-12236 : Enable
+ SimpleFetchOptimizer for more query types
+ (Ashutosh Chauhan via Sergey Shelukhin)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+(cherry picked from commit 66b373a821f3b946a7c771fe0b89f81e6090da9b)
+
+Change-Id: Ifcd3c4bd204640e742292098c86bc8db651ca7e6
+---
+ .../test/resources/testconfiguration.properties    |    1 +
+ .../hive/ql/optimizer/SimpleFetchOptimizer.java    |    7 +
+ .../queries/clientpositive/nonmr_fetch_threshold.q |    6 +
+ .../clientpositive/nonmr_fetch_threshold.q.out     |  107 ++++++++++
+ .../clientpositive/tez/nonmr_fetch_threshold.q.out |  210 ++++++++++++++++++++
+ 5 files changed, 331 insertions(+)
+ create mode 100644 ql/src/test/results/clientpositive/tez/nonmr_fetch_threshold.q.out
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index ee9f4d8..c1fa54a 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -130,6 +130,7 @@ minitez.query.files.shared=alter_merge_2_orc.q,\
+   merge2.q,\
+   metadataonly1.q,\
+   metadata_only_queries.q,\
++  nonmr_fetch_threshold.q,\
+   optimize_nullscan.q,\
+   orc_analyze.q,\
+   orc_merge1.q,\
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
+index 7fcf5f6..55e885d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
+@@ -157,6 +157,13 @@ private boolean checkThreshold(FetchData data, int limit, ParseContext pctx) thr
+     if (threshold < 0) {
+       return true;
+     }
++    Operator child = data.scanOp.getChildOperators().get(0);
++    if(child instanceof SelectOperator) {
++      // select *, constant and casts can be allowed without a threshold check
++      if (checkExpressions((SelectOperator)child)) {
++        return true;
++      }
++    }
+     long remaining = threshold;
+     remaining -= data.getInputLength(pctx, remaining);
+     if (remaining < 0) {
+diff --git a/ql/src/test/queries/clientpositive/nonmr_fetch_threshold.q b/ql/src/test/queries/clientpositive/nonmr_fetch_threshold.q
+index 26f6f5b..a272360 100644
+--- a/ql/src/test/queries/clientpositive/nonmr_fetch_threshold.q
++++ b/ql/src/test/queries/clientpositive/nonmr_fetch_threshold.q
+@@ -17,3 +17,9 @@ explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10;
+ explain select cast(key as int) * 10, upper(value) from src limit 10;
+ -- Scans without limit (should not be Fetch task now)
+ explain select concat(key, value)  from src;
++-- Simple Scans without limit (will be  Fetch task now)
++explain select key, value  from src;
++explain select key  from src;
++explain select *    from src;
++explain select key,1 from src;
++explain select cast(key as char(20)),1 from src;
+diff --git a/ql/src/test/results/clientpositive/nonmr_fetch_threshold.q.out b/ql/src/test/results/clientpositive/nonmr_fetch_threshold.q.out
+index 6bfc624..4ff9f95 100644
+--- a/ql/src/test/results/clientpositive/nonmr_fetch_threshold.q.out
++++ b/ql/src/test/results/clientpositive/nonmr_fetch_threshold.q.out
+@@ -202,3 +202,110 @@ STAGE PLANS:
+       Processor Tree:
+         ListSink
+ 
++PREHOOK: query: -- Simple Scans without limit (will be  Fetch task now)
++explain select key, value  from src
++PREHOOK: type: QUERY
++POSTHOOK: query: -- Simple Scans without limit (will be  Fetch task now)
++explain select key, value  from src
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: src
++          Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++          Select Operator
++            expressions: key (type: string), value (type: string)
++            outputColumnNames: _col0, _col1
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            ListSink
++
++PREHOOK: query: explain select key  from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key  from src
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: src
++          Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++          Select Operator
++            expressions: key (type: string)
++            outputColumnNames: _col0
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            ListSink
++
++PREHOOK: query: explain select *    from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select *    from src
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: src
++          Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++          Select Operator
++            expressions: key (type: string), value (type: string)
++            outputColumnNames: _col0, _col1
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            ListSink
++
++PREHOOK: query: explain select key,1 from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key,1 from src
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: src
++          Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++          Select Operator
++            expressions: key (type: string), 1 (type: int)
++            outputColumnNames: _col0, _col1
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            ListSink
++
++PREHOOK: query: explain select cast(key as char(20)),1 from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cast(key as char(20)),1 from src
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: src
++          Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++          Select Operator
++            expressions: CAST( key AS CHAR(20) (type: char(20)), 1 (type: int)
++            outputColumnNames: _col0, _col1
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            ListSink
++
+diff --git a/ql/src/test/results/clientpositive/tez/nonmr_fetch_threshold.q.out b/ql/src/test/results/clientpositive/tez/nonmr_fetch_threshold.q.out
+new file mode 100644
+index 0000000..d6dd09f
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/tez/nonmr_fetch_threshold.q.out
+@@ -0,0 +1,210 @@
++PREHOOK: query: explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:10
++      Limit [LIM_3]
++         Number of rows:10
++         Select Operator [SEL_2]
++            outputColumnNames:["_col0","_col1","_col2","_col3"]
++            TableScan [TS_0]
++               alias:srcpart
++
++PREHOOK: query: explain select cast(key as int) * 10, upper(value) from src limit 10
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cast(key as int) * 10, upper(value) from src limit 10
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:10
++      Limit [LIM_2]
++         Number of rows:10
++         Select Operator [SEL_1]
++            outputColumnNames:["_col0","_col1"]
++            TableScan [TS_0]
++               alias:src
++
++PREHOOK: query: explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:10
++      Limit [LIM_3]
++         Number of rows:10
++         Select Operator [SEL_2]
++            outputColumnNames:["_col0","_col1","_col2","_col3"]
++            TableScan [TS_0]
++               alias:srcpart
++
++PREHOOK: query: explain select cast(key as int) * 10, upper(value) from src limit 10
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cast(key as int) * 10, upper(value) from src limit 10
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:10
++      Limit [LIM_2]
++         Number of rows:10
++         Select Operator [SEL_1]
++            outputColumnNames:["_col0","_col1"]
++            TableScan [TS_0]
++               alias:src
++
++PREHOOK: query: -- Scans without limit (should be Fetch task now)
++explain select concat(key, value)  from src
++PREHOOK: type: QUERY
++POSTHOOK: query: -- Scans without limit (should be Fetch task now)
++explain select concat(key, value)  from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Select Operator [SEL_1]
++         outputColumnNames:["_col0"]
++         TableScan [TS_0]
++            alias:src
++
++PREHOOK: query: -- from HIVE-7397, limit + partition pruning filter
++explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10
++PREHOOK: type: QUERY
++POSTHOOK: query: -- from HIVE-7397, limit + partition pruning filter
++explain select * from srcpart where ds='2008-04-08' AND hr='11' limit 10
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:10
++      Limit [LIM_3]
++         Number of rows:10
++         Select Operator [SEL_2]
++            outputColumnNames:["_col0","_col1","_col2","_col3"]
++            TableScan [TS_0]
++               alias:srcpart
++
++PREHOOK: query: explain select cast(key as int) * 10, upper(value) from src limit 10
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cast(key as int) * 10, upper(value) from src limit 10
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:10
++      Limit [LIM_2]
++         Number of rows:10
++         Select Operator [SEL_1]
++            outputColumnNames:["_col0","_col1"]
++            TableScan [TS_0]
++               alias:src
++
++PREHOOK: query: -- Scans without limit (should not be Fetch task now)
++explain select concat(key, value)  from src
++PREHOOK: type: QUERY
++POSTHOOK: query: -- Scans without limit (should not be Fetch task now)
++explain select concat(key, value)  from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Stage-1
++         Map 1
++         File Output Operator [FS_2]
++            compressed:false
++            Statistics:Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            table:{"input format:":"org.apache.hadoop.mapred.TextInputFormat","output format:":"org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat","serde:":"org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"}
++            Select Operator [SEL_1]
++               outputColumnNames:["_col0"]
++               Statistics:Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++               TableScan [TS_0]
++                  alias:src
++                  Statistics:Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++
++PREHOOK: query: -- Simple Scans without limit (will be  Fetch task now)
++explain select key, value  from src
++PREHOOK: type: QUERY
++POSTHOOK: query: -- Simple Scans without limit (will be  Fetch task now)
++explain select key, value  from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Select Operator [SEL_1]
++         outputColumnNames:["_col0","_col1"]
++         TableScan [TS_0]
++            alias:src
++
++PREHOOK: query: explain select key  from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key  from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Select Operator [SEL_1]
++         outputColumnNames:["_col0"]
++         TableScan [TS_0]
++            alias:src
++
++PREHOOK: query: explain select *    from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select *    from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Select Operator [SEL_1]
++         outputColumnNames:["_col0","_col1"]
++         TableScan [TS_0]
++            alias:src
++
++PREHOOK: query: explain select key,1 from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key,1 from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Select Operator [SEL_1]
++         outputColumnNames:["_col0","_col1"]
++         TableScan [TS_0]
++            alias:src
++
++PREHOOK: query: explain select cast(key as char(20)),1 from src
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cast(key as char(20)),1 from src
++POSTHOOK: type: QUERY
++Plan optimized by CBO.
++
++Stage-0
++   Fetch Operator
++      limit:-1
++      Select Operator [SEL_1]
++         outputColumnNames:["_col0","_col1"]
++         TableScan [TS_0]
++            alias:src
++
+-- 
+1.7.9.5
+

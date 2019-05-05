@@ -1,0 +1,66 @@
+From c5f0d6a1a25d06dca9eccba1169206a499fce92f Mon Sep 17 00:00:00 2001
+From: xzhang <xzhang@xzdt>
+Date: Mon, 22 Jun 2015 13:04:12 -0700
+Subject: [PATCH 0163/1164] HIVE-10594: Remote Spark client doesn't use
+ Kerberos keytab to authenticate [Spark Branch]
+ (Reviewed by Chao)
+
+---
+ .../apache/hive/spark/client/SparkClientImpl.java  |   21 +++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+index 9e34a49..60baa31 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+@@ -50,7 +50,10 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.shims.Utils;
++import org.apache.hadoop.security.SecurityUtil;
++import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hive.spark.client.rpc.Rpc;
+ import org.apache.hive.spark.client.rpc.RpcConfiguration;
+ import org.apache.hive.spark.client.rpc.RpcServer;
+@@ -310,6 +313,17 @@ public void run() {
+ 
+       List<String> argv = Lists.newArrayList();
+ 
++      if (hiveConf.getVar(HiveConf.ConfVars.HIVE_SERVER2_AUTHENTICATION).equalsIgnoreCase("kerberos")) {
++          argv.add("kinit");
++          String principal = SecurityUtil.getServerPrincipal(hiveConf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL),
++              "0.0.0.0");
++          String keyTabFile = hiveConf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB);
++          argv.add(principal);
++          argv.add("-k");
++          argv.add("-t");
++          argv.add(keyTabFile + ";");
++      }
++
+       if (sparkHome != null) {
+         argv.add(new File(sparkHome, "bin/spark-submit").getAbsolutePath());
+       } else {
+@@ -406,14 +420,15 @@ public void run() {
+         argv.add(String.format("%s=%s", hiveSparkConfKey, value));
+       }
+ 
+-      LOG.info("Running client driver with argv: {}", Joiner.on(" ").join(argv));
++      String cmd = Joiner.on(" ").join(argv);
++      LOG.info("Running client driver with argv: {}", cmd);
++      ProcessBuilder pb = new ProcessBuilder("sh", "-c", cmd);
+ 
+-      ProcessBuilder pb = new ProcessBuilder(argv.toArray(new String[argv.size()]));
+       if (isTesting != null) {
+         pb.environment().put("SPARK_TESTING", isTesting);
+       }
+-      final Process child = pb.start();
+ 
++      final Process child = pb.start();
+       int childId = childIdGenerator.incrementAndGet();
+       redirect("stdout-redir-" + childId, child.getInputStream());
+       redirect("stderr-redir-" + childId, child.getErrorStream());
+-- 
+1.7.9.5
+

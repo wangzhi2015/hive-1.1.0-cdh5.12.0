@@ -1,0 +1,1727 @@
+From d444a8450ed6225ba3114456b815e8f00c13d435 Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Tue, 3 Mar 2015 00:13:46 +0000
+Subject: [PATCH 0317/1164] HIVE-9480: Build UDF TRUNC to implement FIRST_DAY
+ as compared with LAST_DAY (Xiaobing Zhou via
+ Jason Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1663487 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    1 +
+ .../hive/ql/udf/generic/GenericUDFTrunc.java       |  205 ++++++
+ .../hive/ql/udf/generic/TestGenericUDFTrunc.java   |  477 ++++++++++++++
+ .../test/queries/clientnegative/udf_trunc_error1.q |    1 +
+ .../test/queries/clientnegative/udf_trunc_error2.q |    1 +
+ ql/src/test/queries/clientpositive/udf_trunc.q     |  243 +++++++
+ .../results/clientnegative/udf_trunc_error1.q.out  |    1 +
+ .../results/clientnegative/udf_trunc_error2.q.out  |    1 +
+ .../results/clientpositive/show_functions.q.out    |    1 +
+ ql/src/test/results/clientpositive/udf_trunc.q.out |  690 ++++++++++++++++++++
+ 10 files changed, 1621 insertions(+)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTrunc.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFTrunc.java
+ create mode 100644 ql/src/test/queries/clientnegative/udf_trunc_error1.q
+ create mode 100644 ql/src/test/queries/clientnegative/udf_trunc_error2.q
+ create mode 100644 ql/src/test/queries/clientpositive/udf_trunc.q
+ create mode 100644 ql/src/test/results/clientnegative/udf_trunc_error1.q.out
+ create mode 100644 ql/src/test/results/clientnegative/udf_trunc_error2.q.out
+ create mode 100644 ql/src/test/results/clientpositive/udf_trunc.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index f7a4478..20811ab 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -262,6 +262,7 @@
+     system.registerUDF("weekofyear", UDFWeekOfYear.class, false);
+     system.registerGenericUDF("last_day", GenericUDFLastDay.class);
+     system.registerGenericUDF("next_day", GenericUDFNextDay.class);
++    system.registerGenericUDF("trunc", GenericUDFTrunc.class);
+ 
+     system.registerGenericUDF("date_add", GenericUDFDateAdd.class);
+     system.registerGenericUDF("date_sub", GenericUDFDateSub.class);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTrunc.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTrunc.java
+new file mode 100644
+index 0000000..3bf8d34
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTrunc.java
+@@ -0,0 +1,205 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import java.sql.Timestamp;
++import java.text.ParseException;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Calendar;
++import java.util.Date;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.TimestampConverter;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping;
++import org.apache.hadoop.io.Text;
++
++/**
++ * GenericUDFTrunc.
++ *
++ * Returns the first day of the month which the date belongs to.
++ * The time part of the date will be  ignored.
++ *
++ */
++@Description(name = "trunc",
++value = "_FUNC_(date, fmt) - Returns returns date with the time portion of the day truncated "
++    + "to the unit specified by the format model fmt. If you omit fmt, then date is truncated to "
++    + "the nearest day. It now only supports 'MONTH'/'MON'/'MM' and 'YEAR'/'YYYY'/'YY' as format.",
++extended = "date is a string in the format 'yyyy-MM-dd HH:mm:ss' or 'yyyy-MM-dd'."
++    + " The time part of date is ignored.\n"
++    + "Example:\n "
++    + " > SELECT _FUNC_('2009-02-12', 'MM');\n" + "OK\n" + " '2009-02-01'" + "\n"
++    + " > SELECT _FUNC_('2015-10-27', 'YEAR');\n" + "OK\n" + " '2015-01-01'")
++public class GenericUDFTrunc extends GenericUDF {
++
++  private transient SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd");
++  private transient TimestampConverter timestampConverter;
++  private transient Converter textConverter1;
++  private transient Converter textConverter2;
++  private transient Converter dateWritableConverter;
++  private transient PrimitiveCategory inputType1;
++  private transient PrimitiveCategory inputType2;
++  private final Calendar calendar = Calendar.getInstance();
++  private final Text output = new Text();
++  private transient String fmtInput;
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    if (arguments.length != 2) {
++      throw new UDFArgumentLengthException("trunc() requires 2 argument, got " + arguments.length);
++    }
++
++    if (arguments[0].getCategory() != ObjectInspector.Category.PRIMITIVE) {
++      throw new UDFArgumentTypeException(0, "Only primitive type arguments are accepted but "
++          + arguments[0].getTypeName() + " is passed. as first arguments");
++    }
++
++    if (arguments[1].getCategory() != ObjectInspector.Category.PRIMITIVE) {
++      throw new UDFArgumentTypeException(1, "Only primitive type arguments are accepted but "
++          + arguments[1].getTypeName() + " is passed. as second arguments");
++    }
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    inputType1 = ((PrimitiveObjectInspector) arguments[0]).getPrimitiveCategory();
++    switch (inputType1) {
++    case STRING:
++    case VARCHAR:
++    case CHAR:
++      inputType1 = PrimitiveCategory.STRING;
++      textConverter1 = ObjectInspectorConverters.getConverter(
++          (PrimitiveObjectInspector) arguments[0],
++          PrimitiveObjectInspectorFactory.writableStringObjectInspector);
++      break;
++    case TIMESTAMP:
++      timestampConverter = new TimestampConverter((PrimitiveObjectInspector) arguments[0],
++          PrimitiveObjectInspectorFactory.writableTimestampObjectInspector);
++      break;
++    case DATE:
++      dateWritableConverter = ObjectInspectorConverters.getConverter(
++          (PrimitiveObjectInspector) arguments[0],
++          PrimitiveObjectInspectorFactory.writableDateObjectInspector);
++      break;
++    default:
++      throw new UDFArgumentTypeException(0,
++          "TRUNC() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got "
++              + inputType1);
++    }
++
++    inputType2 = ((PrimitiveObjectInspector) arguments[1]).getPrimitiveCategory();
++    if (PrimitiveObjectInspectorUtils.getPrimitiveGrouping(inputType2)
++        != PrimitiveGrouping.STRING_GROUP) {
++      throw new UDFArgumentTypeException(1,
++          "trunk() only takes STRING/CHAR/VARCHAR types as second argument, got " + inputType2);
++    }
++
++    inputType2 = PrimitiveCategory.STRING;
++
++    if (arguments[1] instanceof ConstantObjectInspector) {
++      Object obj = ((ConstantObjectInspector) arguments[1]).getWritableConstantValue();
++      fmtInput = obj != null ? obj.toString() : null;
++    } else {
++      textConverter2 = ObjectInspectorConverters.getConverter(
++          (PrimitiveObjectInspector) arguments[1],
++          PrimitiveObjectInspectorFactory.writableStringObjectInspector);
++    }
++
++    return outputOI;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    if (arguments.length != 2) {
++      throw new UDFArgumentLengthException("trunc() requires 2 argument, got " + arguments.length);
++    }
++
++    if (arguments[0].get() == null || arguments[1].get() == null) {
++      return null;
++    }
++
++    if (textConverter2 != null) {
++      fmtInput = textConverter2.convert(arguments[1].get()).toString();
++    }
++
++    Date date;
++    switch (inputType1) {
++    case STRING:
++      String dateString = textConverter1.convert(arguments[0].get()).toString();
++      try {
++        date = formatter.parse(dateString.toString());
++      } catch (ParseException e) {
++        return null;
++      }
++      break;
++    case TIMESTAMP:
++      Timestamp ts = ((TimestampWritable) timestampConverter.convert(arguments[0].get()))
++          .getTimestamp();
++      date = ts;
++      break;
++    case DATE:
++      DateWritable dw = (DateWritable) dateWritableConverter.convert(arguments[0].get());
++      date = dw.get();
++      break;
++    default:
++      throw new UDFArgumentTypeException(0,
++          "TRUNC() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
++    }
++
++    if (evalDate(date) == null) {
++      return null;
++    }
++
++    Date newDate = calendar.getTime();
++    output.set(formatter.format(newDate));
++    return output;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return getStandardDisplayString("trunc", children);
++  }
++
++  private Calendar evalDate(Date d) throws UDFArgumentException {
++    calendar.setTime(d);
++    if ("MONTH".equals(fmtInput) || "MON".equals(fmtInput) || "MM".equals(fmtInput)) {
++      calendar.set(Calendar.DAY_OF_MONTH, 1);
++      return calendar;
++    } else if ("YEAR".equals(fmtInput) || "YYYY".equals(fmtInput) || "YY".equals(fmtInput)) {
++      calendar.set(Calendar.MONTH, 0);
++      calendar.set(Calendar.DAY_OF_MONTH, 1);
++      return calendar;
++    } else {
++      return null;
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFTrunc.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFTrunc.java
+new file mode 100644
+index 0000000..0021249
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFTrunc.java
+@@ -0,0 +1,477 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import java.sql.Date;
++import java.sql.Timestamp;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.io.Text;
++
++import junit.framework.TestCase;
++
++public class TestGenericUDFTrunc extends TestCase {
++
++  public void testStringToDateWithMonthFormat() throws HiveException {
++    GenericUDFTrunc udf = new GenericUDFTrunc();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector[] initArgs = { valueOI0, valueOI1};
++
++    DeferredObject valueObjFmt = new DeferredJavaObject(new Text("MONTH"));
++
++    DeferredObject valueObj0;
++    DeferredObject[] evalArgs;
++
++    // test date string
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-01"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-14"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-31"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-02"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-28"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-03"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-28"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-29"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    // test timestamp string
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-01 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-14 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-31 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-02 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-28 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-03 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-28 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-29 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++  }
++
++  public void testStringToDateWithYearFormat() throws HiveException {
++    GenericUDFTrunc udf = new GenericUDFTrunc();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector[] initArgs = { valueOI0, valueOI1};
++
++    DeferredObject valueObjFmt = new DeferredJavaObject(new Text("YEAR"));
++
++    DeferredObject valueObj0;
++    DeferredObject[] evalArgs;
++
++    // test date string
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-01"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-14"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-31"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-02"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-28"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-03"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-28"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-29"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    // test timestamp string
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-01 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-14 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-01-31 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-02 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2014-02-28 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-03 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-28 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new Text("2016-02-29 10:30:45"));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++  }
++
++  public void testTimestampToDateWithMonthFormat() throws HiveException {
++    GenericUDFTrunc udf = new GenericUDFTrunc();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector[] initArgs = { valueOI0, valueOI1};
++
++    DeferredObject valueObjFmt = new DeferredJavaObject(new Text("MON"));
++
++    DeferredObject valueObj0;
++    DeferredObject[] evalArgs;
++
++    // test date string
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-01 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-14 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-31 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-02 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-28 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-03 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-28 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-29 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    // test timestamp string
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-01 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-14 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-31 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-02 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-28 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-03 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-28 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-29 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++  }
++
++  public void testTimestampToDateWithYearFormat() throws HiveException {
++    GenericUDFTrunc udf = new GenericUDFTrunc();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector[] initArgs = { valueOI0, valueOI1};
++
++    DeferredObject valueObjFmt = new DeferredJavaObject(new Text("YYYY"));
++
++    DeferredObject valueObj0;
++    DeferredObject[] evalArgs;
++
++    // test date string
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-01 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-14 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-31 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-02 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-28 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-03 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-28 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-29 00:00:00")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    // test timestamp string
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-01 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-14 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-01-31 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-02 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2014-02-28 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-03 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-28 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new TimestampWritable(
++        Timestamp.valueOf("2016-02-29 10:30:45")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++  }
++
++  public void testDateWritableToDateWithMonthFormat() throws HiveException {
++    GenericUDFTrunc udf = new GenericUDFTrunc();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector[] initArgs = { valueOI0, valueOI1};
++
++    DeferredObject valueObjFmt = new DeferredJavaObject(new Text("MM"));
++
++    DeferredObject valueObj0;
++    DeferredObject[] evalArgs;
++
++    // test date string
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-01-01")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-01-14")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-01-31")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-02-02")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-02-28")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2016-02-03")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2016-02-28")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2016-02-29")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-02-01", udf, initArgs, evalArgs);
++  }
++
++  public void testDateWritableToDateWithYearFormat() throws HiveException {
++    GenericUDFTrunc udf = new GenericUDFTrunc();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.javaStringObjectInspector;
++    ObjectInspector[] initArgs = { valueOI0, valueOI1};
++
++    DeferredObject valueObjFmt = new DeferredJavaObject(new Text("YY"));
++
++    DeferredObject valueObj0;
++    DeferredObject[] evalArgs;
++
++    // test date string
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-01-01")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-01-14")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-01-31")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-02-02")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2014-02-28")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2014-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2016-02-03")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2016-02-28")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++
++    valueObj0 = new DeferredJavaObject(new DateWritable(Date.valueOf("2016-02-29")));
++    evalArgs = new DeferredObject[] { valueObj0, valueObjFmt };
++    runAndVerify("2016-01-01", udf, initArgs, evalArgs);
++  }
++
++  private void runAndVerify(String expResult, GenericUDF udf, ObjectInspector[] initArgs,
++      DeferredObject[] evalArgs) throws HiveException {
++    udf.initialize(initArgs);
++    Text output = (Text) udf.evaluate(evalArgs);
++    assertEquals("frist_day() test ", expResult, output.toString());
++  }
++}
+diff --git a/ql/src/test/queries/clientnegative/udf_trunc_error1.q b/ql/src/test/queries/clientnegative/udf_trunc_error1.q
+new file mode 100644
+index 0000000..2a087aa
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/udf_trunc_error1.q
+@@ -0,0 +1 @@
++SELECT TRUNC('2014-01-01', 1);
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientnegative/udf_trunc_error2.q b/ql/src/test/queries/clientnegative/udf_trunc_error2.q
+new file mode 100644
+index 0000000..e4230bf
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/udf_trunc_error2.q
+@@ -0,0 +1 @@
++SELECT TRUNC(1.0, 'MM');
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/udf_trunc.q b/ql/src/test/queries/clientpositive/udf_trunc.q
+new file mode 100644
+index 0000000..2ac40cf
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_trunc.q
+@@ -0,0 +1,243 @@
++DESCRIBE FUNCTION trunc;
++DESCRIBE FUNCTION EXTENDED trunc;
++
++--test string with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-01', 'MM'),
++      TRUNC('2014-01-14', 'MM'),
++      TRUNC('2014-01-31', 'MM'),
++      TRUNC('2014-02-02', 'MM'),
++      TRUNC('2014-02-28', 'MM'),
++      TRUNC('2016-02-03', 'MM'),
++      TRUNC('2016-02-28', 'MM'),
++      TRUNC('2016-02-29', 'MM'),
++      TRUNC('2014-01-01 10:30:45', 'MM'),
++      TRUNC('2014-01-14 10:30:45', 'MM'),
++      TRUNC('2014-01-31 10:30:45', 'MM'),
++      TRUNC('2014-02-02 10:30:45', 'MM'),
++      TRUNC('2014-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-03 10:30:45', 'MM'),
++      TRUNC('2016-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-29 10:30:45', 'MM');
++
++
++SELECT
++      TRUNC('2014-01-01', 'MM'),
++      TRUNC('2014-01-14', 'MM'),
++      TRUNC('2014-01-31', 'MM'),
++      TRUNC('2014-02-02', 'MM'),
++      TRUNC('2014-02-28', 'MM'),
++      TRUNC('2016-02-03', 'MM'),
++      TRUNC('2016-02-28', 'MM'),
++      TRUNC('2016-02-29', 'MM'),
++      TRUNC('2014-01-01 10:30:45', 'MM'),
++      TRUNC('2014-01-14 10:30:45', 'MM'),
++      TRUNC('2014-01-31 10:30:45', 'MM'),
++      TRUNC('2014-02-02 10:30:45', 'MM'),
++      TRUNC('2014-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-03 10:30:45', 'MM'),
++      TRUNC('2016-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-29 10:30:45', 'MM');
++
++--test string with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-01', 'YEAR'),
++      TRUNC('2014-01-14', 'YEAR'),
++      TRUNC('2014-01-31', 'YEAR'),
++      TRUNC('2014-02-02', 'YEAR'),
++      TRUNC('2014-02-28', 'YEAR'),
++      TRUNC('2016-02-03', 'YEAR'),
++      TRUNC('2016-02-28', 'YEAR'),
++      TRUNC('2016-02-29', 'YEAR'),
++      TRUNC('2014-01-01 10:30:45', 'YEAR'),
++      TRUNC('2014-01-14 10:30:45', 'YEAR'),
++      TRUNC('2014-01-31 10:30:45', 'YEAR'),
++      TRUNC('2014-02-02 10:30:45', 'YEAR'),
++      TRUNC('2014-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-03 10:30:45', 'YEAR'),
++      TRUNC('2016-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-29 10:30:45', 'YEAR');
++
++
++SELECT
++      TRUNC('2014-01-01', 'YEAR'),
++      TRUNC('2014-01-14', 'YEAR'),
++      TRUNC('2014-01-31', 'YEAR'),
++      TRUNC('2014-02-02', 'YEAR'),
++      TRUNC('2014-02-28', 'YEAR'),
++      TRUNC('2016-02-03', 'YEAR'),
++      TRUNC('2016-02-28', 'YEAR'),
++      TRUNC('2016-02-29', 'YEAR'),
++      TRUNC('2014-01-01 10:30:45', 'YEAR'),
++      TRUNC('2014-01-14 10:30:45', 'YEAR'),
++      TRUNC('2014-01-31 10:30:45', 'YEAR'),
++      TRUNC('2014-02-02 10:30:45', 'YEAR'),
++      TRUNC('2014-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-03 10:30:45', 'YEAR'),
++      TRUNC('2016-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-29 10:30:45', 'YEAR');
++
++
++--test timestamp with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'MM');
++
++
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'MM');
++
++--test timestamp with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'YEAR');
++
++
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'YEAR');
++
++--test date with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'MM');
++
++
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'MM');
++
++--test date with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'YEAR');
++
++
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'YEAR');
++
++
++--test misc with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-34', 'MM'),
++      TRUNC(CAST(null AS STRING), 'MM'),
++      TRUNC(CAST(null AS DATE), 'MM'),
++      TRUNC(CAST(null AS TIMESTAMP), 'MM'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING));
++
++SELECT
++      TRUNC('2014-01-34', 'MM'),
++      TRUNC(CAST(null AS STRING), 'MM'),
++      TRUNC(CAST(null AS DATE), 'MM'),
++      TRUNC(CAST(null AS TIMESTAMP), 'MM'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING));
++
++
++--test misc with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-34', 'YEAR'),
++      TRUNC(CAST(null AS STRING), 'YEAR'),
++      TRUNC(CAST(null AS DATE), 'YEAR'),
++      TRUNC(CAST(null AS TIMESTAMP), 'YEAR'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING));
++
++SELECT
++      TRUNC('2014-01-34', 'YEAR'),
++      TRUNC(CAST(null AS STRING), 'YEAR'),
++      TRUNC(CAST(null AS DATE), 'YEAR'),
++      TRUNC(CAST(null AS TIMESTAMP), 'YEAR'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING));
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientnegative/udf_trunc_error1.q.out b/ql/src/test/results/clientnegative/udf_trunc_error1.q.out
+new file mode 100644
+index 0000000..5d65b11
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/udf_trunc_error1.q.out
+@@ -0,0 +1 @@
++FAILED: SemanticException [Error 10016]: Line 1:27 Argument type mismatch '1': trunk() only takes STRING/CHAR/VARCHAR types as second argument, got INT
+diff --git a/ql/src/test/results/clientnegative/udf_trunc_error2.q.out b/ql/src/test/results/clientnegative/udf_trunc_error2.q.out
+new file mode 100644
+index 0000000..7d089fd
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/udf_trunc_error2.q.out
+@@ -0,0 +1 @@
++FAILED: SemanticException [Error 10016]: Line 1:13 Argument type mismatch '1.0': TRUNC() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got DOUBLE
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index 5659af5..f2bec47 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -188,6 +188,7 @@ to_unix_timestamp
+ to_utc_timestamp
+ translate
+ trim
++trunc
+ ucase
+ unbase64
+ unhex
+diff --git a/ql/src/test/results/clientpositive/udf_trunc.q.out b/ql/src/test/results/clientpositive/udf_trunc.q.out
+new file mode 100644
+index 0000000..b9b2c48
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_trunc.q.out
+@@ -0,0 +1,690 @@
++PREHOOK: query: DESCRIBE FUNCTION trunc
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION trunc
++POSTHOOK: type: DESCFUNCTION
++trunc(date, fmt) - Returns returns date with the time portion of the day truncated to the unit specified by the format model fmt. If you omit fmt, then date is truncated to the nearest day. It now only supports 'MONTH'/'MON'/'MM' and 'YEAR'/'YYYY'/'YY' as format.
++PREHOOK: query: DESCRIBE FUNCTION EXTENDED trunc
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION EXTENDED trunc
++POSTHOOK: type: DESCFUNCTION
++trunc(date, fmt) - Returns returns date with the time portion of the day truncated to the unit specified by the format model fmt. If you omit fmt, then date is truncated to the nearest day. It now only supports 'MONTH'/'MON'/'MM' and 'YEAR'/'YYYY'/'YY' as format.
++date is a string in the format 'yyyy-MM-dd HH:mm:ss' or 'yyyy-MM-dd'. The time part of date is ignored.
++Example:
++  > SELECT trunc('2009-02-12', 'MM');
++OK
++ '2009-02-01'
++ > SELECT trunc('2015-10-27', 'YEAR');
++OK
++ '2015-01-01'
++PREHOOK: query: --test string with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-01', 'MM'),
++      TRUNC('2014-01-14', 'MM'),
++      TRUNC('2014-01-31', 'MM'),
++      TRUNC('2014-02-02', 'MM'),
++      TRUNC('2014-02-28', 'MM'),
++      TRUNC('2016-02-03', 'MM'),
++      TRUNC('2016-02-28', 'MM'),
++      TRUNC('2016-02-29', 'MM'),
++      TRUNC('2014-01-01 10:30:45', 'MM'),
++      TRUNC('2014-01-14 10:30:45', 'MM'),
++      TRUNC('2014-01-31 10:30:45', 'MM'),
++      TRUNC('2014-02-02 10:30:45', 'MM'),
++      TRUNC('2014-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-03 10:30:45', 'MM'),
++      TRUNC('2016-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-29 10:30:45', 'MM')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test string with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-01', 'MM'),
++      TRUNC('2014-01-14', 'MM'),
++      TRUNC('2014-01-31', 'MM'),
++      TRUNC('2014-02-02', 'MM'),
++      TRUNC('2014-02-28', 'MM'),
++      TRUNC('2016-02-03', 'MM'),
++      TRUNC('2016-02-28', 'MM'),
++      TRUNC('2016-02-29', 'MM'),
++      TRUNC('2014-01-01 10:30:45', 'MM'),
++      TRUNC('2014-01-14 10:30:45', 'MM'),
++      TRUNC('2014-01-31 10:30:45', 'MM'),
++      TRUNC('2014-02-02 10:30:45', 'MM'),
++      TRUNC('2014-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-03 10:30:45', 'MM'),
++      TRUNC('2016-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-29 10:30:45', 'MM')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-02-01' (type: string), '2014-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-02-01' (type: string), '2014-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string)
++            outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: SELECT
++      TRUNC('2014-01-01', 'MM'),
++      TRUNC('2014-01-14', 'MM'),
++      TRUNC('2014-01-31', 'MM'),
++      TRUNC('2014-02-02', 'MM'),
++      TRUNC('2014-02-28', 'MM'),
++      TRUNC('2016-02-03', 'MM'),
++      TRUNC('2016-02-28', 'MM'),
++      TRUNC('2016-02-29', 'MM'),
++      TRUNC('2014-01-01 10:30:45', 'MM'),
++      TRUNC('2014-01-14 10:30:45', 'MM'),
++      TRUNC('2014-01-31 10:30:45', 'MM'),
++      TRUNC('2014-02-02 10:30:45', 'MM'),
++      TRUNC('2014-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-03 10:30:45', 'MM'),
++      TRUNC('2016-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-29 10:30:45', 'MM')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC('2014-01-01', 'MM'),
++      TRUNC('2014-01-14', 'MM'),
++      TRUNC('2014-01-31', 'MM'),
++      TRUNC('2014-02-02', 'MM'),
++      TRUNC('2014-02-28', 'MM'),
++      TRUNC('2016-02-03', 'MM'),
++      TRUNC('2016-02-28', 'MM'),
++      TRUNC('2016-02-29', 'MM'),
++      TRUNC('2014-01-01 10:30:45', 'MM'),
++      TRUNC('2014-01-14 10:30:45', 'MM'),
++      TRUNC('2014-01-31 10:30:45', 'MM'),
++      TRUNC('2014-02-02 10:30:45', 'MM'),
++      TRUNC('2014-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-03 10:30:45', 'MM'),
++      TRUNC('2016-02-28 10:30:45', 'MM'),
++      TRUNC('2016-02-29 10:30:45', 'MM')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	2014-01-01	2014-01-01	2014-02-01	2014-02-01	2016-02-01	2016-02-01	2016-02-01	2014-01-01	2014-01-01	2014-01-01	2014-02-01	2014-02-01	2016-02-01	2016-02-01	2016-02-01
++PREHOOK: query: --test string with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-01', 'YEAR'),
++      TRUNC('2014-01-14', 'YEAR'),
++      TRUNC('2014-01-31', 'YEAR'),
++      TRUNC('2014-02-02', 'YEAR'),
++      TRUNC('2014-02-28', 'YEAR'),
++      TRUNC('2016-02-03', 'YEAR'),
++      TRUNC('2016-02-28', 'YEAR'),
++      TRUNC('2016-02-29', 'YEAR'),
++      TRUNC('2014-01-01 10:30:45', 'YEAR'),
++      TRUNC('2014-01-14 10:30:45', 'YEAR'),
++      TRUNC('2014-01-31 10:30:45', 'YEAR'),
++      TRUNC('2014-02-02 10:30:45', 'YEAR'),
++      TRUNC('2014-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-03 10:30:45', 'YEAR'),
++      TRUNC('2016-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-29 10:30:45', 'YEAR')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test string with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-01', 'YEAR'),
++      TRUNC('2014-01-14', 'YEAR'),
++      TRUNC('2014-01-31', 'YEAR'),
++      TRUNC('2014-02-02', 'YEAR'),
++      TRUNC('2014-02-28', 'YEAR'),
++      TRUNC('2016-02-03', 'YEAR'),
++      TRUNC('2016-02-28', 'YEAR'),
++      TRUNC('2016-02-29', 'YEAR'),
++      TRUNC('2014-01-01 10:30:45', 'YEAR'),
++      TRUNC('2014-01-14 10:30:45', 'YEAR'),
++      TRUNC('2014-01-31 10:30:45', 'YEAR'),
++      TRUNC('2014-02-02 10:30:45', 'YEAR'),
++      TRUNC('2014-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-03 10:30:45', 'YEAR'),
++      TRUNC('2016-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-29 10:30:45', 'YEAR')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string)
++            outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: SELECT
++      TRUNC('2014-01-01', 'YEAR'),
++      TRUNC('2014-01-14', 'YEAR'),
++      TRUNC('2014-01-31', 'YEAR'),
++      TRUNC('2014-02-02', 'YEAR'),
++      TRUNC('2014-02-28', 'YEAR'),
++      TRUNC('2016-02-03', 'YEAR'),
++      TRUNC('2016-02-28', 'YEAR'),
++      TRUNC('2016-02-29', 'YEAR'),
++      TRUNC('2014-01-01 10:30:45', 'YEAR'),
++      TRUNC('2014-01-14 10:30:45', 'YEAR'),
++      TRUNC('2014-01-31 10:30:45', 'YEAR'),
++      TRUNC('2014-02-02 10:30:45', 'YEAR'),
++      TRUNC('2014-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-03 10:30:45', 'YEAR'),
++      TRUNC('2016-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-29 10:30:45', 'YEAR')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC('2014-01-01', 'YEAR'),
++      TRUNC('2014-01-14', 'YEAR'),
++      TRUNC('2014-01-31', 'YEAR'),
++      TRUNC('2014-02-02', 'YEAR'),
++      TRUNC('2014-02-28', 'YEAR'),
++      TRUNC('2016-02-03', 'YEAR'),
++      TRUNC('2016-02-28', 'YEAR'),
++      TRUNC('2016-02-29', 'YEAR'),
++      TRUNC('2014-01-01 10:30:45', 'YEAR'),
++      TRUNC('2014-01-14 10:30:45', 'YEAR'),
++      TRUNC('2014-01-31 10:30:45', 'YEAR'),
++      TRUNC('2014-02-02 10:30:45', 'YEAR'),
++      TRUNC('2014-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-03 10:30:45', 'YEAR'),
++      TRUNC('2016-02-28 10:30:45', 'YEAR'),
++      TRUNC('2016-02-29 10:30:45', 'YEAR')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2016-01-01	2016-01-01	2016-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2016-01-01	2016-01-01	2016-01-01
++PREHOOK: query: --test timestamp with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'MM')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test timestamp with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'MM')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-02-01' (type: string), '2014-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-02-01' (type: string), '2014-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string)
++            outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'MM')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'MM'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'MM')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	2014-01-01	2014-01-01	2014-02-01	2014-02-01	2016-02-01	2016-02-01	2016-02-01	2014-01-01	2014-01-01	2014-01-01	2014-02-01	2014-02-01	2016-02-01	2016-02-01	2016-02-01
++PREHOOK: query: --test timestamp with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'YEAR')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test timestamp with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'YEAR')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string)
++            outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'YEAR')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 00:00:00' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-01 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-14 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-01-31 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-02 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2014-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-03 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-28 10:30:45' AS TIMESTAMP), 'YEAR'),
++      TRUNC(CAST('2016-02-29 10:30:45' AS TIMESTAMP), 'YEAR')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2016-01-01	2016-01-01	2016-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2016-01-01	2016-01-01	2016-01-01
++PREHOOK: query: --test date with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'MM')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test date with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'MM')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-02-01' (type: string), '2014-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string), '2016-02-01' (type: string)
++            outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'MM')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'MM'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'MM'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'MM'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'MM')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	2014-01-01	2014-01-01	2014-02-01	2014-02-01	2016-02-01	2016-02-01	2016-02-01
++PREHOOK: query: --test date with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'YEAR')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test date with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'YEAR')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2014-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string), '2016-01-01' (type: string)
++            outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'YEAR')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC(CAST('2014-01-01' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-14' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-01-31' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-02' AS DATE), 'YEAR'),
++      TRUNC(CAST('2014-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-03' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-28' AS DATE), 'YEAR'),
++      TRUNC(CAST('2016-02-29' AS DATE), 'YEAR')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	2014-01-01	2014-01-01	2014-01-01	2014-01-01	2016-01-01	2016-01-01	2016-01-01
++PREHOOK: query: --test misc with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-34', 'MM'),
++      TRUNC(CAST(null AS STRING), 'MM'),
++      TRUNC(CAST(null AS DATE), 'MM'),
++      TRUNC(CAST(null AS TIMESTAMP), 'MM'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++PREHOOK: type: QUERY
++POSTHOOK: query: --test misc with 'MM' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-34', 'MM'),
++      TRUNC(CAST(null AS STRING), 'MM'),
++      TRUNC(CAST(null AS DATE), 'MM'),
++      TRUNC(CAST(null AS TIMESTAMP), 'MM'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: _dummy_table
++            Row Limit Per Split: 1
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            Select Operator
++              expressions: '2014-02-01' (type: string), trunc(UDFToString(null), 'MM') (type: string), trunc(CAST( null AS DATE), 'MM') (type: string), trunc(CAST( null AS TIMESTAMP), 'MM') (type: string), null (type: void), trunc('2014-01-01', UDFToString(null)) (type: string)
++              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5
++              Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++              File Output Operator
++                compressed: false
++                Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++                table:
++                    input format: org.apache.hadoop.mapred.TextInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: SELECT
++      TRUNC('2014-01-34', 'MM'),
++      TRUNC(CAST(null AS STRING), 'MM'),
++      TRUNC(CAST(null AS DATE), 'MM'),
++      TRUNC(CAST(null AS TIMESTAMP), 'MM'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC('2014-01-34', 'MM'),
++      TRUNC(CAST(null AS STRING), 'MM'),
++      TRUNC(CAST(null AS DATE), 'MM'),
++      TRUNC(CAST(null AS TIMESTAMP), 'MM'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-02-01	NULL	NULL	NULL	NULL	NULL
++PREHOOK: query: --test misc with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-34', 'YEAR'),
++      TRUNC(CAST(null AS STRING), 'YEAR'),
++      TRUNC(CAST(null AS DATE), 'YEAR'),
++      TRUNC(CAST(null AS TIMESTAMP), 'YEAR'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++PREHOOK: type: QUERY
++POSTHOOK: query: --test misc with 'YEAR' as format
++EXPLAIN
++SELECT
++      TRUNC('2014-01-34', 'YEAR'),
++      TRUNC(CAST(null AS STRING), 'YEAR'),
++      TRUNC(CAST(null AS DATE), 'YEAR'),
++      TRUNC(CAST(null AS TIMESTAMP), 'YEAR'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: _dummy_table
++            Row Limit Per Split: 1
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            Select Operator
++              expressions: '2014-01-01' (type: string), trunc(UDFToString(null), 'YEAR') (type: string), trunc(CAST( null AS DATE), 'YEAR') (type: string), trunc(CAST( null AS TIMESTAMP), 'YEAR') (type: string), null (type: void), trunc('2014-01-01', UDFToString(null)) (type: string)
++              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5
++              Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++              File Output Operator
++                compressed: false
++                Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++                table:
++                    input format: org.apache.hadoop.mapred.TextInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: SELECT
++      TRUNC('2014-01-34', 'YEAR'),
++      TRUNC(CAST(null AS STRING), 'YEAR'),
++      TRUNC(CAST(null AS DATE), 'YEAR'),
++      TRUNC(CAST(null AS TIMESTAMP), 'YEAR'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT
++      TRUNC('2014-01-34', 'YEAR'),
++      TRUNC(CAST(null AS STRING), 'YEAR'),
++      TRUNC(CAST(null AS DATE), 'YEAR'),
++      TRUNC(CAST(null AS TIMESTAMP), 'YEAR'),
++      TRUNC('2014-01-01', 'M'),
++      TRUNC('2014-01-01', CAST(null AS STRING))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2014-01-01	NULL	NULL	NULL	NULL	NULL
+-- 
+1.7.9.5
+

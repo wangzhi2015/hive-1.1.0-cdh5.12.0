@@ -1,0 +1,609 @@
+From 1afd39953eb7a9f2bf29a27a1ce7dfb6e219b776 Mon Sep 17 00:00:00 2001
+From: Pengcheng Xiong <pxiong@apache.org>
+Date: Mon, 22 Aug 2016 23:51:38 -0700
+Subject: [PATCH 0899/1164] CDH-43009: HIVE-14511: Improve MSCK for
+ partitioned table to deal with special cases
+ (Pengcheng Xiong, reviewed by Ashutosh Chauhan)
+
+(cherry picked from commit 4777289561340471c4d40184c3fa23d9a35b2599)
+
+Change-Id: I833c06a3d99c54a45d561ba64c3e878f317e914e
+---
+ .../hive/ql/metadata/HiveMetaStoreChecker.java     |  103 +++++++++++++++-----
+ .../hive/ql/metadata/TestHiveMetaStoreChecker.java |   20 +---
+ ql/src/test/queries/clientnegative/msck_repair_1.q |   17 ++++
+ ql/src/test/queries/clientnegative/msck_repair_2.q |   18 ++++
+ ql/src/test/queries/clientnegative/msck_repair_3.q |   19 ++++
+ ql/src/test/queries/clientpositive/msck_repair_1.q |   18 ++++
+ ql/src/test/queries/clientpositive/msck_repair_2.q |   20 ++++
+ ql/src/test/queries/clientpositive/msck_repair_3.q |   17 ++++
+ .../results/clientnegative/msck_repair_1.q.out     |   19 ++++
+ .../results/clientnegative/msck_repair_2.q.out     |   19 ++++
+ .../results/clientnegative/msck_repair_3.q.out     |   19 ++++
+ .../results/clientpositive/msck_repair_1.q.out     |   39 ++++++++
+ .../results/clientpositive/msck_repair_2.q.out     |   39 ++++++++
+ .../results/clientpositive/msck_repair_3.q.out     |   39 ++++++++
+ 14 files changed, 364 insertions(+), 42 deletions(-)
+ create mode 100644 ql/src/test/queries/clientnegative/msck_repair_1.q
+ create mode 100644 ql/src/test/queries/clientnegative/msck_repair_2.q
+ create mode 100644 ql/src/test/queries/clientnegative/msck_repair_3.q
+ create mode 100644 ql/src/test/queries/clientpositive/msck_repair_1.q
+ create mode 100644 ql/src/test/queries/clientpositive/msck_repair_2.q
+ create mode 100644 ql/src/test/queries/clientpositive/msck_repair_3.q
+ create mode 100644 ql/src/test/results/clientnegative/msck_repair_1.q.out
+ create mode 100644 ql/src/test/results/clientnegative/msck_repair_2.q.out
+ create mode 100644 ql/src/test/results/clientnegative/msck_repair_3.q.out
+ create mode 100644 ql/src/test/results/clientpositive/msck_repair_1.q.out
+ create mode 100644 ql/src/test/results/clientpositive/msck_repair_2.q.out
+ create mode 100644 ql/src/test/results/clientpositive/msck_repair_3.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
+index 1410419..ee8a705 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
+@@ -310,7 +310,7 @@ void findUnknownPartitions(Table table, Set<Path> partPaths,
+     // now check the table folder and see if we find anything
+     // that isn't in the metastore
+     Set<Path> allPartDirs = new HashSet<Path>();
+-    getAllLeafDirs(tablePath, allPartDirs);
++    checkPartitionDirs(tablePath, allPartDirs, table.getPartCols().size());
+     // don't want the table dir
+     allPartDirs.remove(tablePath);
+ 
+@@ -358,21 +358,25 @@ private String getPartitionName(Path tablePath, Path partitionPath) {
+   }
+ 
+   /**
+-   * Recursive method to get the leaf directories of a base path. Example:
+-   * base/dir1/dir2 base/dir3
+-   *
+-   * This will return dir2 and dir3 but not dir1.
++   * Assume that depth is 2, i.e., partition columns are a and b
++   * tblPath/a=1  => throw exception
++   * tblPath/a=1/file => throw exception
++   * tblPath/a=1/b=2/file => return a=1/b=2
++   * tblPath/a=1/b=2/c=3 => return a=1/b=2
++   * tblPath/a=1/b=2/c=3/file => return a=1/b=2
+    *
+    * @param basePath
+    *          Start directory
+    * @param allDirs
+    *          This set will contain the leaf paths at the end.
++   * @param maxDepth
++   *          Specify how deep the search goes.
+    * @throws IOException
+    *           Thrown if we can't get lists from the fs.
+    * @throws HiveException 
+    */
+ 
+-  private void getAllLeafDirs(Path basePath, Set<Path> allDirs) throws IOException, HiveException {
++  private void checkPartitionDirs(Path basePath, Set<Path> allDirs, int maxDepth) throws IOException, HiveException {
+     ConcurrentLinkedQueue<Path> basePaths = new ConcurrentLinkedQueue<>();
+     basePaths.add(basePath);
+     // we only use the keySet of ConcurrentHashMap
+@@ -390,7 +394,7 @@ private void getAllLeafDirs(Path basePath, Set<Path> allDirs) throws IOException
+       LOG.debug("Using threaded version of MSCK-GetPaths with number of threads "
+           + ((ThreadPoolExecutor) pool).getPoolSize());
+     }
+-    getAllLeafDirs(pool, basePaths, dirSet, basePath.getFileSystem(conf));
++    checkPartitionDirs(pool, basePaths, dirSet, basePath.getFileSystem(conf), maxDepth, maxDepth);
+     if (pool != null) {
+       pool.shutdown();
+     }
+@@ -398,27 +402,47 @@ private void getAllLeafDirs(Path basePath, Set<Path> allDirs) throws IOException
+   }
+ 
+   // process the basePaths in parallel and then the next level of basePaths
+-  private void getAllLeafDirs(final ExecutorService pool, final ConcurrentLinkedQueue<Path> basePaths,
+-      final Map<Path, Object> allDirs, final FileSystem fs) throws IOException, HiveException {
++  private void checkPartitionDirs(final ExecutorService pool,
++      final ConcurrentLinkedQueue<Path> basePaths, final Map<Path, Object> allDirs,
++      final FileSystem fs, final int depth, final int maxDepth) throws IOException, HiveException {
+     final ConcurrentLinkedQueue<Path> nextLevel = new ConcurrentLinkedQueue<>();
+     if (null == pool) {
+       for (final Path path : basePaths) {
+         FileStatus[] statuses = fs.listStatus(path, FileUtils.HIDDEN_FILES_PATH_FILTER);
+-        boolean directoryFound = false;
++        boolean fileFound = false;
+         for (FileStatus status : statuses) {
+-          if (status.isDir()) {
+-            directoryFound = true;
++          if (status.isDirectory()) {
+             nextLevel.add(status.getPath());
++          } else {
++            fileFound = true;
+           }
+         }
+-
+-        if (!directoryFound) {
+-          // true is just a boolean object place holder because neither the key nor the value can be null.
++        if (depth != 0) {
++          // we are in the middle of the search and we find a file
++          if (fileFound) {
++            if ("throw".equals(HiveConf.getVar(conf, HiveConf.ConfVars.HIVE_MSCK_PATH_VALIDATION))) {
++              throw new HiveException(
++                  "MSCK finds a file rather than a folder when it searches for " + path.toString());
++            } else {
++              LOG.warn("MSCK finds a file rather than a folder when it searches for "
++                  + path.toString());
++            }
++          }
++          if (!nextLevel.isEmpty()) {
++            checkPartitionDirs(pool, nextLevel, allDirs, fs, depth - 1, maxDepth);
++          } else if (depth != maxDepth) {
++            // since nextLevel is empty, we are missing partition columns.
++            if ("throw".equals(HiveConf.getVar(conf, HiveConf.ConfVars.HIVE_MSCK_PATH_VALIDATION))) {
++              throw new HiveException("MSCK is missing partition columns under " + path.toString());
++            } else {
++              LOG.warn("MSCK is missing partition columns under " + path.toString());
++            }
++          }
++        } else {
++          // true is just a boolean object place holder because neither the
++          // key nor the value can be null.
+           allDirs.put(path, true);
+         }
+-        if (!nextLevel.isEmpty()) {
+-          getAllLeafDirs(pool, nextLevel, allDirs, fs);
+-        }
+       }
+     } else {
+       final List<Future<Void>> futures = new LinkedList<>();
+@@ -427,16 +451,42 @@ private void getAllLeafDirs(final ExecutorService pool, final ConcurrentLinkedQu
+           @Override
+           public Void call() throws Exception {
+             FileStatus[] statuses = fs.listStatus(path, FileUtils.HIDDEN_FILES_PATH_FILTER);
+-            boolean directoryFound = false;
+-
++            boolean fileFound = false;
+             for (FileStatus status : statuses) {
+-              if (status.isDir()) {
+-                directoryFound = true;
++              if (status.isDirectory()) {
+                 nextLevel.add(status.getPath());
++              } else {
++                fileFound = true;
+               }
+             }
+-
+-            if (!directoryFound) {
++            if (depth != 0) {
++              // we are in the middle of the search and we find a file
++              if (fileFound) {
++                if ("throw".equals(HiveConf.getVar(conf,
++                    HiveConf.ConfVars.HIVE_MSCK_PATH_VALIDATION))) {
++                  throw new HiveException(
++                      "MSCK finds a file rather than a folder when it searches for "
++                          + path.toString());
++                } else {
++                  LOG.warn("MSCK finds a file rather than a folder when it searches for "
++                      + path.toString());
++                }
++              }
++              if (!nextLevel.isEmpty()) {
++                checkPartitionDirs(pool, nextLevel, allDirs, fs, depth - 1, maxDepth);
++              } else if (depth != maxDepth) {
++                // since nextLevel is empty, we are missing partition columns.
++                if ("throw".equals(HiveConf.getVar(conf,
++                    HiveConf.ConfVars.HIVE_MSCK_PATH_VALIDATION))) {
++                  throw new HiveException("MSCK is missing partition columns under "
++                      + path.toString());
++                } else {
++                  LOG.warn("MSCK is missing partition columns under " + path.toString());
++                }
++              }
++            } else {
++              // true is just a boolean object place holder because neither the
++              // key nor the value can be null.
+               allDirs.put(path, true);
+             }
+             return null;
+@@ -452,10 +502,9 @@ public Void call() throws Exception {
+           throw new HiveException(e.getCause());
+         }
+       }
+-      if (!nextLevel.isEmpty()) {
+-        getAllLeafDirs(pool, nextLevel, allDirs, fs);
++      if (!nextLevel.isEmpty() && depth != 0) {
++        checkPartitionDirs(pool, nextLevel, allDirs, fs, depth - 1, maxDepth);
+       }
+     }
+   }
+-
+ }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHiveMetaStoreChecker.java b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHiveMetaStoreChecker.java
+index 5b8ec60..3f26bcd 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHiveMetaStoreChecker.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHiveMetaStoreChecker.java
+@@ -226,7 +226,10 @@ public void testPartitionsCheck() throws HiveException, MetaException,
+     List<Partition> partitions = hive.getPartitions(table);
+     assertEquals(2, partitions.size());
+     Partition partToRemove = partitions.get(0);
+-    Path partToRemovePath = partToRemove.getDataLocation();
++    // As this partition (partdate=2008-01-01/partcity=london) is the only
++    // partition under (partdate=2008-01-01)
++    // we also need to delete partdate=2008-01-01 to make it consistent.
++    Path partToRemovePath = partToRemove.getDataLocation().getParent();
+     fs = partToRemovePath.getFileSystem(hive.getConf());
+     fs.delete(partToRemovePath, true);
+ 
+@@ -255,20 +258,7 @@ public void testPartitionsCheck() throws HiveException, MetaException,
+     // put the other one back
+     fs.mkdirs(partToRemovePath);
+ 
+-    // add a partition dir on fs
+-    Path fakePart = new Path(table.getDataLocation().toString(),
+-        "fakepartition=fakevalue");
+-    fs.mkdirs(fakePart);
+-    fs.deleteOnExit(fakePart);
+-
+-    checker.checkMetastore(dbName, tableName, null, result);
+-    // one extra partition
+-    assertEquals(Collections.<String>emptyList(), result.getTablesNotInMs());
+-    assertEquals(Collections.<String>emptyList(), result.getTablesNotOnFs());
+-    assertEquals(Collections.<String>emptyList(), result.getPartitionsNotOnFs());
+-    assertEquals(1, result.getPartitionsNotInMs().size());
+-    assertEquals(fakePart.getName(), result.getPartitionsNotInMs().get(0)
+-        .getPartitionName());
++    // old test is moved to msck_repair_2.q
+ 
+     // cleanup
+     hive.dropTable(dbName, tableName, true, true);
+diff --git a/ql/src/test/queries/clientnegative/msck_repair_1.q b/ql/src/test/queries/clientnegative/msck_repair_1.q
+new file mode 100644
+index 0000000..d07afaa
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/msck_repair_1.q
+@@ -0,0 +1,17 @@
++set hive.msck.repair.batch.size=1;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/queries/clientnegative/msck_repair_2.q b/ql/src/test/queries/clientnegative/msck_repair_2.q
+new file mode 100644
+index 0000000..8810e70
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/msck_repair_2.q
+@@ -0,0 +1,18 @@
++set hive.msck.repair.batch.size=1;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/datafile;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/queries/clientnegative/msck_repair_3.q b/ql/src/test/queries/clientnegative/msck_repair_3.q
+new file mode 100644
+index 0000000..28cce2e
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/msck_repair_3.q
+@@ -0,0 +1,19 @@
++set hive.msck.repair.batch.size=1;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b/datafile;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/datafile;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/queries/clientpositive/msck_repair_1.q b/ql/src/test/queries/clientpositive/msck_repair_1.q
+new file mode 100644
+index 0000000..ea596cb
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/msck_repair_1.q
+@@ -0,0 +1,18 @@
++set hive.msck.repair.batch.size=1;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b/datafile;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/queries/clientpositive/msck_repair_2.q b/ql/src/test/queries/clientpositive/msck_repair_2.q
+new file mode 100644
+index 0000000..d833821
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/msck_repair_2.q
+@@ -0,0 +1,20 @@
++set hive.msck.repair.batch.size=1;
++set hive.msck.path.validation=skip;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b/datafile;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/datafile;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/queries/clientpositive/msck_repair_3.q b/ql/src/test/queries/clientpositive/msck_repair_3.q
+new file mode 100644
+index 0000000..fdefca1
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/msck_repair_3.q
+@@ -0,0 +1,17 @@
++set hive.msck.repair.batch.size=1;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/results/clientnegative/msck_repair_1.q.out b/ql/src/test/results/clientnegative/msck_repair_1.q.out
+new file mode 100644
+index 0000000..c5f644d
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/msck_repair_1.q.out
+@@ -0,0 +1,19 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask
+diff --git a/ql/src/test/results/clientnegative/msck_repair_2.q.out b/ql/src/test/results/clientnegative/msck_repair_2.q.out
+new file mode 100644
+index 0000000..c5f644d
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/msck_repair_2.q.out
+@@ -0,0 +1,19 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask
+diff --git a/ql/src/test/results/clientnegative/msck_repair_3.q.out b/ql/src/test/results/clientnegative/msck_repair_3.q.out
+new file mode 100644
+index 0000000..c5f644d
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/msck_repair_3.q.out
+@@ -0,0 +1,19 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask
+diff --git a/ql/src/test/results/clientpositive/msck_repair_1.q.out b/ql/src/test/results/clientpositive/msck_repair_1.q.out
+new file mode 100644
+index 0000000..c394f9b
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/msck_repair_1.q.out
+@@ -0,0 +1,39 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a
++PREHOOK: query: MSCK REPAIR TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK REPAIR TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a
++Repair: Added partition to metastore default.repairtable:p1=c/p2=a
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: DROP TABLE default.repairtable
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repairtable
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: DROP TABLE default.repairtable
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repairtable
++POSTHOOK: Output: default@repairtable
+diff --git a/ql/src/test/results/clientpositive/msck_repair_2.q.out b/ql/src/test/results/clientpositive/msck_repair_2.q.out
+new file mode 100644
+index 0000000..c394f9b
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/msck_repair_2.q.out
+@@ -0,0 +1,39 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a
++PREHOOK: query: MSCK REPAIR TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK REPAIR TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a
++Repair: Added partition to metastore default.repairtable:p1=c/p2=a
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: DROP TABLE default.repairtable
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repairtable
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: DROP TABLE default.repairtable
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repairtable
++POSTHOOK: Output: default@repairtable
+diff --git a/ql/src/test/results/clientpositive/msck_repair_3.q.out b/ql/src/test/results/clientpositive/msck_repair_3.q.out
+new file mode 100644
+index 0000000..c394f9b
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/msck_repair_3.q.out
+@@ -0,0 +1,39 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a
++PREHOOK: query: MSCK REPAIR TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK REPAIR TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a
++Repair: Added partition to metastore default.repairtable:p1=c/p2=a
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: DROP TABLE default.repairtable
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repairtable
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: DROP TABLE default.repairtable
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repairtable
++POSTHOOK: Output: default@repairtable
+-- 
+1.7.9.5
+

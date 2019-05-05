@@ -1,0 +1,105 @@
+From 2ca5a9a20516d00e66c836c83ac9adb289479c0a Mon Sep 17 00:00:00 2001
+From: chengxiang <chengxiang@apache.com>
+Date: Wed, 25 Nov 2015 11:07:12 +0800
+Subject: [PATCH 0424/1164] CDH-34955: HIVE-12466: SparkCounter not
+ initialized error (Rui via Chengxiang)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+
+Change-Id: I8b54a890e1881a993ae893b8b5f8ed630c7ac5c2
+---
+ .../hadoop/hive/ql/exec/FileSinkOperator.java      |   18 ++++++++++--------
+ .../hadoop/hive/ql/exec/ReduceSinkOperator.java    |   14 +++++++++-----
+ .../hadoop/hive/ql/exec/spark/SparkTask.java       |    4 ++--
+ 3 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+index 1c46489..0236b2c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+@@ -397,14 +397,7 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+ 
+       numRows = 0;
+ 
+-      String suffix = Integer.toString(conf.getDestTableId());
+-      String fullName = conf.getTableInfo().getTableName();
+-      if (fullName != null) {
+-        suffix = suffix + "_" + fullName.toLowerCase();
+-      }
+-
+-      statsMap.put(Counter.RECORDS_OUT + "_" + suffix, row_count);
+-
++      statsMap.put(getCounterName(Counter.RECORDS_OUT), row_count);
+       initializeChildren(hconf);
+     } catch (HiveException e) {
+       throw e;
+@@ -414,6 +407,15 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+     }
+   }
+ 
++  public String getCounterName(Counter counter) {
++    String suffix = Integer.toString(conf.getDestTableId());
++    String fullName = conf.getTableInfo().getTableName();
++    if (fullName != null) {
++      suffix = suffix + "_" + fullName.toLowerCase();
++    }
++    return counter + "_" + suffix;
++  }
++
+   /**
+    * Initialize list bucketing information
+    */
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java
+index d2e8898..5c95f61 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java
+@@ -158,11 +158,7 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+ 
+       numRows = 0;
+ 
+-      String context = hconf.get(Operator.CONTEXT_NAME_KEY, "");
+-      if (context != null && !context.isEmpty()) {
+-        context = "_" + context.replace(" ","_");
+-      }
+-      statsMap.put(Counter.RECORDS_OUT_INTERMEDIATE + context, recordCounter);
++      statsMap.put(getCounterName(Counter.RECORDS_OUT_INTERMEDIATE, hconf), recordCounter);
+ 
+       List<ExprNodeDesc> keys = conf.getKeyCols();
+ 
+@@ -245,6 +241,14 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+     }
+   }
+ 
++  public String getCounterName(Counter counter, Configuration hconf) {
++    String context = hconf.get(Operator.CONTEXT_NAME_KEY, "");
++    if (context != null && !context.isEmpty()) {
++      context = "_" + context.replace(" ", "_");
++    }
++    return counter + context;
++  }
++
+ 
+   /**
+    * Initializes array of ExprNodeEvaluator. Adds Union field for distinct
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+index ec14872..8cbee23 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+@@ -378,11 +378,11 @@ private static StatsTask getStatsTaskInChildTasks(Task<? extends Serializable> r
+       for (Operator<? extends OperatorDesc> operator : work.getAllOperators()) {
+         if (operator instanceof FileSinkOperator) {
+           for (FileSinkOperator.Counter counter : FileSinkOperator.Counter.values()) {
+-            hiveCounters.add(counter.toString());
++            hiveCounters.add(((FileSinkOperator) operator).getCounterName(counter));
+           }
+         } else if (operator instanceof ReduceSinkOperator) {
+           for (ReduceSinkOperator.Counter counter : ReduceSinkOperator.Counter.values()) {
+-            hiveCounters.add(counter.toString());
++            hiveCounters.add(((ReduceSinkOperator) operator).getCounterName(counter, conf));
+           }
+         } else if (operator instanceof ScriptOperator) {
+           for (ScriptOperator.Counter counter : ScriptOperator.Counter.values()) {
+-- 
+1.7.9.5
+

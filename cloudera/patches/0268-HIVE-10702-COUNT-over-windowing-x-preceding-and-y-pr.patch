@@ -1,0 +1,245 @@
+From c197802dad5ebe2e1b188520a24b110960d8a244 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@gmail.com>
+Date: Thu, 21 May 2015 14:02:00 -0700
+Subject: [PATCH 0268/1164] HIVE-10702 : COUNT(*) over windowing 'x preceding
+ and y preceding' doesn't work properly (Aihua Xu
+ via Ashutosh Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+
+Conflicts:
+	ql/src/test/queries/clientpositive/windowing_windowspec2.q
+	ql/src/test/results/clientpositive/windowing_windowspec2.q.out
+---
+ .../hadoop/hive/ql/exec/PTFRollingPartition.java   |   30 ++++++++-------
+ .../hive/ql/udf/ptf/WindowingTableFunction.java    |   39 +++++++-------------
+ .../queries/clientpositive/windowing_windowspec2.q |    1 +
+ .../clientpositive/windowing_windowspec2.q.out     |    6 ++-
+ 4 files changed, 36 insertions(+), 40 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/PTFRollingPartition.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/PTFRollingPartition.java
+index e195c0a..ad1cf24 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/PTFRollingPartition.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/PTFRollingPartition.java
+@@ -23,7 +23,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.ql.plan.ptf.WindowFunctionDef;
++import org.apache.hadoop.hive.ql.plan.ptf.WindowFrameDef;
+ import org.apache.hadoop.hive.serde2.SerDe;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils.ObjectInspectorCopyOption;
+@@ -37,14 +37,14 @@
+   int numRowsProcessed;
+ 
+   /*
+-   * number rows to maintain before nextRowToProcess
++   * Relative start position of the windowing. Can be negative.
+    */
+-  int precedingSpan;
++  int startPos;
+ 
+   /*
+-   * number rows to maintain after nextRowToProcess
++   * Relative end position of the windowing. Can be negative.
+    */
+-  int followingSpan;
++  int endPos;
+ 
+   /*
+    * number of rows received.
+@@ -72,11 +72,11 @@
+ 
+   protected PTFRollingPartition(Configuration cfg, SerDe serDe,
+       StructObjectInspector inputOI, StructObjectInspector outputOI,
+-      int precedingSpan, int succeedingSpan) throws HiveException {
++      int startPos, int endPos) throws HiveException {
+     super(cfg, serDe, inputOI, outputOI, false);
+-    this.precedingSpan = precedingSpan;
+-    this.followingSpan = succeedingSpan;
+-    currWindow = new ArrayList<Object>(precedingSpan + followingSpan);
++    this.startPos = startPos;
++    this.endPos = endPos;
++    currWindow = new ArrayList<Object>(endPos - startPos + 1);
+   }
+ 
+   public void reset() throws HiveException {
+@@ -101,7 +101,7 @@ public void append(Object o) throws HiveException {
+   public Object nextOutputRow() throws HiveException {
+     Object row = getAt(numRowsProcessed);
+     numRowsProcessed++;
+-    if (numRowsProcessed > precedingSpan) {
++    if (numRowsProcessed > -startPos) {
+       currWindow.remove(0);
+     }
+     return row;
+@@ -111,9 +111,13 @@ public boolean processedAllRows() {
+     return numRowsProcessed >= numRowsReceived;
+   }
+ 
+-  public int rowToProcess(WindowFunctionDef wFn) {
+-    int rowToProcess = numRowsReceived - wFn.getWindowFrame().getEnd().getAmt()
+-        - 1;
++  /**
++   * Gets the next row index that the data within the window are available and can be processed
++   * @param wFrameDef
++   * @return
++   */
++  public int rowToProcess(WindowFrameDef wFrameDef) {
++    int rowToProcess = numRowsReceived - 1 - Math.max(0, wFrameDef.getEnd().getRelativeOffset());
+     return rowToProcess >= 0 ? rowToProcess : -1;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
+index 3e911f2..e75e677 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
+@@ -212,8 +212,8 @@ private boolean streamingPossible(Configuration cfg, WindowFunctionDef wFnDef)
+     }
+ 
+     WindowTableFunctionDef tabDef = (WindowTableFunctionDef) getTableDef();
+-    int precedingSpan = 0;
+-    int followingSpan = 0;
++    int startPos = Integer.MAX_VALUE;
++    int endPos = Integer.MIN_VALUE;
+ 
+     for (int i = 0; i < tabDef.getWindowFunctions().size(); i++) {
+       WindowFunctionDef wFnDef = tabDef.getWindowFunctions().get(i);
+@@ -230,20 +230,9 @@ private boolean streamingPossible(Configuration cfg, WindowFunctionDef wFnDef)
+       BoundaryDef end = wdwFrame.getEnd();
+       if (!(end instanceof ValueBoundaryDef)
+           && !(start instanceof ValueBoundaryDef)) {
+-        if (end.getAmt() != BoundarySpec.UNBOUNDED_AMOUNT
+-            && start.getAmt() != BoundarySpec.UNBOUNDED_AMOUNT
+-            && end.getDirection() != Direction.PRECEDING
+-            && start.getDirection() != Direction.FOLLOWING) {
+-
+-          int amt = wdwFrame.getStart().getAmt();
+-          if (amt > precedingSpan) {
+-            precedingSpan = amt;
+-          }
+-
+-          amt = wdwFrame.getEnd().getAmt();
+-          if (amt > followingSpan) {
+-            followingSpan = amt;
+-          }
++        if (!end.isUnbounded() && !start.isUnbounded()) {
++          startPos = Math.min(startPos, wdwFrame.getStart().getRelativeOffset());
++          endPos = Math.max(endPos, wdwFrame.getEnd().getRelativeOffset());
+           continue;
+         }
+       }
+@@ -252,12 +241,12 @@ private boolean streamingPossible(Configuration cfg, WindowFunctionDef wFnDef)
+     
+     int windowLimit = HiveConf.getIntVar(cfg, ConfVars.HIVEJOINCACHESIZE);
+ 
+-    if (windowLimit < (followingSpan + precedingSpan + 1)) {
++    if (windowLimit < (endPos - startPos + 1)) {
+       return null;
+     }
+ 
+     canAcceptInputAsStream = true;
+-    return new int[] {precedingSpan, followingSpan};
++    return new int[] {startPos, endPos};
+   }
+ 
+   @Override
+@@ -355,7 +344,7 @@ public void startPartition() throws HiveException {
+                   : out);
+         }
+       } else {
+-        int rowToProcess = streamingState.rollingPart.rowToProcess(wFn);
++        int rowToProcess = streamingState.rollingPart.rowToProcess(wFn.getWindowFrame());
+         if (rowToProcess >= 0) {
+           Range rng = getRange(wFn, rowToProcess, streamingState.rollingPart,
+               streamingState.order);
+@@ -409,7 +398,7 @@ public void startPartition() throws HiveException {
+       WindowFunctionDef wFn = tabDef.getWindowFunctions().get(i);
+       GenericUDAFEvaluator fnEval = wFn.getWFnEval();
+ 
+-      int numRowsRemaining = wFn.getWindowFrame().getEnd().getAmt();
++      int numRowsRemaining = wFn.getWindowFrame().getEnd().getRelativeOffset();
+       if (fnEval instanceof ISupportStreamingModeForWindowing) {
+         fnEval.terminate(streamingState.aggBuffers[i]);
+ 
+@@ -610,7 +599,7 @@ public boolean carryForwardNames() {
+     return vals;
+   }
+ 
+-  Range getRange(WindowFunctionDef wFnDef, int currRow, PTFPartition p, Order order) throws HiveException
++  private Range getRange(WindowFunctionDef wFnDef, int currRow, PTFPartition p, Order order) throws HiveException
+   {
+     BoundaryDef startB = wFnDef.getWindowFrame().getStart();
+     BoundaryDef endB = wFnDef.getWindowFrame().getEnd();
+@@ -644,7 +633,7 @@ Range getRange(WindowFunctionDef wFnDef, int currRow, PTFPartition p, Order orde
+     return new Range(start, end, p);
+   }
+ 
+-  int getRowBoundaryStart(BoundaryDef b, int currRow) throws HiveException {
++  private int getRowBoundaryStart(BoundaryDef b, int currRow) throws HiveException {
+     Direction d = b.getDirection();
+     int amt = b.getAmt();
+     switch(d) {
+@@ -663,7 +652,7 @@ int getRowBoundaryStart(BoundaryDef b, int currRow) throws HiveException {
+     throw new HiveException("Unknown Start Boundary Direction: " + d);
+   }
+ 
+-  int getRowBoundaryEnd(BoundaryDef b, int currRow, PTFPartition p) throws HiveException {
++  private int getRowBoundaryEnd(BoundaryDef b, int currRow, PTFPartition p) throws HiveException {
+     Direction d = b.getDirection();
+     int amt = b.getAmt();
+     switch(d) {
+@@ -671,7 +660,7 @@ int getRowBoundaryEnd(BoundaryDef b, int currRow, PTFPartition p) throws HiveExc
+       if ( amt == 0 ) {
+         return currRow + 1;
+       }
+-      return currRow - amt;
++      return currRow - amt + 1;
+     case CURRENT:
+       return currRow + 1;
+     case FOLLOWING:
+@@ -1442,7 +1431,7 @@ boolean hasOutputRow() {
+       return true;
+     }
+ 
+-    List<Object> nextOutputRow() throws HiveException {
++    private List<Object> nextOutputRow() throws HiveException {
+       List<Object> oRow = new ArrayList<Object>();
+       Object iRow = rollingPart.nextOutputRow();
+       int i = 0;
+diff --git a/ql/src/test/queries/clientpositive/windowing_windowspec2.q b/ql/src/test/queries/clientpositive/windowing_windowspec2.q
+index 991f256..e77c4eb 100644
+--- a/ql/src/test/queries/clientpositive/windowing_windowspec2.q
++++ b/ql/src/test/queries/clientpositive/windowing_windowspec2.q
+@@ -17,6 +17,7 @@ create table over10k(
+ 
+ load data local inpath '../../data/files/over10k' into table over10k;
+ 
++-- sum
+ select ts, f, sum(f) over (partition by ts order by f rows between 2 preceding and 1 preceding) from over10k limit 100;
+ select ts, f, sum(f) over (partition by ts order by f rows between unbounded preceding and 1 preceding) from over10k limit 100;
+ select ts, f, sum(f) over (partition by ts order by f rows between 1 following and 2 following) from over10k limit 100;
+diff --git a/ql/src/test/results/clientpositive/windowing_windowspec2.q.out b/ql/src/test/results/clientpositive/windowing_windowspec2.q.out
+index 2775445..b187f35 100644
+--- a/ql/src/test/results/clientpositive/windowing_windowspec2.q.out
++++ b/ql/src/test/results/clientpositive/windowing_windowspec2.q.out
+@@ -44,11 +44,13 @@ POSTHOOK: query: load data local inpath '../../data/files/over10k' into table ov
+ POSTHOOK: type: LOAD
+ #### A masked pattern was here ####
+ POSTHOOK: Output: default@over10k
+-PREHOOK: query: select ts, f, sum(f) over (partition by ts order by f rows between 2 preceding and 1 preceding) from over10k limit 100
++PREHOOK: query: -- sum
++select ts, f, sum(f) over (partition by ts order by f rows between 2 preceding and 1 preceding) from over10k limit 100
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@over10k
+ #### A masked pattern was here ####
+-POSTHOOK: query: select ts, f, sum(f) over (partition by ts order by f rows between 2 preceding and 1 preceding) from over10k limit 100
++POSTHOOK: query: -- sum
++select ts, f, sum(f) over (partition by ts order by f rows between 2 preceding and 1 preceding) from over10k limit 100
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@over10k
+ #### A masked pattern was here ####
+-- 
+1.7.9.5
+

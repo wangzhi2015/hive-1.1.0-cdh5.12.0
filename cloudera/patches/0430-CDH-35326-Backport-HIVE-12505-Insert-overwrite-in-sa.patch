@@ -1,0 +1,352 @@
+From c278723a9f57672b64a84c3b14e60e4e523ac267 Mon Sep 17 00:00:00 2001
+From: ctang <ctang.ma@gmail.com>
+Date: Fri, 4 Dec 2015 10:46:23 -0500
+Subject: [PATCH 0430/1164] CDH-35326 Backport: HIVE-12505: Insert overwrite
+ in same encrypted zone silently fails to remove
+ some existing files
+
+Change-Id: I1c49532be55488c543fb278d21b0712ec25764df
+---
+ .../org/apache/hadoop/hive/common/FileUtils.java   |   66 +++++++++--
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   26 ++++-
+ .../queries/clientpositive/encryption_with_trash.q |   33 ++++++
+ .../encrypted/encryption_with_trash.q.out          |  122 ++++++++++++++++++++
+ 5 files changed, 234 insertions(+), 16 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/encryption_with_trash.q
+ create mode 100644 ql/src/test/results/clientpositive/encrypted/encryption_with_trash.q.out
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+index 91d237c..9376d06 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+@@ -570,7 +570,7 @@ public static boolean copy(FileSystem srcFS, Path src,
+   }
+ 
+   /**
+-   * Deletes all files under a directory, sending them to the trash.  Leaves the directory as is.
++   * Trashes or deletes all files under a directory. Leaves the directory as is.
+    * @param fs FileSystem to use
+    * @param f path of directory
+    * @param conf hive configuration
+@@ -578,17 +578,34 @@ public static boolean copy(FileSystem srcFS, Path src,
+    * @throws FileNotFoundException
+    * @throws IOException
+    */
+-  public static boolean trashFilesUnderDir(FileSystem fs, Path f, Configuration conf) throws FileNotFoundException, IOException {
++  public static boolean trashFilesUnderDir(FileSystem fs, Path f, Configuration conf)
++      throws FileNotFoundException, IOException {
++    return trashFilesUnderDir(fs, f, conf, true);
++  }
++
++  /**
++   * Trashes or deletes all files under a directory. Leaves the directory as is.
++   * @param fs FileSystem to use
++   * @param f path of directory
++   * @param conf hive configuration
++   * @param forceDelete whether to force delete files if trashing does not succeed
++   * @return true if deletion successful
++   * @throws FileNotFoundException
++   * @throws IOException
++   */
++  public static boolean trashFilesUnderDir(FileSystem fs, Path f, Configuration conf,
++      boolean forceDelete) throws FileNotFoundException, IOException {
+     FileStatus[] statuses = fs.listStatus(f, HIDDEN_FILES_PATH_FILTER);
+     boolean result = true;
+     for (FileStatus status : statuses) {
+-      result = result & moveToTrash(fs, status.getPath(), conf);
++      result = result & moveToTrash(fs, status.getPath(), conf, forceDelete);
+     }
+     return result;
+   }
+ 
+   /**
+-   * Move a particular file or directory to the trash.
++   * Move a particular file or directory to the trash. If for a certain reason the trashing fails
++   * it will force deletes the file or directory
+    * @param fs FileSystem to use
+    * @param f path of file or directory to move to trash.
+    * @param conf
+@@ -596,18 +613,47 @@ public static boolean trashFilesUnderDir(FileSystem fs, Path f, Configuration co
+    * @throws IOException
+    */
+   public static boolean moveToTrash(FileSystem fs, Path f, Configuration conf) throws IOException {
++    return moveToTrash(fs, f, conf, true);
++  }
++
++  /**
++   * Move a particular file or directory to the trash.
++   * @param fs FileSystem to use
++   * @param f path of file or directory to move to trash.
++   * @param conf
++   * @param forceDelete whether force delete the file or directory if trashing fails
++   * @return true if move successful
++   * @throws IOException
++   */
++  public static boolean moveToTrash(FileSystem fs, Path f, Configuration conf, boolean forceDelete)
++      throws IOException {
+     LOG.info("deleting  " + f);
+     HadoopShims hadoopShim = ShimLoader.getHadoopShims();
+ 
+-    if (hadoopShim.moveToAppropriateTrash(fs, f, conf)) {
+-      LOG.info("Moved to trash: " + f);
+-      return true;
++    boolean result = false;
++    try {
++      result = hadoopShim.moveToAppropriateTrash(fs, f, conf);
++      if (result) {
++        LOG.info("Moved to trash: " + f);
++        return true;
++      }
++    } catch (IOException ioe) {
++      if (forceDelete) {
++        // for whatever failure reason including that trash has lower encryption zone
++        // retry with force delete
++        LOG.warn(ioe.getMessage() + "; Force to delete it.");
++      } else {
++        throw ioe;
++      }
+     }
+ 
+-    boolean result = fs.delete(f, true);
+-    if (!result) {
+-      LOG.error("Failed to delete " + f);
++    if (forceDelete) {
++      result = fs.delete(f, true);
++      if (!result) {
++        LOG.error("Failed to delete " + f);
++      }
+     }
++
+     return result;
+   }
+ 
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index 6f7022b..b785ede 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -321,7 +321,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_drop_table.q \
+   encryption_drop_view.q \
+   encryption_insert_values.q \
+-  encryption_drop_partition.q
++  encryption_drop_partition.q \
++  encryption_with_trash.q
+ 
+ beeline.positive.exclude=add_part_exist.q,\
+   alter1.q,\
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 10a5e47..9939e9d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -2820,19 +2820,35 @@ protected static void replaceFiles(Path tablePath, Path srcf, Path destf, Path o
+       List<List<Path[]>> result = checkPaths(conf, destFs, srcs, srcFs, destf, true);
+ 
+       if (oldPath != null) {
++        boolean oldPathDeleted = false;
++        boolean isOldPathUnderDestf = false;
+         try {
+           FileSystem fs2 = oldPath.getFileSystem(conf);
+           if (fs2.exists(oldPath)) {
+             // Do not delete oldPath if:
+             //  - destf is subdir of oldPath
+             //if ( !(fs2.equals(destf.getFileSystem(conf)) && FileUtils.isSubDir(oldPath, destf, fs2)))
+-            if (FileUtils.isSubDir(oldPath, destf, fs2)) {
+-              FileUtils.trashFilesUnderDir(fs2, oldPath, conf);
++            isOldPathUnderDestf = FileUtils.isSubDir(oldPath, destf, fs2);
++            if (isOldPathUnderDestf) {
++              // if oldPath is destf or its subdir, its should definitely be deleted, otherwise its
++              // existing content might result in incorrect (extra) data.
++              // But not sure why we changed not to delete the oldPath in HIVE-8750 if it is
++              // not the destf or its subdir?
++              oldPathDeleted = FileUtils.trashFilesUnderDir(fs2, oldPath, conf);
+             }
+           }
+-        } catch (Exception e) {
+-          //swallow the exception
+-          LOG.warn("Directory " + oldPath.toString() + " cannot be removed: " + e, e);
++        } catch (IOException e) {
++          if (isOldPathUnderDestf) {
++            // if oldPath is a subdir of destf but it could not be cleaned
++            throw new HiveException("Directory " + oldPath.toString()
++                + " could not be cleaned up.", e);
++          } else {
++            //swallow the exception since it won't affect the final result
++            LOG.warn("Directory " + oldPath.toString() + " cannot be cleaned: " + e, e);
++          }
++        }
++        if (isOldPathUnderDestf && !oldPathDeleted) {
++          throw new HiveException("Destination directory " + destf + " has not be cleaned up.");
+         }
+       }
+ 
+diff --git a/ql/src/test/queries/clientpositive/encryption_with_trash.q b/ql/src/test/queries/clientpositive/encryption_with_trash.q
+new file mode 100644
+index 0000000..8f8789a
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/encryption_with_trash.q
+@@ -0,0 +1,33 @@
++set fs.trash.interval=5
++
++-- SORT_QUERY_RESULTS
++
++-- init
++drop table IF EXISTS encryptedTableSrc PURGE;
++drop table IF EXISTS unencryptedTable PURGE;
++
++create table encryptedTableSrc(key string, value string)
++LOCATION '${hiveconf:hive.metastore.warehouse.dir}/encryptedTableSrc';
++
++create table encryptedTable(key string, value string) partitioned by (ds string)
++    LOCATION '${hiveconf:hive.metastore.warehouse.dir}/encryptedTable';
++CRYPTO CREATE_KEY --keyName key_1 --bitLength 128;
++CRYPTO CREATE_ZONE --keyName key_1 --path ${hiveconf:hive.metastore.warehouse.dir}/encryptedTableSrc;
++CRYPTO CREATE_ZONE --keyName key_1 --path ${hiveconf:hive.metastore.warehouse.dir}/encryptedTable;
++
++-- insert src table from values
++insert into table encryptedTableSrc values ('501', 'val_501'), ('502', 'val_502');
++
++insert into table encryptedTable partition (ds='today') select key, value from encryptedTableSrc;
++select count(*) from encryptedTable where ds='today';
++insert into table encryptedTable partition (ds='today') select key, value from encryptedTableSrc;
++select count(*) from encryptedTable where ds='today';
++
++insert overwrite table encryptedTable partition (ds='today') select key, value from encryptedTableSrc;
++select count(*) from encryptedTable where ds='today';
++
++-- clean up
++drop table encryptedTable PURGE;
++drop table unencryptedTable PURGE;
++CRYPTO DELETE_KEY --keyName key_1;
++set fs.trash.interval=0
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_with_trash.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_with_trash.q.out
+new file mode 100644
+index 0000000..3d1f75f
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_with_trash.q.out
+@@ -0,0 +1,122 @@
++Warning: Value had a \n character in it.
++PREHOOK: query: drop table IF EXISTS unencryptedTable PURGE
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table IF EXISTS unencryptedTable PURGE
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: create table encryptedTableSrc(key string, value string)
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@encryptedTableSrc
++POSTHOOK: query: create table encryptedTableSrc(key string, value string)
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@encryptedTableSrc
++PREHOOK: query: create table encryptedTable(key string, value string) partitioned by (ds string)
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@encryptedTable
++POSTHOOK: query: create table encryptedTable(key string, value string) partitioned by (ds string)
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@encryptedTable
++Encryption key created: 'key_1'
++Encryption zone created: '/build/ql/test/data/warehouse/encryptedTableSrc' using key: 'key_1'
++Encryption zone created: '/build/ql/test/data/warehouse/encryptedTable' using key: 'key_1'
++PREHOOK: query: -- insert src table from values
++insert into table encryptedTableSrc values ('501', 'val_501'), ('502', 'val_502')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@encryptedtablesrc
++POSTHOOK: query: -- insert src table from values
++insert into table encryptedTableSrc values ('501', 'val_501'), ('502', 'val_502')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@encryptedtablesrc
++POSTHOOK: Lineage: encryptedtablesrc.key SIMPLE [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: encryptedtablesrc.value SIMPLE [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++PREHOOK: query: insert into table encryptedTable partition (ds='today') select key, value from encryptedTableSrc
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encryptedtablesrc
++PREHOOK: Output: default@encryptedtable@ds=today
++POSTHOOK: query: insert into table encryptedTable partition (ds='today') select key, value from encryptedTableSrc
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encryptedtablesrc
++POSTHOOK: Output: default@encryptedtable@ds=today
++POSTHOOK: Lineage: encryptedtable PARTITION(ds=today).key SIMPLE [(encryptedtablesrc)encryptedtablesrc.FieldSchema(name:key, type:string, comment:null), ]
++POSTHOOK: Lineage: encryptedtable PARTITION(ds=today).value SIMPLE [(encryptedtablesrc)encryptedtablesrc.FieldSchema(name:value, type:string, comment:null), ]
++PREHOOK: query: select count(*) from encryptedTable where ds='today'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encryptedtable
++PREHOOK: Input: default@encryptedtable@ds=today
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
++POSTHOOK: query: select count(*) from encryptedTable where ds='today'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encryptedtable
++POSTHOOK: Input: default@encryptedtable@ds=today
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
++2
++PREHOOK: query: insert into table encryptedTable partition (ds='today') select key, value from encryptedTableSrc
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encryptedtablesrc
++PREHOOK: Output: default@encryptedtable@ds=today
++POSTHOOK: query: insert into table encryptedTable partition (ds='today') select key, value from encryptedTableSrc
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encryptedtablesrc
++POSTHOOK: Output: default@encryptedtable@ds=today
++POSTHOOK: Lineage: encryptedtable PARTITION(ds=today).key SIMPLE [(encryptedtablesrc)encryptedtablesrc.FieldSchema(name:key, type:string, comment:null), ]
++POSTHOOK: Lineage: encryptedtable PARTITION(ds=today).value SIMPLE [(encryptedtablesrc)encryptedtablesrc.FieldSchema(name:value, type:string, comment:null), ]
++PREHOOK: query: select count(*) from encryptedTable where ds='today'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encryptedtable
++PREHOOK: Input: default@encryptedtable@ds=today
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
++POSTHOOK: query: select count(*) from encryptedTable where ds='today'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encryptedtable
++POSTHOOK: Input: default@encryptedtable@ds=today
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
++4
++PREHOOK: query: insert overwrite table encryptedTable partition (ds='today') select key, value from encryptedTableSrc
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encryptedtablesrc
++PREHOOK: Output: default@encryptedtable@ds=today
++POSTHOOK: query: insert overwrite table encryptedTable partition (ds='today') select key, value from encryptedTableSrc
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encryptedtablesrc
++POSTHOOK: Output: default@encryptedtable@ds=today
++POSTHOOK: Lineage: encryptedtable PARTITION(ds=today).key SIMPLE [(encryptedtablesrc)encryptedtablesrc.FieldSchema(name:key, type:string, comment:null), ]
++POSTHOOK: Lineage: encryptedtable PARTITION(ds=today).value SIMPLE [(encryptedtablesrc)encryptedtablesrc.FieldSchema(name:value, type:string, comment:null), ]
++PREHOOK: query: select count(*) from encryptedTable where ds='today'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@encryptedtable
++PREHOOK: Input: default@encryptedtable@ds=today
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
++POSTHOOK: query: select count(*) from encryptedTable where ds='today'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@encryptedtable
++POSTHOOK: Input: default@encryptedtable@ds=today
++#### A PARTIAL masked pattern was here #### data/warehouse/encryptedTable/.hive-staging
++2
++PREHOOK: query: -- clean up
++drop table encryptedTable PURGE
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@encryptedtable
++PREHOOK: Output: default@encryptedtable
++POSTHOOK: query: -- clean up
++drop table encryptedTable PURGE
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@encryptedtable
++POSTHOOK: Output: default@encryptedtable
++PREHOOK: query: drop table unencryptedTable PURGE
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table unencryptedTable PURGE
++POSTHOOK: type: DROPTABLE
++Encryption key deleted: 'key_1'
+-- 
+1.7.9.5
+

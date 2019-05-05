@@ -1,0 +1,87 @@
+From e5ec9a74651cb39fdbdfbb36de0e2b4afa277195 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Fri, 23 Sep 2016 14:58:20 -0700
+Subject: [PATCH 0958/1164] CDH-48190: HIVE-14818. Reduce number of retries
+ while starting HiveServer for tests. (Siddharth
+ Seth, reviewed by Prasanth Jayachandran)
+
+(cherry picked from commit a21311544a4935785aa964e6f2c66b1669982e8a)
+
+Change-Id: I5746509028c046bc57b517ef1991d13100440c27
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    8 ++++++--
+ .../java/org/apache/hive/jdbc/miniHS2/MiniHS2.java |    4 ++++
+ .../apache/hive/service/server/HiveServer2.java    |    7 +++++--
+ 3 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index ee4e737..1679192 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1712,9 +1712,13 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "SSL Versions to disable for all Hive Servers"),
+ 
+      // HiveServer2 specific configs
++    HIVE_SERVER2_SLEEP_INTERVAL_BETWEEN_START_ATTEMPTS("hive.server2.sleep.interval.between.start.attempts",
++        "60s", new TimeValidator(TimeUnit.MILLISECONDS, 0l, true, Long.MAX_VALUE, true),
++        "Amount of time to sleep between HiveServer2 start attempts. Primarily meant for tests"),
+     HIVE_SERVER2_MAX_START_ATTEMPTS("hive.server2.max.start.attempts", 30L, new RangeValidator(0L, null),
+-        "Number of times HiveServer2 will attempt to start before exiting, sleeping 60 seconds " +
+-        "between retries. \n The default of 30 will keep trying for 30 minutes."),
++        "Number of times HiveServer2 will attempt to start before exiting. The sleep interval between retries" +
++        " is determined by " + ConfVars.HIVE_SERVER2_SLEEP_INTERVAL_BETWEEN_START_ATTEMPTS.varname +
++        "\n The default of 30 will keep trying for 30 minutes."),
+     HIVE_SERVER2_SUPPORT_DYNAMIC_SERVICE_DISCOVERY("hive.server2.support.dynamic.service.discovery", false,
+         "Whether HiveServer2 supports dynamic service discovery for its clients. " +
+         "To support this, each instance of HiveServer2 currently uses ZooKeeper to register itself, " +
+diff --git a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+index bbdb992..4a84710 100644
+--- a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
++++ b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+@@ -23,6 +23,7 @@
+ import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+ 
+ import com.google.common.base.Preconditions;
+@@ -175,6 +176,9 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+       String serverPrincipal, String serverKeytab, boolean isMetastoreRemote, String authType, boolean cleanupLocalDirOnStartup) throws Exception {
+     super(hiveConf, "localhost", MetaStoreUtils.findFreePort(), MetaStoreUtils.findFreePort());
+     this.useMiniMR = useMiniMR;
++    hiveConf.setLongVar(ConfVars.HIVE_SERVER2_MAX_START_ATTEMPTS, 3l);
++    hiveConf.setTimeVar(ConfVars.HIVE_SERVER2_SLEEP_INTERVAL_BETWEEN_START_ATTEMPTS, 10,
++        TimeUnit.SECONDS);
+     this.useMiniKdc = useMiniKdc;
+     this.serverPrincipal = serverPrincipal;
+     this.serverKeytab = serverKeytab;
+diff --git a/service/src/java/org/apache/hive/service/server/HiveServer2.java b/service/src/java/org/apache/hive/service/server/HiveServer2.java
+index 3d8f7d5..d04c4e9 100644
+--- a/service/src/java/org/apache/hive/service/server/HiveServer2.java
++++ b/service/src/java/org/apache/hive/service/server/HiveServer2.java
+@@ -507,6 +507,9 @@ private static void startHiveServer2() throws Throwable {
+       LOG.info("Starting HiveServer2");
+       HiveConf hiveConf = new HiveConf();
+       maxAttempts = hiveConf.getLongVar(HiveConf.ConfVars.HIVE_SERVER2_MAX_START_ATTEMPTS);
++      long retrySleepIntervalMs = hiveConf
++          .getTimeVar(ConfVars.HIVE_SERVER2_SLEEP_INTERVAL_BETWEEN_START_ATTEMPTS,
++              TimeUnit.MILLISECONDS);
+       HiveServer2 server = null;
+       try {
+         server = new HiveServer2();
+@@ -550,9 +553,9 @@ private static void startHiveServer2() throws Throwable {
+           throw new Error("Max start attempts " + maxAttempts + " exhausted", throwable);
+         } else {
+           LOG.warn("Error starting HiveServer2 on attempt " + attempts
+-              + ", will retry in 60 seconds", throwable);
++              + ", will retry in " + retrySleepIntervalMs + "ms", throwable);
+           try {
+-            Thread.sleep(60L * 1000L);
++            Thread.sleep(retrySleepIntervalMs);
+           } catch (InterruptedException e) {
+             Thread.currentThread().interrupt();
+           }
+-- 
+1.7.9.5
+

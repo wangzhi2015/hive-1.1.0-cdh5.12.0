@@ -1,0 +1,341 @@
+From f835594af768310922ae397e39911444889f4143 Mon Sep 17 00:00:00 2001
+From: Brock Noland <brock@apache.org>
+Date: Mon, 19 Jan 2015 01:57:12 -0800
+Subject: [PATCH 0015/1164] Revert "HIVE-7313: Memory & SSD storage policies
+ for temporary tables. (Gopal V, reviewed by
+ Gunther Hagleitner)"
+
+This reverts commit 8541eb6a0452dcd726a68c44ff5e2cc80d77d101.
+
+(cherry picked from commit 44e9780f22958790c09e6ff6c16436e8571f4a6d)
+
+Conflicts:
+	shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+	shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    4 --
+ .../hadoop/hive/ql/exec/FileSinkOperator.java      |   21 -------
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |    5 --
+ .../apache/hadoop/hive/ql/plan/FileSinkDesc.java   |   16 ------
+ .../apache/hadoop/hive/shims/Hadoop20SShims.java   |    5 --
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |   59 --------------------
+ .../org/apache/hadoop/hive/shims/HadoopShims.java  |   29 ----------
+ 7 files changed, 139 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index bf0831f..6973df7 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1630,10 +1630,6 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "inheriting the permission of the warehouse or database directory."),
+     HIVE_INSERT_INTO_EXTERNAL_TABLES("hive.insert.into.external.tables", true,
+         "whether insert into external tables is allowed"),
+-    HIVE_TEMPORARY_TABLE_STORAGE(
+-        "hive.exec.temporary.table.storage", "default", new StringSet("memory",
+-         "ssd", "default"), "Define the storage policy for temporary tables." +
+-         "Choices between memory, ssd and default"),
+ 
+     HIVE_DRIVER_RUN_HOOKS("hive.exec.driver.run.hooks", "",
+         "A comma separated list of hooks which implement HiveDriverRunHook. Will be run at the beginning " +
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+index a48fd60..ca3e3bc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+@@ -68,16 +68,11 @@
+ import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.SubStructObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.IntObjectInspector;
+-import org.apache.hadoop.hive.shims.HadoopShims.StoragePolicyShim;
+-import org.apache.hadoop.hive.shims.HadoopShims.StoragePolicyValue;
+-import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
+-import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.HIVE_TEMPORARY_TABLE_STORAGE;
+-
+ /**
+  * File Sink operator implementation.
+  **/
+@@ -93,7 +88,6 @@
+   protected transient List<String> dpColNames;
+   protected transient DynamicPartitionCtx dpCtx;
+   protected transient boolean isCompressed;
+-  protected transient boolean isTemporary;
+   protected transient Path parent;
+   protected transient HiveOutputFormat<?, ?> hiveOutputFormat;
+   protected transient Path specPath;
+@@ -324,7 +318,6 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+       this.hconf = hconf;
+       filesCreated = false;
+       isNativeTable = !conf.getTableInfo().isNonNative();
+-      isTemporary = conf.isTemporary();
+       multiFileSpray = conf.isMultiFileSpray();
+       totalFiles = conf.getTotalFiles();
+       numFiles = conf.getNumFiles();
+@@ -391,20 +384,6 @@ protected void initializeOp(Configuration hconf) throws HiveException {
+           valToPaths.put("", fsp); // special entry for non-DP case
+         }
+       }
+-      
+-      final StoragePolicyValue tmpStorage = StoragePolicyValue.lookup(HiveConf
+-                                            .getVar(hconf, HIVE_TEMPORARY_TABLE_STORAGE));
+-      if (isTemporary && fsp != null
+-          && tmpStorage != StoragePolicyValue.DEFAULT) {
+-        final Path outputPath = fsp.taskOutputTempPath;
+-        StoragePolicyShim shim = ShimLoader.getHadoopShims()
+-            .getStoragePolicyShim(fs);
+-        if (shim != null) {
+-          // directory creation is otherwise within the writers
+-          fs.mkdirs(outputPath);
+-          shim.setStoragePolicy(outputPath, tmpStorage);
+-        }
+-      }
+ 
+       if (conf.getWriteType() == AcidUtils.Operation.UPDATE ||
+           conf.getWriteType() == AcidUtils.Operation.DELETE) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index c05b2aa..720a5a9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -6017,7 +6017,6 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+ 
+     Table dest_tab = null; // destination table if any
+     boolean destTableIsAcid = false; // should the destination table be written to using ACID
+-    boolean destTableIsTemporary = false;
+     Partition dest_part = null;// destination partition if any
+     Path queryTmpdir = null; // the intermediate destination directory
+     Path dest_path = null; // the final destination directory
+@@ -6035,7 +6034,6 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+ 
+       dest_tab = qbm.getDestTableForAlias(dest);
+       destTableIsAcid = isAcidTable(dest_tab);
+-      destTableIsTemporary = dest_tab.isTemporary();
+ 
+       // Is the user trying to insert into a external tables
+       if ((!conf.getBoolVar(HiveConf.ConfVars.HIVE_INSERT_INTO_EXTERNAL_TABLES)) &&
+@@ -6305,7 +6303,6 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+       CreateTableDesc tblDesc = qb.getTableDesc();
+       if (tblDesc != null) {
+         field_schemas = new ArrayList<FieldSchema>();
+-        destTableIsTemporary = tblDesc.isTemporary();
+       }
+ 
+       boolean first = true;
+@@ -6450,8 +6447,6 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+       fileSinkDesc.setWriteType(wt);
+       acidFileSinks.add(fileSinkDesc);
+     }
+-    
+-    fileSinkDesc.setTemporary(destTableIsTemporary);
+ 
+     /* Set List Bucketing context. */
+     if (lbCtx != null) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java
+index 83ebfa3..ddb19e4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java
+@@ -48,7 +48,6 @@
+   private String compressCodec;
+   private String compressType;
+   private boolean multiFileSpray;
+-  private boolean temporary;
+   // Whether the files output by this FileSink can be merged, e.g. if they are to be put into a
+   // bucketed or sorted table/partition they cannot be merged.
+   private boolean canBeMerged;
+@@ -221,21 +220,6 @@ public boolean isMultiFileSpray() {
+   public void setMultiFileSpray(boolean multiFileSpray) {
+     this.multiFileSpray = multiFileSpray;
+   }
+-  
+-  /**
+-   * @return destination is temporary
+-   */
+-  public boolean isTemporary() {
+-    return temporary;
+-  }
+-
+-  /**
+-   * @param totalFiles the totalFiles to set
+-   */
+-  public void setTemporary(boolean temporary) {
+-    this.temporary = temporary;
+-  }
+-
+ 
+   public boolean canBeMerged() {
+     return canBeMerged;
+diff --git a/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java b/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+index d5f2603..49ae0c2 100644
+--- a/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
++++ b/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+@@ -654,11 +654,6 @@ public String getShortName() throws IOException {
+   }
+ 
+   @Override
+-  public StoragePolicyShim getStoragePolicyShim(FileSystem fs) {
+-    return null;
+-  }
+-
+-  @Override
+   public boolean runDistCp(Path src, Path dst, Configuration conf) throws IOException {
+     int rc;
+ 
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index c4b7b75..2c2c678 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -32,7 +32,6 @@
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Set;
+ import java.util.TreeMap;
+ 
+ import org.apache.commons.lang.StringUtils;
+@@ -62,7 +61,6 @@
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hdfs.DistributedFileSystem;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+-import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
+ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+ import org.apache.hadoop.hdfs.client.HdfsAdmin;
+ import org.apache.hadoop.hdfs.protocol.EncryptionZone;
+@@ -104,28 +102,15 @@
+ 
+   HadoopShims.MiniDFSShim cluster = null;
+   final boolean zeroCopy;
+-  final boolean storagePolicy;
+ 
+   public Hadoop23Shims() {
+     boolean zcr = false;
+-    boolean storage = false;
+     try {
+       Class.forName("org.apache.hadoop.fs.CacheFlag", false,
+           ShimLoader.class.getClassLoader());
+       zcr = true;
+     } catch (ClassNotFoundException ce) {
+     }
+-    
+-    if (zcr) {
+-      // in-memory HDFS is only available after zcr
+-      try {
+-        Class.forName("org.apache.hadoop.hdfs.protocol.BlockStoragePolicy",
+-            false, ShimLoader.class.getClassLoader());
+-        storage = true;
+-      } catch (ClassNotFoundException ce) {
+-      }
+-    }
+-    this.storagePolicy = storage;
+     this.zeroCopy = zcr;
+   }
+ 
+@@ -1112,50 +1097,6 @@ public String getShortName() throws IOException {
+     }
+   }
+ 
+-
+-  public static class StoragePolicyShim implements HadoopShims.StoragePolicyShim {
+-
+-    private final DistributedFileSystem dfs;
+-
+-    public StoragePolicyShim(DistributedFileSystem fs) {
+-      this.dfs = fs;
+-    }
+-
+-    @Override
+-    public void setStoragePolicy(Path path, StoragePolicyValue policy)
+-        throws IOException {
+-      switch (policy) {
+-      case MEMORY: {
+-        dfs.setStoragePolicy(path, HdfsConstants.MEMORY_STORAGE_POLICY_NAME);
+-        break;
+-      }
+-      case SSD: {
+-        dfs.setStoragePolicy(path, HdfsConstants.ALLSSD_STORAGE_POLICY_NAME);
+-        break;
+-      }
+-      case DEFAULT: {
+-        /* do nothing */
+-        break;
+-      }
+-      default:
+-        throw new IllegalArgumentException("Unknown storage policy " + policy);
+-      }
+-    }
+-  }
+-    
+-
+-  @Override
+-  public HadoopShims.StoragePolicyShim getStoragePolicyShim(FileSystem fs) {
+-    if (!storagePolicy) {
+-      return null;
+-    }
+-    try {
+-      return new StoragePolicyShim((DistributedFileSystem) fs);
+-    } catch (ClassCastException ce) {
+-      return null;
+-    }
+-  }
+-
+   @Override
+   public boolean runDistCp(Path src, Path dst, Configuration conf) throws IOException {
+     int rc;
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+index 93379cf..c14db86 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+@@ -28,7 +28,6 @@
+ import java.util.Comparator;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Set;
+ import java.util.TreeMap;
+ 
+ import javax.security.auth.login.LoginException;
+@@ -46,7 +45,6 @@
+ import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.fs.permission.FsAction;
+ import org.apache.hadoop.fs.permission.FsPermission;
+-import org.apache.hadoop.hive.shims.HadoopShims.StoragePolicyValue;
+ import org.apache.hadoop.io.LongWritable;
+ import org.apache.hadoop.mapred.ClusterStatus;
+ import org.apache.hadoop.mapred.JobConf;
+@@ -400,33 +398,6 @@ public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
+   public FileSystem createProxyFileSystem(FileSystem fs, URI uri);
+ 
+   public Map<String, String> getHadoopConfNames();
+-  
+-  /**
+-   * Create a shim for DFS storage policy.
+-   */
+-  
+-  public enum StoragePolicyValue {
+-    MEMORY, /* 1-replica memory */
+-    SSD, /* 3-replica ssd */
+-    DEFAULT /* system defaults (usually 3-replica disk) */;
+-
+-    public static StoragePolicyValue lookup(String name) {
+-      if (name == null) {
+-        return DEFAULT;
+-      }
+-      return StoragePolicyValue.valueOf(name.toUpperCase().trim());
+-    }
+-  };
+-  
+-  public interface StoragePolicyShim {
+-    void setStoragePolicy(Path path, StoragePolicyValue policy) throws IOException;
+-  }
+-  
+-  /**
+-   *  obtain a storage policy shim associated with the filesystem.
+-   *  Returns null when the filesystem has no storage policies.
+-   */
+-  public StoragePolicyShim getStoragePolicyShim(FileSystem fs);
+ 
+   /**
+    * a hadoop.io ByteBufferPool shim.
+-- 
+1.7.9.5
+

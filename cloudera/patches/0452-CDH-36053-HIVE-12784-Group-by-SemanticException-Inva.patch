@@ -1,0 +1,125 @@
+From 7092bb6d43d09d8297cbe773b72585100fa0aace Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Wed, 6 Jan 2016 11:51:02 -0500
+Subject: [PATCH 0452/1164] CDH-36053 HIVE-12784: Group by SemanticException:
+ Invalid column reference (Yongzhi Chen, reviewed
+ by Xuefu Zhang)
+
+Change-Id: I220e73528a05ef3462708091cdea5f0917ef30fe
+---
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |    4 +--
+ .../queries/clientpositive/groupby_constcolval.q   |    4 +++
+ .../clientpositive/groupby_constcolval.q.out       |   32 ++++++++++++++++++++
+ .../clientpositive/groupby_duplicate_key.q.out     |   16 +++++-----
+ 4 files changed, 46 insertions(+), 10 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/groupby_constcolval.q
+ create mode 100644 ql/src/test/results/clientpositive/groupby_constcolval.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index f455faa..9053e8d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -4464,8 +4464,8 @@ private Operator genGroupByPlanMapGroupByOperator(QB qb,
+       ExprNodeDesc grpByExprNode = genExprNodeDesc(grpbyExpr,
+           groupByInputRowResolver);
+ 
+-      if (ExprNodeDescUtils.indexOf(grpByExprNode, groupByKeys) >= 0) {
+-        // Skip duplicated grouping keys
++      if ((grpByExprNode instanceof ExprNodeColumnDesc) && ExprNodeDescUtils.indexOf(grpByExprNode, groupByKeys) >= 0) {
++        // Skip duplicated grouping keys, it happens when define column alias.
+         grpByExprs.remove(i--);
+         continue;
+       }
+diff --git a/ql/src/test/queries/clientpositive/groupby_constcolval.q b/ql/src/test/queries/clientpositive/groupby_constcolval.q
+new file mode 100644
+index 0000000..e0ad694
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/groupby_constcolval.q
+@@ -0,0 +1,4 @@
++DROP TABLE IF EXISTS tlbtest;
++create table tlbtest (key int, key1 int, key2 int);
++select key, key1, key2 from (select a.key, 0 as key1 , 0 as key2 from tlbtest a inner join src b on a.key = b.key) a group by key, key1, key2;
++select key, key1, key2 from (select a.key, 0 as key1 , 1 as key2 from tlbtest a inner join src b on a.key = b.key) a group by key, key1, key2;
+diff --git a/ql/src/test/results/clientpositive/groupby_constcolval.q.out b/ql/src/test/results/clientpositive/groupby_constcolval.q.out
+new file mode 100644
+index 0000000..22fc1a1
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/groupby_constcolval.q.out
+@@ -0,0 +1,32 @@
++PREHOOK: query: DROP TABLE IF EXISTS tlbtest
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS tlbtest
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: create table tlbtest (key int, key1 int, key2 int)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@tlbtest
++POSTHOOK: query: create table tlbtest (key int, key1 int, key2 int)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@tlbtest
++PREHOOK: query: select key, key1, key2 from (select a.key, 0 as key1 , 0 as key2 from tlbtest a inner join src b on a.key = b.key) a group by key, key1, key2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Input: default@tlbtest
++#### A masked pattern was here ####
++POSTHOOK: query: select key, key1, key2 from (select a.key, 0 as key1 , 0 as key2 from tlbtest a inner join src b on a.key = b.key) a group by key, key1, key2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@tlbtest
++#### A masked pattern was here ####
++PREHOOK: query: select key, key1, key2 from (select a.key, 0 as key1 , 1 as key2 from tlbtest a inner join src b on a.key = b.key) a group by key, key1, key2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Input: default@tlbtest
++#### A masked pattern was here ####
++POSTHOOK: query: select key, key1, key2 from (select a.key, 0 as key1 , 1 as key2 from tlbtest a inner join src b on a.key = b.key) a group by key, key1, key2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@tlbtest
++#### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/groupby_duplicate_key.q.out b/ql/src/test/results/clientpositive/groupby_duplicate_key.q.out
+index fc95f41..2f2a6e6 100644
+--- a/ql/src/test/results/clientpositive/groupby_duplicate_key.q.out
++++ b/ql/src/test/results/clientpositive/groupby_duplicate_key.q.out
+@@ -21,14 +21,14 @@ STAGE PLANS:
+               outputColumnNames: key
+               Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+               Group By Operator
+-                keys: key (type: string), '' (type: string)
++                keys: key (type: string), '' (type: string), '' (type: string)
+                 mode: hash
+-                outputColumnNames: _col0, _col1
++                outputColumnNames: _col0, _col1, _col2
+                 Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+                 Reduce Output Operator
+-                  key expressions: _col0 (type: string), _col1 (type: string)
++                  key expressions: _col0 (type: string), _col2 (type: string)
+                   sort order: ++
+-                  Map-reduce partition columns: _col0 (type: string), _col1 (type: string)
++                  Map-reduce partition columns: _col0 (type: string), _col2 (type: string)
+                   Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+       Reduce Operator Tree:
+         Group By Operator
+@@ -99,14 +99,14 @@ STAGE PLANS:
+               outputColumnNames: key
+               Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+               Group By Operator
+-                keys: key (type: string), 'X' (type: string)
++                keys: key (type: string), 'X' (type: string), 'X' (type: string)
+                 mode: hash
+-                outputColumnNames: _col0, _col1
++                outputColumnNames: _col0, _col1, _col2
+                 Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+                 Reduce Output Operator
+-                  key expressions: _col0 (type: string), _col1 (type: string)
++                  key expressions: _col0 (type: string), _col2 (type: string)
+                   sort order: ++
+-                  Map-reduce partition columns: _col0 (type: string), _col1 (type: string)
++                  Map-reduce partition columns: _col0 (type: string), _col2 (type: string)
+                   Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+       Reduce Operator Tree:
+         Group By Operator
+-- 
+1.7.9.5
+

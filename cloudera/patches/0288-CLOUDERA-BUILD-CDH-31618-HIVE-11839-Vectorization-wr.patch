@@ -1,0 +1,169 @@
+From 3959de68c84343a2e83aad928a29f5a9546a4d77 Mon Sep 17 00:00:00 2001
+From: Matt McCline <mmccline@hortonworks.com>
+Date: Wed, 16 Sep 2015 14:55:12 -0700
+Subject: [PATCH 0288/1164] CLOUDERA-BUILD: CDH-31618: HIVE-11839:
+ Vectorization wrong results with filter of (CAST
+ AS CHAR) (Matt McCline reviewed by Sergey
+ Shelukin)
+
+---
+ .../test/resources/testconfiguration.properties    |    1 +
+ .../hive/ql/exec/vector/VectorizationContext.java  |   10 +++---
+ .../test/queries/clientpositive/vector_char_cast.q |    9 +++++
+ .../clientpositive/tez/vector_char_cast.q.out      |   35 ++++++++++++++++++++
+ .../results/clientpositive/vector_char_cast.q.out  |   35 ++++++++++++++++++++
+ 5 files changed, 85 insertions(+), 5 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/vector_char_cast.q
+ create mode 100644 ql/src/test/results/clientpositive/tez/vector_char_cast.q.out
+ create mode 100644 ql/src/test/results/clientpositive/vector_char_cast.q.out
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index aac0fb8..a16f3be 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -180,6 +180,7 @@ minitez.query.files.shared=alter_merge_2_orc.q,\
+   vector_between_in.q,\
+   vector_binary_join_groupby.q,\
+   vector_bucket.q,\
++  vector_char_cast.q,\
+   vector_cast_constant.q,\
+   vector_char_4.q,\
+   vector_char_mapjoin1.q,\
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
+index 5201c57..a040e62 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
+@@ -1434,7 +1434,7 @@ private VectorExpression getCastToString(List<ExprNodeDesc> childExpr, TypeInfo
+       // Boolean must come before the integer family. It's a special case.
+       return createVectorExpression(CastBooleanToStringViaLongToString.class, childExpr, Mode.PROJECTION, null);
+     } else if (isIntFamily(inputType)) {
+-      return createVectorExpression(CastLongToString.class, childExpr, Mode.PROJECTION, null);
++      return createVectorExpression(CastLongToString.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isDecimalFamily(inputType)) {
+       return createVectorExpression(CastDecimalToString.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isDateFamily(inputType)) {
+@@ -1458,9 +1458,9 @@ private VectorExpression getCastToChar(List<ExprNodeDesc> childExpr, TypeInfo re
+     }
+     if (inputType.equals("boolean")) {
+       // Boolean must come before the integer family. It's a special case.
+-      return createVectorExpression(CastBooleanToCharViaLongToChar.class, childExpr, Mode.PROJECTION, null);
++      return createVectorExpression(CastBooleanToCharViaLongToChar.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isIntFamily(inputType)) {
+-      return createVectorExpression(CastLongToChar.class, childExpr, Mode.PROJECTION, null);
++      return createVectorExpression(CastLongToChar.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isDecimalFamily(inputType)) {
+       return createVectorExpression(CastDecimalToChar.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isDateFamily(inputType)) {
+@@ -1487,9 +1487,9 @@ private VectorExpression getCastToVarChar(List<ExprNodeDesc> childExpr, TypeInfo
+     }
+     if (inputType.equals("boolean")) {
+       // Boolean must come before the integer family. It's a special case.
+-      return createVectorExpression(CastBooleanToVarCharViaLongToVarChar.class, childExpr, Mode.PROJECTION, null);
++      return createVectorExpression(CastBooleanToVarCharViaLongToVarChar.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isIntFamily(inputType)) {
+-      return createVectorExpression(CastLongToVarChar.class, childExpr, Mode.PROJECTION, null);
++      return createVectorExpression(CastLongToVarChar.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isDecimalFamily(inputType)) {
+       return createVectorExpression(CastDecimalToVarChar.class, childExpr, Mode.PROJECTION, returnType);
+     } else if (isDateFamily(inputType)) {
+diff --git a/ql/src/test/queries/clientpositive/vector_char_cast.q b/ql/src/test/queries/clientpositive/vector_char_cast.q
+new file mode 100644
+index 0000000..bc78d51
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/vector_char_cast.q
+@@ -0,0 +1,9 @@
++create table s1(id smallint) stored as orc;
++
++insert into table s1 values (1000),(1001),(1002),(1003),(1000);
++
++set hive.vectorized.execution.enabled=true;
++select count(1) from s1 where cast(id as char(4))='1000';
++
++set hive.vectorized.execution.enabled=false;
++select count(1) from s1 where cast(id as char(4))='1000';
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/tez/vector_char_cast.q.out b/ql/src/test/results/clientpositive/tez/vector_char_cast.q.out
+new file mode 100644
+index 0000000..dbeae74
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/tez/vector_char_cast.q.out
+@@ -0,0 +1,35 @@
++PREHOOK: query: create table s1(id smallint) stored as orc
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@s1
++POSTHOOK: query: create table s1(id smallint) stored as orc
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@s1
++PREHOOK: query: insert into table s1 values (1000),(1001),(1002),(1003),(1000)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@s1
++POSTHOOK: query: insert into table s1 values (1000),(1001),(1002),(1003),(1000)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@s1
++POSTHOOK: Lineage: s1.id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@s1
++#### A masked pattern was here ####
++POSTHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@s1
++#### A masked pattern was here ####
++2
++PREHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@s1
++#### A masked pattern was here ####
++POSTHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@s1
++#### A masked pattern was here ####
++2
+diff --git a/ql/src/test/results/clientpositive/vector_char_cast.q.out b/ql/src/test/results/clientpositive/vector_char_cast.q.out
+new file mode 100644
+index 0000000..dbeae74
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/vector_char_cast.q.out
+@@ -0,0 +1,35 @@
++PREHOOK: query: create table s1(id smallint) stored as orc
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@s1
++POSTHOOK: query: create table s1(id smallint) stored as orc
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@s1
++PREHOOK: query: insert into table s1 values (1000),(1001),(1002),(1003),(1000)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@s1
++POSTHOOK: query: insert into table s1 values (1000),(1001),(1002),(1003),(1000)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@s1
++POSTHOOK: Lineage: s1.id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@s1
++#### A masked pattern was here ####
++POSTHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@s1
++#### A masked pattern was here ####
++2
++PREHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@s1
++#### A masked pattern was here ####
++POSTHOOK: query: select count(1) from s1 where cast(id as char(4))='1000'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@s1
++#### A masked pattern was here ####
++2
+-- 
+1.7.9.5
+

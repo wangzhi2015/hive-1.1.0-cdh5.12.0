@@ -1,0 +1,118 @@
+From 8e983aed030ea1cc8a19efe3e2f163396b19cc97 Mon Sep 17 00:00:00 2001
+From: Gunther Hagleitner <gunther@apache.org>
+Date: Wed, 18 Mar 2015 23:51:31 +0000
+Subject: [PATCH 0271/1164] CDH-26679: HIVE-9984: JoinReorder's getOutputSize
+ is exponential (Gopal V and Gunther Hagleitner)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1667641 13f79535-47bb-0310-9956-ffa450edef68
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    4 +++-
+ .../hadoop/hive/ql/optimizer/JoinReorder.java      |   24 ++++++++++++++++++++
+ .../apache/hadoop/hive/ql/optimizer/Optimizer.java |    6 ++++-
+ 3 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index d54c5da..486447d 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2073,7 +2073,9 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+       "Channel logging level for remote Spark driver.  One of {DEBUG, ERROR, INFO, TRACE, WARN}."),
+     SPARK_RPC_SASL_MECHANISM("hive.spark.client.rpc.sasl.mechanisms", "DIGEST-MD5",
+       "Name of the SASL mechanism to use for authentication."),
+-    SPARK_ENABLED("hive.enable.spark.execution.engine", false, "Whether Spark is allowed as an execution engine");
++    SPARK_ENABLED("hive.enable.spark.execution.engine", false, "Whether Spark is allowed as an execution engine"),
++    NWAYJOINREORDER("hive.reorder.nway.joins", true,
++      "Runs reordering of tables within single n-way join (i.e.: picks streamtable)");
+ 
+     public final String varname;
+     private final String defaultExpr;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/JoinReorder.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/JoinReorder.java
+index 065edef..e31dc9b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/JoinReorder.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/JoinReorder.java
+@@ -19,6 +19,8 @@
+ package org.apache.hadoop.hive.ql.optimizer;
+ 
+ import java.util.HashSet;
++import java.util.IdentityHashMap;
++import java.util.Map;
+ import java.util.Set;
+ 
+ import org.apache.hadoop.hive.ql.exec.JoinOperator;
+@@ -36,6 +38,8 @@
+  * implemented, this transformation can also be done based on costs.
+  */
+ public class JoinReorder implements Transform {
++
++  private final Map<Operator<?>, Integer> cache = new IdentityHashMap<Operator<?>, Integer>();
+   /**
+    * Estimate the size of the output based on the STREAMTABLE hints. To do so
+    * the whole tree is traversed. Possible sizes: 0: the operator and its
+@@ -49,8 +53,25 @@
+    * @return The estimated size - 0 (no streamed tables), 1 (streamed tables in
+    *         subtree) or 2 (a streamed table)
+    */
++
+   private int getOutputSize(Operator<? extends OperatorDesc> operator,
+       Set<String> bigTables) {
++
++    // memoize decorator for getOutputSizeInternal
++    if (cache.containsKey(operator)) {
++      return cache.get(operator);
++    }
++
++    int result = getOutputSizeInternal(operator, bigTables);
++
++    cache.put(operator, result);
++
++    return result;
++  }
++
++  private int getOutputSizeInternal(Operator<? extends OperatorDesc> operator,
++      Set<String> bigTables) {
++
+     // If a join operator contains a big subtree, there is a chance that its
+     // output is also big, so the output size is 1 (medium)
+     if (operator instanceof JoinOperator) {
+@@ -74,6 +95,7 @@ private int getOutputSize(Operator<? extends OperatorDesc> operator,
+     int maxSize = 0;
+     if (operator.getParentOperators() != null) {
+       for (Operator<? extends OperatorDesc> o : operator.getParentOperators()) {
++        // recurse into memoized decorator
+         int current = getOutputSize(o, bigTables);
+         if (current > maxSize) {
+           maxSize = current;
+@@ -151,8 +173,10 @@ private void reorder(JoinOperator joinOp, Set<String> bigTables) {
+    * @param pactx
+    *          current parse context
+    */
++  @Override
+   public ParseContext transform(ParseContext pactx) throws SemanticException {
+     Set<String> bigTables = getBigTables(pactx);
++    cache.clear();
+ 
+     for (JoinOperator joinOp : pactx.getJoinOps()) {
+       reorder(joinOp, bigTables);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java
+index 3482a47..ea5efe5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java
+@@ -128,7 +128,11 @@ public void initialize(HiveConf hiveConf) {
+     }
+ 
+     transformations.add(new UnionProcessor());
+-    transformations.add(new JoinReorder());
++
++    if (HiveConf.getBoolVar(hiveConf, HiveConf.ConfVars.NWAYJOINREORDER)) {
++      transformations.add(new JoinReorder());
++    }
++
+     if(HiveConf.getBoolVar(hiveConf, HiveConf.ConfVars.DYNAMICPARTITIONING) &&
+         HiveConf.getVar(hiveConf, HiveConf.ConfVars.DYNAMICPARTITIONINGMODE).equals("nonstrict") &&
+         HiveConf.getBoolVar(hiveConf, HiveConf.ConfVars.HIVEOPTSORTDYNAMICPARTITION) &&
+-- 
+1.7.9.5
+

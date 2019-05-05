@@ -1,0 +1,608 @@
+From 4bacb98505b218f4c303aeaaa47273e9ee031e11 Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Fri, 5 May 2017 13:01:31 +0200
+Subject: [PATCH 1097/1164] CDH-52465 HIVE-16449: BeeLineDriver should handle
+ query result sorting (Peter Vary via Zoltan
+ Haindrich)
+
+Signed-off-by: Zoltan Haindrich <kirk@rxd.hu>
+(cherry picked from commit 44804d82f5c1226b0247680954fdd22fc3b200bd)
+
+Change-Id: I2e9d07bd87575390b066381468227ae36b43ae43
+---
+ .../src/java/org/apache/hive/beeline/Commands.java |   12 +++
+ .../java/org/apache/hive/beeline/OutputFile.java   |   74 +++++++++++++--
+ .../hadoop/hive/cli/control/CoreBeeLineDriver.java |    4 +-
+ .../apache/hive/beeline/ConvertedOutputFile.java   |   94 ++++++++++++++++++++
+ .../main/java/org/apache/hive/beeline/QFile.java   |   17 ++++
+ .../apache/hive/beeline/QFileBeeLineClient.java    |   20 +++--
+ .../clientpositive/beeline/smb_mapjoin_1.q.out     |    8 +-
+ .../clientpositive/beeline/smb_mapjoin_2.q.out     |   16 ++--
+ .../clientpositive/beeline/smb_mapjoin_3.q.out     |   28 +++---
+ 9 files changed, 232 insertions(+), 41 deletions(-)
+ create mode 100644 itests/util/src/main/java/org/apache/hive/beeline/ConvertedOutputFile.java
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 0852297..290c888 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -997,6 +997,15 @@ private boolean executeInternal(String sql, boolean call) {
+         beeLine.showWarnings();
+ 
+         if (hasResults) {
++          OutputFile outputFile = beeLine.getRecordOutputFile();
++          if (beeLine.isTestMode() && outputFile != null && outputFile.isActiveConverter()) {
++            outputFile.fetchStarted();
++            if (!sql.trim().toLowerCase().startsWith("explain")) {
++              outputFile.foundQuery(true);
++            } else {
++              outputFile.foundQuery(false);
++            }
++          }
+           do {
+             ResultSet rs = stmnt.getResultSet();
+             try {
+@@ -1014,6 +1023,9 @@ private boolean executeInternal(String sql, boolean call) {
+               rs.close();
+             }
+           } while (BeeLine.getMoreResults(stmnt));
++          if (beeLine.isTestMode() && outputFile != null && outputFile.isActiveConverter()) {
++            outputFile.fetchFinished();
++          }
+         } else {
+           int count = stmnt.getUpdateCount();
+           long end = System.currentTimeMillis();
+diff --git a/beeline/src/java/org/apache/hive/beeline/OutputFile.java b/beeline/src/java/org/apache/hive/beeline/OutputFile.java
+index 1014af3..3d6c335 100644
+--- a/beeline/src/java/org/apache/hive/beeline/OutputFile.java
++++ b/beeline/src/java/org/apache/hive/beeline/OutputFile.java
+@@ -22,23 +22,83 @@
+  */
+ package org.apache.hive.beeline;
+ 
++import com.google.common.annotations.VisibleForTesting;
++
+ import java.io.File;
+-import java.io.FileWriter;
+ import java.io.IOException;
+-import java.io.PrintWriter;
++import java.io.PrintStream;
+ 
+ public class OutputFile {
+-  final File file;
+-  final PrintWriter out;
++  private final PrintStream out;
++  private final String filename;
+ 
+   public OutputFile(String filename) throws IOException {
+-    file = new File(filename);
+-    out = new PrintWriter(new FileWriter(file));
++    File file = new File(filename);
++    this.filename = file.getAbsolutePath();
++    this.out = new PrintStream(file, "UTF-8");
++  }
++
++  @VisibleForTesting
++  protected PrintStream getOut() {
++    return out;
++  }
++
++  @VisibleForTesting
++  protected String getFilename() {
++    return filename;
++  }
++
++  /**
++   * Constructor used by the decorating classes in tests.
++   * @param out The output stream
++   * @param filename The filename, to use in the toString() method
++   */
++  @VisibleForTesting
++  protected OutputFile(PrintStream out, String filename) {
++    this.out = out;
++    this.filename = filename;
++  }
++
++  /**
++   * Returns true if a FetchConverter is defined for writing the results. Should be used only for
++   * testing, otherwise returns false.
++   * @return True if a FetchConverter is active
++   */
++  boolean isActiveConverter() {
++    return false;
++  }
++
++  /**
++   * Indicates that result fetching is started, and the converter should be activated. The
++   * Converter starts to collect the data when the fetch is started, and prints out the
++   * converted data when the fetch is finished. Converter will collect data only if
++   * fetchStarted, and foundQuery is true.
++   */
++  void fetchStarted() {
++    // no-op for default output file
++  }
++
++  /**
++   * Indicates that the following data will be a query result, and the converter should be
++   * activated. Converter will collect the data only if fetchStarted, and foundQuery is true.
++   * @param foundQuery The following data will be a query result (true) or not (false)
++   */
++  void foundQuery(boolean foundQuery) {
++    // no-op for default output file
++  }
++
++  /**
++   * Indicates that the previously collected data should be converted and written. Converter
++   * starts to collect the data when the fetch is started, and prints out the converted data when
++   * the fetch is finished.
++   */
++  void fetchFinished() {
++    // no-op for default output file
+   }
+ 
+   @Override
+   public String toString() {
+-    return file.getAbsolutePath();
++    return filename;
+   }
+ 
+   public void addLine(String command) {
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
+index 8c7057c..2be83ca 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
+@@ -23,6 +23,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.QTestProcessExecResult;
+ import org.apache.hadoop.hive.ql.hooks.PreExecutePrinter;
++import org.apache.hive.beeline.ConvertedOutputFile.Converter;
+ import org.apache.hive.beeline.QFile;
+ import org.apache.hive.beeline.QFile.QFileBuilder;
+ import org.apache.hive.beeline.QFileBeeLineClient;
+@@ -118,7 +119,8 @@ protected void runInfraScript(File script, File beeLineOutput, File log)
+             "set test.script.dir=" + testScriptDirectory + ";",
+             "!run " + script,
+           },
+-          log);
++          log,
++          Converter.NONE);
+     } catch (Exception e) {
+       throw new SQLException("Error running infra script: " + script
+           + "\nCheck the following logs for details:\n - " + beeLineOutput + "\n - " + log, e);
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/ConvertedOutputFile.java b/itests/util/src/main/java/org/apache/hive/beeline/ConvertedOutputFile.java
+new file mode 100644
+index 0000000..ffca4ae
+--- /dev/null
++++ b/itests/util/src/main/java/org/apache/hive/beeline/ConvertedOutputFile.java
+@@ -0,0 +1,94 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.beeline;
++
++import org.apache.hadoop.hive.common.io.DigestPrintStream;
++import org.apache.hadoop.hive.common.io.FetchConverter;
++import org.apache.hadoop.hive.common.io.SortAndDigestPrintStream;
++import org.apache.hadoop.hive.common.io.SortPrintStream;
++
++import java.io.PrintStream;
++
++/**
++ * Class for representing an OutputFile, into which the writes are converted by the existing
++ * FetchConverters.
++ */
++public class ConvertedOutputFile extends OutputFile {
++  private final boolean isActiveFetchConverter;
++
++  public ConvertedOutputFile(OutputFile inner, Converter converter) throws Exception {
++    super(converter.getConvertedPrintStream(inner.getOut()), inner.getFilename());
++    isActiveFetchConverter = (getOut() instanceof FetchConverter);
++  }
++
++  @Override
++  boolean isActiveConverter() {
++    return isActiveFetchConverter;
++  }
++
++  @Override
++  void fetchStarted() {
++    if (isActiveFetchConverter) {
++      ((FetchConverter) getOut()).fetchStarted();
++    }
++  }
++
++  @Override
++  void foundQuery(boolean foundQuery) {
++    if (isActiveFetchConverter) {
++      ((FetchConverter) getOut()).foundQuery(foundQuery);
++    }
++  }
++
++  @Override
++  void fetchFinished() {
++    if (isActiveFetchConverter) {
++      ((FetchConverter) getOut()).fetchFinished();
++    }
++  }
++
++  /**
++   * The supported type of converters pointing to a specific FetchConverter class, and the method
++   * which provides the actual converted stream.
++   */
++  public enum Converter {
++    SORT_QUERY_RESULTS {
++      public PrintStream getConvertedPrintStream(PrintStream inner) throws Exception {
++        return new SortPrintStream(inner, "UTF-8");
++      }
++    },
++    HASH_QUERY_RESULTS {
++      public PrintStream getConvertedPrintStream(PrintStream inner) throws Exception {
++        return new DigestPrintStream(inner, "UTF-8");
++      }
++    },
++    SORT_AND_HASH_QUERY_RESULTS {
++      public PrintStream getConvertedPrintStream(PrintStream inner) throws Exception {
++        return new SortAndDigestPrintStream(inner, "UTF-8");
++      }
++    },
++    NONE {
++      public PrintStream getConvertedPrintStream(PrintStream inner) throws Exception {
++        return inner;
++      }
++    };
++
++    public abstract PrintStream getConvertedPrintStream(PrintStream inner) throws Exception;
++  }
++}
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/QFile.java b/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
+index a96f7f2..4c3efa6 100644
+--- a/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
++++ b/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
+@@ -23,6 +23,7 @@
+ import org.apache.hadoop.hive.ql.QTestUtil;
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hive.common.util.StreamPrinter;
++import org.apache.hive.beeline.ConvertedOutputFile.Converter;
+ 
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
+@@ -72,6 +73,7 @@
+   private static RegexFilterSet staticFilterSet = getStaticFilterSet();
+   private RegexFilterSet specificFilterSet;
+   private boolean rewriteSourceTables;
++  private Converter converter;
+ 
+   private QFile() {}
+ 
+@@ -107,6 +109,10 @@ public File getAfterExecuteLogFile() {
+     return afterExecuteLogFile;
+   }
+ 
++  public Converter getConverter() {
++    return converter;
++  }
++
+   public String getDebugHint() {
+     return String.format(DEBUG_HINT, inputFile, rawOutputFile, outputFile, expectedOutputFile,
+         logFile, beforeExecuteLogFile, afterExecuteLogFile,
+@@ -327,6 +333,17 @@ public QFile getQFile(String name) throws IOException {
+           .addFilter("(PREHOOK|POSTHOOK): (Output|Input): " + name + "@", "$1: $2: default@")
+           .addFilter("name(:?) " + name + "\\.(.*)\n", "name$1 default.$2\n")
+           .addFilter("/" + name + ".db/", "/");
++      result.converter = Converter.NONE;
++      String input = FileUtils.readFileToString(result.inputFile, "UTF-8");
++      if (input.contains("-- SORT_QUERY_RESULTS")) {
++        result.converter = Converter.SORT_QUERY_RESULTS;
++      }
++      if (input.contains("-- HASH_QUERY_RESULTS")) {
++        result.converter = Converter.HASH_QUERY_RESULTS;
++      }
++      if (input.contains("-- SORT_AND_HASH_QUERY_RESULTS")) {
++        result.converter = Converter.SORT_AND_HASH_QUERY_RESULTS;
++      }
+       return result;
+     }
+   }
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/QFileBeeLineClient.java b/itests/util/src/main/java/org/apache/hive/beeline/QFileBeeLineClient.java
+index dd15b9f..fa222ff 100644
+--- a/itests/util/src/main/java/org/apache/hive/beeline/QFileBeeLineClient.java
++++ b/itests/util/src/main/java/org/apache/hive/beeline/QFileBeeLineClient.java
+@@ -18,6 +18,8 @@
+ 
+ package org.apache.hive.beeline;
+ 
++import org.apache.hive.beeline.ConvertedOutputFile.Converter;
++
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.PrintStream;
+@@ -51,11 +53,13 @@ protected QFileBeeLineClient(String jdbcUrl, String jdbcDriver, String username,
+         });
+   }
+ 
+-  public void execute(String[] commands, File resultFile) throws SQLException {
++  public void execute(String[] commands, File resultFile, Converter converter)
++      throws Exception {
+     beeLine.runCommands(
+         new String[] {
+           "!record " + resultFile.getAbsolutePath()
+         });
++    beeLine.setRecordOutputFile(new ConvertedOutputFile(beeLine.getRecordOutputFile(), converter));
+ 
+     int lastSuccessfulCommand = beeLine.runCommands(commands);
+     if (commands.length != lastSuccessfulCommand) {
+@@ -65,7 +69,7 @@ public void execute(String[] commands, File resultFile) throws SQLException {
+     beeLine.runCommands(new String[] {"!record"});
+   }
+ 
+-  private void beforeExecute(QFile qFile) throws SQLException {
++  private void beforeExecute(QFile qFile) throws Exception {
+     execute(
+         new String[] {
+           "!set outputformat tsv2",
+@@ -80,11 +84,12 @@ private void beforeExecute(QFile qFile) throws SQLException {
+           "set hive.in.test.short.logs=true;",
+           "set hive.in.test.remove.logs=false;",
+         },
+-        qFile.getBeforeExecuteLogFile());
++        qFile.getBeforeExecuteLogFile(),
++        Converter.NONE);
+     beeLine.setIsTestMode(true);
+   }
+ 
+-  private void afterExecute(QFile qFile) throws SQLException {
++  private void afterExecute(QFile qFile) throws Exception {
+     beeLine.setIsTestMode(false);
+     execute(
+         new String[] {
+@@ -96,13 +101,14 @@ private void afterExecute(QFile qFile) throws SQLException {
+           "USE default;",
+           "DROP DATABASE IF EXISTS `" + qFile.getName() + "` CASCADE;",
+         },
+-        qFile.getAfterExecuteLogFile());
++        qFile.getAfterExecuteLogFile(),
++        Converter.NONE);
+   }
+ 
+-  public void execute(QFile qFile) throws SQLException, IOException {
++  public void execute(QFile qFile) throws Exception {
+     beforeExecute(qFile);
+     String[] commands = beeLine.getCommands(qFile.getInputFile());
+-    execute(qFile.filterCommands(commands), qFile.getRawOutputFile());
++    execute(qFile.filterCommands(commands), qFile.getRawOutputFile(), qFile.getConverter());
+     afterExecute(qFile);
+   }
+ 
+diff --git a/ql/src/test/results/clientpositive/beeline/smb_mapjoin_1.q.out b/ql/src/test/results/clientpositive/beeline/smb_mapjoin_1.q.out
+index 7918405..1025a4e 100644
+--- a/ql/src/test/results/clientpositive/beeline/smb_mapjoin_1.q.out
++++ b/ql/src/test/results/clientpositive/beeline/smb_mapjoin_1.q.out
+@@ -150,10 +150,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_2
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	NULL	NULL
+ 3	val_3	NULL	NULL
+ 4	val_4	NULL	NULL
+ 5	val_5	NULL	NULL
+-10	val_10	NULL	NULL
+ PREHOOK: query: explain
+ select /*+mapjoin(a)*/ * from smb_bucket_1 a right outer join smb_bucket_2 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -259,10 +259,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_2
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	NULL	NULL
+ 3	val_3	NULL	NULL
+ 4	val_4	NULL	NULL
+ 5	val_5	NULL	NULL
+-10	val_10	NULL	NULL
+ NULL	NULL	20	val_20
+ NULL	NULL	23	val_23
+ NULL	NULL	25	val_25
+@@ -371,10 +371,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_2
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	NULL	NULL
+ 3	val_3	NULL	NULL
+ 4	val_4	NULL	NULL
+ 5	val_5	NULL	NULL
+-10	val_10	NULL	NULL
+ PREHOOK: query: explain
+ select /*+mapjoin(b)*/ * from smb_bucket_1 a right outer join smb_bucket_2 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -480,10 +480,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_2
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	NULL	NULL
+ 3	val_3	NULL	NULL
+ 4	val_4	NULL	NULL
+ 5	val_5	NULL	NULL
+-10	val_10	NULL	NULL
+ NULL	NULL	20	val_20
+ NULL	NULL	23	val_23
+ NULL	NULL	25	val_25
+diff --git a/ql/src/test/results/clientpositive/beeline/smb_mapjoin_2.q.out b/ql/src/test/results/clientpositive/beeline/smb_mapjoin_2.q.out
+index 0ba94c6..c2d9eda 100644
+--- a/ql/src/test/results/clientpositive/beeline/smb_mapjoin_2.q.out
++++ b/ql/src/test/results/clientpositive/beeline/smb_mapjoin_2.q.out
+@@ -99,8 +99,8 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-4	val_4	4	val_4
+ 10	val_10	10	val_10
++4	val_4	4	val_4
+ PREHOOK: query: explain
+ select /*+mapjoin(a)*/ * from smb_bucket_1 a left outer join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -152,10 +152,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	10	val_10
+ 3	val_3	NULL	NULL
+ 4	val_4	4	val_4
+ 5	val_5	NULL	NULL
+-10	val_10	10	val_10
+ PREHOOK: query: explain
+ select /*+mapjoin(a)*/ * from smb_bucket_1 a right outer join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -206,8 +206,8 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-4	val_4	4	val_4
+ 10	val_10	10	val_10
++4	val_4	4	val_4
+ NULL	NULL	17	val_17
+ NULL	NULL	19	val_19
+ NULL	NULL	20	val_20
+@@ -263,10 +263,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	10	val_10
+ 3	val_3	NULL	NULL
+ 4	val_4	4	val_4
+ 5	val_5	NULL	NULL
+-10	val_10	10	val_10
+ NULL	NULL	17	val_17
+ NULL	NULL	19	val_19
+ NULL	NULL	20	val_20
+@@ -324,8 +324,8 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-4	val_4	4	val_4
+ 10	val_10	10	val_10
++4	val_4	4	val_4
+ PREHOOK: query: explain
+ select /*+mapjoin(b)*/ * from smb_bucket_1 a left outer join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -377,10 +377,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	10	val_10
+ 3	val_3	NULL	NULL
+ 4	val_4	4	val_4
+ 5	val_5	NULL	NULL
+-10	val_10	10	val_10
+ PREHOOK: query: explain
+ select /*+mapjoin(b)*/ * from smb_bucket_1 a right outer join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -431,8 +431,8 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-4	val_4	4	val_4
+ 10	val_10	10	val_10
++4	val_4	4	val_4
+ NULL	NULL	17	val_17
+ NULL	NULL	19	val_19
+ NULL	NULL	20	val_20
+@@ -488,10 +488,10 @@ POSTHOOK: Input: default@smb_bucket_1
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+ 1	val_1	NULL	NULL
++10	val_10	10	val_10
+ 3	val_3	NULL	NULL
+ 4	val_4	4	val_4
+ 5	val_5	NULL	NULL
+-10	val_10	10	val_10
+ NULL	NULL	17	val_17
+ NULL	NULL	19	val_19
+ NULL	NULL	20	val_20
+diff --git a/ql/src/test/results/clientpositive/beeline/smb_mapjoin_3.q.out b/ql/src/test/results/clientpositive/beeline/smb_mapjoin_3.q.out
+index 65154d0..f0b0b39 100644
+--- a/ql/src/test/results/clientpositive/beeline/smb_mapjoin_3.q.out
++++ b/ql/src/test/results/clientpositive/beeline/smb_mapjoin_3.q.out
+@@ -205,12 +205,12 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_2
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-NULL	NULL	4	val_4
++20	val_20	20	val_20
++23	val_23	23	val_23
+ NULL	NULL	10	val_10
+ NULL	NULL	17	val_17
+ NULL	NULL	19	val_19
+-20	val_20	20	val_20
+-23	val_23	23	val_23
++NULL	NULL	4	val_4
+ PREHOOK: query: explain
+ select /*+mapjoin(a)*/ * from smb_bucket_2 a full outer join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -261,14 +261,14 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_2
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-NULL	NULL	4	val_4
+-NULL	NULL	10	val_10
+-NULL	NULL	17	val_17
+-NULL	NULL	19	val_19
+ 20	val_20	20	val_20
+ 23	val_23	23	val_23
+ 25	val_25	NULL	NULL
+ 30	val_30	NULL	NULL
++NULL	NULL	10	val_10
++NULL	NULL	17	val_17
++NULL	NULL	19	val_19
++NULL	NULL	4	val_4
+ PREHOOK: query: explain
+ select /*+mapjoin(b)*/ * from smb_bucket_2 a join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -428,12 +428,12 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_2
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-NULL	NULL	4	val_4
++20	val_20	20	val_20
++23	val_23	23	val_23
+ NULL	NULL	10	val_10
+ NULL	NULL	17	val_17
+ NULL	NULL	19	val_19
+-20	val_20	20	val_20
+-23	val_23	23	val_23
++NULL	NULL	4	val_4
+ PREHOOK: query: explain
+ select /*+mapjoin(b)*/ * from smb_bucket_2 a full outer join smb_bucket_3 b on a.key = b.key
+ PREHOOK: type: QUERY
+@@ -484,11 +484,11 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@smb_bucket_2
+ POSTHOOK: Input: default@smb_bucket_3
+ #### A masked pattern was here ####
+-NULL	NULL	4	val_4
+-NULL	NULL	10	val_10
+-NULL	NULL	17	val_17
+-NULL	NULL	19	val_19
+ 20	val_20	20	val_20
+ 23	val_23	23	val_23
+ 25	val_25	NULL	NULL
+ 30	val_30	NULL	NULL
++NULL	NULL	10	val_10
++NULL	NULL	17	val_17
++NULL	NULL	19	val_19
++NULL	NULL	4	val_4
+-- 
+1.7.9.5
+

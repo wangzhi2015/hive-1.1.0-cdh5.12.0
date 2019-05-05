@@ -1,0 +1,1661 @@
+From 55050e9f0b20fccf61dbda2886f2b1d74c3464aa Mon Sep 17 00:00:00 2001
+From: Matt McCline <mmccline@hortonworks.com>
+Date: Mon, 12 Dec 2016 01:51:24 -0800
+Subject: [PATCH 0950/1164] CDH-47503: HIVE-15338: Wrong result from
+ non-vectorized DATEDIFF with scalar parameter of
+ type DATE/TIMESTAMP (Matt McCline, reviewed by
+ Jason Dere)
+
+Change-Id: I7d0f7a752df12855e560e6b7375d8ca4fb8b0796
+---
+ .../hive/ql/exec/vector/VectorizationContext.java  |    4 +-
+ .../expressions/VectorUDFDateAddScalarCol.java     |    2 +
+ .../expressions/VectorUDFDateDiffColScalar.java    |    2 +
+ .../expressions/VectorUDFDateDiffScalarCol.java    |    2 +
+ .../hive/ql/udf/generic/GenericUDFDateDiff.java    |   14 +-
+ .../TestVectorGenericDateExpressions.java          |    4 +-
+ ql/src/test/queries/clientpositive/date_udf.q      |   15 +-
+ .../queries/clientpositive/vectorized_date_funcs.q |   67 +-
+ ql/src/test/results/clientpositive/date_udf.q.out  |   34 +-
+ .../results/clientpositive/spark/date_udf.q.out    |   34 +-
+ .../clientpositive/vectorized_date_funcs.q.out     |  979 +++++++++++---------
+ 11 files changed, 695 insertions(+), 462 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
+index 8139ec6..f37bd87 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
+@@ -1255,7 +1255,7 @@ private VectorExpression getInExpression(List<ExprNodeDesc> childExpr, Mode mode
+       cl = (mode == Mode.FILTER ? FilterLongColumnInList.class : LongColumnInList.class);
+       long[] inVals = new long[childrenForInList.size()];
+       for (int i = 0; i != inVals.length; i++) {
+-        inVals[i] = (Integer) getVectorTypeScalarValue((ExprNodeConstantDesc) childrenForInList.get(i));
++        inVals[i] = (Long) getVectorTypeScalarValue((ExprNodeConstantDesc) childrenForInList.get(i));
+       }
+       expr = createVectorExpression(cl, childExpr.subList(0, 1), Mode.PROJECTION, returnType);
+       ((ILongInExpr) expr).setInListValues(inVals);
+@@ -1845,7 +1845,7 @@ private Object getVectorTypeScalarValue(ExprNodeConstantDesc constDesc) throws H
+     if (isTimestampFamily(t)) {
+       return TimestampUtils.getTimeNanoSec((Timestamp) getScalarValue(constDesc));
+     } else if (isDateFamily(t)) {
+-      return DateWritable.dateToDays((Date) getScalarValue(constDesc));
++      return new Long(DateWritable.dateToDays((Date) getScalarValue(constDesc)));
+     } else {
+       return getScalarValue(constDesc);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateAddScalarCol.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateAddScalarCol.java
+index e0497a1..22b43a0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateAddScalarCol.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateAddScalarCol.java
+@@ -58,6 +58,8 @@ public VectorUDFDateAddScalarCol(Object object, int colNum, int outputColumn) {
+       this.longValue = (Long) object;
+     } else if (object instanceof byte []) {
+       this.stringValue = (byte[]) object;
++    } else {
++      throw new RuntimeException("Unexpected scalar object " + object.getClass().getName() + " " + object.toString());
+     }
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffColScalar.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffColScalar.java
+index 3df53a4..691fa2d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffColScalar.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffColScalar.java
+@@ -52,6 +52,8 @@ public VectorUDFDateDiffColScalar(int colNum, Object object, int outputColumn) {
+       this.longValue = (Long) object;
+     } else if (object instanceof byte []) {
+       this.stringValue = (byte []) object;
++    } else {
++      throw new RuntimeException("Unexpected scalar object " + object.getClass().getName() + " " + object.toString());
+     }
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffScalarCol.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffScalarCol.java
+index b16a21c..11c8547 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffScalarCol.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/expressions/VectorUDFDateDiffScalarCol.java
+@@ -51,6 +51,8 @@ public VectorUDFDateDiffScalarCol(Object object, int colNum, int outputColumn) {
+       this.longValue = (Long) object;
+     } else if (object instanceof byte []) {
+       this.stringValue = (byte[]) object;
++    } else {
++      throw new RuntimeException("Unexpected scalar object " + object.getClass().getName() + " " + object.toString());
+     }
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateDiff.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateDiff.java
+index 403cf11..ac48f01 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateDiff.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateDiff.java
+@@ -20,7 +20,7 @@
+ import java.sql.Timestamp;
+ import java.text.ParseException;
+ import java.text.SimpleDateFormat;
+-import java.util.Date;
++import java.sql.Date;
+ import java.util.TimeZone;
+ 
+ import org.apache.hadoop.hive.ql.exec.Description;
+@@ -70,7 +70,6 @@
+   private IntWritable result = new IntWritable();
+ 
+   public GenericUDFDateDiff() {
+-    formatter.setTimeZone(TimeZone.getTimeZone("UTC"));
+   }
+ 
+   @Override
+@@ -106,14 +105,14 @@ private Date convertToDate(PrimitiveCategory inputType, Converter converter, Def
+     if (argument.get() == null) {
+       return null;
+     }
+-    Date date = new Date();
++    Date date = new Date(0);
+     switch (inputType) {
+     case STRING:
+     case VARCHAR:
+     case CHAR:
+       String dateString = converter.convert(argument.get()).toString();
+       try {
+-        date = formatter.parse(dateString);
++        date.setTime(formatter.parse(dateString).getTime());
+       } catch (ParseException e) {
+         return null;
+       }
+@@ -171,11 +170,8 @@ private IntWritable evaluate(Date date, Date date2) {
+     if (date == null || date2 == null) {
+       return null;
+     }
+-    // NOTE: This implementation avoids the extra-second problem
+-    // by comparing with UTC epoch and integer division.
+-    // 86400 is the number of seconds in a day
+-    long diffInMilliSeconds = date.getTime() - date2.getTime();
+-    result.set((int) (diffInMilliSeconds / (86400 * 1000)));
++
++    result.set(DateWritable.dateToDays(date) - DateWritable.dateToDays(date2));
+     return result;
+   }
+ }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/vector/expressions/TestVectorGenericDateExpressions.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/vector/expressions/TestVectorGenericDateExpressions.java
+index 74f4671..faa4162 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/vector/expressions/TestVectorGenericDateExpressions.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/vector/expressions/TestVectorGenericDateExpressions.java
+@@ -474,7 +474,7 @@ public void testDateDiffScalarCol() {
+     }
+     VectorizedRowBatch batch = new VectorizedRowBatch(2, 1);
+ 
+-    udf = new VectorUDFDateDiffScalarCol(0, 0, 1);
++    udf = new VectorUDFDateDiffScalarCol(0L, 0, 1);
+     udf.setInputTypes(VectorExpression.Type.TIMESTAMP, VectorExpression.Type.STRING);
+     batch.cols[0] = new BytesColumnVector(1);
+     batch.cols[1] = new LongColumnVector(1);
+@@ -545,7 +545,7 @@ public void testDateDiffColScalar() {
+     }
+     VectorizedRowBatch batch = new VectorizedRowBatch(2, 1);
+ 
+-    udf = new VectorUDFDateDiffColScalar(0, 0, 1);
++    udf = new VectorUDFDateDiffColScalar(0, 0L, 1);
+     udf.setInputTypes(VectorExpression.Type.TIMESTAMP, VectorExpression.Type.STRING);
+     batch.cols[0] = new BytesColumnVector(1);
+     batch.cols[1] = new LongColumnVector(1);
+diff --git a/ql/src/test/queries/clientpositive/date_udf.q b/ql/src/test/queries/clientpositive/date_udf.q
+index c55b9f9..3b82265 100644
+--- a/ql/src/test/queries/clientpositive/date_udf.q
++++ b/ql/src/test/queries/clientpositive/date_udf.q
+@@ -39,9 +39,20 @@ select unix_timestamp(d), year(d), month(d), day(d), dayofmonth(d),
+ 
+ select date_add(d, 5), date_sub(d, 10)  from date_udf_string;
+ 
+-select datediff(d, d), datediff(d, '2002-03-21'), datediff('2002-03-21', d),
++select
++    datediff(d, d),
++    datediff(d, '2002-03-21'),
++    datediff(d, date '2002-03-21'),
++    datediff('2002-03-21', d),
++    datediff(date '2002-03-21', d),
+     datediff('2002-03-21 00:00:00', d),
+-    datediff(d, '2002-03-21 00:00:00')
++    datediff(timestamp '2002-03-21 00:00:00', d),
++    datediff(d, '2002-03-21 00:00:00'),
++    datediff(d, timestamp '2002-03-21 00:00:00'),
++    datediff('2002-03-21 08:01:59', d),
++    datediff(timestamp '2002-03-21 08:01:59', d),
++    datediff(d, '2002-03-21 08:01:59'),
++    datediff(d, timestamp '2002-03-21 08:01:59')
+   from date_udf_string;
+ 
+ select 
+diff --git a/ql/src/test/queries/clientpositive/vectorized_date_funcs.q b/ql/src/test/queries/clientpositive/vectorized_date_funcs.q
+index 46ef0dc..3444032 100644
+--- a/ql/src/test/queries/clientpositive/vectorized_date_funcs.q
++++ b/ql/src/test/queries/clientpositive/vectorized_date_funcs.q
+@@ -1,4 +1,5 @@
+ SET hive.vectorized.execution.enabled = true;
++set hive.cli.print.header=true;
+ 
+ -- Test timestamp functions in vectorized mode to verify they run correctly end-to-end.
+ 
+@@ -21,6 +22,7 @@ INSERT INTO TABLE date_udf_flight_orc SELECT fl_date, to_utc_timestamp(fl_date,
+ SELECT * FROM date_udf_flight_orc;
+ 
+ EXPLAIN SELECT
++  fl_time,
+   to_unix_timestamp(fl_time),
+   year(fl_time),
+   month(fl_time),
+@@ -32,10 +34,18 @@ EXPLAIN SELECT
+   to_date(fl_time),
+   date_add(fl_time, 2),
+   date_sub(fl_time, 2),
+-  datediff(fl_time, "2000-01-01")
++  datediff(fl_time, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc;
+ 
+ SELECT
++  fl_time,
+   to_unix_timestamp(fl_time),
+   year(fl_time),
+   month(fl_time),
+@@ -47,10 +57,18 @@ SELECT
+   to_date(fl_time),
+   date_add(fl_time, 2),
+   date_sub(fl_time, 2),
+-  datediff(fl_time, "2000-01-01")
++  datediff(fl_time, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc;
+ 
+ EXPLAIN SELECT
++  fl_date,
+   to_unix_timestamp(fl_date),
+   year(fl_date),
+   month(fl_date),
+@@ -62,10 +80,18 @@ EXPLAIN SELECT
+   to_date(fl_date),
+   date_add(fl_date, 2),
+   date_sub(fl_date, 2),
+-  datediff(fl_date, "2000-01-01")
++  datediff(fl_date, "2000-01-01"),
++  datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_date, "2007-03-14"),
++  datediff(fl_date, date "2007-03-14"),
++  datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_date, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc;
+ 
+ SELECT
++  fl_date,
+   to_unix_timestamp(fl_date),
+   year(fl_date),
+   month(fl_date),
+@@ -77,10 +103,19 @@ SELECT
+   to_date(fl_date),
+   date_add(fl_date, 2),
+   date_sub(fl_date, 2),
+-  datediff(fl_date, "2000-01-01")
++  datediff(fl_date, "2000-01-01"),
++  datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_date, "2007-03-14"),
++  datediff(fl_date, date "2007-03-14"),
++  datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_date, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc;
+ 
+ EXPLAIN SELECT
++  fl_time,
++  fl_date,
+   year(fl_time) = year(fl_date),
+   month(fl_time) = month(fl_date),
+   day(fl_time) = day(fl_date),
+@@ -91,11 +126,22 @@ EXPLAIN SELECT
+   to_date(fl_time) = to_date(fl_date),
+   date_add(fl_time, 2) = date_add(fl_date, 2),
+   date_sub(fl_time, 2) = date_sub(fl_date, 2),
+-  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01")
++  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00") = datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09") = datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14") = datediff(fl_date, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14") = datediff(fl_date, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00") = datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59") = datediff(fl_date, timestamp "2007-03-14 08:21:59"),
++  datediff(fl_date, "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, "2007-03-14") = datediff(fl_date, date "2007-03-14")
+ FROM date_udf_flight_orc;
+ 
+ -- Should all be true or NULL
+ SELECT
++  fl_time,
++  fl_date,
+   year(fl_time) = year(fl_date),
+   month(fl_time) = month(fl_date),
+   day(fl_time) = day(fl_date),
+@@ -106,7 +152,16 @@ SELECT
+   to_date(fl_time) = to_date(fl_date),
+   date_add(fl_time, 2) = date_add(fl_date, 2),
+   date_sub(fl_time, 2) = date_sub(fl_date, 2),
+-  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01")
++  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00") = datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09") = datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14") = datediff(fl_date, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14") = datediff(fl_date, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00") = datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59") = datediff(fl_date, timestamp "2007-03-14 08:21:59"),
++  datediff(fl_date, "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, "2007-03-14") = datediff(fl_date, date "2007-03-14")
+ FROM date_udf_flight_orc;
+ 
+ EXPLAIN SELECT 
+diff --git a/ql/src/test/results/clientpositive/date_udf.q.out b/ql/src/test/results/clientpositive/date_udf.q.out
+index 9b37da6..2037367 100644
+--- a/ql/src/test/results/clientpositive/date_udf.q.out
++++ b/ql/src/test/results/clientpositive/date_udf.q.out
+@@ -114,7 +114,7 @@ POSTHOOK: query: select datediff(d, d), datediff(d, '2002-03-21'), datediff('200
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf
+ #### A masked pattern was here ####
+-0	3333	-3333	-3332	3332
++0	3333	-3333	-3333	3333
+ PREHOOK: query: -- Test UDFs with string input
+ select unix_timestamp(d), year(d), month(d), day(d), dayofmonth(d), 
+     weekofyear(d), to_date(d)
+@@ -139,21 +139,43 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_string
+ #### A masked pattern was here ####
+ 2011-05-11	2011-04-26
+-PREHOOK: query: select datediff(d, d), datediff(d, '2002-03-21'), datediff('2002-03-21', d),
++PREHOOK: query: select
++    datediff(d, d),
++    datediff(d, '2002-03-21'),
++    datediff(d, date '2002-03-21'),
++    datediff('2002-03-21', d),
++    datediff(date '2002-03-21', d),
+     datediff('2002-03-21 00:00:00', d),
+-    datediff(d, '2002-03-21 00:00:00')
++    datediff(timestamp '2002-03-21 00:00:00', d),
++    datediff(d, '2002-03-21 00:00:00'),
++    datediff(d, timestamp '2002-03-21 00:00:00'),
++    datediff('2002-03-21 08:01:59', d),
++    datediff(timestamp '2002-03-21 08:01:59', d),
++    datediff(d, '2002-03-21 08:01:59'),
++    datediff(d, timestamp '2002-03-21 08:01:59')
+   from date_udf_string
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@date_udf_string
+ #### A masked pattern was here ####
+-POSTHOOK: query: select datediff(d, d), datediff(d, '2002-03-21'), datediff('2002-03-21', d),
++POSTHOOK: query: select
++    datediff(d, d),
++    datediff(d, '2002-03-21'),
++    datediff(d, date '2002-03-21'),
++    datediff('2002-03-21', d),
++    datediff(date '2002-03-21', d),
+     datediff('2002-03-21 00:00:00', d),
+-    datediff(d, '2002-03-21 00:00:00')
++    datediff(timestamp '2002-03-21 00:00:00', d),
++    datediff(d, '2002-03-21 00:00:00'),
++    datediff(d, timestamp '2002-03-21 00:00:00'),
++    datediff('2002-03-21 08:01:59', d),
++    datediff(timestamp '2002-03-21 08:01:59', d),
++    datediff(d, '2002-03-21 08:01:59'),
++    datediff(d, timestamp '2002-03-21 08:01:59')
+   from date_udf_string
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_string
+ #### A masked pattern was here ####
+-0	3333	-3333	-3333	3333
++0	3333	3333	-3333	-3333	-3333	-3333	3333	3333	-3333	-3333	3333	3333
+ PREHOOK: query: select 
+     to_utc_timestamp(date '1970-01-01', 'America/Los_Angeles'),
+     from_utc_timestamp(date '1970-01-01', 'America/Los_Angeles'),
+diff --git a/ql/src/test/results/clientpositive/spark/date_udf.q.out b/ql/src/test/results/clientpositive/spark/date_udf.q.out
+index 9b37da6..2037367 100644
+--- a/ql/src/test/results/clientpositive/spark/date_udf.q.out
++++ b/ql/src/test/results/clientpositive/spark/date_udf.q.out
+@@ -114,7 +114,7 @@ POSTHOOK: query: select datediff(d, d), datediff(d, '2002-03-21'), datediff('200
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf
+ #### A masked pattern was here ####
+-0	3333	-3333	-3332	3332
++0	3333	-3333	-3333	3333
+ PREHOOK: query: -- Test UDFs with string input
+ select unix_timestamp(d), year(d), month(d), day(d), dayofmonth(d), 
+     weekofyear(d), to_date(d)
+@@ -139,21 +139,43 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_string
+ #### A masked pattern was here ####
+ 2011-05-11	2011-04-26
+-PREHOOK: query: select datediff(d, d), datediff(d, '2002-03-21'), datediff('2002-03-21', d),
++PREHOOK: query: select
++    datediff(d, d),
++    datediff(d, '2002-03-21'),
++    datediff(d, date '2002-03-21'),
++    datediff('2002-03-21', d),
++    datediff(date '2002-03-21', d),
+     datediff('2002-03-21 00:00:00', d),
+-    datediff(d, '2002-03-21 00:00:00')
++    datediff(timestamp '2002-03-21 00:00:00', d),
++    datediff(d, '2002-03-21 00:00:00'),
++    datediff(d, timestamp '2002-03-21 00:00:00'),
++    datediff('2002-03-21 08:01:59', d),
++    datediff(timestamp '2002-03-21 08:01:59', d),
++    datediff(d, '2002-03-21 08:01:59'),
++    datediff(d, timestamp '2002-03-21 08:01:59')
+   from date_udf_string
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@date_udf_string
+ #### A masked pattern was here ####
+-POSTHOOK: query: select datediff(d, d), datediff(d, '2002-03-21'), datediff('2002-03-21', d),
++POSTHOOK: query: select
++    datediff(d, d),
++    datediff(d, '2002-03-21'),
++    datediff(d, date '2002-03-21'),
++    datediff('2002-03-21', d),
++    datediff(date '2002-03-21', d),
+     datediff('2002-03-21 00:00:00', d),
+-    datediff(d, '2002-03-21 00:00:00')
++    datediff(timestamp '2002-03-21 00:00:00', d),
++    datediff(d, '2002-03-21 00:00:00'),
++    datediff(d, timestamp '2002-03-21 00:00:00'),
++    datediff('2002-03-21 08:01:59', d),
++    datediff(timestamp '2002-03-21 08:01:59', d),
++    datediff(d, '2002-03-21 08:01:59'),
++    datediff(d, timestamp '2002-03-21 08:01:59')
+   from date_udf_string
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_string
+ #### A masked pattern was here ####
+-0	3333	-3333	-3333	3333
++0	3333	3333	-3333	-3333	-3333	-3333	3333	3333	-3333	-3333	3333	3333
+ PREHOOK: query: select 
+     to_utc_timestamp(date '1970-01-01', 'America/Los_Angeles'),
+     from_utc_timestamp(date '1970-01-01', 'America/Los_Angeles'),
+diff --git a/ql/src/test/results/clientpositive/vectorized_date_funcs.q.out b/ql/src/test/results/clientpositive/vectorized_date_funcs.q.out
+index 443e9e4..ba1172d 100644
+--- a/ql/src/test/results/clientpositive/vectorized_date_funcs.q.out
++++ b/ql/src/test/results/clientpositive/vectorized_date_funcs.q.out
+@@ -54,6 +54,7 @@ POSTHOOK: Input: default@date_udf_flight
+ POSTHOOK: Output: default@date_udf_flight_orc
+ POSTHOOK: Lineage: date_udf_flight_orc.fl_date SIMPLE [(date_udf_flight)date_udf_flight.FieldSchema(name:fl_date, type:date, comment:null), ]
+ POSTHOOK: Lineage: date_udf_flight_orc.fl_time EXPRESSION [(date_udf_flight)date_udf_flight.FieldSchema(name:fl_date, type:date, comment:null), ]
++fl_date	c1
+ PREHOOK: query: SELECT * FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@date_udf_flight_orc
+@@ -62,6 +63,7 @@ POSTHOOK: query: SELECT * FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
++date_udf_flight_orc.fl_date	date_udf_flight_orc.fl_time
+ 2010-10-20	2010-10-20 07:00:00
+ 2010-10-20	2010-10-20 07:00:00
+ 2010-10-20	2010-10-20 07:00:00
+@@ -200,6 +202,7 @@ POSTHOOK: Input: default@date_udf_flight_orc
+ 2010-10-29	2010-10-29 07:00:00
+ 2010-10-31	2010-10-31 07:00:00
+ PREHOOK: query: EXPLAIN SELECT
++  fl_time,
+   to_unix_timestamp(fl_time),
+   year(fl_time),
+   month(fl_time),
+@@ -211,10 +214,18 @@ PREHOOK: query: EXPLAIN SELECT
+   to_date(fl_time),
+   date_add(fl_time, 2),
+   date_sub(fl_time, 2),
+-  datediff(fl_time, "2000-01-01")
++  datediff(fl_time, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN SELECT
++  fl_time,
+   to_unix_timestamp(fl_time),
+   year(fl_time),
+   month(fl_time),
+@@ -226,9 +237,17 @@ POSTHOOK: query: EXPLAIN SELECT
+   to_date(fl_time),
+   date_add(fl_time, 2),
+   date_sub(fl_time, 2),
+-  datediff(fl_time, "2000-01-01")
++  datediff(fl_time, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
++Explain
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-0 depends on stages: Stage-1
+@@ -241,8 +260,8 @@ STAGE PLANS:
+             alias: date_udf_flight_orc
+             Statistics: Num rows: 137 Data size: 13152 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+-              expressions: to_unix_timestamp(fl_time) (type: bigint), year(fl_time) (type: int), month(fl_time) (type: int), day(fl_time) (type: int), dayofmonth(fl_time) (type: int), dayofweek(fl_time) (type: int), weekofyear(fl_time) (type: int), CAST( fl_time AS DATE) (type: date), to_date(fl_time) (type: string), date_add(fl_time, 2) (type: string), date_sub(fl_time, 2) (type: string), datediff(fl_time, '2000-01-01') (type: int)
+-              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11
++              expressions: fl_time (type: timestamp), to_unix_timestamp(fl_time) (type: bigint), year(fl_time) (type: int), month(fl_time) (type: int), day(fl_time) (type: int), dayofmonth(fl_time) (type: int), dayofweek(fl_time) (type: int), weekofyear(fl_time) (type: int), CAST( fl_time AS DATE) (type: date), to_date(fl_time) (type: string), date_add(fl_time, 2) (type: string), date_sub(fl_time, 2) (type: string), datediff(fl_time, '2000-01-01') (type: int), datediff(fl_time, 2000-01-01) (type: int), datediff(fl_time, 2000-01-01 12:00:00.0) (type: int), datediff(fl_time, 2000-01-01 11:13:09.0) (type: int), datediff(fl_time, '2007-03-14') (type: int), datediff(fl_time, 2007-03-14) (type: int), datediff(fl_time, 2007-03-14 12:00:00.0) (type: int), datediff(fl_time, 2007-03-14 08:21:59.0) (type: int)
++              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15, _col16, _col17, _col18, _col19
+               Statistics: Num rows: 137 Data size: 13152 Basic stats: COMPLETE Column stats: NONE
+               File Output Operator
+                 compressed: false
+@@ -259,6 +278,7 @@ STAGE PLANS:
+         ListSink
+ 
+ PREHOOK: query: SELECT
++  fl_time,
+   to_unix_timestamp(fl_time),
+   year(fl_time),
+   month(fl_time),
+@@ -270,12 +290,20 @@ PREHOOK: query: SELECT
+   to_date(fl_time),
+   date_add(fl_time, 2),
+   date_sub(fl_time, 2),
+-  datediff(fl_time, "2000-01-01")
++  datediff(fl_time, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
+ POSTHOOK: query: SELECT
++  fl_time,
+   to_unix_timestamp(fl_time),
+   year(fl_time),
+   month(fl_time),
+@@ -287,149 +315,158 @@ POSTHOOK: query: SELECT
+   to_date(fl_time),
+   date_add(fl_time, 2),
+   date_sub(fl_time, 2),
+-  datediff(fl_time, "2000-01-01")
++  datediff(fl_time, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
++fl_time	c1	c2	c3	c4	c5	c6	c7	c8	c9	c10	c11	c12	c13	c14	c15	c16	c17	c18	c19
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22 07:00:00	1287756000	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30 07:00:00	1288447200	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-20 07:00:00	1287583200	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-21 07:00:00	1287669600	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-23 07:00:00	1287842400	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-24 07:00:00	1287928800	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-25 07:00:00	1288015200	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-26 07:00:00	1288101600	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-27 07:00:00	1288188000	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-28 07:00:00	1288274400	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-29 07:00:00	1288360800	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-31 07:00:00	1288533600	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
+ PREHOOK: query: EXPLAIN SELECT
++  fl_date,
+   to_unix_timestamp(fl_date),
+   year(fl_date),
+   month(fl_date),
+@@ -441,10 +478,18 @@ PREHOOK: query: EXPLAIN SELECT
+   to_date(fl_date),
+   date_add(fl_date, 2),
+   date_sub(fl_date, 2),
+-  datediff(fl_date, "2000-01-01")
++  datediff(fl_date, "2000-01-01"),
++  datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_date, "2007-03-14"),
++  datediff(fl_date, date "2007-03-14"),
++  datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_date, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN SELECT
++  fl_date,
+   to_unix_timestamp(fl_date),
+   year(fl_date),
+   month(fl_date),
+@@ -456,9 +501,17 @@ POSTHOOK: query: EXPLAIN SELECT
+   to_date(fl_date),
+   date_add(fl_date, 2),
+   date_sub(fl_date, 2),
+-  datediff(fl_date, "2000-01-01")
++  datediff(fl_date, "2000-01-01"),
++  datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_date, "2007-03-14"),
++  datediff(fl_date, date "2007-03-14"),
++  datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_date, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
++Explain
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-0 depends on stages: Stage-1
+@@ -471,8 +524,8 @@ STAGE PLANS:
+             alias: date_udf_flight_orc
+             Statistics: Num rows: 137 Data size: 13152 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+-              expressions: to_unix_timestamp(fl_date) (type: bigint), year(fl_date) (type: int), month(fl_date) (type: int), day(fl_date) (type: int), dayofmonth(fl_date) (type: int), dayofweek(fl_date) (type: int), weekofyear(fl_date) (type: int), fl_date (type: date), to_date(fl_date) (type: string), date_add(fl_date, 2) (type: string), date_sub(fl_date, 2) (type: string), datediff(fl_date, '2000-01-01') (type: int)
+-              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11
++              expressions: fl_date (type: date), to_unix_timestamp(fl_date) (type: bigint), year(fl_date) (type: int), month(fl_date) (type: int), day(fl_date) (type: int), dayofmonth(fl_date) (type: int), dayofweek(fl_date) (type: int), weekofyear(fl_date) (type: int), fl_date (type: date), to_date(fl_date) (type: string), date_add(fl_date, 2) (type: string), date_sub(fl_date, 2) (type: string), datediff(fl_date, '2000-01-01') (type: int), datediff(fl_date, 2000-01-01) (type: int), datediff(fl_date, 2000-01-01 12:00:00.0) (type: int), datediff(fl_date, 2000-01-01 11:13:09.0) (type: int), datediff(fl_date, '2007-03-14') (type: int), datediff(fl_date, 2007-03-14) (type: int), datediff(fl_date, 2007-03-14 12:00:00.0) (type: int), datediff(fl_date, 2007-03-14 08:21:59.0) (type: int)
++              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15, _col16, _col17, _col18, _col19
+               Statistics: Num rows: 137 Data size: 13152 Basic stats: COMPLETE Column stats: NONE
+               File Output Operator
+                 compressed: false
+@@ -489,6 +542,7 @@ STAGE PLANS:
+         ListSink
+ 
+ PREHOOK: query: SELECT
++  fl_date,
+   to_unix_timestamp(fl_date),
+   year(fl_date),
+   month(fl_date),
+@@ -500,12 +554,20 @@ PREHOOK: query: SELECT
+   to_date(fl_date),
+   date_add(fl_date, 2),
+   date_sub(fl_date, 2),
+-  datediff(fl_date, "2000-01-01")
++  datediff(fl_date, "2000-01-01"),
++  datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_date, "2007-03-14"),
++  datediff(fl_date, date "2007-03-14"),
++  datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_date, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
+ POSTHOOK: query: SELECT
++  fl_date,
+   to_unix_timestamp(fl_date),
+   year(fl_date),
+   month(fl_date),
+@@ -517,149 +579,159 @@ POSTHOOK: query: SELECT
+   to_date(fl_date),
+   date_add(fl_date, 2),
+   date_sub(fl_date, 2),
+-  datediff(fl_date, "2000-01-01")
++  datediff(fl_date, "2000-01-01"),
++  datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_date, "2007-03-14"),
++  datediff(fl_date, date "2007-03-14"),
++  datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_date, timestamp "2007-03-14 08:21:59")
+ FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955
+-1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945
+-1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946
+-1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948
+-1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949
+-1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950
+-1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951
+-1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952
+-1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953
+-1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954
+-1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956
++fl_date	c1	c2	c3	c4	c5	c6	c7	c8	c9	c10	c11	c12	c13	c14	c15	c16	c17	c18	c19
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-22	1287730800	2010	10	22	22	6	42	2010-10-22	2010-10-22	2010-10-24	2010-10-20	3947	3947	3947	3947	1318	1318	1318	1318
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-30	1288422000	2010	10	30	30	7	43	2010-10-30	2010-10-30	2010-11-01	2010-10-28	3955	3955	3955	3955	1326	1326	1326	1326
++2010-10-20	1287558000	2010	10	20	20	4	42	2010-10-20	2010-10-20	2010-10-22	2010-10-18	3945	3945	3945	3945	1316	1316	1316	1316
++2010-10-21	1287644400	2010	10	21	21	5	42	2010-10-21	2010-10-21	2010-10-23	2010-10-19	3946	3946	3946	3946	1317	1317	1317	1317
++2010-10-23	1287817200	2010	10	23	23	7	42	2010-10-23	2010-10-23	2010-10-25	2010-10-21	3948	3948	3948	3948	1319	1319	1319	1319
++2010-10-24	1287903600	2010	10	24	24	1	42	2010-10-24	2010-10-24	2010-10-26	2010-10-22	3949	3949	3949	3949	1320	1320	1320	1320
++2010-10-25	1287990000	2010	10	25	25	2	43	2010-10-25	2010-10-25	2010-10-27	2010-10-23	3950	3950	3950	3950	1321	1321	1321	1321
++2010-10-26	1288076400	2010	10	26	26	3	43	2010-10-26	2010-10-26	2010-10-28	2010-10-24	3951	3951	3951	3951	1322	1322	1322	1322
++2010-10-27	1288162800	2010	10	27	27	4	43	2010-10-27	2010-10-27	2010-10-29	2010-10-25	3952	3952	3952	3952	1323	1323	1323	1323
++2010-10-28	1288249200	2010	10	28	28	5	43	2010-10-28	2010-10-28	2010-10-30	2010-10-26	3953	3953	3953	3953	1324	1324	1324	1324
++2010-10-29	1288335600	2010	10	29	29	6	43	2010-10-29	2010-10-29	2010-10-31	2010-10-27	3954	3954	3954	3954	1325	1325	1325	1325
++2010-10-31	1288508400	2010	10	31	31	1	43	2010-10-31	2010-10-31	2010-11-02	2010-10-29	3956	3956	3956	3956	1327	1327	1327	1327
+ PREHOOK: query: EXPLAIN SELECT
++  fl_time,
++  fl_date,
+   year(fl_time) = year(fl_date),
+   month(fl_time) = month(fl_date),
+   day(fl_time) = day(fl_date),
+@@ -670,10 +742,21 @@ PREHOOK: query: EXPLAIN SELECT
+   to_date(fl_time) = to_date(fl_date),
+   date_add(fl_time, 2) = date_add(fl_date, 2),
+   date_sub(fl_time, 2) = date_sub(fl_date, 2),
+-  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01")
++  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00") = datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09") = datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14") = datediff(fl_date, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14") = datediff(fl_date, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00") = datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59") = datediff(fl_date, timestamp "2007-03-14 08:21:59"),
++  datediff(fl_date, "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, "2007-03-14") = datediff(fl_date, date "2007-03-14")
+ FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN SELECT
++  fl_time,
++  fl_date,
+   year(fl_time) = year(fl_date),
+   month(fl_time) = month(fl_date),
+   day(fl_time) = day(fl_date),
+@@ -684,9 +767,19 @@ POSTHOOK: query: EXPLAIN SELECT
+   to_date(fl_time) = to_date(fl_date),
+   date_add(fl_time, 2) = date_add(fl_date, 2),
+   date_sub(fl_time, 2) = date_sub(fl_date, 2),
+-  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01")
++  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00") = datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09") = datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14") = datediff(fl_date, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14") = datediff(fl_date, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00") = datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59") = datediff(fl_date, timestamp "2007-03-14 08:21:59"),
++  datediff(fl_date, "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, "2007-03-14") = datediff(fl_date, date "2007-03-14")
+ FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
++Explain
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-0 depends on stages: Stage-1
+@@ -699,8 +792,8 @@ STAGE PLANS:
+             alias: date_udf_flight_orc
+             Statistics: Num rows: 137 Data size: 13152 Basic stats: COMPLETE Column stats: NONE
+             Select Operator
+-              expressions: (year(fl_time) = year(fl_date)) (type: boolean), (month(fl_time) = month(fl_date)) (type: boolean), (day(fl_time) = day(fl_date)) (type: boolean), (dayofmonth(fl_time) = dayofmonth(fl_date)) (type: boolean), (dayofweek(fl_time) = dayofweek(fl_date)) (type: boolean), (weekofyear(fl_time) = weekofyear(fl_date)) (type: boolean), (CAST( fl_time AS DATE) = fl_date) (type: boolean), (to_date(fl_time) = to_date(fl_date)) (type: boolean), (date_add(fl_time, 2) = date_add(fl_date, 2)) (type: boolean), (date_sub(fl_time, 2) = date_sub(fl_date, 2)) (type: boolean), (datediff(fl_time, '2000-01-01') = datediff(fl_date, '2000-01-01')) (type: boolean)
+-              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10
++              expressions: fl_time (type: timestamp), fl_date (type: date), (year(fl_time) = year(fl_date)) (type: boolean), (month(fl_time) = month(fl_date)) (type: boolean), (day(fl_time) = day(fl_date)) (type: boolean), (dayofmonth(fl_time) = dayofmonth(fl_date)) (type: boolean), (dayofweek(fl_time) = dayofweek(fl_date)) (type: boolean), (weekofyear(fl_time) = weekofyear(fl_date)) (type: boolean), (CAST( fl_time AS DATE) = fl_date) (type: boolean), (to_date(fl_time) = to_date(fl_date)) (type: boolean), (date_add(fl_time, 2) = date_add(fl_date, 2)) (type: boolean), (date_sub(fl_time, 2) = date_sub(fl_date, 2)) (type: boolean), (datediff(fl_time, '2000-01-01') = datediff(fl_date, '2000-01-01')) (type: boolean), (datediff(fl_time, 2000-01-01) = datediff(fl_date, 2000-01-01)) (type: boolean), (datediff(fl_time, 2000-01-01 12:00:00.0) = datediff(fl_date, 2000-01-01 12:00:00.0)) (type: boolean), (datediff(fl_time, 2000-01-01 11:13:09.0) = datediff(fl_date, 2000-01-01 11:13:09.0)) (type: boolean), (datediff(fl_time, '2007-03-14') = datediff(fl_date, '2007-03-14')) (type: boolean), (datediff(fl_time, 2007-03-14) = datediff(fl_date, 2007-03-14)) (type: boolean), (datediff(fl_time, 2007-03-14 12:00:00.0) = datediff(fl_date, 2007-03-14 12:00:00.0)) (type: boolean), (datediff(fl_time, 2007-03-14 08:21:59.0) = datediff(fl_date, 2007-03-14 08:21:59.0)) (type: boolean), (datediff(fl_date, '2000-01-01') = datediff(fl_date, 2000-01-01)) (type: boolean), (datediff(fl_date, '2007-03-14') = datediff(fl_date, 2007-03-14)) (type: boolean)
++              outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8, _col9, _col10, _col11, _col12, _col13, _col14, _col15, _col16, _col17, _col18, _col19, _col20, _col21
+               Statistics: Num rows: 137 Data size: 13152 Basic stats: COMPLETE Column stats: NONE
+               File Output Operator
+                 compressed: false
+@@ -718,6 +811,8 @@ STAGE PLANS:
+ 
+ PREHOOK: query: -- Should all be true or NULL
+ SELECT
++  fl_time,
++  fl_date,
+   year(fl_time) = year(fl_date),
+   month(fl_time) = month(fl_date),
+   day(fl_time) = day(fl_date),
+@@ -728,13 +823,24 @@ SELECT
+   to_date(fl_time) = to_date(fl_date),
+   date_add(fl_time, 2) = date_add(fl_date, 2),
+   date_sub(fl_time, 2) = date_sub(fl_date, 2),
+-  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01")
++  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00") = datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09") = datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14") = datediff(fl_date, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14") = datediff(fl_date, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00") = datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59") = datediff(fl_date, timestamp "2007-03-14 08:21:59"),
++  datediff(fl_date, "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, "2007-03-14") = datediff(fl_date, date "2007-03-14")
+ FROM date_udf_flight_orc
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
+ POSTHOOK: query: -- Should all be true or NULL
+ SELECT
++  fl_time,
++  fl_date,
+   year(fl_time) = year(fl_date),
+   month(fl_time) = month(fl_date),
+   day(fl_time) = day(fl_date),
+@@ -745,148 +851,158 @@ SELECT
+   to_date(fl_time) = to_date(fl_date),
+   date_add(fl_time, 2) = date_add(fl_date, 2),
+   date_sub(fl_time, 2) = date_sub(fl_date, 2),
+-  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01")
++  datediff(fl_time, "2000-01-01") = datediff(fl_date, "2000-01-01"),
++  datediff(fl_time, date "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_time, timestamp "2000-01-01 00:00:00") = datediff(fl_date, timestamp "2000-01-01 00:00:00"),
++  datediff(fl_time, timestamp "2000-01-01 11:13:09") = datediff(fl_date, timestamp "2000-01-01 11:13:09"),
++  datediff(fl_time, "2007-03-14") = datediff(fl_date, "2007-03-14"),
++  datediff(fl_time, date "2007-03-14") = datediff(fl_date, date "2007-03-14"),
++  datediff(fl_time, timestamp "2007-03-14 00:00:00") = datediff(fl_date, timestamp "2007-03-14 00:00:00"),
++  datediff(fl_time, timestamp "2007-03-14 08:21:59") = datediff(fl_date, timestamp "2007-03-14 08:21:59"),
++  datediff(fl_date, "2000-01-01") = datediff(fl_date, date "2000-01-01"),
++  datediff(fl_date, "2007-03-14") = datediff(fl_date, date "2007-03-14")
+ FROM date_udf_flight_orc
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
+-true	true	true	true	true	true	true	true	true	true	true
++fl_time	fl_date	c2	c3	c4	c5	c6	c7	c8	c9	c10	c11	c12	c13	c14	c15	c16	c17	c18	c19	c20	c21
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-22 07:00:00	2010-10-22	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-30 07:00:00	2010-10-30	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-20 07:00:00	2010-10-20	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-21 07:00:00	2010-10-21	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-23 07:00:00	2010-10-23	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-24 07:00:00	2010-10-24	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-25 07:00:00	2010-10-25	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-26 07:00:00	2010-10-26	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-27 07:00:00	2010-10-27	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-28 07:00:00	2010-10-28	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-29 07:00:00	2010-10-29	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
++2010-10-31 07:00:00	2010-10-31	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true	true
+ PREHOOK: query: EXPLAIN SELECT 
+   fl_date, 
+   to_date(date_add(fl_date, 2)), 
+@@ -905,6 +1021,7 @@ POSTHOOK: query: EXPLAIN SELECT
+   datediff(date_add(fl_date, 2), date_sub(fl_date, 2)) 
+ FROM date_udf_flight_orc LIMIT 10
+ POSTHOOK: type: QUERY
++Explain
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-0 depends on stages: Stage-1
+@@ -960,6 +1077,7 @@ FROM date_udf_flight_orc LIMIT 10
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
++fl_date	c1	c2	c3	c4	c5
+ 2010-10-20	2010-10-22	2010-10-18	-2	2	4
+ 2010-10-20	2010-10-22	2010-10-18	-2	2	4
+ 2010-10-20	2010-10-22	2010-10-18	-2	2	4
+@@ -980,6 +1098,7 @@ SELECT to_date('2009-07-30 04:17:52') FROM date_udf_flight_orc LIMIT 1
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
++c0
+ 2009-07-30
+ PREHOOK: query: EXPLAIN SELECT
+   min(fl_date) AS c1,
+@@ -997,6 +1116,7 @@ POSTHOOK: query: EXPLAIN SELECT
+ FROM date_udf_flight_orc
+ ORDER BY c1
+ POSTHOOK: type: QUERY
++Explain
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-2 depends on stages: Stage-1
+@@ -1084,4 +1204,5 @@ ORDER BY c1
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@date_udf_flight_orc
+ #### A masked pattern was here ####
++c1	_c1	_c2	_c3
+ 2010-10-20	2010-10-31	137	137
+-- 
+1.7.9.5
+

@@ -1,0 +1,1513 @@
+From a4c0139bdc95ee7b9250ad523cecb17e751d342e Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Thu, 5 Mar 2015 01:31:08 +0000
+Subject: [PATCH 0316/1164] HIVE-9744: Move common arguments validation and
+ value extraction code to GenericUDF (Alexander
+ Pivovarov via Jason Dere)
+
+---
+ .../org/apache/hive/common/util/DateUtils.java     |   39 +++
+ .../hadoop/hive/ql/udf/generic/GenericUDF.java     |  317 +++++++++++++++++++-
+ .../hive/ql/udf/generic/GenericUDFAddMonths.java   |  138 +++------
+ .../hive/ql/udf/generic/GenericUDFInitCap.java     |   80 ++---
+ .../hive/ql/udf/generic/GenericUDFLastDay.java     |   96 ++----
+ .../hive/ql/udf/generic/GenericUDFLevenshtein.java |   64 +---
+ .../hive/ql/udf/generic/GenericUDFNextDay.java     |  153 +++-------
+ .../ql/udf/generic/TestGenericUDFAddMonths.java    |   91 +++++-
+ .../hive/ql/udf/generic/TestGenericUDFLastDay.java |   19 +-
+ .../ql/udf/generic/TestGenericUDFLevenshtein.java  |    2 +-
+ .../hive/ql/udf/generic/TestGenericUDFNextDay.java |   18 +-
+ .../clientnegative/udf_add_months_error_1.q.out    |    2 +-
+ .../clientnegative/udf_add_months_error_2.q.out    |    2 +-
+ .../clientnegative/udf_last_day_error_1.q.out      |    2 +-
+ .../clientnegative/udf_last_day_error_2.q.out      |    2 +-
+ .../clientnegative/udf_next_day_error_1.q.out      |    2 +-
+ .../clientnegative/udf_next_day_error_2.q.out      |    2 +-
+ 17 files changed, 620 insertions(+), 409 deletions(-)
+ create mode 100644 common/src/java/org/apache/hive/common/util/DateUtils.java
+
+diff --git a/common/src/java/org/apache/hive/common/util/DateUtils.java b/common/src/java/org/apache/hive/common/util/DateUtils.java
+new file mode 100644
+index 0000000..92b7f62
+--- /dev/null
++++ b/common/src/java/org/apache/hive/common/util/DateUtils.java
+@@ -0,0 +1,39 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.common.util;
++
++import java.text.SimpleDateFormat;
++
++/**
++ * DateUtils. Thread-safe class
++ *
++ */
++public class DateUtils {
++
++  private static final ThreadLocal<SimpleDateFormat> dateFormatLocal = new ThreadLocal<SimpleDateFormat>() {
++    @Override
++    protected SimpleDateFormat initialValue() {
++      return new SimpleDateFormat("yyyy-MM-dd");
++    }
++  };
++
++  public static SimpleDateFormat getDateFormat() {
++    return dateFormatLocal.get();
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
+index e558f52..9c2af3c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
+@@ -20,16 +20,34 @@
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
++import java.sql.Timestamp;
++import java.text.ParseException;
++import java.util.Date;
+ 
+-import org.apache.hadoop.hive.ql.exec.MapredContext;
+ import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
++import org.apache.hadoop.hive.ql.exec.MapredContext;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.udf.UDFType;
++import org.apache.hadoop.hive.serde2.io.ByteWritable;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.io.ShortWritable;
++import org.apache.hadoop.hive.serde2.io.TimestampWritable;
+ import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping;
++import org.apache.hadoop.io.IntWritable;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hive.common.util.DateUtils;
+ 
+ /**
+  * A Generic User-defined function (GenericUDF) for the use with Hive.
+@@ -46,6 +64,9 @@
+ @UDFType(deterministic = true)
+ public abstract class GenericUDF implements Closeable {
+ 
++  private static final String[] ORDINAL_SUFFIXES = new String[] { "th", "st", "nd", "rd", "th",
++      "th", "th", "th", "th", "th" };
++
+   /**
+    * A Defered Object allows us to do lazy-evaluation and short-circuiting.
+    * GenericUDF use DeferedObject to pass arguments.
+@@ -212,6 +233,25 @@ public void copyToNewInstance(Object newInstance) throws UDFArgumentException {
+     }
+   }
+ 
++  protected String getStandardDisplayString(String name, String[] children) {
++    return getStandardDisplayString(name, children, ", ");
++  }
++
++  protected String getStandardDisplayString(String name, String[] children, String delim) {
++    StringBuilder sb = new StringBuilder();
++    sb.append(name);
++    sb.append("(");
++    if (children.length > 0) {
++      sb.append(children[0]);
++      for (int i = 1; i < children.length; i++) {
++        sb.append(delim);
++        sb.append(children[i]);
++      }
++    }
++    sb.append(")");
++    return sb.toString();
++  }
++
+   protected String getFuncName() {
+     return getClass().getSimpleName().substring(10).toLowerCase();
+   }
+@@ -233,22 +273,273 @@ protected void checkArgsSize(ObjectInspector[] arguments, int min, int max)
+     }
+   }
+ 
+-  protected String getStandardDisplayString(String name, String[] children) {
+-    return getStandardDisplayString(name, children, ", ");
++  protected void checkArgPrimitive(ObjectInspector[] arguments, int i)
++      throws UDFArgumentTypeException {
++    ObjectInspector.Category oiCat = arguments[i].getCategory();
++    if (oiCat != ObjectInspector.Category.PRIMITIVE) {
++      throw new UDFArgumentTypeException(i, getFuncName() + " only takes primitive types as "
++          + getArgOrder(i) + " argument, got " + oiCat);
++    }
+   }
+ 
+-  protected String getStandardDisplayString(String name, String[] children, String delim) {
++  protected void checkArgGroups(ObjectInspector[] arguments, int i, PrimitiveCategory[] inputTypes,
++      PrimitiveGrouping... grps) throws UDFArgumentTypeException {
++    PrimitiveCategory inputType = ((PrimitiveObjectInspector) arguments[i]).getPrimitiveCategory();
++    for (PrimitiveGrouping grp : grps) {
++      if (PrimitiveObjectInspectorUtils.getPrimitiveGrouping(inputType) == grp) {
++        inputTypes[i] = inputType;
++        return;
++      }
++    }
++    // build error message
+     StringBuilder sb = new StringBuilder();
+-    sb.append(name);
+-    sb.append("(");
+-    if (children.length > 0) {
+-      sb.append(children[0]);
+-      for (int i = 1; i < children.length; i++) {
+-        sb.append(delim);
+-        sb.append(children[i]);
++    sb.append(getFuncName());
++    sb.append(" only takes ");
++    sb.append(grps[0]);
++    for (int j = 1; j < grps.length; j++) {
++      sb.append(", ");
++      sb.append(grps[j]);
++    }
++    sb.append(" types as ");
++    sb.append(getArgOrder(i));
++    sb.append(" argument, got ");
++    sb.append(inputType);
++    throw new UDFArgumentTypeException(i, sb.toString());
++  }
++
++  protected void obtainStringConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++
++    Converter converter = ObjectInspectorConverters.getConverter(
++        (PrimitiveObjectInspector) arguments[i],
++        PrimitiveObjectInspectorFactory.writableStringObjectInspector);
++    converters[i] = converter;
++    inputTypes[i] = inputType;
++  }
++
++  protected void obtainIntConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++    switch (inputType) {
++    case BYTE:
++    case SHORT:
++    case INT:
++      break;
++    default:
++      throw new UDFArgumentTypeException(i, getFuncName() + " only takes INT/SHORT/BYTE types as "
++          + getArgOrder(i) + " argument, got " + inputType);
++    }
++
++    Converter converter = ObjectInspectorConverters.getConverter(
++        (PrimitiveObjectInspector) arguments[i],
++        PrimitiveObjectInspectorFactory.writableIntObjectInspector);
++    converters[i] = converter;
++    inputTypes[i] = inputType;
++  }
++
++  protected void obtainLongConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++    switch (inputType) {
++    case BYTE:
++    case SHORT:
++    case INT:
++    case LONG:
++      break;
++    default:
++      throw new UDFArgumentTypeException(i, getFuncName()
++          + " only takes LONG/INT/SHORT/BYTE types as " + getArgOrder(i) + " argument, got "
++          + inputType);
++    }
++
++    Converter converter = ObjectInspectorConverters.getConverter(
++        (PrimitiveObjectInspector) arguments[i],
++        PrimitiveObjectInspectorFactory.writableIntObjectInspector);
++    converters[i] = converter;
++    inputTypes[i] = inputType;
++  }
++
++  protected void obtainDateConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++    ObjectInspector outOi;
++    switch (inputType) {
++    case STRING:
++    case VARCHAR:
++    case CHAR:
++      outOi = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++      break;
++    case TIMESTAMP:
++    case DATE:
++      outOi = PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++      break;
++    default:
++      throw new UDFArgumentTypeException(i, getFuncName()
++          + " only takes STRING_GROUP or DATE_GROUP types as " + getArgOrder(i) + " argument, got "
++          + inputType);
++    }
++    converters[i] = ObjectInspectorConverters.getConverter(inOi, outOi);
++    inputTypes[i] = inputType;
++  }
++
++  protected void obtainTimestampConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++    ObjectInspector outOi;
++    switch (inputType) {
++    case STRING:
++    case VARCHAR:
++    case CHAR:
++    case TIMESTAMP:
++    case DATE:
++      break;
++    default:
++      throw new UDFArgumentTypeException(i, getFuncName()
++          + " only takes STRING_GROUP or DATE_GROUP types as " + getArgOrder(i) + " argument, got "
++          + inputType);
++    }
++    outOi = PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++    converters[i] = ObjectInspectorConverters.getConverter(inOi, outOi);
++    inputTypes[i] = inputType;
++  }
++
++  protected String getStringValue(DeferredObject[] arguments, int i, Converter[] converters)
++      throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    return converters[i].convert(obj).toString();
++  }
++
++  protected Integer getIntValue(DeferredObject[] arguments, int i, Converter[] converters)
++      throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    Object writableValue = converters[i].convert(obj);
++    int v = ((IntWritable) writableValue).get();
++    return v;
++  }
++
++  protected Long getLongValue(DeferredObject[] arguments, int i, Converter[] converters)
++      throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    Object writableValue = converters[i].convert(obj);
++    long v = ((LongWritable) writableValue).get();
++    return v;
++  }
++
++  protected Date getDateValue(DeferredObject[] arguments, int i, PrimitiveCategory[] inputTypes,
++      Converter[] converters) throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++
++    Date date;
++    switch (inputTypes[i]) {
++    case STRING:
++    case VARCHAR:
++    case CHAR:
++      String dateStr = converters[i].convert(obj).toString();
++      try {
++        date = DateUtils.getDateFormat().parse(dateStr);
++      } catch (ParseException e) {
++        return null;
+       }
++      break;
++    case TIMESTAMP:
++    case DATE:
++      Object writableValue = converters[i].convert(obj);
++      date = ((DateWritable) writableValue).get();
++      break;
++    default:
++      throw new UDFArgumentTypeException(0, getFuncName()
++          + " only takes STRING_GROUP and DATE_GROUP types, got " + inputTypes[i]);
++    }
++    return date;
++  }
++
++  protected Date getTimestampValue(DeferredObject[] arguments, int i, Converter[] converters)
++      throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    Object writableValue = converters[i].convert(obj);
++    Timestamp ts = ((TimestampWritable) writableValue).getTimestamp();
++    return ts;
++  }
++
++  protected String getConstantStringValue(ObjectInspector[] arguments, int i) {
++    Object constValue = ((ConstantObjectInspector) arguments[i]).getWritableConstantValue();
++    String str = constValue == null ? null : constValue.toString();
++    return str;
++  }
++
++  protected Integer getConstantIntValue(ObjectInspector[] arguments, int i)
++      throws UDFArgumentTypeException {
++    Object constValue = ((ConstantObjectInspector) arguments[i]).getWritableConstantValue();
++    if (constValue == null) {
++      return null;
++    }
++    int v;
++    if (constValue instanceof IntWritable) {
++      v = ((IntWritable) constValue).get();
++    } else if (constValue instanceof ShortWritable) {
++      v = ((ShortWritable) constValue).get();
++    } else if (constValue instanceof ByteWritable) {
++      v = ((ByteWritable) constValue).get();
++    } else {
++      throw new UDFArgumentTypeException(i, getFuncName() + " only takes INT/SHORT/BYTE types as "
++          + getArgOrder(i) + " argument, got " + constValue.getClass());
++    }
++    return v;
++  }
++
++  protected Long getConstantLongValue(ObjectInspector[] arguments, int i)
++      throws UDFArgumentTypeException {
++    Object constValue = ((ConstantObjectInspector) arguments[i]).getWritableConstantValue();
++    if (constValue == null) {
++      return null;
++    }
++    long v;
++    if (constValue instanceof IntWritable) {
++      v = ((LongWritable) constValue).get();
++    } else if (constValue instanceof IntWritable) {
++      v = ((IntWritable) constValue).get();
++    } else if (constValue instanceof ShortWritable) {
++      v = ((ShortWritable) constValue).get();
++    } else if (constValue instanceof ByteWritable) {
++      v = ((ByteWritable) constValue).get();
++    } else {
++      throw new UDFArgumentTypeException(i, getFuncName()
++          + " only takes LONG/INT/SHORT/BYTE types as " + getArgOrder(i) + " argument, got "
++          + constValue.getClass());
++    }
++    return v;
++  }
++
++  protected String getArgOrder(int i) {
++    i++;
++    switch (i % 100) {
++    case 11:
++    case 12:
++    case 13:
++      return i + "th";
++    default:
++      return i + ORDINAL_SUFFIXES[i % 10];
+     }
+-    sb.append(")");
+-    return sb.toString();
+   }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFAddMonths.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFAddMonths.java
+index c596883..4cf6318 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFAddMonths.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFAddMonths.java
+@@ -17,29 +17,23 @@
+  */
+ package org.apache.hadoop.hive.ql.udf.generic;
+ 
+-import java.sql.Timestamp;
+-import java.text.ParseException;
+-import java.text.SimpleDateFormat;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.DATE_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.NUMERIC_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
+ import java.util.Calendar;
+ import java.util.Date;
+ 
+ import org.apache.hadoop.hive.ql.exec.Description;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+-import org.apache.hadoop.hive.serde2.io.DateWritable;
+-import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
+-import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.TimestampConverter;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+-import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.Text;
++import org.apache.hive.common.util.DateUtils;
+ 
+ /**
+  * GenericUDFAddMonths.
+@@ -55,108 +49,68 @@
+         + "ignored.\n"
+         + "Example:\n " + " > SELECT _FUNC_('2009-08-31', 1) FROM src LIMIT 1;\n" + " '2009-09-30'")
+ public class GenericUDFAddMonths extends GenericUDF {
+-  private transient SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd");
+-  private transient TimestampConverter timestampConverter;
+-  private transient Converter textConverter;
+-  private transient Converter dateWritableConverter;
+-  private transient Converter intWritableConverter;
+-  private transient PrimitiveCategory inputType1;
+-  private transient PrimitiveCategory inputType2;
++  private transient Converter[] converters = new Converter[2];
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[2];
+   private final Calendar calendar = Calendar.getInstance();
+   private final Text output = new Text();
++  private transient Integer numMonthsConst;
++  private transient boolean isNumMonthsConst;
+ 
+   @Override
+   public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
+-    if (arguments.length != 2) {
+-      throw new UDFArgumentLengthException("add_months() requires 2 argument, got "
+-          + arguments.length);
+-    }
+-    if (arguments[0].getCategory() != ObjectInspector.Category.PRIMITIVE) {
+-      throw new UDFArgumentTypeException(0, "Only primitive type arguments are accepted but "
+-          + arguments[0].getTypeName() + " is passed as first arguments");
+-    }
+-    if (arguments[1].getCategory() != ObjectInspector.Category.PRIMITIVE) {
+-      throw new UDFArgumentTypeException(1, "Only primitive type arguments are accepted but "
+-          + arguments[1].getTypeName() + " is passed as second arguments");
++    checkArgsSize(arguments, 2, 2);
++
++    checkArgPrimitive(arguments, 0);
++    checkArgPrimitive(arguments, 1);
++
++    checkArgGroups(arguments, 0, inputTypes, STRING_GROUP, DATE_GROUP);
++    checkArgGroups(arguments, 1, inputTypes, NUMERIC_GROUP);
++
++    obtainDateConverter(arguments, 0, inputTypes, converters);
++    obtainIntConverter(arguments, 1, inputTypes, converters);
++
++    if (arguments[1] instanceof ConstantObjectInspector) {
++      numMonthsConst = getConstantIntValue(arguments, 1);
++      isNumMonthsConst = true;
+     }
+-    inputType1 = ((PrimitiveObjectInspector) arguments[0]).getPrimitiveCategory();
++
+     ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+-    switch (inputType1) {
+-    case STRING:
+-    case VARCHAR:
+-    case CHAR:
+-      inputType1 = PrimitiveCategory.STRING;
+-      textConverter = ObjectInspectorConverters.getConverter(
+-          (PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableStringObjectInspector);
+-      break;
+-    case TIMESTAMP:
+-      timestampConverter = new TimestampConverter((PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableTimestampObjectInspector);
+-      break;
+-    case DATE:
+-      dateWritableConverter = ObjectInspectorConverters.getConverter(
+-          (PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableDateObjectInspector);
+-      break;
+-    default:
+-      throw new UDFArgumentTypeException(0,
+-          "ADD_MONTHS() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got "
+-              + inputType1);
+-    }
+-    inputType2 = ((PrimitiveObjectInspector) arguments[1]).getPrimitiveCategory();
+-    if (inputType2 != PrimitiveCategory.INT) {
+-      throw new UDFArgumentTypeException(1,
+-          "ADD_MONTHS() only takes INT types as second argument, got " + inputType2);
+-    }
+-    intWritableConverter = ObjectInspectorConverters.getConverter(
+-        (PrimitiveObjectInspector) arguments[1],
+-        PrimitiveObjectInspectorFactory.writableIntObjectInspector);
+     return outputOI;
+   }
+ 
+   @Override
+   public Object evaluate(DeferredObject[] arguments) throws HiveException {
+-    if (arguments[0].get() == null) {
+-      return null;
++    Integer numMonthV;
++    if (isNumMonthsConst) {
++      numMonthV = numMonthsConst;
++    } else {
++      numMonthV = getIntValue(arguments, 1, converters);
+     }
+-    IntWritable toBeAdded = (IntWritable) intWritableConverter.convert(arguments[1].get());
+-    if (toBeAdded == null) {
++
++    if (numMonthV == null) {
+       return null;
+     }
+-    Date date;
+-    switch (inputType1) {
+-    case STRING:
+-      String dateString = textConverter.convert(arguments[0].get()).toString();
+-      try {
+-        date = formatter.parse(dateString.toString());
+-      } catch (ParseException e) {
+-        return null;
+-      }
+-      break;
+-    case TIMESTAMP:
+-      Timestamp ts = ((TimestampWritable) timestampConverter.convert(arguments[0].get()))
+-          .getTimestamp();
+-      date = ts;
+-      break;
+-    case DATE:
+-      DateWritable dw = (DateWritable) dateWritableConverter.convert(arguments[0].get());
+-      date = dw.get();
+-      break;
+-    default:
+-      throw new UDFArgumentTypeException(0,
+-          "ADD_MONTHS() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
++
++    int numMonthInt = numMonthV.intValue();
++    Date date = getDateValue(arguments, 0, inputTypes, converters);
++    if (date == null) {
++      return null;
+     }
+-    int numMonth = toBeAdded.get();
+-    addMonth(date, numMonth);
++
++    addMonth(date, numMonthInt);
+     Date newDate = calendar.getTime();
+-    output.set(formatter.format(newDate));
++    output.set(DateUtils.getDateFormat().format(newDate));
+     return output;
+   }
+ 
+   @Override
+   public String getDisplayString(String[] children) {
+-    return getStandardDisplayString("add_months", children);
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "add_months";
+   }
+ 
+   protected Calendar addMonth(Date d, int numMonths) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInitCap.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInitCap.java
+index 406fcd6..811a596 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInitCap.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInitCap.java
+@@ -18,24 +18,19 @@
+ 
+ package org.apache.hadoop.hive.ql.udf.generic;
+ 
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
+ import org.apache.commons.lang.WordUtils;
+ import org.apache.hadoop.hive.ql.exec.Description;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
+ import org.apache.hadoop.hive.ql.exec.vector.VectorizedExpressions;
+ import org.apache.hadoop.hive.ql.exec.vector.expressions.StringInitCap;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+-import org.apache.hadoop.hive.ql.udf.generic.GenericUDFUtils;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector.Category;
+-import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
+ import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.StringConverter;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+-import org.apache.hadoop.hive.serde2.typeinfo.BaseCharTypeInfo;
+-import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
++import org.apache.hadoop.io.Text;
+ 
+ /**
+  * UDFInitCap.
+@@ -48,66 +43,43 @@
+     extended = "Example:\n" + " > SELECT _FUNC_('tHe soap') FROM src LIMIT 1;\n" + " 'The Soap'")
+ @VectorizedExpressions({ StringInitCap.class })
+ public class GenericUDFInitCap extends GenericUDF {
+-  private transient PrimitiveObjectInspector argumentOI;
+-  private transient StringConverter stringConverter;
+-  private transient PrimitiveCategory returnType = PrimitiveCategory.STRING;
+-  private transient GenericUDFUtils.StringHelper returnHelper;
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[1];
++  private transient Converter[] converters = new Converter[1];
++  private final Text output = new Text();
+ 
+   @Override
+   public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
+-    if (arguments.length != 1) {
+-      throw new UDFArgumentLengthException("INITCAP requires 1 argument, got " + arguments.length);
+-    }
+-    if (arguments[0].getCategory() != Category.PRIMITIVE) {
+-      throw new UDFArgumentException("INITCAP only takes primitive types, got "
+-          + argumentOI.getTypeName());
+-    }
+-    argumentOI = (PrimitiveObjectInspector) arguments[0];
+-    stringConverter = new PrimitiveObjectInspectorConverter.StringConverter(argumentOI);
+-    PrimitiveCategory inputType = argumentOI.getPrimitiveCategory();
+-    ObjectInspector outputOI = null;
+-    BaseCharTypeInfo typeInfo;
+-    switch (inputType) {
+-    case CHAR:
+-      // return type should have same length as the input.
+-      returnType = inputType;
+-      typeInfo = TypeInfoFactory.getCharTypeInfo(GenericUDFUtils.StringHelper
+-          .getFixedStringSizeForType(argumentOI));
+-      outputOI = PrimitiveObjectInspectorFactory.getPrimitiveWritableObjectInspector(typeInfo);
+-      break;
+-    case VARCHAR:
+-      // return type should have same length as the input.
+-      returnType = inputType;
+-      typeInfo = TypeInfoFactory.getVarcharTypeInfo(GenericUDFUtils.StringHelper
+-          .getFixedStringSizeForType(argumentOI));
+-      outputOI = PrimitiveObjectInspectorFactory.getPrimitiveWritableObjectInspector(typeInfo);
+-      break;
+-    default:
+-      returnType = PrimitiveCategory.STRING;
+-      outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+-      break;
+-    }
+-    returnHelper = new GenericUDFUtils.StringHelper(returnType);
++    checkArgsSize(arguments, 1, 1);
++
++    checkArgPrimitive(arguments, 0);
++
++    checkArgGroups(arguments, 0, inputTypes, STRING_GROUP);
++
++    obtainStringConverter(arguments, 0, inputTypes, converters);
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+     return outputOI;
+   }
+ 
+   @Override
+   public Object evaluate(DeferredObject[] arguments) throws HiveException {
+-    String val = null;
+-    if (arguments[0] != null) {
+-      val = (String) stringConverter.convert(arguments[0].get());
+-    }
++    String val = getStringValue(arguments, 0, converters);
+     if (val == null) {
+       return null;
+     }
+ 
+-    val = WordUtils.capitalizeFully(val);
+-
+-    return returnHelper.setReturnValue(val);
++    String valCap = WordUtils.capitalizeFully(val);
++    output.set(valCap);
++    return output;
+   }
+ 
+   @Override
+   public String getDisplayString(String[] children) {
+-    return getStandardDisplayString("initcap", children);
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "initcap";
+   }
+ }
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java
+index 3a43c57..6ead4be 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLastDay.java
+@@ -17,27 +17,21 @@
+  */
+ package org.apache.hadoop.hive.ql.udf.generic;
+ 
+-import java.sql.Timestamp;
+-import java.text.ParseException;
+-import java.text.SimpleDateFormat;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.DATE_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
+ import java.util.Calendar;
+ import java.util.Date;
+ 
+ import org.apache.hadoop.hive.ql.exec.Description;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.serde2.io.DateWritable;
+-import org.apache.hadoop.hive.serde2.io.TimestampWritable;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
+-import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.TimestampConverter;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+ import org.apache.hadoop.io.Text;
++import org.apache.hive.common.util.DateUtils;
+ 
+ /**
+  * GenericUDFLastDay.
+@@ -52,88 +46,46 @@
+         + " The time part of date is ignored.\n"
+         + "Example:\n " + " > SELECT _FUNC_('2009-01-12') FROM src LIMIT 1;\n" + " '2009-01-31'")
+ public class GenericUDFLastDay extends GenericUDF {
+-  private transient SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd");
+-  private transient TimestampConverter timestampConverter;
+-  private transient Converter textConverter;
+-  private transient Converter dateWritableConverter;
+-  private transient PrimitiveCategory inputType1;
++  private transient Converter[] converters = new Converter[1];
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[1];
+   private final Calendar calendar = Calendar.getInstance();
+   private final Text output = new Text();
+ 
+   @Override
+   public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
+-    if (arguments.length != 1) {
+-      throw new UDFArgumentLengthException("last_day() requires 1 argument, got "
+-          + arguments.length);
+-    }
+-    if (arguments[0].getCategory() != ObjectInspector.Category.PRIMITIVE) {
+-      throw new UDFArgumentTypeException(0, "Only primitive type arguments are accepted but "
+-          + arguments[0].getTypeName() + " is passed");
+-    }
+-    inputType1 = ((PrimitiveObjectInspector) arguments[0]).getPrimitiveCategory();
++    checkArgsSize(arguments, 1, 1);
++
++    checkArgPrimitive(arguments, 0);
++
++    checkArgGroups(arguments, 0, inputTypes, STRING_GROUP, DATE_GROUP);
++
++    obtainDateConverter(arguments, 0, inputTypes, converters);
++
+     ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+-    switch (inputType1) {
+-    case STRING:
+-    case VARCHAR:
+-    case CHAR:
+-      inputType1 = PrimitiveCategory.STRING;
+-      textConverter = ObjectInspectorConverters.getConverter(
+-          (PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableStringObjectInspector);
+-      break;
+-    case TIMESTAMP:
+-      timestampConverter = new TimestampConverter((PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableTimestampObjectInspector);
+-      break;
+-    case DATE:
+-      dateWritableConverter = ObjectInspectorConverters.getConverter(
+-          (PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableDateObjectInspector);
+-      break;
+-    default:
+-      throw new UDFArgumentTypeException(0,
+-          "LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
+-    }
+     return outputOI;
+   }
+ 
+   @Override
+   public Object evaluate(DeferredObject[] arguments) throws HiveException {
+-    if (arguments[0].get() == null) {
++    Date date = getDateValue(arguments, 0, inputTypes, converters);
++    if (date == null) {
+       return null;
+     }
+-    Date date;
+-    switch (inputType1) {
+-    case STRING:
+-      String dateString = textConverter.convert(arguments[0].get()).toString();
+-      try {
+-        date = formatter.parse(dateString.toString());
+-      } catch (ParseException e) {
+-        return null;
+-      }
+-      break;
+-    case TIMESTAMP:
+-      Timestamp ts = ((TimestampWritable) timestampConverter.convert(arguments[0].get()))
+-          .getTimestamp();
+-      date = ts;
+-      break;
+-    case DATE:
+-      DateWritable dw = (DateWritable) dateWritableConverter.convert(arguments[0].get());
+-      date = dw.get();
+-      break;
+-    default:
+-      throw new UDFArgumentTypeException(0,
+-          "LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
+-    }
++
+     lastDay(date);
+     Date newDate = calendar.getTime();
+-    output.set(formatter.format(newDate));
++    output.set(DateUtils.getDateFormat().format(newDate));
+     return output;
+   }
+ 
+   @Override
+   public String getDisplayString(String[] children) {
+-    return getStandardDisplayString("last_day", children);
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "last_day";
+   }
+ 
+   protected Calendar lastDay(Date d) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenshtein.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenshtein.java
+index 4c9f9b1..4bba876 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenshtein.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLevenshtein.java
+@@ -17,20 +17,16 @@
+  */
+ package org.apache.hadoop.hive.ql.udf.generic;
+ 
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
+ import org.apache.commons.lang3.StringUtils;
+ import org.apache.hadoop.hive.ql.exec.Description;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
+-import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping;
+ import org.apache.hadoop.io.IntWritable;
+ 
+ /**
+@@ -53,24 +49,22 @@
+     + "Example:\n "
+     + " > SELECT _FUNC_('kitten', 'sitting');\n 3")
+ public class GenericUDFLevenshtein extends GenericUDF {
+-  private transient Converter[] textConverters = new Converter[2];
++  private transient Converter[] converters = new Converter[2];
+   private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[2];
+   private final IntWritable output = new IntWritable();
+ 
+   @Override
+   public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
+-    if (arguments.length != 2) {
+-      throw new UDFArgumentLengthException(getFuncName() + " requires 2 arguments, got "
+-          + arguments.length);
+-    }
+-    checkIfPrimitive(arguments, 0, "1st");
+-    checkIfPrimitive(arguments, 1, "2nd");
++    checkArgsSize(arguments, 2, 2);
+ 
+-    checkIfStringGroup(arguments, 0, "1st");
+-    checkIfStringGroup(arguments, 1, "2nd");
++    checkArgPrimitive(arguments, 0);
++    checkArgPrimitive(arguments, 1);
+ 
+-    getStringConverter(arguments, 0, "1st");
+-    getStringConverter(arguments, 1, "2nd");
++    checkArgGroups(arguments, 0, inputTypes, STRING_GROUP);
++    checkArgGroups(arguments, 1, inputTypes, STRING_GROUP);
++
++    obtainStringConverter(arguments, 0, inputTypes, converters);
++    obtainStringConverter(arguments, 1, inputTypes, converters);
+ 
+     ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableIntObjectInspector;
+     return outputOI;
+@@ -78,15 +72,13 @@ public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumen
+ 
+   @Override
+   public Object evaluate(DeferredObject[] arguments) throws HiveException {
+-    Object obj0;
+-    Object obj1;
+-    if ((obj0 = arguments[0].get()) == null || (obj1 = arguments[1].get()) == null) {
++    String str0 = getStringValue(arguments, 0, converters);
++    String str1 = getStringValue(arguments, 1, converters);
++
++    if (str0 == null || str1 == null) {
+       return null;
+     }
+ 
+-    String str0 = textConverters[0].convert(obj0).toString();
+-    String str1 = textConverters[1].convert(obj1).toString();
+-
+     int dist = StringUtils.getLevenshteinDistance(str0, str1);
+     output.set(dist);
+     return output;
+@@ -97,31 +89,7 @@ public String getDisplayString(String[] children) {
+     return getStandardDisplayString(getFuncName(), children);
+   }
+ 
+-  protected void checkIfPrimitive(ObjectInspector[] arguments, int i, String argOrder)
+-      throws UDFArgumentTypeException {
+-    ObjectInspector.Category oiCat = arguments[i].getCategory();
+-    if (oiCat != ObjectInspector.Category.PRIMITIVE) {
+-      throw new UDFArgumentTypeException(i, getFuncName() + " only takes primitive types as "
+-          + argOrder + " argument, got " + oiCat);
+-    }
+-  }
+-
+-  protected void checkIfStringGroup(ObjectInspector[] arguments, int i, String argOrder)
+-      throws UDFArgumentTypeException {
+-    inputTypes[i] = ((PrimitiveObjectInspector) arguments[i]).getPrimitiveCategory();
+-    if (PrimitiveObjectInspectorUtils.getPrimitiveGrouping(inputTypes[i]) != PrimitiveGrouping.STRING_GROUP) {
+-      throw new UDFArgumentTypeException(i, getFuncName() + " only takes STRING_GROUP types as "
+-          + argOrder + " argument, got " + inputTypes[i]);
+-    }
+-  }
+-
+-  protected void getStringConverter(ObjectInspector[] arguments, int i, String argOrder)
+-      throws UDFArgumentTypeException {
+-    textConverters[i] = ObjectInspectorConverters.getConverter(
+-        (PrimitiveObjectInspector) arguments[i],
+-        PrimitiveObjectInspectorFactory.writableStringObjectInspector);
+-  }
+-
++  @Override
+   protected String getFuncName() {
+     return "levenshtein";
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFNextDay.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFNextDay.java
+index 38f08b7..c0a0ab1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFNextDay.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFNextDay.java
+@@ -24,30 +24,22 @@
+ import static org.apache.hadoop.hive.ql.udf.generic.GenericUDFNextDay.DayOfWeek.THU;
+ import static org.apache.hadoop.hive.ql.udf.generic.GenericUDFNextDay.DayOfWeek.TUE;
+ import static org.apache.hadoop.hive.ql.udf.generic.GenericUDFNextDay.DayOfWeek.WED;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.DATE_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
+ 
+-import java.sql.Timestamp;
+-import java.text.ParseException;
+-import java.text.SimpleDateFormat;
+ import java.util.Calendar;
+ import java.util.Date;
+ 
+ import org.apache.hadoop.hive.ql.exec.Description;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
+-import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.serde2.io.DateWritable;
+-import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
+-import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.TimestampConverter;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping;
+ import org.apache.hadoop.io.Text;
++import org.apache.hive.common.util.DateUtils;
+ 
+ /**
+  * GenericUDFNextDay.
+@@ -62,120 +54,68 @@
+         + " 'yyyy-MM-dd'. day_of_week is day of the week (e.g. Mo, tue, FRIDAY)."
+         + "Example:\n " + " > SELECT _FUNC_('2015-01-14', 'TU') FROM src LIMIT 1;\n" + " '2015-01-20'")
+ public class GenericUDFNextDay extends GenericUDF {
+-  private transient SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd");
+-  private transient TimestampConverter timestampConverter;
+-  private transient Converter textConverter0;
+-  private transient Converter textConverter1;
+-  private transient Converter dateWritableConverter;
+-  private transient PrimitiveCategory inputType1;
+-  private transient PrimitiveCategory inputType2;
++  private transient Converter[] converters = new Converter[2];
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[2];
+   private final Calendar calendar = Calendar.getInstance();
+   private final Text output = new Text();
++  private transient int dayOfWeekIntConst;
++  private transient boolean isDayOfWeekConst;
+ 
+   @Override
+   public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
+-    if (arguments.length != 2) {
+-      throw new UDFArgumentLengthException("next_day() requires 2 argument, got "
+-          + arguments.length);
+-    }
+-    if (arguments[0].getCategory() != ObjectInspector.Category.PRIMITIVE) {
+-      throw new UDFArgumentTypeException(0, "Only primitive type arguments are accepted but "
+-          + arguments[0].getTypeName() + " is passed as first arguments");
+-    }
+-    if (arguments[1].getCategory() != ObjectInspector.Category.PRIMITIVE) {
+-      throw new UDFArgumentTypeException(1, "Only primitive type arguments are accepted but "
+-          + arguments[1].getTypeName() + " is passed as second arguments");
++    checkArgsSize(arguments, 2, 2);
++
++    checkArgPrimitive(arguments, 0);
++    checkArgPrimitive(arguments, 1);
++
++    checkArgGroups(arguments, 0, inputTypes, STRING_GROUP, DATE_GROUP);
++    checkArgGroups(arguments, 1, inputTypes, STRING_GROUP);
++
++    obtainDateConverter(arguments, 0, inputTypes, converters);
++    obtainStringConverter(arguments, 1, inputTypes, converters);
++
++    if (arguments[1] instanceof ConstantObjectInspector) {
++      String dayOfWeek = getConstantStringValue(arguments, 1);
++      isDayOfWeekConst = true;
++      dayOfWeekIntConst = getIntDayOfWeek(dayOfWeek);
+     }
+-    inputType1 = ((PrimitiveObjectInspector) arguments[0]).getPrimitiveCategory();
++
+     ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+-    switch (inputType1) {
+-    case STRING:
+-    case VARCHAR:
+-    case CHAR:
+-      inputType1 = PrimitiveCategory.STRING;
+-      textConverter0 = ObjectInspectorConverters.getConverter(
+-          (PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableStringObjectInspector);
+-      break;
+-    case TIMESTAMP:
+-      timestampConverter = new TimestampConverter((PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableTimestampObjectInspector);
+-      break;
+-    case DATE:
+-      dateWritableConverter = ObjectInspectorConverters.getConverter(
+-          (PrimitiveObjectInspector) arguments[0],
+-          PrimitiveObjectInspectorFactory.writableDateObjectInspector);
+-      break;
+-    default:
+-      throw new UDFArgumentTypeException(0,
+-          "next_day() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got "
+-              + inputType1);
+-    }
+-    inputType2 = ((PrimitiveObjectInspector) arguments[1]).getPrimitiveCategory();
+-    if (PrimitiveObjectInspectorUtils.getPrimitiveGrouping(inputType2) != PrimitiveGrouping.STRING_GROUP) {
+-      throw new UDFArgumentTypeException(1,
+-          "next_day() only takes STRING_GROUP types as second argument, got " + inputType2);
+-    }
+-    textConverter1 = ObjectInspectorConverters.getConverter(
+-        (PrimitiveObjectInspector) arguments[1],
+-        PrimitiveObjectInspectorFactory.writableStringObjectInspector);
+     return outputOI;
+   }
+ 
+   @Override
+   public Object evaluate(DeferredObject[] arguments) throws HiveException {
+-    if (arguments[0].get() == null || arguments[1].get() == null) {
+-      return null;
++    int dayOfWeekInt;
++    if (isDayOfWeekConst) {
++      dayOfWeekInt = dayOfWeekIntConst;
++    } else {
++      String dayOfWeek = getStringValue(arguments, 1, converters);
++      dayOfWeekInt = getIntDayOfWeek(dayOfWeek);
+     }
+-    String dayOfWeek = textConverter1.convert(arguments[1].get()).toString();
+-    int dayOfWeekInt = getIntDayOfWeek(dayOfWeek);
+     if (dayOfWeekInt == -1) {
+       return null;
+     }
+ 
+-    Date date;
+-    switch (inputType1) {
+-    case STRING:
+-      String dateString = textConverter0.convert(arguments[0].get()).toString();
+-      try {
+-        date = formatter.parse(dateString);
+-      } catch (ParseException e) {
+-        return null;
+-      }
+-      break;
+-    case TIMESTAMP:
+-      Timestamp ts = ((TimestampWritable) timestampConverter.convert(arguments[0].get()))
+-          .getTimestamp();
+-      date = ts;
+-      break;
+-    case DATE:
+-      DateWritable dw = (DateWritable) dateWritableConverter.convert(arguments[0].get());
+-      date = dw.get();
+-      break;
+-    default:
+-      throw new UDFArgumentTypeException(0,
+-          "next_day() only takes STRING/TIMESTAMP/DATEWRITABLE types, got " + inputType1);
++    Date date = getDateValue(arguments, 0, inputTypes, converters);
++    if (date == null) {
++      return null;
+     }
+ 
+     nextDay(date, dayOfWeekInt);
+     Date newDate = calendar.getTime();
+-    output.set(formatter.format(newDate));
++    output.set(DateUtils.getDateFormat().format(newDate));
+     return output;
+   }
+ 
+   @Override
+   public String getDisplayString(String[] children) {
+-    StringBuilder sb = new StringBuilder();
+-    sb.append("next_day(");
+-    if (children.length > 0) {
+-      sb.append(children[0]);
+-      for (int i = 1; i < children.length; i++) {
+-        sb.append(", ");
+-        sb.append(children[i]);
+-      }
+-    }
+-    sb.append(")");
+-    return sb.toString();
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "next_day";
+   }
+ 
+   protected Calendar nextDay(Date date, int dayOfWeek) {
+@@ -196,6 +136,9 @@ protected Calendar nextDay(Date date, int dayOfWeek) {
+   }
+ 
+   protected int getIntDayOfWeek(String dayOfWeek) throws UDFArgumentException {
++    if (dayOfWeek == null) {
++      return -1;
++    }
+     if (MON.matches(dayOfWeek)) {
+       return Calendar.MONDAY;
+     }
+@@ -221,13 +164,9 @@ protected int getIntDayOfWeek(String dayOfWeek) throws UDFArgumentException {
+   }
+ 
+   public static enum DayOfWeek {
+-    MON ("MO", "MON", "MONDAY"),
+-    TUE ("TU", "TUE", "TUESDAY"),
+-    WED ("WE", "WED", "WEDNESDAY"),
+-    THU ("TH", "THU", "THURSDAY"),
+-    FRI ("FR", "FRI", "FRIDAY"),
+-    SAT ("SA", "SAT", "SATURDAY"),
+-    SUN ("SU", "SUN", "SUNDAY");
++    MON("MO", "MON", "MONDAY"), TUE("TU", "TUE", "TUESDAY"), WED("WE", "WED", "WEDNESDAY"), THU(
++        "TH", "THU", "THURSDAY"), FRI("FR", "FRI", "FRIDAY"), SAT("SA", "SAT", "SATURDAY"), SUN(
++        "SU", "SUN", "SUNDAY");
+ 
+     private String name2;
+     private String name3;
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFAddMonths.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFAddMonths.java
+index 4ccae97..683d4d2 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFAddMonths.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFAddMonths.java
+@@ -17,26 +17,30 @@
+  */
+ package org.apache.hadoop.hive.ql.udf.generic;
+ 
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.io.ByteWritable;
++import org.apache.hadoop.hive.serde2.io.ShortWritable;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.Text;
+ 
+-import junit.framework.TestCase;
+-
+ public class TestGenericUDFAddMonths extends TestCase {
+ 
+-  public void testAddMonths() throws HiveException {
++  public void testAddMonthsInt() throws HiveException {
+     GenericUDFAddMonths udf = new GenericUDFAddMonths();
+     ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
+     ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableIntObjectInspector;
+     ObjectInspector[] arguments = { valueOI0, valueOI1 };
+ 
+     udf.initialize(arguments);
++
++    // date str
+     runAndVerify("2014-01-14", 1, "2014-02-14", udf);
+     runAndVerify("2014-01-31", 1, "2014-02-28", udf);
+     runAndVerify("2014-02-28", -1, "2014-01-31", udf);
+@@ -46,7 +50,64 @@ public void testAddMonths() throws HiveException {
+     runAndVerify("2016-02-29", -12, "2015-02-28", udf);
+     runAndVerify("2016-01-29", 1, "2016-02-29", udf);
+     runAndVerify("2016-02-29", -1, "2016-01-31", udf);
+-    runAndVerify("2014-01-32", 1, "2014-03-01", udf);
++    // wrong date str
++    runAndVerify("2014-02-30", 1, "2014-04-02", udf);
++    runAndVerify("2014-02-32", 1, "2014-04-04", udf);
++    runAndVerify("2014-01", 1, null, udf);
++
++    // ts str
++    runAndVerify("2014-01-14 10:30:00", 1, "2014-02-14", udf);
++    runAndVerify("2014-01-31 10:30:00", 1, "2014-02-28", udf);
++    runAndVerify("2014-02-28 10:30:00.1", -1, "2014-01-31", udf);
++    runAndVerify("2014-02-28 10:30:00.100", 2, "2014-04-30", udf);
++    runAndVerify("2014-04-30 10:30:00.001", -2, "2014-02-28", udf);
++    runAndVerify("2015-02-28 10:30:00.000000001", 12, "2016-02-29", udf);
++    runAndVerify("2016-02-29 10:30:00", -12, "2015-02-28", udf);
++    runAndVerify("2016-01-29 10:30:00", 1, "2016-02-29", udf);
++    runAndVerify("2016-02-29 10:30:00", -1, "2016-01-31", udf);
++    // wrong ts str
++    runAndVerify("2014-02-30 10:30:00", 1, "2014-04-02", udf);
++    runAndVerify("2014-02-32 10:30:00", 1, "2014-04-04", udf);
++    runAndVerify("2014/01/31 10:30:00", 1, null, udf);
++    runAndVerify("2014-01-31T10:30:00", 1, "2014-02-28", udf);
++  }
++
++  public void testAddMonthsShort() throws HiveException {
++    GenericUDFAddMonths udf = new GenericUDFAddMonths();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableShortObjectInspector;
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++    // short
++    runAndVerify("2014-01-14", (short) 1, "2014-02-14", udf);
++  }
++
++  public void testAddMonthsByte() throws HiveException {
++    GenericUDFAddMonths udf = new GenericUDFAddMonths();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableByteObjectInspector;
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++    // short
++    runAndVerify("2014-01-14", (byte) 1, "2014-02-14", udf);
++  }
++
++  public void testAddMonthsLong() throws HiveException {
++    @SuppressWarnings("resource")
++    GenericUDFAddMonths udf = new GenericUDFAddMonths();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableLongObjectInspector;
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    try {
++      udf.initialize(arguments);
++      assertTrue("add_months exception expected", false);
++    } catch (UDFArgumentTypeException e) {
++      assertEquals("add_months test",
++          "add_months only takes INT/SHORT/BYTE types as 2nd argument, got LONG", e.getMessage());
++    }
+   }
+ 
+   private void runAndVerify(String str, int months, String expResult, GenericUDF udf)
+@@ -55,6 +116,24 @@ private void runAndVerify(String str, int months, String expResult, GenericUDF u
+     DeferredObject valueObj1 = new DeferredJavaObject(new IntWritable(months));
+     DeferredObject[] args = { valueObj0, valueObj1 };
+     Text output = (Text) udf.evaluate(args);
+-    assertEquals("add_months() test ", expResult, output.toString());
++    assertEquals("add_months() test ", expResult, output != null ? output.toString() : null);
++  }
++
++  private void runAndVerify(String str, short months, String expResult, GenericUDF udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(new Text(str));
++    DeferredObject valueObj1 = new DeferredJavaObject(new ShortWritable(months));
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("add_months() test ", expResult, output != null ? output.toString() : null);
++  }
++
++  private void runAndVerify(String str, byte months, String expResult, GenericUDF udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(new Text(str));
++    DeferredObject valueObj1 = new DeferredJavaObject(new ByteWritable(months));
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("add_months() test ", expResult, output != null ? output.toString() : null);
+   }
+ }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java
+index 4b233a6..a842876 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLastDay.java
+@@ -35,6 +35,8 @@ public void testLastDay() throws HiveException {
+     ObjectInspector[] arguments = { valueOI0 };
+ 
+     udf.initialize(arguments);
++
++    // date str
+     runAndVerify("2014-01-01", "2014-01-31", udf);
+     runAndVerify("2014-01-14", "2014-01-31", udf);
+     runAndVerify("2014-01-31", "2014-01-31", udf);
+@@ -43,17 +45,26 @@ public void testLastDay() throws HiveException {
+     runAndVerify("2016-02-03", "2016-02-29", udf);
+     runAndVerify("2016-02-28", "2016-02-29", udf);
+     runAndVerify("2016-02-29", "2016-02-29", udf);
++    //wrong date str
++    runAndVerify("2016-02-30", "2016-03-31", udf);
++    runAndVerify("2014-01-32", "2014-02-28", udf);
+     runAndVerify("01/14/2014", null, udf);
+     runAndVerify(null, null, udf);
+ 
++    // ts str
+     runAndVerify("2014-01-01 10:30:45", "2014-01-31", udf);
+     runAndVerify("2014-01-14 10:30:45", "2014-01-31", udf);
+-    runAndVerify("2014-01-31 10:30:45", "2014-01-31", udf);
+-    runAndVerify("2014-02-02 10:30:45", "2014-02-28", udf);
+-    runAndVerify("2014-02-28 10:30:45", "2014-02-28", udf);
+-    runAndVerify("2016-02-03 10:30:45", "2016-02-29", udf);
++    runAndVerify("2014-01-31 10:30:45.1", "2014-01-31", udf);
++    runAndVerify("2014-02-02 10:30:45.100", "2014-02-28", udf);
++    runAndVerify("2014-02-28 10:30:45.001", "2014-02-28", udf);
++    runAndVerify("2016-02-03 10:30:45.000000001", "2016-02-29", udf);
+     runAndVerify("2016-02-28 10:30:45", "2016-02-29", udf);
+     runAndVerify("2016-02-29 10:30:45", "2016-02-29", udf);
++    // wrong ts str
++    runAndVerify("2016-02-30 10:30:45", "2016-03-31", udf);
++    runAndVerify("2014-01-32 10:30:45", "2014-02-28", udf);
++    runAndVerify("01/14/2014 10:30:45", null, udf);
++    runAndVerify("2016-02-28T10:30:45", "2016-02-29", udf);
+   }
+ 
+   private void runAndVerify(String str, String expResult, GenericUDF udf)
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java
+index 5346e45..9f14ffd 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFLevenshtein.java
+@@ -92,7 +92,7 @@ public void testLevenshteinWrongLength() throws HiveException {
+       udf.initialize(arguments);
+       assertTrue("levenshtein test. UDFArgumentLengthException is expected", false);
+     } catch (UDFArgumentLengthException e) {
+-      assertEquals("levenshtein test", "levenshtein requires 2 arguments, got 1", e.getMessage());
++      assertEquals("levenshtein test", "levenshtein requires 2 argument(s), got 1", e.getMessage());
+     }
+   }
+ 
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFNextDay.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFNextDay.java
+index e2ec551..83ded3c 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFNextDay.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFNextDay.java
+@@ -57,10 +57,10 @@ public void testNextDay() throws HiveException {
+ 
+     // start_date is Wed, full timestamp, full day name
+     runAndVerify("2015-01-14 14:04:34", "sunday", "2015-01-18", udf);
+-    runAndVerify("2015-01-14 14:04:34", "Monday", "2015-01-19", udf);
+-    runAndVerify("2015-01-14 14:04:34", "Tuesday", "2015-01-20", udf);
+-    runAndVerify("2015-01-14 14:04:34", "wednesday", "2015-01-21", udf);
+-    runAndVerify("2015-01-14 14:04:34", "thursDAY", "2015-01-15", udf);
++    runAndVerify("2015-01-14 14:04:34.1", "Monday", "2015-01-19", udf);
++    runAndVerify("2015-01-14 14:04:34.100", "Tuesday", "2015-01-20", udf);
++    runAndVerify("2015-01-14 14:04:34.001", "wednesday", "2015-01-21", udf);
++    runAndVerify("2015-01-14 14:04:34.000000001", "thursDAY", "2015-01-15", udf);
+     runAndVerify("2015-01-14 14:04:34", "FRIDAY", "2015-01-16", udf);
+     runAndVerify("2015-01-14 14:04:34", "SATurday", "2015-01-17", udf);
+ 
+@@ -72,6 +72,12 @@ public void testNextDay() throws HiveException {
+     // not valid values
+     runAndVerify("01/14/2015", "TU", null, udf);
+     runAndVerify("2015-01-14", "VT", null, udf);
++    runAndVerify("2015-02-30", "WE", "2015-03-04", udf);
++    runAndVerify("2015-02-32", "WE", "2015-03-11", udf);
++    runAndVerify("2015-02-30 10:30:00", "WE", "2015-03-04", udf);
++    runAndVerify("2015-02-32 10:30:00", "WE", "2015-03-11", udf);
++    runAndVerify("2015/01/14 14:04:34", "SAT", null, udf);
++    runAndVerify("2015-01-14T14:04:34", "SAT", "2015-01-17", udf);
+   }
+ 
+   public void testNextDayErrorArg1() throws HiveException {
+@@ -86,7 +92,7 @@ public void testNextDayErrorArg1() throws HiveException {
+       assertTrue("UDFArgumentException expected", false);
+     } catch (UDFArgumentException e) {
+       assertEquals(
+-          "next_day() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got LONG",
++          "next_day only takes STRING_GROUP, DATE_GROUP types as 1st argument, got LONG",
+           e.getMessage());
+     }
+   }
+@@ -102,7 +108,7 @@ public void testNextDayErrorArg2() throws HiveException {
+       udf.initialize(arguments);
+       assertTrue("UDFArgumentException expected", false);
+     } catch (UDFArgumentException e) {
+-      assertEquals("next_day() only takes STRING_GROUP types as second argument, got INT",
++      assertEquals("next_day only takes STRING_GROUP types as 2nd argument, got INT",
+           e.getMessage());
+     }
+   }
+diff --git a/ql/src/test/results/clientnegative/udf_add_months_error_1.q.out b/ql/src/test/results/clientnegative/udf_add_months_error_1.q.out
+index 8226ac6..e128612 100644
+--- a/ql/src/test/results/clientnegative/udf_add_months_error_1.q.out
++++ b/ql/src/test/results/clientnegative/udf_add_months_error_1.q.out
+@@ -1 +1 @@
+-FAILED: SemanticException [Error 10016]: Line 1:18 Argument type mismatch '14567893456': ADD_MONTHS() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got LONG
++FAILED: SemanticException [Error 10016]: Line 1:18 Argument type mismatch '14567893456': add_months only takes STRING_GROUP, DATE_GROUP types as 1st argument, got LONG
+diff --git a/ql/src/test/results/clientnegative/udf_add_months_error_2.q.out b/ql/src/test/results/clientnegative/udf_add_months_error_2.q.out
+index f00949e..897f4f2 100644
+--- a/ql/src/test/results/clientnegative/udf_add_months_error_2.q.out
++++ b/ql/src/test/results/clientnegative/udf_add_months_error_2.q.out
+@@ -1 +1 @@
+-FAILED: SemanticException [Error 10016]: Line 1:32 Argument type mismatch '2.4': ADD_MONTHS() only takes INT types as second argument, got DOUBLE
++FAILED: SemanticException [Error 10016]: Line 1:32 Argument type mismatch '2.4': add_months only takes INT/SHORT/BYTE types as 2nd argument, got DOUBLE
+diff --git a/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out b/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out
+index 6e718a0..71376e2 100644
+--- a/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out
++++ b/ql/src/test/results/clientnegative/udf_last_day_error_1.q.out
+@@ -1 +1 @@
+-FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch '1423199465': LAST_DAY() only takes STRING/TIMESTAMP/DATEWRITABLE types, got INT
++FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch '1423199465': last_day only takes STRING_GROUP, DATE_GROUP types as 1st argument, got INT
+diff --git a/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out b/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out
+index dc8e3d1..ad0bfb4 100644
+--- a/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out
++++ b/ql/src/test/results/clientnegative/udf_last_day_error_2.q.out
+@@ -1 +1 @@
+-FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch ''test'': Only primitive type arguments are accepted but map<string,string> is passed
++FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch ''test'': last_day only takes primitive types as 1st argument, got MAP
+diff --git a/ql/src/test/results/clientnegative/udf_next_day_error_1.q.out b/ql/src/test/results/clientnegative/udf_next_day_error_1.q.out
+index c67b9c4..1d9c25f 100644
+--- a/ql/src/test/results/clientnegative/udf_next_day_error_1.q.out
++++ b/ql/src/test/results/clientnegative/udf_next_day_error_1.q.out
+@@ -1 +1 @@
+-FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch '145622345': next_day() only takes STRING/TIMESTAMP/DATEWRITABLE types as first argument, got INT
++FAILED: SemanticException [Error 10016]: Line 1:16 Argument type mismatch '145622345': next_day only takes STRING_GROUP, DATE_GROUP types as 1st argument, got INT
+diff --git a/ql/src/test/results/clientnegative/udf_next_day_error_2.q.out b/ql/src/test/results/clientnegative/udf_next_day_error_2.q.out
+index e3cb6a4..e23186a 100644
+--- a/ql/src/test/results/clientnegative/udf_next_day_error_2.q.out
++++ b/ql/src/test/results/clientnegative/udf_next_day_error_2.q.out
+@@ -1 +1 @@
+-FAILED: SemanticException [Error 10016]: Line 1:30 Argument type mismatch '4': next_day() only takes STRING_GROUP types as second argument, got INT
++FAILED: SemanticException [Error 10016]: Line 1:30 Argument type mismatch '4': next_day only takes STRING_GROUP types as 2nd argument, got INT
+-- 
+1.7.9.5
+

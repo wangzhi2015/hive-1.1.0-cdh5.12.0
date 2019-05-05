@@ -1,0 +1,513 @@
+From c15d81edea1347158e99fae1a6f3bf010af87525 Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Fri, 26 May 2017 13:59:15 +0200
+Subject: [PATCH 1151/1164] Revert "CDH-53836: HIVE-14389: Beeline should not
+ output query and prompt to stdout (Vihang
+ Karajgaonkar, reviewed by Peter Vary, Thejas M
+ Nair and Yongzhi Chen)"
+
+This reverts commit 5eecf810a5689c2014608586fefc5de3ccf1f3f1.
+
+Change-Id: Ibdf44cb3d889ea803b6748f7b1d2d42afb7a67e7
+(cherry picked from commit 41d28a83444318328286b1b0459d42769d1dbe4f)
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |    9 +-
+ .../org/apache/hive/beeline/cli/TestHiveCli.java   |    8 +-
+ .../apache/hive/beeline/TestBeeLineWithArgs.java   |  157 +++++++-------------
+ 3 files changed, 57 insertions(+), 117 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index 5462e28..e8fb463 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -135,7 +135,6 @@
+   private OutputFile recordOutputFile = null;
+   private PrintStream outputStream = new PrintStream(System.out, true);
+   private PrintStream errorStream = new PrintStream(System.err, true);
+-  private InputStream inputStream = System.in;
+   private ConsoleReader consoleReader;
+   private List<String> batch = null;
+   private final Reflector reflector;
+@@ -1031,10 +1030,10 @@ public ConsoleReader getConsoleReader(InputStream inputStream) throws IOExceptio
+       // by appending a newline to the end of inputstream
+       InputStream inputStreamAppendedNewline = new SequenceInputStream(inputStream,
+           new ByteArrayInputStream((new String("\n")).getBytes()));
+-      consoleReader = new ConsoleReader(inputStreamAppendedNewline, getErrorStream());
++      consoleReader = new ConsoleReader(inputStreamAppendedNewline, getOutputStream());
+       consoleReader.setCopyPasteDetection(true); // jline will detect if <tab> is regular character
+     } else {
+-      consoleReader = new ConsoleReader(getInputStream(), getErrorStream());
++      consoleReader = new ConsoleReader();
+     }
+ 
+     //disable the expandEvents for the purpose of backward compatibility
+@@ -2254,10 +2253,6 @@ PrintStream getErrorStream() {
+     return errorStream;
+   }
+ 
+-  InputStream getInputStream() {
+-    return inputStream;
+-  }
+-
+   ConsoleReader getConsoleReader() {
+     return consoleReader;
+   }
+diff --git a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+index a53a7b4..4b6d617 100644
+--- a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
++++ b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+@@ -113,7 +113,7 @@ public void testCmd() {
+ 
+   @Test
+   public void testSetPromptValue() {
+-    verifyCMD("set hive.cli.prompt=MYCLI;SHOW\nTABLES;", "MYCLI> ", errS, null,
++    verifyCMD("set hive.cli.prompt=MYCLI;SHOW\nTABLES;", "MYCLI> ", os, null,
+         ERRNO_OK, true);
+   }
+ 
+@@ -222,21 +222,21 @@ public void testErrOutput() {
+   public void testUseCurrentDB1() {
+     verifyCMD(
+         "create database if not exists testDB; set hive.cli.print.current.db=true;use testDB;\n"
+-            + "use default;drop if exists testDB;", "hive (testDB)>", errS, null, ERRNO_OK, true);
++            + "use default;drop if exists testDB;", "hive (testDB)>", os, null, ERRNO_OK, true);
+   }
+ 
+   @Test
+   public void testUseCurrentDB2() {
+     verifyCMD(
+         "create database if not exists testDB; set hive.cli.print.current.db=true;use\ntestDB;\nuse default;drop if exists testDB;",
+-        "hive (testDB)>", errS, null, ERRNO_OK, true);
++        "hive (testDB)>", os, null, ERRNO_OK, true);
+   }
+ 
+   @Test
+   public void testUseCurrentDB3() {
+     verifyCMD(
+         "create database if not exists testDB; set hive.cli.print.current.db=true;use  testDB;\n"
+-            + "use default;drop if exists testDB;", "hive (testDB)>", errS, null, ERRNO_OK, true);
++            + "use default;drop if exists testDB;", "hive (testDB)>", os, null, ERRNO_OK, true);
+   }
+ 
+   @Test
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+index 681ac9b..97a6a2b 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+@@ -36,8 +36,6 @@
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+ 
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -53,15 +51,11 @@
+  *
+  */
+ public class TestBeeLineWithArgs {
+-  private enum OutStream {
+-    ERR, OUT
+-  };
+-
+   // Default location of HiveServer2
+   private static final String tableName = "TestBeelineTable1";
+   private static final String tableComment = "Test table comment";
++
+   private static MiniHS2 miniHS2;
+-  private static final String userName = System.getProperty("user.name");
+ 
+   private List<String> getBaseArgs(String jdbcUrl) {
+     List<String> argList = new ArrayList<String>(8);
+@@ -69,8 +63,6 @@
+     argList.add(BeeLine.BEELINE_DEFAULT_JDBC_DRIVER);
+     argList.add("-u");
+     argList.add(jdbcUrl);
+-    argList.add("-n");
+-    argList.add(userName);
+     return argList;
+   }
+   /**
+@@ -93,8 +85,7 @@ public static void preTests() throws Exception {
+    */
+   private static void createTable() throws ClassNotFoundException, SQLException {
+     Class.forName(BeeLine.BEELINE_DEFAULT_JDBC_DRIVER);
+-    Connection con = DriverManager.getConnection(miniHS2.getBaseJdbcURL(),
+-        userName , "");
++    Connection con = DriverManager.getConnection(miniHS2.getBaseJdbcURL(),"", "");
+ 
+     assertNotNull("Connection is null", con);
+     assertFalse("Connection should not be closed", con.isClosed());
+@@ -136,27 +127,16 @@ public static void postTests() {
+ 
+   /**
+    * Execute a script with "beeline -f or -i"
+-   * @param argList List of arguments for beeline
+-   * @param inputStream input stream if any
+-   * @param streamType if output from STDERR or STDOUT needs to be returned
++   *
+    * @return The stderr and stdout from running the script
+-   * @throws Throwable
+    */
+-  private String testCommandLineScript(List<String> argList, InputStream inputStream, OutStream streamType)
++  private String testCommandLineScript(List<String> argList, InputStream inputStream)
+       throws Throwable {
+     BeeLine beeLine = new BeeLine();
+     ByteArrayOutputStream os = new ByteArrayOutputStream();
+     PrintStream beelineOutputStream = new PrintStream(os);
+-    switch (streamType) {
+-    case OUT:
+-      beeLine.setOutputStream(beelineOutputStream);
+-      break;
+-    case ERR:
+-      beeLine.setErrorStream(beelineOutputStream);
+-      break;
+-    default:
+-      throw new RuntimeException("Unexpected outstream type " + streamType);
+-    }
++    beeLine.setOutputStream(beelineOutputStream);
++    beeLine.setErrorStream(beelineOutputStream);
+     String[] args = argList.toArray(new String[argList.size()]);
+     beeLine.begin(args, inputStream);
+     String output = os.toString("UTF8");
+@@ -166,53 +146,33 @@ private String testCommandLineScript(List<String> argList, InputStream inputStre
+   }
+ 
+   /**
+-   * Attempt to execute a simple script file with the -f and -i option to
+-   * BeeLine to test for presence of an expected pattern in the output (stdout
+-   * or stderr), fail if not found. Print PASSED or FAILED
+-   * 
+-   * @param expectedRegex
+-   *          Text to look for in command output (stdout)
+-   * @param shouldMatch
+-   *          true if the pattern should be found, false if it should not
+-   * @throws Exception
+-   *           on command execution error
+-   */
+-  private void testScriptFile(String scriptText, String expectedRegex,
+-      boolean shouldMatch, List<String> argList) throws Throwable {
+-    testScriptFile(scriptText, expectedRegex, shouldMatch, argList, true, true, OutStream.OUT);
+-  }
+-
+-  /**
+    * Attempt to execute a simple script file with the -f and -i option
+    * to BeeLine to test for presence of an expected pattern
+    * in the output (stdout or stderr), fail if not found.
+    * Print PASSED or FAILED
+-   * @param expectedRegex Text to look for in command output (stdout)
++   * @param expectedPattern Text to look for in command output/error
+    * @param shouldMatch true if the pattern should be found, false if it should not
+-   * @param argList arguments
+-   * @param outType output stream type
+-   * @throws Throwable
++   * @throws Exception on command execution error
+    */
+-  private void testScriptFile(String scriptText, String expectedRegex,
+-      boolean shouldMatch, List<String> argList, OutStream outType) throws Throwable {
+-    testScriptFile(scriptText, expectedRegex, shouldMatch, argList, true, true, outType);
++  private void testScriptFile(String scriptText, String expectedPattern,
++      boolean shouldMatch, List<String> argList) throws Throwable {
++    testScriptFile(scriptText, expectedPattern, shouldMatch, argList, true, true);
+   }
+-  
++
+   /**
+    * Attempt to execute a simple script file with the -f or -i option
+    * to BeeLine (or both) to  test for presence of an expected pattern
+    * in the output (stdout or stderr), fail if not found.
+    * Print PASSED or FAILED
+-   * @param expectedRegex Text to look for in command output/error
++   * @param expectedPattern Text to look for in command output/error
+    * @param shouldMatch true if the pattern should be found, false if it should not
+    * @param testScript Whether we should test -f
+    * @param testInit Whether we should test -i
+-   * @param streamType Whether match should be done against STDERR or STDOUT
+    * @throws Exception on command execution error
+    */
+-  private void testScriptFile(String scriptText, String expectedRegex,
++  private void testScriptFile(String scriptText, String expectedPattern,
+       boolean shouldMatch, List<String> argList,
+-      boolean testScript, boolean testInit, OutStream streamType) throws Throwable {
++      boolean testScript, boolean testInit) throws Throwable {
+ 
+     // Put the script content in a temp file
+     File scriptFile = File.createTempFile(this.getClass().getSimpleName(), "temp");
+@@ -222,20 +182,17 @@ private void testScriptFile(String scriptText, String expectedRegex,
+     os.print(scriptText);
+     os.close();
+ 
+-    Pattern expectedPattern = Pattern.compile(".*" + expectedRegex + ".*", Pattern.DOTALL);
+     if (testScript) {
+       List<String> copy = new ArrayList<String>(argList);
+       copy.add("-f");
+       copy.add(scriptFile.getAbsolutePath());
+ 
+-      String output = testCommandLineScript(copy, null, streamType);
+-
+-      Matcher m = expectedPattern.matcher(output);
+-      boolean matches = m.matches();
++      String output = testCommandLineScript(copy, null);
++      boolean matches = output.contains(expectedPattern);
+       if (shouldMatch != matches) {
+         //failed
+         fail("Output" + output + " should" +  (shouldMatch ? "" : " not") +
+-            " contain " + expectedRegex);
++            " contain " + expectedPattern);
+       }
+     }
+ 
+@@ -247,13 +204,12 @@ private void testScriptFile(String scriptText, String expectedRegex,
+       copy.add("-i");
+       copy.add(scriptFile.getAbsolutePath());
+ 
+-      String output = testCommandLineScript(copy, new StringBufferInputStream("!quit\n"), streamType);
+-      Matcher m = expectedPattern.matcher(output);
+-      boolean matches = m.matches();
++      String output = testCommandLineScript(copy, new StringBufferInputStream("!quit\n"));
++      boolean matches = output.contains(expectedPattern);
+       if (shouldMatch != matches) {
+         //failed
+         fail("Output" + output + " should" +  (shouldMatch ? "" : " not") +
+-            " contain " + expectedRegex);
++            " contain " + expectedPattern);
+       }
+     }
+     scriptFile.delete();
+@@ -268,15 +224,14 @@ private void testScriptFile(String scriptText, String expectedRegex,
+    * @param shouldMatch true if the pattern should be found, false if it should not
+    * @throws Exception on command execution error
+    */
+-
+   private void testCommandEnclosedQuery(String enclosedQuery, String expectedPattern,
+-      boolean shouldMatch, List<String> argList, OutStream out) throws Throwable {
++      boolean shouldMatch, List<String> argList) throws Throwable {
+ 
+     List<String> copy = new ArrayList<String>(argList);
+     copy.add("-e");
+     copy.add(enclosedQuery);
+ 
+-    String output = testCommandLineScript(copy, null, out);
++    String output = testCommandLineScript(copy, null);
+     boolean matches = output.contains(expectedPattern);
+     if (shouldMatch != matches) {
+       //failed
+@@ -334,7 +289,7 @@ public void testBeelineHiveVariable() throws Throwable {
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+     argList.add("--hivevar");
+     argList.add("DUMMY_TBL=dummy");
+-    final String SCRIPT_TEXT = "create table ${DUMMY_TBL} (d int);\nshow tables;\n drop table  ${DUMMY_TBL};";
++    final String SCRIPT_TEXT = "create table ${DUMMY_TBL} (d int);\nshow tables;\n";
+     final String EXPECTED_PATTERN = "dummy";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+@@ -344,8 +299,7 @@ public void testBeelineHiveConfVariable() throws Throwable {
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+     argList.add("--hiveconf");
+     argList.add("test.hive.table.name=dummy");
+-    final String SCRIPT_TEXT = "create table ${hiveconf:test.hive.table.name} (d int);\nshow tables;\n"
+-        + " drop table ${hiveconf:test.hive.table.name};\n";
++    final String SCRIPT_TEXT = "create table ${hiveconf:test.hive.table.name} (d int);\nshow tables;\n";
+     final String EXPECTED_PATTERN = "dummy";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+@@ -372,9 +326,7 @@ public void testBeelineMultiHiveVariable() throws Throwable {
+     argList.add("--hiveconf");
+     argList.add("COLUMN_TYPE=int");
+ 
+-    final String SCRIPT_TEXT = "${COMMAND} ${OBJECT} ${TABLE_NAME} "
+-        + "(${hiveconf:COLUMN_NAME} ${hiveconf:COLUMN_TYPE});"
+-        + "\nshow tables;\n drop ${OBJECT} ${TABLE_NAME};\n";
++    final String SCRIPT_TEXT = "${COMMAND} ${OBJECT} ${TABLE_NAME} (${hiveconf:COLUMN_NAME} ${hiveconf:COLUMN_TYPE});\nshow tables;\n";
+     final String EXPECTED_PATTERN = "dummy2";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+@@ -395,11 +347,9 @@ public void testBreakOnErrorScriptFile() throws Throwable {
+   @Test
+   public void testTabInScriptFile() throws Throwable {
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+-    final String SCRIPT_TEXT = "CREATE\tTABLE IF NOT EXISTS testTabInScriptFile\n(id\tint);\nSHOW TABLES;"
+-        + "\ndrop table testTabInScriptFile";
++    final String SCRIPT_TEXT = "CREATE\tTABLE IF NOT EXISTS testTabInScriptFile\n(id\tint);\nSHOW TABLES;";
+     final String EXPECTED_PATTERN = "testTabInScriptFile";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, OutStream.ERR);
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, false, argList, OutStream.OUT);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
+   @Test
+@@ -438,7 +388,7 @@ public void testNullNonEmpty() throws Throwable {
+   public void testGetVariableValue() throws Throwable {
+     final String SCRIPT_TEXT = "set env:TERM;";
+     final String EXPECTED_PATTERN = "env:TERM";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, getBaseArgs(miniHS2.getBaseJdbcURL()), OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, getBaseArgs(miniHS2.getBaseJdbcURL()));
+   }
+ 
+   /**
+@@ -586,7 +536,7 @@ public void testTSVOutputDeprecation() throws Throwable {
+     argList.add("--outputformat=tsv");
+ 
+     final String EXPECTED_PATTERN = "Format tsv is deprecated, please use tsv2";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
+   /**
+@@ -600,7 +550,7 @@ public void testCSVOutputDeprecation() throws Throwable {
+     argList.add("--outputformat=csv");
+ 
+     final String EXPECTED_PATTERN = "Format csv is deprecated, please use csv2";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, true, true, OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
+   /**
+@@ -661,7 +611,7 @@ public void testNegativeScriptFile() throws Throwable {
+     argList.add(scriptFile.getAbsolutePath());
+ 
+     try {
+-      String output = testCommandLineScript(argList, null, OutStream.OUT);
++      String output = testCommandLineScript(argList, null);
+       if (output.contains(EXPECTED_PATTERN)) {
+         fail("Output: " + output +  " Negative pattern: " + EXPECTED_PATTERN);
+       }
+@@ -700,7 +650,7 @@ public void testNPE() throws UnsupportedEncodingException {
+   @Test
+   public void testHiveVarSubstitution() throws Throwable {
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL() + "#D_TBL=dummy_t");
+-    final String SCRIPT_TEXT = "create table ${D_TBL} (d int);\nshow tables;\ndrop  table ${D_TBL};\n";
++    final String SCRIPT_TEXT = "create table ${D_TBL} (d int);\nshow tables;\n";
+     final String EXPECTED_PATTERN = "dummy_t";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+@@ -714,7 +664,7 @@ public void testEmbeddedBeelineConnection() throws Throwable{
+     // Set to non-zk lock manager to avoid trying to connect to zookeeper
+     final String SCRIPT_TEXT =
+         "set hive.lock.manager=org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager;\n" +
+-        "create table ${DUMMY_TBL} (d int);\nshow tables;\n drop table ${DUMMY_TBL};\n";
++        "create table ${DUMMY_TBL} (d int);\nshow tables;\n";
+     final String EXPECTED_PATTERN = "embedded_table";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+@@ -727,10 +677,8 @@ public void testEmbeddedBeelineConnection() throws Throwable{
+   public void testQueryProgress() throws Throwable {
+     final String SCRIPT_TEXT = "set hive.support.concurrency = false;\n" +
+         "select count(*) from " + tableName + ";\n";
+-    // Check for part of log message as well as part of progress information
+     final String EXPECTED_PATTERN = "number of splits";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, getBaseArgs(miniHS2.getBaseJdbcURL()),
+-        OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, getBaseArgs(miniHS2.getBaseJdbcURL()));
+   }
+ 
+   /**
+@@ -743,10 +691,8 @@ public void testQueryProgressParallel() throws Throwable {
+     final String SCRIPT_TEXT = "set hive.support.concurrency = false;\n" +
+         "set hive.exec.parallel = true;\n" +
+         "select count(*) from " + tableName + ";\n";
+-    // Check for part of log message as well as part of progress information
+     final String EXPECTED_PATTERN = "number of splits";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, getBaseArgs(miniHS2.getBaseJdbcURL()),
+-        OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, getBaseArgs(miniHS2.getBaseJdbcURL()));
+   }
+ 
+   /**
+@@ -759,7 +705,7 @@ public void testQueryProgressHidden() throws Throwable {
+         "!set silent true\n" +
+         "select count(*) from " + tableName + ";\n";
+     final String EXPECTED_PATTERN = "Executing command";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, false, getBaseArgs(miniHS2.getBaseJdbcURL()), OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, false, getBaseArgs(miniHS2.getBaseJdbcURL()));
+   }
+ 
+   @Test
+@@ -780,10 +726,10 @@ public void testMultiCommandsInOneEnclosedQuery() throws Throwable {
+         +"(key int);show tables; --multicommands in one line";
+     final String EXPECTED_PATTERN = " multicmdtbl ";
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+-    testCommandEnclosedQuery(QUERY_TEXT, EXPECTED_PATTERN, true, argList, OutStream.OUT);
++    testCommandEnclosedQuery(QUERY_TEXT, EXPECTED_PATTERN, true, argList);
+ 
+     final String QUERY_TEXT_DROP = "drop table multiCmdTbl;show tables;";
+-    testCommandEnclosedQuery(QUERY_TEXT_DROP, EXPECTED_PATTERN, false, argList, OutStream.OUT);
++    testCommandEnclosedQuery(QUERY_TEXT_DROP, EXPECTED_PATTERN, false, argList);
+   }
+ 
+   @Test
+@@ -818,10 +764,10 @@ public void testEscapeSemiColonInEnclosedQuery() throws Throwable {
+         + " TERMINATED BY '\\n';show tables;";
+     final String EXPECTED_PATTERN = " multicmdtbl ";
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+-    testCommandEnclosedQuery(QUERY_TEXT, EXPECTED_PATTERN, true, argList, OutStream.OUT);
++    testCommandEnclosedQuery(QUERY_TEXT, EXPECTED_PATTERN, true, argList);
+ 
+     final String QUERY_TEXT_DROP = "drop table multiCmdTbl;show tables;";
+-    testCommandEnclosedQuery(QUERY_TEXT_DROP, EXPECTED_PATTERN, false, argList, OutStream.OUT);
++    testCommandEnclosedQuery(QUERY_TEXT_DROP, EXPECTED_PATTERN, false, argList);
+   }
+ 
+   @Test
+@@ -829,13 +775,12 @@ public void testEmbeddedBeelineOutputs() throws Throwable{
+     String embeddedJdbcURL = Utils.URL_PREFIX+"/Default";
+     List<String> argList = getBaseArgs(embeddedJdbcURL);
+     // Set to non-zk lock manager to avoid trying to connect to zookeeper
+-    final String SCRIPT_TEXT = "set hive.lock.manager=org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager;\n"
+-        + "set hive.compute.query.using.stats=false;\n"
+-        + "create table if not exists embeddedBeelineOutputs(d int);\n"
+-        + "set a=1;\nselect count(*) from embeddedBeelineOutputs;\n"
+-        + "drop table embeddedBeelineOutputs;\n";
++    final String SCRIPT_TEXT =
++        "set hive.lock.manager=org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager;\n" +
++        "create table if not exists embeddedBeelineOutputs(d int);\n" +
++        "set a=1;\nselect count(*) from embeddedBeelineOutputs;\n";
+     final String EXPECTED_PATTERN = "Stage-1 map =";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, OutStream.ERR);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
+   @Test
+@@ -879,7 +824,7 @@ public void testBeelineConnectEnvVar() throws Throwable {
+     argList.add(BeeLine.BEELINE_DEFAULT_JDBC_DRIVER);
+ 
+     final String SCRIPT_TEXT =
+-        "create table blueconnecttest (d int);\nshow tables;\ndrop table blueconnecttest;\n";
++        "create table blueconnecttest (d int);\nshow tables;\n";
+     final String EXPECTED_PATTERN = "blueconnecttest";
+ 
+     // We go through these hijinxes because java considers System.getEnv
+@@ -899,7 +844,7 @@ public String get(String envVar) {
+     };
+     BeeLineOpts.setEnv(newEnv);
+ 
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, true, false, OutStream.OUT);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, true, false);
+   }
+ 
+   /**
+@@ -912,10 +857,10 @@ public void testBeelineReconnect() throws  Throwable {
+     final String SCRIPT_TEXT =
+         "!close\n" +
+         "!reconnect\n\n\n" +
+-        "create table reconnecttest (d int);\nshow tables;\ndrop table reconnecttest;\n";
++        "create table reconnecttest (d int);\nshow tables;\n";
+     final String EXPECTED_PATTERN = "reconnecttest";
+ 
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, true, false, OutStream.OUT);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, true, false);
+ 
+   }
+ 
+@@ -924,6 +869,6 @@ public void testBeelineShellCommandWithoutConn() throws Throwable {
+     List<String> argList = new ArrayList<String>();
+     final String SCRIPT_TEXT = "!sh echo hello world";
+     final String EXPECTED_PATTERN = "hello world";
+-    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList, true, false, OutStream.OUT);
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList,true,false);
+   }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,1437 @@
+From 33d48ab98f3180d66d2827c96c9b587031c65ef9 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Tue, 12 May 2015 14:58:06 -0700
+Subject: [PATCH 0590/1164] CDH-40121: HIVE-10636 : CASE comparison operator
+ rotation optimization (Ashutosh Chauhan via Gopal
+ V)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java
+	ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
+	ql/src/test/results/clientpositive/tez/vector_coalesce.q.out
+	ql/src/test/results/clientpositive/vector_coalesce.q.out
+
+Change-Id: Icdebde93cdf3fa1b2f62bc72a66d3c0ea50dd149
+---
+ .../hive/ql/exec/ExprNodeEvaluatorFactory.java     |    7 -
+ .../hive/ql/exec/vector/VectorizationContext.java  |   13 +-
+ .../ql/optimizer/ConstantPropagateProcFactory.java |   86 +++++---
+ .../hadoop/hive/ql/optimizer/GroupByOptimizer.java |    7 +-
+ .../optimizer/PrunerExpressionOperatorFactory.java |    3 -
+ .../hive/ql/optimizer/SimpleFetchOptimizer.java    |    2 -
+ .../calcite/translator/RexNodeConverter.java       |    5 +-
+ .../hive/ql/optimizer/lineage/ExprProcFactory.java |    3 +-
+ .../hive/ql/optimizer/pcr/PcrExprProcFactory.java  |    3 +-
+ .../hadoop/hive/ql/parse/TableAccessAnalyzer.java  |    6 +-
+ .../hadoop/hive/ql/parse/TypeCheckProcFactory.java |    5 +-
+ .../hadoop/hive/ql/plan/ExprNodeConstantDesc.java  |   14 +-
+ .../hadoop/hive/ql/plan/ExprNodeNullDesc.java      |   69 ------
+ .../apache/hadoop/hive/ql/stats/StatsUtils.java    |   12 +-
+ .../hive/ql/udf/generic/GenericUDFCoalesce.java    |    2 +-
+ .../hive/ql/udf/generic/GenericUDFGreatest.java    |    1 +
+ .../hive/ql/udf/generic/GenericUDFInstr.java       |    2 +-
+ .../hive/ql/udf/generic/GenericUDFLocate.java      |    2 +-
+ .../hive/ql/udf/generic/GenericUDFPrintf.java      |    3 +-
+ .../hive/ql/udf/generic/GenericUDFTranslate.java   |    8 +-
+ .../hive/ql/udf/generic/GenericUDFUtils.java       |    6 +-
+ .../clientpositive/fold_eq_with_case_when.q        |   21 ++
+ .../clientpositive/annotate_stats_filter.q.out     |    4 +-
+ .../clientpositive/fold_eq_with_case_when.q.out    |  231 ++++++++++++++++++++
+ ql/src/test/results/clientpositive/fold_when.q.out |    2 +-
+ ql/src/test/results/clientpositive/input6.q.out    |    2 +-
+ .../results/clientpositive/join_nullsafe.q.out     |   10 +-
+ .../clientpositive/spark/join_nullsafe.q.out       |   10 +-
+ .../subquery_notin_having.q.java1.7.out            |    2 +-
+ .../results/clientpositive/tez/join_nullsafe.q.out |   14 +-
+ .../clientpositive/tez/vector_coalesce.q.out       |   24 +-
+ .../results/clientpositive/vector_coalesce.q.out   |    4 +-
+ .../hadoop/hive/serde2/io/HiveVarcharWritable.java |    7 +-
+ .../objectinspector/ObjectInspectorConverters.java |    5 +-
+ .../objectinspector/ObjectInspectorUtils.java      |    4 +-
+ .../AbstractPrimitiveObjectInspector.java          |    1 +
+ .../primitive/WritableVoidObjectInspector.java     |    5 +
+ 37 files changed, 396 insertions(+), 209 deletions(-)
+ delete mode 100644 ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeNullDesc.java
+ create mode 100644 ql/src/test/queries/clientpositive/fold_eq_with_case_when.q
+ create mode 100644 ql/src/test/results/clientpositive/fold_eq_with_case_when.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java
+index a149571..f08321c 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java
+@@ -27,7 +27,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+ import org.apache.hadoop.io.NullWritable;
+ 
+@@ -57,12 +56,6 @@ public static ExprNodeEvaluator get(ExprNodeDesc desc) throws HiveException {
+     if (desc instanceof ExprNodeFieldDesc) {
+       return new ExprNodeFieldEvaluator((ExprNodeFieldDesc) desc);
+     }
+-    // Null node, a constant node with value NULL and no type information
+-    if (desc instanceof ExprNodeNullDesc) {
+-      return new ExprNodeConstantEvaluator(new ExprNodeConstantDesc(TypeInfoFactory
+-          .getPrimitiveTypeInfoFromPrimitiveWritable(NullWritable.class), null));
+-    }
+-
+     throw new RuntimeException(
+         "Cannot find ExprNodeEvaluator for the exprNodeDesc = " + desc);
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
+index a1dde64..f144e72 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorizationContext.java
+@@ -88,7 +88,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.GroupByDesc;
+ import org.apache.hadoop.hive.ql.udf.SettableUDF;
+ import org.apache.hadoop.hive.ql.udf.UDFConv;
+@@ -419,7 +418,7 @@ public VectorExpression getVectorExpression(ExprNodeDesc exprDesc, Mode mode) th
+         ve = getGenericUdfVectorExpression(expr.getGenericUDF(),
+             childExpressions, mode, exprDesc.getTypeInfo());
+       }
+-    } else if (exprDesc instanceof ExprNodeNullDesc) {
++    } else if (exprDesc instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)exprDesc).getValue()) {
+       ve = getConstantVectorExpression(null, exprDesc.getTypeInfo(), mode);
+     } else if (exprDesc instanceof ExprNodeConstantDesc) {
+       ve = getConstantVectorExpression(((ExprNodeConstantDesc) exprDesc).getValue(), exprDesc.getTypeInfo(),
+@@ -1400,7 +1399,7 @@ private VectorExpression getCastToDecimal(List<ExprNodeDesc> childExpr, TypeInfo
+       Object constantValue = ((ExprNodeConstantDesc) child).getValue();
+       HiveDecimal decimalValue = castConstantToDecimal(constantValue, child.getTypeInfo());
+       return getConstantVectorExpression(decimalValue, returnType, Mode.PROJECTION);
+-    } else if (child instanceof ExprNodeNullDesc) {
++    } else if (child instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)child).getValue()) {
+       return getConstantVectorExpression(null, returnType, Mode.PROJECTION);
+     }
+     if (isIntFamily(inputType)) {
+@@ -1427,7 +1426,7 @@ private VectorExpression getCastToString(List<ExprNodeDesc> childExpr, TypeInfo
+         Object constantValue = ((ExprNodeConstantDesc) child).getValue();
+         String strValue = castConstantToString(constantValue, child.getTypeInfo());
+         return getConstantVectorExpression(strValue, returnType, Mode.PROJECTION);
+-    } else if (child instanceof ExprNodeNullDesc) {
++    } else if (child instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)child).getValue()) {
+       return getConstantVectorExpression(null, returnType, Mode.PROJECTION);
+     }
+     if (inputType.equals("boolean")) {
+@@ -1514,7 +1513,7 @@ private VectorExpression getCastToDoubleExpression(Class<?> udf, List<ExprNodeDe
+         Object constantValue = ((ExprNodeConstantDesc) child).getValue();
+         Double doubleValue = castConstantToDouble(constantValue, child.getTypeInfo());
+         return getConstantVectorExpression(doubleValue, returnType, Mode.PROJECTION);
+-    } else if (child instanceof ExprNodeNullDesc) {
++    } else if (child instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)child).getValue()) {
+       return getConstantVectorExpression(null, returnType, Mode.PROJECTION);
+     }
+     if (isIntFamily(inputType)) {
+@@ -1540,7 +1539,7 @@ private VectorExpression getCastToBoolean(List<ExprNodeDesc> childExpr)
+       // Don't do constant folding here.  Wait until the optimizer is changed to do it.
+       // Family of related JIRAs: HIVE-7421, HIVE-7422, and HIVE-7424.
+       return null;
+-    } else if (child instanceof ExprNodeNullDesc) {
++    } else if (child instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)child).getValue()) {
+       return getConstantVectorExpression(null, TypeInfoFactory.booleanTypeInfo, Mode.PROJECTION);
+     }
+     // Long and double are handled using descriptors, string needs to be specially handled.
+@@ -1570,7 +1569,7 @@ private VectorExpression getCastToLongExpression(List<ExprNodeDesc> childExpr)
+         Object constantValue = ((ExprNodeConstantDesc) child).getValue();
+         Long longValue = castConstantToLong(constantValue, child.getTypeInfo());
+         return getConstantVectorExpression(longValue, TypeInfoFactory.longTypeInfo, Mode.PROJECTION);
+-    } else if (child instanceof ExprNodeNullDesc) {
++    } else if (child instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)child).getValue()) {
+       return getConstantVectorExpression(null, TypeInfoFactory.longTypeInfo, Mode.PROJECTION);
+     }
+     // Float family, timestamp are handled via descriptor based lookup, int family needs
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java
+index e988370..491a8ac 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConstantPropagateProcFactory.java
+@@ -54,7 +54,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
+ import org.apache.hadoop.hive.ql.plan.GroupByDesc;
+ import org.apache.hadoop.hive.ql.plan.JoinCondDesc;
+@@ -84,13 +83,12 @@
+ import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.WritableConstantBooleanObjectInspector;
+ import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+-import org.apache.hadoop.io.BooleanWritable;
+ 
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Lists;
+ 
+ /**
+  * Factory for generating the different node processors used by ConstantPropagate.
+@@ -140,7 +138,7 @@ public static ColumnInfo resolveColumn(RowSchema rs,
+    * @return cast constant, or null if the type cast failed.
+    */
+   private static ExprNodeConstantDesc typeCast(ExprNodeDesc desc, TypeInfo ti) {
+-    if (desc instanceof ExprNodeNullDesc) {
++    if (desc instanceof ExprNodeConstantDesc && null == ((ExprNodeConstantDesc)desc).getValue()) {
+       return null;
+     }
+     if (!(ti instanceof PrimitiveTypeInfo) || !(desc.getTypeInfo() instanceof PrimitiveTypeInfo)) {
+@@ -356,7 +354,7 @@ private static void propagate(GenericUDF udf, List<ExprNodeDesc> newExprs, RowSc
+         ExprNodeColumnDesc c = (ExprNodeColumnDesc) operand;
+         ColumnInfo ci = resolveColumn(rs, c);
+         if (ci != null) {
+-          constants.put(ci, new ExprNodeNullDesc());
++          constants.put(ci, new ExprNodeConstantDesc(ci.getType(), null));
+         }
+       }
+     }
+@@ -370,6 +368,57 @@ private static ExprNodeColumnDesc getColumnExpr(ExprNodeDesc expr) {
+   }
+ 
+   private static ExprNodeDesc shortcutFunction(GenericUDF udf, List<ExprNodeDesc> newExprs) throws UDFArgumentException {
++
++    if (udf instanceof GenericUDFOPEqual) {
++     assert newExprs.size() == 2;
++     boolean foundUDFInFirst = false;
++     ExprNodeGenericFuncDesc caseOrWhenexpr = null;
++     if (newExprs.get(0) instanceof ExprNodeGenericFuncDesc) {
++       caseOrWhenexpr = (ExprNodeGenericFuncDesc) newExprs.get(0);
++       if (caseOrWhenexpr.getGenericUDF() instanceof GenericUDFWhen || caseOrWhenexpr.getGenericUDF() instanceof GenericUDFCase) {
++         foundUDFInFirst = true;
++       }
++     }
++     if (!foundUDFInFirst && newExprs.get(1) instanceof ExprNodeGenericFuncDesc) {
++       caseOrWhenexpr = (ExprNodeGenericFuncDesc) newExprs.get(1);
++       if (!(caseOrWhenexpr.getGenericUDF() instanceof GenericUDFWhen || caseOrWhenexpr.getGenericUDF() instanceof GenericUDFCase)) {
++         return null;
++       }
++     }
++     if (null == caseOrWhenexpr) {
++       // we didn't find case or when udf
++       return null;
++     }
++     GenericUDF childUDF = caseOrWhenexpr.getGenericUDF();
++     List<ExprNodeDesc> children = caseOrWhenexpr.getChildren();
++     int i;
++     if (childUDF instanceof GenericUDFWhen) {
++       for (i = 1; i < children.size(); i+=2) {
++        children.set(i, ExprNodeGenericFuncDesc.newInstance(new GenericUDFOPEqual(),
++            Lists.newArrayList(children.get(i),newExprs.get(foundUDFInFirst ? 1 : 0))));
++      }
++       if(children.size() % 2 == 1) {
++         i = children.size()-1;
++         children.set(i, ExprNodeGenericFuncDesc.newInstance(new GenericUDFOPEqual(),
++             Lists.newArrayList(children.get(i),newExprs.get(foundUDFInFirst ? 1 : 0))));
++       }
++       return caseOrWhenexpr;
++     } else if (childUDF instanceof GenericUDFCase) {
++       for (i = 2; i < children.size(); i+=2) {
++         children.set(i, ExprNodeGenericFuncDesc.newInstance(new GenericUDFOPEqual(),
++             Lists.newArrayList(children.get(i),newExprs.get(foundUDFInFirst ? 1 : 0))));
++       }
++        if(children.size() % 2 == 0) {
++          i = children.size()-1;
++          children.set(i, ExprNodeGenericFuncDesc.newInstance(new GenericUDFOPEqual(),
++              Lists.newArrayList(children.get(i),newExprs.get(foundUDFInFirst ? 1 : 0))));
++        }
++        return caseOrWhenexpr;
++     } else {
++       // cant happen
++       return null;
++     }
++    }
+     if (udf instanceof GenericUDFOPAnd) {
+       for (int i = 0; i < 2; i++) {
+         ExprNodeDesc childExpr = newExprs.get(i);
+@@ -427,11 +476,8 @@ private static ExprNodeDesc shortcutFunction(GenericUDF udf, List<ExprNodeDesc>
+         return null;
+       }
+       ExprNodeDesc thenExpr = newExprs.get(1);
+-      if (thenExpr instanceof ExprNodeNullDesc && (newExprs.size() == 2 || newExprs.get(2) instanceof ExprNodeNullDesc)) {
+-        return thenExpr;
+-      }
+       ExprNodeDesc elseExpr = newExprs.size() == 3 ? newExprs.get(2) :
+-        new ExprNodeConstantDesc(newExprs.get(2).getTypeInfo(),null);
++        new ExprNodeConstantDesc(newExprs.get(1).getTypeInfo(),null);
+ 
+       ExprNodeDesc whenExpr = newExprs.get(0);
+       if (whenExpr instanceof ExprNodeConstantDesc) {
+@@ -449,7 +495,7 @@ private static ExprNodeDesc shortcutFunction(GenericUDF udf, List<ExprNodeDesc>
+         } else if(thenVal.equals(elseVal)){
+           return thenExpr;
+         } else if (thenVal instanceof Boolean && elseVal instanceof Boolean) {
+-          return Boolean.TRUE.equals(thenVal) ? newExprs.get(0) :
++          return Boolean.TRUE.equals(thenVal) ? whenExpr :
+             ExprNodeGenericFuncDesc.newInstance(new GenericUDFOPNot(), newExprs.subList(0, 1));
+         } else {
+           return null;
+@@ -466,10 +512,6 @@ private static ExprNodeDesc shortcutFunction(GenericUDF udf, List<ExprNodeDesc>
+         return null;
+       }
+       ExprNodeDesc thenExpr = newExprs.get(2);
+-      if (thenExpr instanceof ExprNodeNullDesc && (newExprs.size() == 3 || newExprs.get(3) instanceof ExprNodeNullDesc)) {
+-        return thenExpr;
+-      }
+-
+       ExprNodeDesc elseExpr = newExprs.size() == 4 ? newExprs.get(3) :
+         new ExprNodeConstantDesc(newExprs.get(2).getTypeInfo(),null);
+ 
+@@ -564,16 +606,14 @@ private static ExprNodeDesc evaluateFunction(GenericUDF udf, List<ExprNodeDesc>
+         }
+         Object value = constant.getValue();
+         PrimitiveTypeInfo pti = (PrimitiveTypeInfo) constant.getTypeInfo();
+-        Object writableValue =
++        Object writableValue = null == value ? value :
+             PrimitiveObjectInspectorFactory.getPrimitiveJavaObjectInspector(pti)
+                 .getPrimitiveWritableObject(value);
+         arguments[i] = new DeferredJavaObject(writableValue);
+         argois[i] =
+             ObjectInspectorUtils.getConstantObjectInspector(constant.getWritableObjectInspector(),
+                 writableValue);
+-      } else if (desc instanceof ExprNodeNullDesc) {
+-         argois[i] = desc.getWritableObjectInspector();
+-         arguments[i] = new DeferredJavaObject(((ExprNodeNullDesc) desc).getValue());
++
+       } else if (desc instanceof ExprNodeGenericFuncDesc) {
+         ExprNodeDesc evaluatedFn = foldExpr((ExprNodeGenericFuncDesc)desc);
+         if (null == evaluatedFn || !(evaluatedFn instanceof ExprNodeConstantDesc)) {
+@@ -594,11 +634,7 @@ private static ExprNodeDesc evaluateFunction(GenericUDF udf, List<ExprNodeDesc>
+       Object o = udf.evaluate(arguments);
+       LOG.debug(udf.getClass().getName() + "(" + exprs + ")=" + o);
+       if (o == null) {
+-        if (oi instanceof PrimitiveObjectInspector) {
+-
+-          return new ExprNodeConstantDesc(((PrimitiveObjectInspector) oi).getTypeInfo(), o);
+-        }
+-        return new ExprNodeNullDesc();
++        return new ExprNodeConstantDesc(TypeInfoUtils.getTypeInfoFromObjectInspector(oi), o);
+       }
+       Class<?> clz = o.getClass();
+       if (PrimitiveObjectInspectorUtils.isPrimitiveWritableClass(clz)) {
+@@ -695,7 +731,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx ctx, Object..
+           LOG.warn("Filter expression " + condn + " holds false!");
+         }
+       }
+-      if (newCondn instanceof ExprNodeNullDesc || (newCondn instanceof ExprNodeConstantDesc && ((ExprNodeConstantDesc)newCondn).getValue() == null)) {
++      if (newCondn instanceof ExprNodeConstantDesc && ((ExprNodeConstantDesc)newCondn).getValue() == null) {
+         // where null is same as where false
+         newCondn = new ExprNodeConstantDesc(Boolean.FALSE);
+       }
+@@ -1037,7 +1073,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx ctx, Object..
+         List<ExprNodeDesc> newExprs = new ArrayList<ExprNodeDesc>();
+         for (ExprNodeDesc expr : exprs) {
+           ExprNodeDesc newExpr = foldExpr(expr, constants, cppCtx, op, tag, false);
+-          if (newExpr instanceof ExprNodeConstantDesc || newExpr instanceof ExprNodeNullDesc) {
++          if (newExpr instanceof ExprNodeConstantDesc) {
+             LOG.info("expr " + newExpr + " fold from " + expr + " is removed.");
+             continue;
+           }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GroupByOptimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GroupByOptimizer.java
+index 1e47fcb..af54286 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GroupByOptimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GroupByOptimizer.java
+@@ -55,7 +55,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.GroupByDesc;
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ import org.apache.hadoop.hive.ql.plan.SelectDesc;
+@@ -340,9 +339,6 @@ protected GroupByOptimizerSortMatch checkSortGroupBy(Stack<Node> stack,
+             }
+             else {
+               tableColsMapping.remove(outputColumnName);
+-              if (selectCol instanceof ExprNodeNullDesc) {
+-                newConstantCols.add(outputColumnName);
+-              }
+               if (selectCol instanceof ExprNodeConstantDesc) {
+                 // Lets see if this constant was folded because of optimization.
+                 String origCol = ((ExprNodeConstantDesc) selectCol).getFoldedFromCol();
+@@ -380,8 +376,7 @@ protected GroupByOptimizerSortMatch checkSortGroupBy(Stack<Node> stack,
+           }
+         }
+         // Constants and nulls are OK
+-        else if ((expr instanceof ExprNodeConstantDesc) ||
+-            (expr instanceof ExprNodeNullDesc)) {
++        else if (expr instanceof ExprNodeConstantDesc) {
+           continue;
+         } else {
+           return GroupByOptimizerSortMatch.NO_MATCH;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/PrunerExpressionOperatorFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/PrunerExpressionOperatorFactory.java
+index e633fdc..306e714 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/PrunerExpressionOperatorFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/PrunerExpressionOperatorFactory.java
+@@ -30,7 +30,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ 
+ /**
+  * Expression processor factory for pruning. Each processor tries to
+@@ -182,8 +181,6 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+         Object... nodeOutputs) throws SemanticException {
+       if (nd instanceof ExprNodeConstantDesc) {
+         return ((ExprNodeConstantDesc) nd).clone();
+-      } else if (nd instanceof ExprNodeNullDesc) {
+-        return ((ExprNodeNullDesc) nd).clone();
+       }
+ 
+       return new ExprNodeConstantDesc(((ExprNodeDesc)nd).getTypeInfo(), null);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
+index 986e33b..8e9b7a3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/SimpleFetchOptimizer.java
+@@ -65,7 +65,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.FetchWork;
+ import org.apache.hadoop.hive.ql.plan.ListSinkDesc;
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+@@ -264,7 +263,6 @@ private boolean checkExpressions(SelectOperator op) {
+ 
+   private boolean checkExpression(ExprNodeDesc expr) {
+     if (expr instanceof ExprNodeConstantDesc ||
+-        expr instanceof ExprNodeNullDesc||
+         expr instanceof ExprNodeColumnDesc) {
+       return true;
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java
+index 57544f3..79d2502 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java
+@@ -59,7 +59,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDFBaseCompare;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDFBaseNumeric;
+@@ -116,9 +115,7 @@ public RexNodeConverter(RelOptCluster cluster, List<InputCtx> inpCtxLst, boolean
+   }
+ 
+   public RexNode convert(ExprNodeDesc expr) throws SemanticException {
+-    if (expr instanceof ExprNodeNullDesc) {
+-      return createNullLiteral(expr);
+-    } else if (expr instanceof ExprNodeGenericFuncDesc) {
++    if (expr instanceof ExprNodeGenericFuncDesc) {
+       return convert((ExprNodeGenericFuncDesc) expr);
+     } else if (expr instanceof ExprNodeConstantDesc) {
+       return convert((ExprNodeConstantDesc) expr);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/lineage/ExprProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/lineage/ExprProcFactory.java
+index 000993e..38040e3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/lineage/ExprProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/lineage/ExprProcFactory.java
+@@ -56,7 +56,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ 
+ /**
+@@ -143,7 +142,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+     @Override
+     public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+         Object... nodeOutputs) throws SemanticException {
+-      assert (nd instanceof ExprNodeConstantDesc || nd instanceof ExprNodeNullDesc);
++      assert (nd instanceof ExprNodeConstantDesc);
+ 
+       // Create a dependency that has no basecols
+       Dependency dep = new Dependency();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/pcr/PcrExprProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/pcr/PcrExprProcFactory.java
+index cbd4e6c..d5102bc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/pcr/PcrExprProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/pcr/PcrExprProcFactory.java
+@@ -46,7 +46,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+ import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+@@ -392,7 +391,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+     @Override
+     public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+         Object... nodeOutputs) throws SemanticException {
+-      if (nd instanceof ExprNodeConstantDesc || nd instanceof ExprNodeNullDesc) {
++      if (nd instanceof ExprNodeConstantDesc) {
+         return new NodeInfoWrapper(WalkState.CONSTANT, null,
+             (ExprNodeDesc) nd);
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/TableAccessAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/TableAccessAnalyzer.java
+index 01398f0..cc0a7d1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/TableAccessAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/TableAccessAnalyzer.java
+@@ -45,7 +45,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ import org.apache.hadoop.hive.ql.plan.SelectDesc;
+ 
+@@ -291,8 +290,7 @@ private static boolean genColNameMap(
+             continue;
+           }
+ 
+-          if ((colExpr instanceof ExprNodeConstantDesc) ||
+-            (colExpr instanceof ExprNodeNullDesc)) {
++          if (colExpr instanceof ExprNodeConstantDesc) {
+             currColNames.remove(outputColName);
+             continue;
+           } else if (colExpr instanceof ExprNodeColumnDesc) {
+@@ -317,7 +315,7 @@ private static boolean genColNameMap(
+       if (expr instanceof ExprNodeColumnDesc) {
+         ExprNodeColumnDesc colExpr = (ExprNodeColumnDesc)expr;
+         colList.add(colExpr.getColumn());
+-      } else if (expr instanceof ExprNodeConstantDesc || expr instanceof ExprNodeNullDesc) {
++      } else if (expr instanceof ExprNodeConstantDesc) {
+         continue;
+       } else {
+         return null;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java
+index a89a8bc..0d58e7a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java
+@@ -56,7 +56,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.udf.SettableUDF;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDFBaseCompare;
+@@ -75,6 +74,8 @@
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+ import org.apache.hadoop.hive.serde2.typeinfo.VarcharTypeInfo;
++import org.apache.hadoop.io.NullWritable;
++import org.apache.hive.common.util.DateUtils;
+ 
+ import com.google.common.collect.Lists;
+ 
+@@ -227,7 +228,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+         return desc;
+       }
+ 
+-      return new ExprNodeNullDesc();
++      return new ExprNodeConstantDesc(TypeInfoFactory.getPrimitiveTypeInfoFromPrimitiveWritable(NullWritable.class), null);
+     }
+ 
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
+index 89a175e..2674fe3 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
+@@ -23,12 +23,11 @@
+ import org.apache.commons.lang.builder.HashCodeBuilder;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils;
+ import org.apache.hadoop.hive.serde2.typeinfo.BaseCharTypeInfo;
+-import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+ 
+ /**
+  * A constant expression.
+@@ -83,13 +82,8 @@ public Object getValue() {
+ 
+   @Override
+   public ConstantObjectInspector getWritableObjectInspector() {
+-    PrimitiveTypeInfo pti = (PrimitiveTypeInfo) getTypeInfo();
+-    // Convert from Java to Writable
+-    Object writableValue = PrimitiveObjectInspectorFactory
+-        .getPrimitiveJavaObjectInspector(pti).getPrimitiveWritableObject(
+-          getValue());
+-    return PrimitiveObjectInspectorFactory
+-        .getPrimitiveWritableConstantObjectInspector((PrimitiveTypeInfo) getTypeInfo(), writableValue);
++    return ObjectInspectorUtils.getConstantObjectInspector(
++      TypeInfoUtils.getStandardJavaObjectInspectorFromTypeInfo(typeInfo), value);
+   }
+ 
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeNullDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeNullDesc.java
+deleted file mode 100644
+index 25b16da..0000000
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeNullDesc.java
++++ /dev/null
+@@ -1,69 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.hive.ql.plan;
+-
+-import java.io.Serializable;
+-
+-import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+-import org.apache.hadoop.io.NullWritable;
+-
+-/**
+- * ExprNodeNullDesc.
+- *
+- */
+-public class ExprNodeNullDesc extends ExprNodeDesc implements Serializable {
+-
+-  private static final long serialVersionUID = 1L;
+-
+-  public ExprNodeNullDesc() {
+-    super(TypeInfoFactory
+-        .getPrimitiveTypeInfoFromPrimitiveWritable(NullWritable.class));
+-  }
+-
+-  public Object getValue() {
+-    return null;
+-  }
+-
+-  @Override
+-  public String toString() {
+-    return "null";
+-  }
+-
+-  @Override
+-  public String getExprString() {
+-    return "null";
+-  }
+-
+-  @Override
+-  public ExprNodeDesc clone() {
+-    return new ExprNodeNullDesc();
+-  }
+-
+-  @Override
+-  public boolean isSame(Object o) {
+-    if (!(o instanceof ExprNodeNullDesc)) {
+-      return false;
+-    }
+-    if (!typeInfo.equals(((ExprNodeNullDesc) o).getTypeInfo())) {
+-      return false;
+-    }
+-
+-    return true;
+-  }
+-}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java
+index 2f7eac5..88d16c4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java
+@@ -51,7 +51,6 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+ import org.apache.hadoop.hive.ql.plan.Statistics;
+ import org.apache.hadoop.hive.ql.plan.Statistics.State;
+ import org.apache.hadoop.hive.ql.util.JavaDataModel;
+@@ -1194,13 +1193,6 @@ public static ColStatistics getColStatisticsFromExpression(HiveConf conf, Statis
+       colType = engfd.getTypeString();
+       countDistincts = numRows;
+       oi = engfd.getWritableObjectInspector();
+-    } else if (end instanceof ExprNodeNullDesc) {
+-
+-      // null projection
+-      ExprNodeNullDesc ennd = (ExprNodeNullDesc) end;
+-      colName = ennd.getName();
+-      colType = "null";
+-      numNulls = numRows;
+     } else if (end instanceof ExprNodeColumnListDesc) {
+ 
+       // column list
+@@ -1424,7 +1416,7 @@ public static long safeMult(long a, double b) {
+     double result = a * b;
+     return (result > Long.MAX_VALUE) ? Long.MAX_VALUE : (long)result;
+   }
+- 
++
+   /** Bounded addition - overflows become MAX_VALUE */
+   public static long safeAdd(long a, long b) {
+     try {
+@@ -1433,7 +1425,7 @@ public static long safeAdd(long a, long b) {
+       return Long.MAX_VALUE;
+     }
+   }
+- 
++
+   /** Bounded multiplication - overflows become MAX_VALUE */
+   public static long safeMult(long a, long b) {
+     try {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCoalesce.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCoalesce.java
+index 8890e69..aa708ce 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCoalesce.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCoalesce.java
+@@ -25,7 +25,7 @@
+ 
+ /**
+  * GenericUDF Class for SQL construct "COALESCE(a, b, c)".
+- * 
++ *
+  * NOTES: 1. a, b and c should have the same TypeInfo, or an exception will be
+  * thrown.
+  */
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFGreatest.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFGreatest.java
+index 39da1b0..a79be1b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFGreatest.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFGreatest.java
+@@ -29,6 +29,7 @@
+     + "  > SELECT _FUNC_(2, 3, 1) FROM src LIMIT 1;\n" + "  3")
+ public class GenericUDFGreatest extends GenericUDFBaseNwayCompare {
+ 
++  @Override
+   protected String getFuncName() {
+     return "greatest";
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInstr.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInstr.java
+index 0a13ac9..0f7d4d6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInstr.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFInstr.java
+@@ -34,7 +34,7 @@
+  * Generic UDF for string function <code>INSTR(str,substr)</code>. This mimcs
+  * the function from MySQL
+  * http://dev.mysql.com/doc/refman/5.1/en/string-functions.html#function_instr
+- * 
++ *
+  * <pre>
+  * usage:
+  * INSTR(str, substr)
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLocate.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLocate.java
+index 094f280..137eb3e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLocate.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFLocate.java
+@@ -34,7 +34,7 @@
+  * Generic UDF for string function <code>LOCATE(substr, str)</code>,
+  * <code>LOCATE(substr, str, start)</code>. This mimcs the function from MySQL
+  * http://dev.mysql.com/doc/refman/5.1/en/string-functions.html#function_locate
+- * 
++ *
+  * <pre>
+  * usage:
+  * LOCATE(substr, str)
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFPrintf.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFPrintf.java
+index cb6dd62..e52e431 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFPrintf.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFPrintf.java
+@@ -133,8 +133,9 @@ public Object evaluate(DeferredObject[] arguments) throws HiveException {
+       }
+     }
+     formatter.format(pattern.toString(), argumentList.toArray());
+-
+     resultText.set(sb.toString());
++    formatter.close();
++
+     return resultText;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTranslate.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTranslate.java
+index 4ac542f..2717f00 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTranslate.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFTranslate.java
+@@ -41,7 +41,7 @@
+ /**
+  * TRANSLATE(string input, string from, string to) is an equivalent function to translate in
+  * PostGresSQL. See explain extended annotation below to read more about how this UDF works
+- * 
++ *
+  */
+ @UDFType(deterministic = true)
+ //@formatter:off
+@@ -188,7 +188,7 @@ public Object evaluate(DeferredObject[] arguments) throws HiveException {
+   /**
+    * Pre-processes the from and to strings by calling {@link #populateMappings(Text, Text)} if
+    * necessary.
+-   * 
++   *
+    * @param from
+    *          from string to be used for translation
+    * @param to
+@@ -215,7 +215,7 @@ private void populateMappingsIfNecessary(Text from, Text to) {
+ 
+   /**
+    * Pre-process the from and to strings populate {@link #replacementMap} and {@link #deletionSet}.
+-   * 
++   *
+    * @param from
+    *          from string to be used for translation
+    * @param to
+@@ -255,7 +255,7 @@ private void populateMappings(Text from, Text to) {
+   /**
+    * Translates the input string based on {@link #replacementMap} and {@link #deletionSet} and
+    * returns the translated string.
+-   * 
++   *
+    * @param input
+    *          input string to perform the translation on
+    * @return translated string
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
+index f9dd801..6fa49f0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFUtils.java
+@@ -174,7 +174,7 @@ private boolean update(ObjectInspector oi, boolean isUnionAll) throws UDFArgumen
+        * that.
+        */
+       if (commonTypeInfo instanceof DecimalTypeInfo) {
+-        if ((!FunctionRegistry.isExactNumericType((PrimitiveTypeInfo) oiTypeInfo)) || 
++        if ((!FunctionRegistry.isExactNumericType((PrimitiveTypeInfo) oiTypeInfo)) ||
+             (!FunctionRegistry.isExactNumericType((PrimitiveTypeInfo) rTypeInfo))) {
+           commonTypeInfo = TypeInfoFactory.doubleTypeInfo;
+         }
+@@ -199,7 +199,9 @@ public ObjectInspector get(ObjectInspector defaultOI) {
+ 
+     /**
+      * Convert the return Object if necessary (when the ObjectInspectors of
+-     * different possibilities are not all the same).
++     * different possibilities are not all the same). If reuse is true,
++     * the result Object will be the same object as the last invocation
++     * (as long as the oi is the same)
+      */
+     public Object convertIfNecessary(Object o, ObjectInspector oi) {
+       Object converted = null;
+diff --git a/ql/src/test/queries/clientpositive/fold_eq_with_case_when.q b/ql/src/test/queries/clientpositive/fold_eq_with_case_when.q
+new file mode 100644
+index 0000000..b6b54b4
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/fold_eq_with_case_when.q
+@@ -0,0 +1,21 @@
++explain
++SELECT  
++SUM((CASE WHEN 1000000 = 0 THEN NULL ELSE l_partkey / 1000000 END)),
++SUM(1) AS `sum_number_of_records_ok` FROM lineitem  
++WHERE 
++(((CASE WHEN ('N' = l_returnflag) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('MAIL' = l_shipmode) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('O' = l_linestatus) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('NONE' = l_shipinstruct) THEN 1 ELSE 1 END) = 1) AND  
++((CASE WHEN ('All' = (CASE WHEN (l_shipmode = 'TRUCK') THEN 'East' WHEN (l_shipmode = 'MAIL') THEN 'West' WHEN (l_shipmode = 'REG AIR') THEN 'BizDev' ELSE 'Other' END)) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('AIR' = l_shipmode) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('1996-03-30' = TO_DATE(l_shipdate)) THEN 1 ELSE NULL END) = 1) AND  
++((CASE WHEN ('RAIL' = l_shipmode) THEN 1 ELSE NULL END) = 1) AND (1 = 1) AND 
++((CASE WHEN (1 = l_linenumber) THEN 1 ELSE 1 END) = 1) AND (1 = 1)) 
++GROUP BY l_orderkey;
++
++
++explain select key from src where (case key when '238' then 1 else 2 end) = 1; 
++explain select key from src where (case key when '238' then 1  when '94' then 1 else 3 end) = cast('1' as int); 
++explain select key from src where (case key when '238' then 1 else 2 end) = (case when key != '238' then 1 else 1 end); 
++explain select key from src where (case key when '238' then 1 end) = (case when key != '238' then 1 when key = '23' then 1 end); 
+diff --git a/ql/src/test/results/clientpositive/annotate_stats_filter.q.out b/ql/src/test/results/clientpositive/annotate_stats_filter.q.out
+index 695e3c2..492e302 100644
+--- a/ql/src/test/results/clientpositive/annotate_stats_filter.q.out
++++ b/ql/src/test/results/clientpositive/annotate_stats_filter.q.out
+@@ -262,7 +262,7 @@ STAGE PLANS:
+               predicate: zip is null (type: boolean)
+               Statistics: Num rows: 1 Data size: 102 Basic stats: COMPLETE Column stats: COMPLETE
+               Select Operator
+-                expressions: state (type: string), locid (type: int), null (type: void), year (type: int)
++                expressions: state (type: string), locid (type: int), null (type: bigint), year (type: int)
+                 outputColumnNames: _col0, _col1, _col2, _col3
+                 Statistics: Num rows: 1 Data size: 94 Basic stats: COMPLETE Column stats: COMPLETE
+                 File Output Operator
+@@ -721,7 +721,7 @@ STAGE PLANS:
+               predicate: ((year = 2001) and year is null) (type: boolean)
+               Statistics: Num rows: 1 Data size: 102 Basic stats: COMPLETE Column stats: COMPLETE
+               Select Operator
+-                expressions: state (type: string), locid (type: int), zip (type: bigint), null (type: void)
++                expressions: state (type: string), locid (type: int), zip (type: bigint), null (type: int)
+                 outputColumnNames: _col0, _col1, _col2, _col3
+                 Statistics: Num rows: 1 Data size: 98 Basic stats: COMPLETE Column stats: COMPLETE
+                 File Output Operator
+diff --git a/ql/src/test/results/clientpositive/fold_eq_with_case_when.q.out b/ql/src/test/results/clientpositive/fold_eq_with_case_when.q.out
+new file mode 100644
+index 0000000..45a0cb1
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/fold_eq_with_case_when.q.out
+@@ -0,0 +1,231 @@
++PREHOOK: query: explain
++SELECT  
++SUM((CASE WHEN 1000000 = 0 THEN NULL ELSE l_partkey / 1000000 END)),
++SUM(1) AS `sum_number_of_records_ok` FROM lineitem  
++WHERE 
++(((CASE WHEN ('N' = l_returnflag) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('MAIL' = l_shipmode) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('O' = l_linestatus) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('NONE' = l_shipinstruct) THEN 1 ELSE 1 END) = 1) AND  
++((CASE WHEN ('All' = (CASE WHEN (l_shipmode = 'TRUCK') THEN 'East' WHEN (l_shipmode = 'MAIL') THEN 'West' WHEN (l_shipmode = 'REG AIR') THEN 'BizDev' ELSE 'Other' END)) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('AIR' = l_shipmode) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('1996-03-30' = TO_DATE(l_shipdate)) THEN 1 ELSE NULL END) = 1) AND  
++((CASE WHEN ('RAIL' = l_shipmode) THEN 1 ELSE NULL END) = 1) AND (1 = 1) AND 
++((CASE WHEN (1 = l_linenumber) THEN 1 ELSE 1 END) = 1) AND (1 = 1)) 
++GROUP BY l_orderkey
++PREHOOK: type: QUERY
++POSTHOOK: query: explain
++SELECT  
++SUM((CASE WHEN 1000000 = 0 THEN NULL ELSE l_partkey / 1000000 END)),
++SUM(1) AS `sum_number_of_records_ok` FROM lineitem  
++WHERE 
++(((CASE WHEN ('N' = l_returnflag) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('MAIL' = l_shipmode) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('O' = l_linestatus) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('NONE' = l_shipinstruct) THEN 1 ELSE 1 END) = 1) AND  
++((CASE WHEN ('All' = (CASE WHEN (l_shipmode = 'TRUCK') THEN 'East' WHEN (l_shipmode = 'MAIL') THEN 'West' WHEN (l_shipmode = 'REG AIR') THEN 'BizDev' ELSE 'Other' END)) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('AIR' = l_shipmode) THEN 1 ELSE 1 END) = 1) AND 
++((CASE WHEN ('1996-03-30' = TO_DATE(l_shipdate)) THEN 1 ELSE NULL END) = 1) AND  
++((CASE WHEN ('RAIL' = l_shipmode) THEN 1 ELSE NULL END) = 1) AND (1 = 1) AND 
++((CASE WHEN (1 = l_linenumber) THEN 1 ELSE 1 END) = 1) AND (1 = 1)) 
++GROUP BY l_orderkey
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: lineitem
++            Statistics: Num rows: 100 Data size: 11999 Basic stats: COMPLETE Column stats: NONE
++            Filter Operator
++              predicate: (CASE WHEN (('1996-03-30' = to_date(l_shipdate))) THEN (true) ELSE (null) END and CASE WHEN (('RAIL' = l_shipmode)) THEN (true) ELSE (null) END) (type: boolean)
++              Statistics: Num rows: 25 Data size: 2999 Basic stats: COMPLETE Column stats: NONE
++              Select Operator
++                expressions: l_orderkey (type: int), (UDFToDouble(l_partkey) / 1000000.0) (type: double)
++                outputColumnNames: _col0, _col1
++                Statistics: Num rows: 25 Data size: 2999 Basic stats: COMPLETE Column stats: NONE
++                Group By Operator
++                  aggregations: sum(_col1), sum(1)
++                  keys: _col0 (type: int)
++                  mode: hash
++                  outputColumnNames: _col0, _col1, _col2
++                  Statistics: Num rows: 25 Data size: 2999 Basic stats: COMPLETE Column stats: NONE
++                  Reduce Output Operator
++                    key expressions: _col0 (type: int)
++                    sort order: +
++                    Map-reduce partition columns: _col0 (type: int)
++                    Statistics: Num rows: 25 Data size: 2999 Basic stats: COMPLETE Column stats: NONE
++                    value expressions: _col1 (type: double), _col2 (type: bigint)
++      Reduce Operator Tree:
++        Group By Operator
++          aggregations: sum(VALUE._col0), sum(VALUE._col1)
++          keys: KEY._col0 (type: int)
++          mode: mergepartial
++          outputColumnNames: _col0, _col1, _col2
++          Statistics: Num rows: 12 Data size: 1439 Basic stats: COMPLETE Column stats: NONE
++          Select Operator
++            expressions: _col1 (type: double), _col2 (type: bigint)
++            outputColumnNames: _col0, _col1
++            Statistics: Num rows: 12 Data size: 1439 Basic stats: COMPLETE Column stats: NONE
++            File Output Operator
++              compressed: false
++              Statistics: Num rows: 12 Data size: 1439 Basic stats: COMPLETE Column stats: NONE
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: explain select key from src where (case key when '238' then 1 else 2 end) = 1
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key from src where (case key when '238' then 1 else 2 end) = 1
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: src
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            Filter Operator
++              predicate: (key = '238') (type: boolean)
++              Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++              Select Operator
++                expressions: key (type: string)
++                outputColumnNames: _col0
++                Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                File Output Operator
++                  compressed: false
++                  Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                  table:
++                      input format: org.apache.hadoop.mapred.TextInputFormat
++                      output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                      serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: explain select key from src where (case key when '238' then 1  when '94' then 1 else 3 end) = cast('1' as int)
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key from src where (case key when '238' then 1  when '94' then 1 else 3 end) = cast('1' as int)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: src
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            Filter Operator
++              predicate: CASE (key) WHEN ('238') THEN (true) WHEN ('94') THEN (true) ELSE (false) END (type: int)
++              Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++              Select Operator
++                expressions: key (type: string)
++                outputColumnNames: _col0
++                Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                File Output Operator
++                  compressed: false
++                  Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                  table:
++                      input format: org.apache.hadoop.mapred.TextInputFormat
++                      output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                      serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: explain select key from src where (case key when '238' then 1 else 2 end) = (case when key != '238' then 1 else 1 end)
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key from src where (case key when '238' then 1 else 2 end) = (case when key != '238' then 1 else 1 end)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: src
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            Filter Operator
++              predicate: (key = '238') (type: boolean)
++              Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++              Select Operator
++                expressions: key (type: string)
++                outputColumnNames: _col0
++                Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                File Output Operator
++                  compressed: false
++                  Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                  table:
++                      input format: org.apache.hadoop.mapred.TextInputFormat
++                      output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                      serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
++PREHOOK: query: explain select key from src where (case key when '238' then 1 end) = (case when key != '238' then 1 when key = '23' then 1 end)
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select key from src where (case key when '238' then 1 end) = (case when key != '238' then 1 when key = '23' then 1 end)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: src
++            Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
++            Filter Operator
++              predicate: CASE (key) WHEN ('238') THEN (CASE WHEN ((key <> '238')) THEN ((1 = 1)) WHEN ((key = '23')) THEN ((1 = 1)) END) END (type: int)
++              Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++              Select Operator
++                expressions: key (type: string)
++                outputColumnNames: _col0
++                Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                File Output Operator
++                  compressed: false
++                  Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
++                  table:
++                      input format: org.apache.hadoop.mapred.TextInputFormat
++                      output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                      serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        ListSink
++
+diff --git a/ql/src/test/results/clientpositive/fold_when.q.out b/ql/src/test/results/clientpositive/fold_when.q.out
+index 67c349f..e169697 100644
+--- a/ql/src/test/results/clientpositive/fold_when.q.out
++++ b/ql/src/test/results/clientpositive/fold_when.q.out
+@@ -153,7 +153,7 @@ STAGE PLANS:
+             alias: src
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+-              predicate: (CASE WHEN ((key = '238')) THEN (1) ELSE (null) END = 1) (type: boolean)
++              predicate: CASE WHEN ((key = '238')) THEN (true) ELSE (null) END (type: int)
+               Statistics: Num rows: 250 Data size: 2656 Basic stats: COMPLETE Column stats: NONE
+               Select Operator
+                 expressions: key (type: string)
+diff --git a/ql/src/test/results/clientpositive/input6.q.out b/ql/src/test/results/clientpositive/input6.q.out
+index 38c9fe1..5ed2767 100644
+--- a/ql/src/test/results/clientpositive/input6.q.out
++++ b/ql/src/test/results/clientpositive/input6.q.out
+@@ -35,7 +35,7 @@ STAGE PLANS:
+               predicate: key is null (type: boolean)
+               Statistics: Num rows: 12 Data size: 91 Basic stats: COMPLETE Column stats: NONE
+               Select Operator
+-                expressions: null (type: void), value (type: string)
++                expressions: null (type: string), value (type: string)
+                 outputColumnNames: _col0, _col1
+                 Statistics: Num rows: 12 Data size: 91 Basic stats: COMPLETE Column stats: NONE
+                 File Output Operator
+diff --git a/ql/src/test/results/clientpositive/join_nullsafe.q.out b/ql/src/test/results/clientpositive/join_nullsafe.q.out
+index 9bdfcbd..27ceae5 100644
+--- a/ql/src/test/results/clientpositive/join_nullsafe.q.out
++++ b/ql/src/test/results/clientpositive/join_nullsafe.q.out
+@@ -1523,9 +1523,9 @@ STAGE PLANS:
+               predicate: key is null (type: boolean)
+               Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+               Reduce Output Operator
+-                key expressions: null (type: void)
++                key expressions: null (type: int)
+                 sort order: +
+-                Map-reduce partition columns: null (type: void)
++                Map-reduce partition columns: null (type: int)
+                 Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                 value expressions: value (type: int)
+           TableScan
+@@ -1535,9 +1535,9 @@ STAGE PLANS:
+               predicate: value is null (type: boolean)
+               Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+               Reduce Output Operator
+-                key expressions: null (type: void)
++                key expressions: null (type: int)
+                 sort order: +
+-                Map-reduce partition columns: null (type: void)
++                Map-reduce partition columns: null (type: int)
+                 Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                 value expressions: key (type: int)
+       Reduce Operator Tree:
+@@ -1551,7 +1551,7 @@ STAGE PLANS:
+           outputColumnNames: _col1, _col5
+           Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+           Select Operator
+-            expressions: null (type: void), _col1 (type: int), _col5 (type: int), null (type: void)
++            expressions: null (type: int), _col1 (type: int), _col5 (type: int), null (type: int)
+             outputColumnNames: _col0, _col1, _col2, _col3
+             Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+             File Output Operator
+diff --git a/ql/src/test/results/clientpositive/spark/join_nullsafe.q.out b/ql/src/test/results/clientpositive/spark/join_nullsafe.q.out
+index 96db301..70459f7 100644
+--- a/ql/src/test/results/clientpositive/spark/join_nullsafe.q.out
++++ b/ql/src/test/results/clientpositive/spark/join_nullsafe.q.out
+@@ -1576,9 +1576,9 @@ STAGE PLANS:
+                     predicate: key is null (type: boolean)
+                     Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                     Reduce Output Operator
+-                      key expressions: null (type: void)
++                      key expressions: null (type: int)
+                       sort order: +
+-                      Map-reduce partition columns: null (type: void)
++                      Map-reduce partition columns: null (type: int)
+                       Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                       value expressions: value (type: int)
+         Map 3 
+@@ -1590,9 +1590,9 @@ STAGE PLANS:
+                     predicate: value is null (type: boolean)
+                     Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                     Reduce Output Operator
+-                      key expressions: null (type: void)
++                      key expressions: null (type: int)
+                       sort order: +
+-                      Map-reduce partition columns: null (type: void)
++                      Map-reduce partition columns: null (type: int)
+                       Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                       value expressions: key (type: int)
+         Reducer 2 
+@@ -1607,7 +1607,7 @@ STAGE PLANS:
+                 outputColumnNames: _col1, _col5
+                 Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                 Select Operator
+-                  expressions: null (type: void), _col1 (type: int), _col5 (type: int), null (type: void)
++                  expressions: null (type: int), _col1 (type: int), _col5 (type: int), null (type: int)
+                   outputColumnNames: _col0, _col1, _col2, _col3
+                   Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                   File Output Operator
+diff --git a/ql/src/test/results/clientpositive/subquery_notin_having.q.java1.7.out b/ql/src/test/results/clientpositive/subquery_notin_having.q.java1.7.out
+index 5d06c22..a1409b6 100644
+--- a/ql/src/test/results/clientpositive/subquery_notin_having.q.java1.7.out
++++ b/ql/src/test/results/clientpositive/subquery_notin_having.q.java1.7.out
+@@ -658,7 +658,7 @@ STAGE PLANS:
+               predicate: p_mfgr is null (type: boolean)
+               Statistics: Num rows: 13 Data size: 1573 Basic stats: COMPLETE Column stats: NONE
+               Select Operator
+-                expressions: null (type: void), p_retailprice (type: double)
++                expressions: null (type: string), p_retailprice (type: double)
+                 outputColumnNames: _col0, _col1
+                 Statistics: Num rows: 13 Data size: 1573 Basic stats: COMPLETE Column stats: NONE
+                 Group By Operator
+diff --git a/ql/src/test/results/clientpositive/tez/join_nullsafe.q.out b/ql/src/test/results/clientpositive/tez/join_nullsafe.q.out
+index 787f1f5..6fadf5a 100644
+--- a/ql/src/test/results/clientpositive/tez/join_nullsafe.q.out
++++ b/ql/src/test/results/clientpositive/tez/join_nullsafe.q.out
+@@ -1576,9 +1576,9 @@ STAGE PLANS:
+                     predicate: key is null (type: boolean)
+                     Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                     Reduce Output Operator
+-                      key expressions: null (type: void)
++                      key expressions: null (type: int)
+                       sort order: +
+-                      Map-reduce partition columns: null (type: void)
++                      Map-reduce partition columns: null (type: int)
+                       Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                       value expressions: value (type: int)
+         Map 3 
+@@ -1590,9 +1590,9 @@ STAGE PLANS:
+                     predicate: value is null (type: boolean)
+                     Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                     Reduce Output Operator
+-                      key expressions: null (type: void)
++                      key expressions: null (type: int)
+                       sort order: +
+-                      Map-reduce partition columns: null (type: void)
++                      Map-reduce partition columns: null (type: int)
+                       Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                       value expressions: key (type: int)
+         Reducer 2 
+@@ -1601,13 +1601,13 @@ STAGE PLANS:
+                 condition map:
+                      Inner Join 0 to 1
+                 keys:
+-                  0 null (type: void)
+-                  1 null (type: void)
++                  0 null (type: int)
++                  1 null (type: int)
+                 nullSafes: [true]
+                 outputColumnNames: _col1, _col5
+                 Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                 Select Operator
+-                  expressions: null (type: void), _col1 (type: int), _col5 (type: int), null (type: void)
++                  expressions: null (type: int), _col1 (type: int), _col5 (type: int), null (type: int)
+                   outputColumnNames: _col0, _col1, _col2, _col3
+                   Statistics: Num rows: 1 Data size: 8 Basic stats: COMPLETE Column stats: NONE
+                   File Output Operator
+diff --git a/ql/src/test/results/clientpositive/tez/vector_coalesce.q.out b/ql/src/test/results/clientpositive/tez/vector_coalesce.q.out
+index a131ab9..a5a36dd 100644
+--- a/ql/src/test/results/clientpositive/tez/vector_coalesce.q.out
++++ b/ql/src/test/results/clientpositive/tez/vector_coalesce.q.out
+@@ -19,7 +19,7 @@ STAGE PLANS:
+           Filter Operator
+             predicate: cdouble is null (type: boolean)
+             Select Operator
+-              expressions: null (type: void), cstring1 (type: string), cint (type: int), cfloat (type: float), csmallint (type: smallint), COALESCE(null,cstring1,cint,cfloat,csmallint) (type: string)
++              expressions: null (type: double), cstring1 (type: string), cint (type: int), cfloat (type: float), csmallint (type: smallint), COALESCE(null,cstring1,cint,cfloat,csmallint) (type: string)
+               outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5
+               Limit
+                 Number of rows: 10
+@@ -117,7 +117,7 @@ STAGE PLANS:
+           Filter Operator
+             predicate: (cfloat is null and cbigint is null) (type: boolean)
+             Select Operator
+-              expressions: null (type: void), null (type: void), 0 (type: int)
++              expressions: null (type: float), null (type: bigint), 0.0 (type: float)
+               outputColumnNames: _col0, _col1, _col2
+               Limit
+                 Number of rows: 10
+@@ -135,16 +135,16 @@ WHERE (cfloat IS NULL AND cbigint IS NULL) LIMIT 10
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@alltypesorc
+ #### A masked pattern was here ####
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
+-NULL	NULL	0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
++NULL	NULL	0.0
+ PREHOOK: query: EXPLAIN SELECT ctimestamp1, ctimestamp2, coalesce(ctimestamp1, ctimestamp2) 
+ FROM alltypesorc 
+ WHERE ctimestamp1 IS NOT NULL OR ctimestamp2 IS NOT NULL LIMIT 10
+diff --git a/ql/src/test/results/clientpositive/vector_coalesce.q.out b/ql/src/test/results/clientpositive/vector_coalesce.q.out
+index 537a236..3d02c09 100644
+--- a/ql/src/test/results/clientpositive/vector_coalesce.q.out
++++ b/ql/src/test/results/clientpositive/vector_coalesce.q.out
+@@ -21,7 +21,7 @@ STAGE PLANS:
+               predicate: cdouble is null (type: boolean)
+               Statistics: Num rows: 6144 Data size: 188618 Basic stats: COMPLETE Column stats: NONE
+               Select Operator
+-                expressions: null (type: void), cstring1 (type: string), cint (type: int), cfloat (type: float), csmallint (type: smallint), COALESCE(null,cstring1,cint,cfloat,csmallint) (type: string)
++                expressions: null (type: double), cstring1 (type: string), cint (type: int), cfloat (type: float), csmallint (type: smallint), COALESCE(null,cstring1,cint,cfloat,csmallint) (type: string)
+                 outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5
+                 Statistics: Num rows: 6144 Data size: 188618 Basic stats: COMPLETE Column stats: NONE
+                 Limit
+@@ -153,7 +153,7 @@ STAGE PLANS:
+               predicate: (cfloat is null and cbigint is null) (type: boolean)
+               Statistics: Num rows: 3072 Data size: 94309 Basic stats: COMPLETE Column stats: NONE
+               Select Operator
+-                expressions: null (type: void), null (type: void), 0 (type: int)
++                expressions: null (type: float), null (type: bigint), 0.0 (type: float)
+                 outputColumnNames: _col0, _col1, _col2
+                 Statistics: Num rows: 3072 Data size: 94309 Basic stats: COMPLETE Column stats: NONE
+                 Limit
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/io/HiveVarcharWritable.java b/serde/src/java/org/apache/hadoop/hive/serde2/io/HiveVarcharWritable.java
+index a165b84..2e24730 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/io/HiveVarcharWritable.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/io/HiveVarcharWritable.java
+@@ -17,14 +17,8 @@
+  */
+ package org.apache.hadoop.hive.serde2.io;
+ 
+-import java.io.DataInput;
+-import java.io.DataOutput;
+-import java.io.IOException;
+-
+ import org.apache.hadoop.hive.common.type.HiveBaseChar;
+ import org.apache.hadoop.hive.common.type.HiveVarchar;
+-import org.apache.hadoop.hive.shims.ShimLoader;
+-import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.WritableComparable;
+ 
+ public class HiveVarcharWritable extends HiveBaseCharWritable
+@@ -74,6 +68,7 @@ public void enforceMaxLength(int maxLength) {
+     set(getHiveVarchar(), maxLength);
+   }
+ 
++  @Override
+   public int compareTo(HiveVarcharWritable rhs) {
+     return value.compareTo(rhs.value);
+   }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorConverters.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorConverters.java
+index 824527f..39a9d1a 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorConverters.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorConverters.java
+@@ -60,6 +60,7 @@
+    *
+    */
+   public static class IdentityConverter implements Converter {
++    @Override
+     public Object convert(Object input) {
+       return input;
+     }
+@@ -126,7 +127,7 @@ private static Converter getConverter(PrimitiveObjectInspector inputOI,
+           (SettableBinaryObjectInspector)outputOI);
+     case DECIMAL:
+       return new PrimitiveObjectInspectorConverter.HiveDecimalConverter(
+-          (PrimitiveObjectInspector) inputOI,
++          inputOI,
+           (SettableHiveDecimalObjectInspector) outputOI);
+     default:
+       throw new RuntimeException("Hive internal error: conversion of "
+@@ -229,7 +230,7 @@ public static ObjectInspector getConvertedOI(
+       // Create a writable object inspector for primitive type and return it.
+       PrimitiveObjectInspector primOutputOI = (PrimitiveObjectInspector) outputOI;
+       return PrimitiveObjectInspectorFactory.getPrimitiveWritableObjectInspector(
+-          (PrimitiveTypeInfo)primOutputOI.getTypeInfo());
++          primOutputOI.getTypeInfo());
+     case STRUCT:
+       StructObjectInspector structOutputOI = (StructObjectInspector) outputOI;
+       // create a standard settable struct object inspector.
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java
+index be12a59..2874ca6 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorUtils.java
+@@ -1073,10 +1073,10 @@ public static boolean compareTypes(ObjectInspector o1, ObjectInspector o2) {
+ 
+   public static ConstantObjectInspector getConstantObjectInspector(ObjectInspector oi, Object value) {
+     if (oi instanceof ConstantObjectInspector) {
+-      return (ConstantObjectInspector) oi;  
++      return (ConstantObjectInspector) oi;
+     }
+     ObjectInspector writableOI = getStandardObjectInspector(oi, ObjectInspectorCopyOption.WRITABLE);
+-    Object writableValue =
++    Object writableValue = value == null ? value :
+       ObjectInspectorConverters.getConverter(oi, writableOI).convert(value);
+     switch (writableOI.getCategory()) {
+       case PRIMITIVE:
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/AbstractPrimitiveObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/AbstractPrimitiveObjectInspector.java
+index baa4a94..0cbd30e 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/AbstractPrimitiveObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/AbstractPrimitiveObjectInspector.java
+@@ -83,6 +83,7 @@ public String getTypeName() {
+     return typeInfo.getTypeName();
+   }
+ 
++  @Override
+   public PrimitiveTypeInfo getTypeInfo() {
+     return this.typeInfo;
+   }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/WritableVoidObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/WritableVoidObjectInspector.java
+index f3f4838..8ffc91d 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/WritableVoidObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/primitive/WritableVoidObjectInspector.java
+@@ -46,4 +46,9 @@ public Object getWritableConstantValue() {
+   public Object getPrimitiveJavaObject(Object o) {
+     return null;
+   }
++
++  @Override
++  public boolean equals(Object obj) {
++    return null != obj && obj instanceof WritableVoidObjectInspector;
++  }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,391 @@
+From c448cd7d0f1112b2823efd81bff99f1d04d8bff1 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Fri, 26 Aug 2016 15:25:24 -0700
+Subject: [PATCH 0915/1164] CDH-48084 : HIVE-14561. Minor ptest2 improvements.
+ (Siddharth Seth, reviewed by Prasanth
+ Jayachandran)
+
+Change-Id: I42de32b07f63e0281bb635ffd4e91f1004b49b55
+---
+ testutils/ptest2/pom.xml                           |    5 ++--
+ .../apache/hive/ptest/api/client/PTestClient.java  |   22 ++++++++++-----
+ .../hive/ptest/api/server/ExecutionController.java |    4 +++
+ .../apache/hive/ptest/api/server/TestExecutor.java |    6 +++--
+ .../apache/hive/ptest/api/server/TestLogger.java   |    8 ++++++
+ .../apache/hive/ptest/execution/HostExecutor.java  |   16 +++++------
+ .../apache/hive/ptest/execution/LocalCommand.java  |    4 +--
+ .../org/apache/hive/ptest/execution/PTest.java     |    4 ++-
+ .../conf/ExecutionContextConfiguration.java        |   12 +++++++++
+ .../ptest/execution/conf/TestConfiguration.java    |   28 ++++++++++++++++++++
+ .../hive/ptest/execution/conf/TestParser.java      |   10 ++++++-
+ .../context/FixedExecutionContextProvider.java     |    6 ++++-
+ 12 files changed, 101 insertions(+), 24 deletions(-)
+
+diff --git a/testutils/ptest2/pom.xml b/testutils/ptest2/pom.xml
+index 2ec89c7..cdf6cc4 100644
+--- a/testutils/ptest2/pom.xml
++++ b/testutils/ptest2/pom.xml
+@@ -26,6 +26,7 @@ limitations under the License.
+   <name>hive-ptest</name>
+   <properties>
+     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
++    <spring.framework.version>3.2.16.RELEASE</spring.framework.version>
+   </properties>
+ 
+   <repositories>
+@@ -141,12 +142,12 @@ limitations under the License.
+     <dependency>
+       <groupId>org.springframework</groupId>
+       <artifactId>spring-web</artifactId>
+-      <version>3.2.1.RELEASE</version>
++      <version>${spring.framework.version}</version>
+     </dependency>
+     <dependency>
+       <groupId>org.springframework</groupId>
+       <artifactId>spring-webmvc</artifactId>
+-      <version>3.2.1.RELEASE</version>
++      <version>${spring.framework.version}</version>
+     </dependency>
+     <dependency>
+       <groupId>xml-apis</groupId>
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/client/PTestClient.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/client/PTestClient.java
+index 14a639a..8e2604d 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/client/PTestClient.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/client/PTestClient.java
+@@ -90,13 +90,21 @@
+   private final String mLogsEndpoint;
+   private final ObjectMapper mMapper;
+   private final DefaultHttpClient mHttpClient;
++  private final String testOutputDir;
+ 
+-  public PTestClient(String logsEndpoint, String apiEndPoint, String password)
++  public PTestClient(String logsEndpoint, String apiEndPoint, String password, String testOutputDir)
+       throws MalformedURLException {
+-    if (logsEndpoint.endsWith("/")) {
+-      this.mLogsEndpoint = logsEndpoint;
++    this.testOutputDir = testOutputDir;
++    if (!Strings.isNullOrEmpty(testOutputDir)) {
++      Preconditions.checkArgument(!Strings.isNullOrEmpty(logsEndpoint),
++          "logsEndPoint must be specified if " + OUTPUT_DIR + " is specified");
++      if (logsEndpoint.endsWith("/")) {
++        this.mLogsEndpoint = logsEndpoint;
++      } else {
++        this.mLogsEndpoint = logsEndpoint + "/";
++      }
+     } else {
+-      this.mLogsEndpoint = logsEndpoint + "/";
++      this.mLogsEndpoint = null;
+     }
+     if(apiEndPoint.endsWith("/")) {
+       this.mApiEndPoint = apiEndPoint + "api/v1";
+@@ -111,7 +119,7 @@ public PTestClient(String logsEndpoint, String apiEndPoint, String password)
+         new UsernamePasswordCredentials("hive", password));
+   }
+   public boolean testStart(String profile, String testHandle,
+-      String jira, String patch, String testOutputDir, boolean clearLibraryCache)
++      String jira, String patch, boolean clearLibraryCache)
+           throws Exception {
+     patch = Strings.nullToEmpty(patch).trim();
+     if(!patch.isEmpty()) {
+@@ -301,7 +309,7 @@ public static void main(String[] args) throws Exception {
+         ENDPOINT
+     });
+     PTestClient client = new PTestClient(commandLine.getOptionValue(LOGS_ENDPOINT), commandLine.getOptionValue(ENDPOINT),
+-        commandLine.getOptionValue(PASSWORD));
++        commandLine.getOptionValue(PASSWORD), commandLine.getOptionValue(OUTPUT_DIR));
+     String command = commandLine.getOptionValue(COMMAND);
+     boolean result;
+     if("testStart".equalsIgnoreCase(command)) {
+@@ -310,7 +318,7 @@ public static void main(String[] args) throws Exception {
+           TEST_HANDLE
+       });
+       result = client.testStart(commandLine.getOptionValue(PROFILE), commandLine.getOptionValue(TEST_HANDLE),
+-          commandLine.getOptionValue(JIRA), commandLine.getOptionValue(PATCH), commandLine.getOptionValue(OUTPUT_DIR),
++          commandLine.getOptionValue(JIRA), commandLine.getOptionValue(PATCH),
+           commandLine.hasOption(CLEAR_LIBRARY_CACHE));
+     } else if("testTailLog".equalsIgnoreCase(command)) {
+       result = client.testTailLog(commandLine.getOptionValue(TEST_HANDLE));
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/ExecutionController.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/ExecutionController.java
+index 279cd72..2f96ad0 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/ExecutionController.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/ExecutionController.java
+@@ -57,6 +57,8 @@
+ import com.google.common.collect.Lists;
+ 
+ 
++
++
+ /**
+  * Server interface of the ptest environment. Each request
+  * is converted from JSON and each response is returned in JSON.
+@@ -79,7 +81,9 @@ public ExecutionController()
+       throws IOException {
+     String executionContextConfigurationFile = System.getProperty(CONF_PROPERTY, "").trim();
+     Preconditions.checkArgument(!executionContextConfigurationFile.isEmpty(), CONF_PROPERTY + " is required");
++    LOG.info("Reading configuration from file: " + executionContextConfigurationFile);
+     mExecutionContextConfiguration = ExecutionContextConfiguration.fromFile(executionContextConfigurationFile);
++    LOG.info("ExecutionContext is [{}]", mExecutionContextConfiguration);
+     mExecutionContextProvider = mExecutionContextConfiguration.getExecutionContextProvider();
+     mTests = Collections.synchronizedMap(new LinkedHashMap<String, Test>() {
+       private static final long serialVersionUID = 1L;
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestExecutor.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestExecutor.java
+index 2d0939d..a33d222 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestExecutor.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestExecutor.java
+@@ -98,7 +98,9 @@ public void run() {
+           File profileConfFile = new File(mExecutionContextConfiguration.getProfileDirectory(),
+               String.format("%s.properties", profile));
+           if(!profileConfFile.isFile()) {
+-            test.setStatus(Status.illegalArgument("Profile " + profile + " not found"));
++            test.setStatus(Status.illegalArgument(
++                "Profile " + profile + " not found in directory " +
++                    mExecutionContextConfiguration.getProfileDirectory()));
+             test.setExecutionFinishTime(System.currentTimeMillis());
+           } else {
+             File logDir = Dirs.create(new File(mExecutionContextConfiguration.
+@@ -124,7 +126,7 @@ public void run() {
+               test.setStatus(Status.failed("Tests failed with exit code " + result));
+             }
+             logStream.flush();
+-            // if all drones where abandoned on a host, replace it
++            // if all drones where abandoned on a host, try replacing them.
+             mExecutionContext.replaceBadHosts();
+           }
+         }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestLogger.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestLogger.java
+index d8c6d2e..ca2c8a3 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestLogger.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/api/server/TestLogger.java
+@@ -225,6 +225,10 @@ private String getCaller() {
+     return "<unknown>";
+   }
+ 
++  private String getThreadName() {
++    return Thread.currentThread().getName();
++  }
++
+   private String getCallerShortName(StackTraceElement frame) {
+     String className = frame.getClassName();
+     String methodName = frame.getMethodName();
+@@ -242,6 +246,10 @@ private synchronized void log(LEVEL level, String msg, Throwable t) {
+       mLog.print(" ");
+       mLog.print(String.format("%5s", level.name()));
+       mLog.print(" ");
++      mLog.print("[");
++      mLog.print(getThreadName());
++      mLog.print("]");
++      mLog.print(" ");
+       mLog.print(getCaller());
+       mLog.print(" ");
+       mLog.print(msg);
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+index 735b261..9e638a3 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+@@ -109,10 +109,10 @@ public Void call() throws Exception {
+           executeTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults);
+         } finally {
+           stopwatch.stop();
+-          mLogger.info("Finishing submitTests on host: {}. ElapsedTime(seconds)={}," +
++          mLogger.info("Finishing submitTests on host: {}. ElapsedTime(ms)={}," +
+               " NumParallelBatchesProcessed={}, NumIsolatedBatchesProcessed={}",
+               new Object[]{getHost().toString(),
+-                  stopwatch.elapsed(TimeUnit.SECONDS), numParallelBatchesProcessed,
++                  stopwatch.elapsed(TimeUnit.MILLISECONDS), numParallelBatchesProcessed,
+                   numIsolatedBatchesProcessed});
+         }
+         return null;
+@@ -174,8 +174,8 @@ public Void call() throws Exception {
+                   }
+                 } finally {
+                   sw.stop();
+-                  mLogger.info("Finished processing parallel batch [{}] on host {}. ElapsedTime(seconds)={}",
+-                      new Object[]{batch.getName(), getHost().toShortString(), sw.elapsed(TimeUnit.SECONDS)});
++                  mLogger.info("Finished processing parallel batch [{}] on host {}. ElapsedTime(ms)={}",
++                      new Object[]{batch.getName(), getHost().toShortString(), sw.elapsed(TimeUnit.MILLISECONDS)});
+                 }
+               }
+             } while(!mShutdown && !parallelWorkQueue.isEmpty());
+@@ -213,8 +213,8 @@ public Void call() throws Exception {
+               }
+             } finally {
+               sw.stop();
+-              mLogger.info("Finished processing isolated batch [{}] on host {}. ElapsedTime(seconds)={}",
+-                  new Object[]{batch.getName(), getHost().toShortString(), sw.elapsed(TimeUnit.SECONDS)});
++              mLogger.info("Finished processing isolated batch [{}] on host {}. ElapsedTime(ms)={}",
++                  new Object[]{batch.getName(), getHost().toShortString(), sw.elapsed(TimeUnit.MILLISECONDS)});
+             }
+           }
+         } while(!mShutdown && !isolatedWorkQueue.isEmpty());
+@@ -254,9 +254,9 @@ private boolean executeTestBatch(Drone drone, TestBatch batch, Set<TestBatch> fa
+         drone.getHost(), drone.getInstance(), command, true).
+         call();
+     sw.stop();
+-    mLogger.info("Completed executing tests for batch [{}] on host {}. ElapsedTime(seconds)={}",
++    mLogger.info("Completed executing tests for batch [{}] on host {}. ElapsedTime(ms)={}",
+         new Object[]{batch.getName(),
+-            getHost().toShortString(), sw.elapsed(TimeUnit.SECONDS)});
++            getHost().toShortString(), sw.elapsed(TimeUnit.MILLISECONDS)});
+     File batchLogDir = null;
+     if(sshResult.getExitCode() == Constants.EXIT_CODE_UNKNOWN) {
+       throw new AbortDroneException("Drone " + drone.toString() + " exited with " +
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java
+index de9fe68..e5894b5 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java
+@@ -64,9 +64,9 @@ private void awaitProcessCompletion() throws InterruptedException {
+         exitCode = process.waitFor();
+         if (stopwatch.isRunning()) {
+           stopwatch.stop();
+-          logger.info("Finished LocalCommandId={}. ElapsedTime(seconds)={}", commandId,
++          logger.info("Finished LocalCommandId={}. ElapsedTime(ms)={}", commandId,
+               stopwatch.elapsed(
+-                  TimeUnit.SECONDS));
++                  TimeUnit.MILLISECONDS));
+         }
+       }
+     }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+index 696b790..8fd1db8 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+@@ -33,6 +33,7 @@
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ 
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.apache.commons.cli.CommandLine;
+ import org.apache.commons.cli.CommandLineParser;
+ import org.apache.commons.cli.GnuParser;
+@@ -93,7 +94,8 @@ public PTest(final TestConfiguration configuration, final ExecutionContext execu
+     mExecutionContext = executionContext;
+     mSshCommandExecutor = sshCommandExecutor;
+     mRsyncCommandExecutor = rsyncCommandExecutor;
+-    mExecutor = MoreExecutors.listeningDecorator(Executors.newCachedThreadPool());
++    mExecutor = MoreExecutors.listeningDecorator(Executors.newCachedThreadPool(
++        new ThreadFactoryBuilder().setDaemon(true).setNameFormat("HostExecutor %d").build()));
+     final File failedLogDir = Dirs.create(new File(logDir, "failed"));
+     final File succeededLogDir = Dirs.create(new File(logDir, "succeeded"));
+     final File scratchDir = Dirs.createEmpty(new File(mExecutionContext.getLocalWorkingDirectory(), "scratch"));
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/ExecutionContextConfiguration.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/ExecutionContextConfiguration.java
+index 945ad77..35ddd44 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/ExecutionContextConfiguration.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/ExecutionContextConfiguration.java
+@@ -103,4 +103,16 @@ public static ExecutionContextConfiguration fromFile(String file) throws IOExcep
+       in.close();
+     }
+   }
++
++  @Override
++  public String toString() {
++    return "ExecutionContextConfiguration{" +
++        "mExecutionContextProvider=" + mExecutionContextProvider +
++        ", mWorkingDirectory='" + mWorkingDirectory + '\'' +
++        ", mGlobalLogDirectory='" + mGlobalLogDirectory + '\'' +
++        ", mProfileDirectory='" + mProfileDirectory + '\'' +
++        ", mMaxLogDirectoriesPerProfile=" + mMaxLogDirectoriesPerProfile +
++        ", mMaxRsyncThreads=" + mMaxRsyncThreads +
++        '}';
++  }
+ }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java
+index 71c513d..a51dafb 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java
+@@ -59,6 +59,11 @@
+   private static final String LOGS_URL = "logsURL";
+   private static final String TEST_CASE_PROPERTY_NAME = "testCasePropertyName";
+   private static final String BUILD_TOOL = "buildTool";
++  // The following parameters are not supported yet. TODO Add support
++  private static final String APPLY_PATCH_SCRIPT_PATH = "applyPatchScriptPath";
++  private static final String PREP_TEMPLATE_PATH = "prepTemplatePath";
++  private static final String BATCH_EXEC_TEMPLATE_PATH = "batchExecTemplatePath";
++
+ 
+   private final Context context;
+   private String antArgs;
+@@ -84,6 +89,9 @@
+   private final String jiraPassword;
+   private final String testCasePropertyName;
+   private final String buildTool;
++  private final String applyPathScriptPath;
++  private final String prepTemplatePath;
++  private final String batchExecTemplatePath;
+   
+   private String jiraName;
+   private boolean clearLibraryCache;
+@@ -125,6 +133,11 @@ public TestConfiguration(Context context, Logger logger)
+     logsURL = context.getString(LOGS_URL, "").trim();
+     testCasePropertyName = context.getString(TEST_CASE_PROPERTY_NAME, "testcase").trim();
+     sshOpts = context.getString(SSH_OPTS, "").trim();
++
++    applyPathScriptPath = context.getString(APPLY_PATCH_SCRIPT_PATH, null);
++    prepTemplatePath = context.getString(PREP_TEMPLATE_PATH, null);
++    batchExecTemplatePath = context.getString(BATCH_EXEC_TEMPLATE_PATH, null);
++
+   }
+   public Context getContext() {
+     return context;
+@@ -210,6 +223,21 @@ public String getPatch() {
+   public String getTestCasePropertyName() {
+     return testCasePropertyName;
+   }
++
++  public String getApplyPathScriptPath() {
++    return applyPathScriptPath;
++  }
++
++  public String getPrepTemplatePath() {
++    return prepTemplatePath;
++  }
++
++  public String getBatchExecTemplatePath() {
++    return batchExecTemplatePath;
++  }
++
++  // TODO - Allow the branch to be specified as a parameter to ptest, rather than requiring a separate property file.
++  // (will need to handle an alternate work-dir as well in this case - derive from branch?)
+   public void setPatch(String patch) {
+     this.patch = Strings.nullToEmpty(patch);
+   }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
+index aef6ac1..1cb0554 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
+@@ -113,7 +113,15 @@ public TestParser(Context context, String testCasePropertyName,
+     Map<String, Properties> properties = parseQTestProperties();
+ 
+     List<QFileTestBatch> result = Lists.newArrayList();
+-    for(String alias : context.getString("qFileTests", "").split(" ")) {
++    String qFileTestsString = context.getString("qFileTests",null);
++    String []aliases;
++    if (qFileTestsString != null) {
++      aliases = qFileTestsString.split(" ");
++    } else {
++      aliases = new String[0];
++    }
++
++    for(String alias : aliases) {
+       Context testContext = new Context(context.getSubProperties(
+           Joiner.on(".").join("qFileTest", alias, "")));
+       String driver = checkNotNull(testContext.getString("driver"), "driver").trim();
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/context/FixedExecutionContextProvider.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/context/FixedExecutionContextProvider.java
+index 075ae3e..f7b50d6 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/context/FixedExecutionContextProvider.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/context/FixedExecutionContextProvider.java
+@@ -57,7 +57,11 @@ public void terminate(ExecutionContext executionContext) {
+   }
+   @Override
+   public void replaceBadHosts(ExecutionContext executionContext) throws CreateHostsFailedException {
+-    throw new UnsupportedOperationException();
++    if (!executionContext.getBadHosts().isEmpty()) {
++      LOG.warn(
++          "Found bad nodes on FixedExecutionContext. Cannot replace them. Degraded performance. badNodes={}",
++          executionContext.getBadHosts());
++    }
+   }
+ 
+   @Override
+-- 
+1.7.9.5
+

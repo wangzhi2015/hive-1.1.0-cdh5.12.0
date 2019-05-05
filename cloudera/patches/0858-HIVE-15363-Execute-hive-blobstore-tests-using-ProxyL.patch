@@ -1,0 +1,126 @@
+From b449a1a677602a3eb95c9c0790e48dc1cf0eee73 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Tue, 6 Dec 2016 14:59:42 -0600
+Subject: [PATCH 0858/1164] HIVE-15363: Execute hive-blobstore tests using
+ ProxyLocalFileSystem (Sergio Pena, reviewed by
+ Mohit Sabharwal)
+
+Change-Id: I89ac510a443f80e4f6157a5b085a3cdc1e3344a6
+---
+ itests/hive-blobstore/pom.xml                      |   22 --------------------
+ .../src/test/resources/hive-site.xml               |   19 +++++++++++++++++
+ .../control/AbstractCoreBlobstoreCliDriver.java    |   13 +++++++++++-
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |    2 +-
+ 4 files changed, 32 insertions(+), 24 deletions(-)
+
+diff --git a/itests/hive-blobstore/pom.xml b/itests/hive-blobstore/pom.xml
+index cd3943b..46f28cd 100644
+--- a/itests/hive-blobstore/pom.xml
++++ b/itests/hive-blobstore/pom.xml
+@@ -41,28 +41,6 @@
+ 
+   <profiles>
+     <profile>
+-      <id>tests-off</id>
+-      <activation>
+-        <file>
+-          <missing>src/test/resources/blobstore-conf.xml</missing>
+-        </file>
+-      </activation>
+-      <properties>
+-        <maven.test.skip>true</maven.test.skip>
+-      </properties>
+-    </profile>
+-    <profile>
+-      <id>tests-on</id>
+-      <activation>
+-        <file>
+-          <exists>src/test/resources/blobstore-conf.xml</exists>
+-        </file>
+-      </activation>
+-      <properties>
+-        <maven.test.skip>false</maven.test.skip>
+-      </properties>
+-    </profile>
+-    <profile>
+       <id>hadoop-2</id>
+       <dependencies>
+         <dependency>
+diff --git a/itests/hive-blobstore/src/test/resources/hive-site.xml b/itests/hive-blobstore/src/test/resources/hive-site.xml
+index ffac40a..406b3b8 100644
+--- a/itests/hive-blobstore/src/test/resources/hive-site.xml
++++ b/itests/hive-blobstore/src/test/resources/hive-site.xml
+@@ -261,6 +261,25 @@
+   </property>
+ 
+   <!--
++    The following 3 properties are used for testing blobstore changes on the local filesystem.
++    If tests are required to run on an real Blobstore system, then create the blobstore-conf.xml.
++  -->
++  <property>
++    <name>fs.pblob.impl</name>
++    <value>org.apache.hadoop.fs.ProxyLocalFileSystem</value>
++  </property>
++
++  <property>
++    <name>hive.blobstore.supported.schemes</name>
++    <value>pblob,s3a,s3c,s3</value>
++  </property>
++
++  <property>
++    <name>test.blobstore.path</name>
++    <value>pblob:${system:test.tmp.dir}/bucket</value>
++  </property>
++
++  <!--
+   To run these tests:
+   # Create a file blobstore-conf.xml  - DO NOT ADD TO REVISION CONTROL
+   # Add the credentials for the service you are testing against
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java
+index e12e3e4..f43951e 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/AbstractCoreBlobstoreCliDriver.java
+@@ -23,7 +23,12 @@
+ import com.google.common.base.Strings;
+ import java.text.SimpleDateFormat;
+ import java.util.Calendar;
++import java.util.Map;
++
+ import org.apache.hadoop.hive.cli.control.AbstractCliConfig.MetastoreType;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveVariableSource;
++import org.apache.hadoop.hive.conf.VariableSubstitution;
+ import org.apache.hadoop.hive.ql.QTestUtil;
+ import org.apache.hadoop.hive.ql.QTestUtil.MiniClusterType;
+ import org.junit.After;
+@@ -156,7 +161,13 @@ protected void runTestHelper(String tname, String fname, String fpath, boolean e
+    *  the same ${test.blobstore.path} (possible if test runs are controlled by an automated system)
+    */
+   private void setupUniqueTestPath() {
+-    String testBlobstorePath = qt.getConf().get(HCONF_TEST_BLOBSTORE_PATH);
++    String testBlobstorePath = new VariableSubstitution(new HiveVariableSource() {
++      @Override
++      public Map<String, String> getHiveVariable() {
++        return null;
++      }
++    }).substitute(new HiveConf(), qt.getConf().get(HCONF_TEST_BLOBSTORE_PATH));
++
+     testBlobstorePath = QTestUtil.ensurePathEndsInSlash(testBlobstorePath);
+     testBlobstorePath += QTestUtil.ensurePathEndsInSlash(this.getClass().getSimpleName()); // name of child class
+     String uid = new SimpleDateFormat("yyyyMMdd.HHmmss.SSS").format(Calendar.getInstance().getTime())
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index 40d2517..781eef8 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -1563,7 +1563,7 @@ private void maskPatterns(Pattern[] patterns, String fname) throws Exception {
+ 
+   /* This list may be modified by specific cli drivers to mask strings that change on every test */
+   private List<Pair<Pattern, String>> patternsWithMaskComments = new ArrayList<Pair<Pattern, String>>() {{
+-    add(toPatternPair("(s3.?|swift|wasb.?).*hive-staging.*","### BLOBSTORE_STAGING_PATH ###"));
++    add(toPatternPair("(pblob|s3.?|swift|wasb.?).*hive-staging.*","### BLOBSTORE_STAGING_PATH ###"));
+   }};
+ 
+   private Pair<Pattern, String> toPatternPair(String patternStr, String maskComment) {
+-- 
+1.7.9.5
+

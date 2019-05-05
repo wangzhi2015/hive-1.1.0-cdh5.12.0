@@ -1,0 +1,135 @@
+From 2c38dc5008649a704ef729e2f1eaf2f802c294b2 Mon Sep 17 00:00:00 2001
+From: Aleksei Statkevich <me.aleksei@gmail.com>
+Date: Sat, 17 Oct 2015 23:37:00 -0800
+Subject: [PATCH 0502/1164] HIVE-12207 : Query fails when non-ascii characters
+ are used in string literals (Aleksei Statkevich
+ via Ashutosh Chauhan)
+
+Change-Id: If776444b4751078eff2e25b87e473c21db4e96f4
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../calcite/translator/RexNodeConverter.java       |   13 ++++++++---
+ .../queries/clientpositive/non_ascii_literal1.q    |    1 +
+ .../queries/clientpositive/non_ascii_literal2.q    |    5 +++++
+ .../clientpositive/non_ascii_literal1.q.out        |    9 ++++++++
+ .../clientpositive/non_ascii_literal2.q.out        |   23 ++++++++++++++++++++
+ 5 files changed, 48 insertions(+), 3 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/non_ascii_literal1.q
+ create mode 100644 ql/src/test/queries/clientpositive/non_ascii_literal2.q
+ create mode 100644 ql/src/test/results/clientpositive/non_ascii_literal1.q.out
+ create mode 100644 ql/src/test/results/clientpositive/non_ascii_literal2.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java
+index 58f89c5..57544f3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/RexNodeConverter.java
+@@ -37,11 +37,14 @@
+ import org.apache.calcite.rex.RexCall;
+ import org.apache.calcite.rex.RexNode;
+ import org.apache.calcite.rex.RexUtil;
++import org.apache.calcite.sql.SqlCollation;
+ import org.apache.calcite.sql.SqlOperator;
+ import org.apache.calcite.sql.fun.SqlCastFunction;
+ import org.apache.calcite.sql.type.SqlTypeName;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.calcite.util.ConversionUtil;
++import org.apache.calcite.util.NlsString;
+ import org.apache.hadoop.hive.common.type.Decimal128;
+ import org.apache.hadoop.hive.common.type.HiveChar;
+ import org.apache.hadoop.hive.common.type.HiveDecimal;
+@@ -289,6 +292,10 @@ protected RexNode convert(ExprNodeColumnDesc col) throws SemanticException {
+   private static final BigInteger MIN_LONG_BI = BigInteger.valueOf(Long.MIN_VALUE),
+       MAX_LONG_BI = BigInteger.valueOf(Long.MAX_VALUE);
+ 
++  private static NlsString asUnicodeString(String text) {
++    return new NlsString(text, ConversionUtil.NATIVE_UTF16_CHARSET_NAME, SqlCollation.IMPLICIT);
++  }
++
+   protected RexNode convert(ExprNodeConstantDesc literal) throws CalciteSemanticException {
+     RexBuilder rexBuilder = cluster.getRexBuilder();
+     RelDataTypeFactory dtFactory = rexBuilder.getTypeFactory();
+@@ -364,15 +371,15 @@ protected RexNode convert(ExprNodeConstantDesc literal) throws CalciteSemanticEx
+     case CHAR:
+       if (value instanceof HiveChar)
+         value = ((HiveChar) value).getValue();
+-      calciteLiteral = rexBuilder.makeLiteral((String) value);
++      calciteLiteral = rexBuilder.makeCharLiteral(asUnicodeString((String) value));
+       break;
+     case VARCHAR:
+       if (value instanceof HiveVarchar)
+         value = ((HiveVarchar) value).getValue();
+-      calciteLiteral = rexBuilder.makeLiteral((String) value);
++      calciteLiteral = rexBuilder.makeCharLiteral(asUnicodeString((String) value));
+       break;
+     case STRING:
+-      calciteLiteral = rexBuilder.makeLiteral((String) value);
++      calciteLiteral = rexBuilder.makeCharLiteral(asUnicodeString((String) value));
+       break;
+     case DATE:
+       Calendar cal = new GregorianCalendar();
+diff --git a/ql/src/test/queries/clientpositive/non_ascii_literal1.q b/ql/src/test/queries/clientpositive/non_ascii_literal1.q
+new file mode 100644
+index 0000000..9573653
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/non_ascii_literal1.q
+@@ -0,0 +1 @@
++select concat("Абвгде", "谢谢") from src limit 1;
+diff --git a/ql/src/test/queries/clientpositive/non_ascii_literal2.q b/ql/src/test/queries/clientpositive/non_ascii_literal2.q
+new file mode 100644
+index 0000000..6b25273
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/non_ascii_literal2.q
+@@ -0,0 +1,5 @@
++create table non_ascii_literal2 as
++select "谢谢" as col1, "Абвгде" as col2;
++
++select * from non_ascii_literal2
++where col2 = "Абвгде";
+diff --git a/ql/src/test/results/clientpositive/non_ascii_literal1.q.out b/ql/src/test/results/clientpositive/non_ascii_literal1.q.out
+new file mode 100644
+index 0000000..5b28f4e
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/non_ascii_literal1.q.out
+@@ -0,0 +1,9 @@
++PREHOOK: query: select concat("Абвгде", "谢谢") from src limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++#### A masked pattern was here ####
++POSTHOOK: query: select concat("Абвгде", "谢谢") from src limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++#### A masked pattern was here ####
++Абвгде谢谢
+diff --git a/ql/src/test/results/clientpositive/non_ascii_literal2.q.out b/ql/src/test/results/clientpositive/non_ascii_literal2.q.out
+new file mode 100644
+index 0000000..7e19143
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/non_ascii_literal2.q.out
+@@ -0,0 +1,23 @@
++PREHOOK: query: create table non_ascii_literal2 as
++select "谢谢" as col1, "Абвгде" as col2
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: database:default
++PREHOOK: Output: default@non_ascii_literal2
++POSTHOOK: query: create table non_ascii_literal2 as
++select "谢谢" as col1, "Абвгде" as col2
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@non_ascii_literal2
++PREHOOK: query: select * from non_ascii_literal2
++where col2 = "Абвгде"
++PREHOOK: type: QUERY
++PREHOOK: Input: default@non_ascii_literal2
++#### A masked pattern was here ####
++POSTHOOK: query: select * from non_ascii_literal2
++where col2 = "Абвгде"
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@non_ascii_literal2
++#### A masked pattern was here ####
++谢谢	Абвгде
+-- 
+1.7.9.5
+

@@ -1,0 +1,311 @@
+From f1e77b269f61e81521773c9dd73da8eda7ae8e40 Mon Sep 17 00:00:00 2001
+From: Alexander Pivovarov <apivovarov@gmail.com>
+Date: Wed, 6 May 2015 23:14:29 -0700
+Subject: [PATCH 0857/1164] CDH-42811: HIVE-10641 create CRC32 UDF (Alexander
+ Pivovarov, reviewed by Jason Dere)
+
+(cherry picked from commit f82c0c20c5038f54b4a24561c943ca646a272d18)
+
+Change-Id: I88338cdcbb66ac488e5d876729a979918f7879bc
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    2 +
+ .../org/apache/hadoop/hive/ql/udf/UDFCrc32.java    |   75 ++++++++++++++++++++
+ .../apache/hadoop/hive/ql/udf/TestUDFCrc32.java    |   74 +++++++++++++++++++
+ ql/src/test/queries/clientpositive/udf_crc32.q     |   13 ++++
+ .../results/clientpositive/show_functions.q.out    |    2 +
+ ql/src/test/results/clientpositive/udf_crc32.q.out |   60 ++++++++++++++++
+ 6 files changed, 226 insertions(+)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/UDFCrc32.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFCrc32.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_crc32.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_crc32.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 9d081f3..931f88d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -50,6 +50,7 @@
+ import org.apache.hadoop.hive.ql.udf.UDFBin;
+ import org.apache.hadoop.hive.ql.udf.UDFConv;
+ import org.apache.hadoop.hive.ql.udf.UDFCos;
++import org.apache.hadoop.hive.ql.udf.UDFCrc32;
+ import org.apache.hadoop.hive.ql.udf.UDFDayOfMonth;
+ import org.apache.hadoop.hive.ql.udf.UDFDegrees;
+ import org.apache.hadoop.hive.ql.udf.UDFE;
+@@ -216,6 +217,7 @@
+     system.registerUDF("atan", UDFAtan.class, false);
+     system.registerUDF("tan", UDFTan.class, false);
+     system.registerUDF("e", UDFE.class, false);
++    system.registerUDF("crc32", UDFCrc32.class, false);
+ 
+     system.registerUDF("conv", UDFConv.class, false);
+     system.registerUDF("bin", UDFBin.class, false);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/UDFCrc32.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/UDFCrc32.java
+new file mode 100644
+index 0000000..c1f0e38
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/UDFCrc32.java
+@@ -0,0 +1,75 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf;
++
++import java.util.zip.CRC32;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDF;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
++
++/**
++ * UDFCrc32.
++ *
++ */
++@Description(name = "crc32",
++    value = "_FUNC_(str or bin) - Computes a cyclic redundancy check value "
++    + "for string or binary argument and returns bigint value.",
++    extended = "Example:\n"
++    + "  > SELECT _FUNC_('ABC');\n"
++    + "  2743272264\n"
++    + "  > SELECT _FUNC_(binary('ABC'));\n"
++    + "  2743272264")
++public class UDFCrc32 extends UDF {
++
++  private final LongWritable result = new LongWritable();
++  private final CRC32 crc32 = new CRC32();
++
++  /**
++   * CRC32 for string
++   */
++  public LongWritable evaluate(Text n) {
++    if (n == null) {
++      return null;
++    }
++
++    crc32.reset();
++    crc32.update(n.getBytes(), 0, n.getLength());
++
++    result.set(crc32.getValue());
++    return result;
++  }
++
++  /**
++   * CRC32 for binary
++   */
++  public LongWritable evaluate(BytesWritable b) {
++    if (b == null) {
++      return null;
++    }
++
++    crc32.reset();
++    crc32.update(b.getBytes(), 0, b.getLength());
++
++    result.set(crc32.getValue());
++    return result;
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFCrc32.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFCrc32.java
+new file mode 100644
+index 0000000..97a8672
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFCrc32.java
+@@ -0,0 +1,74 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.LongWritable;
++import org.apache.hadoop.io.Text;
++
++public class TestUDFCrc32 extends TestCase {
++
++  public void testCrc32Str() throws HiveException {
++    UDFCrc32 udf = new UDFCrc32();
++
++    runAndVerifyStr("ABC", 2743272264L, udf);
++    runAndVerifyStr("", 0L, udf);
++    // repeat again
++    runAndVerifyStr("ABC", 2743272264L, udf);
++    runAndVerifyStr("", 0L, udf);
++    // null
++    runAndVerifyStr(null, null, udf);
++  }
++
++  public void testCrc32Bin() throws HiveException {
++    UDFCrc32 udf = new UDFCrc32();
++
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, 2743272264L, udf);
++    runAndVerifyBin(new byte[0], 0L, udf);
++    // repeat again
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, 2743272264L, udf);
++    runAndVerifyBin(new byte[0], 0L, udf);
++    // null
++    runAndVerifyBin(null, null, udf);
++  }
++
++  private void runAndVerifyStr(String str, Long expResult, UDFCrc32 udf) throws HiveException {
++    Text t = str != null ? new Text(str) : null;
++    LongWritable output = (LongWritable) udf.evaluate(t);
++    if (expResult == null) {
++      assertNull(output);
++    } else {
++      assertNotNull(output);
++      assertEquals("crc32() test ", expResult.longValue(), output.get());
++    }
++  }
++
++  private void runAndVerifyBin(byte[] binV, Long expResult, UDFCrc32 udf) throws HiveException {
++    BytesWritable binWr = binV != null ? new BytesWritable(binV) : null;
++    LongWritable output = (LongWritable) udf.evaluate(binWr);
++    if (expResult == null) {
++      assertNull(output);
++    } else {
++      assertNotNull(output);
++      assertEquals("crc32() test ", expResult.longValue(), output.get());
++    }
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_crc32.q b/ql/src/test/queries/clientpositive/udf_crc32.q
+new file mode 100644
+index 0000000..650205e
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_crc32.q
+@@ -0,0 +1,13 @@
++DESCRIBE FUNCTION crc32;
++DESC FUNCTION EXTENDED crc32;
++
++explain select crc32('ABC');
++
++select
++crc32('ABC'),
++crc32(''),
++crc32(binary('ABC')),
++crc32(binary('')),
++crc32(cast(null as string)),
++crc32(cast(null as binary)),
++crc32(null);
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index c2aa95c..52b1424 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -50,6 +50,7 @@ cos
+ count
+ covar_pop
+ covar_samp
++crc32
+ create_union
+ cume_dist
+ current_database
+@@ -241,6 +242,7 @@ cos
+ count
+ covar_pop
+ covar_samp
++crc32
+ create_union
+ cume_dist
+ current_database
+diff --git a/ql/src/test/results/clientpositive/udf_crc32.q.out b/ql/src/test/results/clientpositive/udf_crc32.q.out
+new file mode 100644
+index 0000000..8280210
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_crc32.q.out
+@@ -0,0 +1,60 @@
++PREHOOK: query: DESCRIBE FUNCTION crc32
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION crc32
++POSTHOOK: type: DESCFUNCTION
++crc32(str or bin) - Computes a cyclic redundancy check value for string or binary argument and returns bigint value.
++PREHOOK: query: DESC FUNCTION EXTENDED crc32
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED crc32
++POSTHOOK: type: DESCFUNCTION
++crc32(str or bin) - Computes a cyclic redundancy check value for string or binary argument and returns bigint value.
++Example:
++  > SELECT crc32('ABC');
++  2743272264
++  > SELECT crc32(binary('ABC'));
++  2743272264
++PREHOOK: query: explain select crc32('ABC')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select crc32('ABC')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 2743272264 (type: bigint)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++crc32('ABC'),
++crc32(''),
++crc32(binary('ABC')),
++crc32(binary('')),
++crc32(cast(null as string)),
++crc32(cast(null as binary)),
++crc32(null)
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++crc32('ABC'),
++crc32(''),
++crc32(binary('ABC')),
++crc32(binary('')),
++crc32(cast(null as string)),
++crc32(cast(null as binary)),
++crc32(null)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2743272264	0	2743272264	0	NULL	NULL	NULL
+-- 
+1.7.9.5
+

@@ -1,0 +1,235 @@
+From c5300563a3b3849b646fcac421bd80b0553f179a Mon Sep 17 00:00:00 2001
+From: Chaoyu Tang <ctang@cloudera.com>
+Date: Fri, 7 Apr 2017 08:44:28 -0400
+Subject: [PATCH 1064/1164] CDH-52173: HIVE-16334: Query lock contains the
+ query string, which can cause OOM on ZooKeeper
+ (Peter Vary via Chaoyu Tang)
+
+(cherry picked from commit 0d0e4976c155a450b93a14ce678b6ffb21f639df)
+
+Change-Id: Ie7d5b1974ef4cf0062e71495e2c5cfd1b1dc3ea2
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    3 ++
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    3 +-
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    5 ++--
+ .../hadoop/hive/ql/lockmgr/DummyTxnManager.java    |    3 +-
+ .../hadoop/hive/ql/lockmgr/HiveLockObject.java     |   18 ++++++++----
+ .../hive/ql/lockmgr/TestDummyTxnManager.java       |    4 +--
+ .../hive/ql/lockmgr/TestEmbeddedLockManager.java   |    4 ++-
+ .../hadoop/hive/ql/lockmgr/TestHiveLockObject.java |   30 ++++++++++++++++++--
+ .../zookeeper/TestZookeeperLockManager.java        |    2 +-
+ 9 files changed, 57 insertions(+), 15 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index d328d7b..225d3eb 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1357,6 +1357,9 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_LOCK_MAPRED_ONLY("hive.lock.mapred.only.operation", false,
+         "This param is to control whether or not only do lock on queries\n" +
+         "that need to execute at least one mapred job."),
++    HIVE_LOCK_QUERY_STRING_MAX_LENGTH("hive.lock.query.string.max.length", 1000000,
++        "The maximum length of the query string to store in the lock.\n" +
++        "The default value is 1000000, since the data limit of a znode is 1MB"),
+ 
+      // Zookeeper related configs
+     HIVE_ZOOKEEPER_QUORUM("hive.zookeeper.quorum", "",
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 406e21d..0a43ab5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -1005,7 +1005,8 @@ public QueryPlan getPlan() {
+       new HiveLockObjectData(plan.getQueryId(),
+                              String.valueOf(System.currentTimeMillis()),
+                              "IMPLICIT",
+-                             plan.getQueryStr());
++                             plan.getQueryStr(),
++                             conf);
+     if (d != null) {
+       locks.add(new HiveLockObj(new HiveLockObject(d.getName(), lockData), mode));
+       return locks;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index f325030..4fd1469 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -2700,7 +2700,8 @@ private int lockTable(LockTableDesc lockTbl) throws HiveException {
+         new HiveLockObjectData(lockTbl.getQueryId(),
+             String.valueOf(System.currentTimeMillis()),
+             "EXPLICIT",
+-            lockTbl.getQueryStr());
++            lockTbl.getQueryStr(),
++            conf);
+ 
+     if (partSpec == null) {
+       HiveLock lck = lockMgr.lock(new HiveLockObject(tbl, lockData), mode, true);
+@@ -2753,7 +2754,7 @@ private int lockDatabase(LockDatabaseDesc lockDb) throws HiveException {
+     HiveLockObjectData lockData =
+         new HiveLockObjectData(lockDb.getQueryId(),
+             String.valueOf(System.currentTimeMillis()),
+-            "EXPLICIT", lockDb.getQueryStr());
++            "EXPLICIT", lockDb.getQueryStr(), conf);
+ 
+     HiveLock lck = lockMgr.lock(new HiveLockObject(dbObj.getName(), lockData), mode, true);
+     if (lck == null) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java
+index 3a0f911..b8f7620 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java
+@@ -274,7 +274,8 @@ private HiveLockMode getWriteEntityLockMode (WriteEntity we) {
+       new HiveLockObject.HiveLockObjectData(plan.getQueryId(),
+                              String.valueOf(System.currentTimeMillis()),
+                              "IMPLICIT",
+-                             plan.getQueryStr());
++                             plan.getQueryStr(),
++                             conf);
+ 
+     if (db != null) {
+       locks.add(new HiveLockObj(new HiveLockObject(db.getName(), lockData),
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java
+index f77b025..fde9445 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java
+@@ -21,6 +21,7 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.lang.builder.HashCodeBuilder;
+ import org.apache.hadoop.hive.common.StringInternUtils;
++import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.metadata.DummyPartition;
+ import org.apache.hadoop.hive.ql.metadata.Partition;
+ import org.apache.hadoop.hive.ql.metadata.Table;
+@@ -43,16 +44,23 @@
+      * Note: The parameters are used to uniquely identify a HiveLockObject. 
+      * The parameters will be stripped off any ':' characters in order not 
+      * to interfere with the way the data is serialized (':' delimited string).
++     * The query string might be truncated depending on HIVE_LOCK_QUERY_STRING_MAX_LENGTH
++     * @param queryId The query identifier will be added to the object without change
++     * @param lockTime The lock time  will be added to the object without change
++     * @param lockMode The lock mode  will be added to the object without change
++     * @param queryStr The query string might be truncated based on
++     *     HIVE_LOCK_QUERY_STRING_MAX_LENGTH conf variable
++     * @param conf The hive configuration based on which we decide if we should truncate the query
++     *     string or not
+      */
+-    public HiveLockObjectData(String queryId,
+-        String lockTime,
+-        String lockMode,
+-        String queryStr) {
++    public HiveLockObjectData(String queryId, String lockTime, String lockMode, String queryStr,
++        HiveConf conf) {
+       this.queryId = removeDelimiter(queryId);
+       this.lockTime = StringInternUtils.internIfNotNull(removeDelimiter(lockTime));
+       this.lockMode = removeDelimiter(lockMode);
+       this.queryStr = StringInternUtils.internIfNotNull(
+-          removeDelimiter(queryStr == null ? null : queryStr.trim()));
++          queryStr == null ? null : StringUtils.substring(removeDelimiter(queryStr.trim()), 0,
++              conf.getIntVar(HiveConf.ConfVars.HIVE_LOCK_QUERY_STRING_MAX_LENGTH)));
+     }
+ 
+     /**
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
+index 0d96619..f7842e8 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
+@@ -147,9 +147,9 @@ public void testDedupLockObjects() {
+     String path1 = "path1";
+     String path2 = "path2";
+     HiveLockObjectData lockData1 = new HiveLockObjectData(
+-        "query1", "1", "IMPLICIT", "drop table table1");
++        "query1", "1", "IMPLICIT", "drop table table1", conf);
+     HiveLockObjectData lockData2 = new HiveLockObjectData(
+-        "query1", "1", "IMPLICIT", "drop table table1");
++        "query1", "1", "IMPLICIT", "drop table table1", conf);
+ 
+     // Start with the following locks:
+     // [path1, shared]
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestEmbeddedLockManager.java b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestEmbeddedLockManager.java
+index 0afbc1c..95a9856 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestEmbeddedLockManager.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestEmbeddedLockManager.java
+@@ -27,6 +27,7 @@
+ public class TestEmbeddedLockManager extends TestCase {
+ 
+   private int counter;
++  private HiveConf conf = new HiveConf();
+ 
+   public void testLocking() throws LockException {
+     HiveConf conf = new HiveConf();
+@@ -119,7 +120,8 @@ public void testLocking() throws LockException {
+   }
+ 
+   private HiveLockObject lockObj(String path, String query) {
+-    HiveLockObjectData data = new HiveLockObjectData(String.valueOf(++counter), null, null, query);
++    HiveLockObjectData data = new HiveLockObjectData(String.valueOf(++counter), null, null,
++        query, conf);
+     return new HiveLockObject(path.split("/"), data);
+   }
+ }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestHiveLockObject.java b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestHiveLockObject.java
+index 19cb129..024114f 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestHiveLockObject.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestHiveLockObject.java
+@@ -20,15 +20,20 @@
+ 
+ import junit.framework.Assert;
+ 
++import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.lockmgr.HiveLockObject.HiveLockObjectData;
+ import org.junit.Test;
+ 
+ public class TestHiveLockObject {
+ 
++  private HiveConf conf = new HiveConf();
++
+   @Test
+   public void testEqualsAndHashCode() {
+-    HiveLockObjectData data1 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01", "select * from mytable");
+-    HiveLockObjectData data2 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01", "select * from mytable");
++    HiveLockObjectData data1 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        "select * from mytable", conf);
++    HiveLockObjectData data2 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        "select * from mytable", conf);
+     Assert.assertEquals(data1, data2);
+     Assert.assertEquals(data1.hashCode(), data2.hashCode());
+ 
+@@ -38,4 +43,25 @@ public void testEqualsAndHashCode() {
+     Assert.assertEquals(obj1.hashCode(), obj2.hashCode());
+   }
+ 
++  @Test
++  public void testTruncate() {
++    conf.setIntVar(HiveConf.ConfVars.HIVE_LOCK_QUERY_STRING_MAX_LENGTH, 1000000);
++    HiveLockObjectData data0 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        "01234567890", conf);
++    Assert.assertEquals("With default settings query string should not be truncated",
++        data0.getQueryStr().length(), 11);
++    conf.setIntVar(HiveConf.ConfVars.HIVE_LOCK_QUERY_STRING_MAX_LENGTH, 10);
++    HiveLockObjectData data1 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        "01234567890", conf);
++    HiveLockObjectData data2 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        "0123456789", conf);
++    HiveLockObjectData data3 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        "012345678", conf);
++    HiveLockObjectData data4 = new HiveLockObjectData("ID1", "SHARED", "1997-07-01",
++        null, conf);
++    Assert.assertEquals("Long string truncation failed", data1.getQueryStr().length(), 10);
++    Assert.assertEquals("String truncation failed", data2.getQueryStr().length(), 10);
++    Assert.assertEquals("Short string should not be truncated", data3.getQueryStr().length(), 9);
++    Assert.assertNull("Null query string handling failed", data4.getQueryStr());
++  }
+ }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java
+index 3f9926e..a7a76a4 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java
+@@ -62,7 +62,7 @@
+   @Before
+   public void setup() {
+     conf = new HiveConf();
+-    lockObjData = new HiveLockObjectData("1", "10", "SHARED", "show tables");
++    lockObjData = new HiveLockObjectData("1", "10", "SHARED", "show tables", conf);
+     hiveLock = new HiveLockObject(TABLE, lockObjData);
+     zLock = new ZooKeeperHiveLock(TABLE_LOCK_PATH, hiveLock, HiveLockMode.SHARED);
+ 
+-- 
+1.7.9.5
+

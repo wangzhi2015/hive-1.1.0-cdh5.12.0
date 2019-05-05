@@ -1,0 +1,1009 @@
+From 307294901ac1f818bb476f7044ec5b7f32d3ec65 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Wed, 23 Nov 2016 16:54:44 -0600
+Subject: [PATCH 0839/1164] CDH-46317: HIVE-15114: Remove extra MoveTask
+ operators from the ConditionalTask
+
+Change-Id: I092fb09226688e7f9fc6bbed1ec947340241b593
+---
+ .../clientpositive/conditional_task_optimization.q |   28 ++
+ .../conditional_task_optimization.q.out            |  453 ++++++++++++++++++++
+ .../test/results/clientpositive/insert_into.q.out  |   68 ++-
+ .../clientpositive/parallel_directory_rename.q.out |    1 -
+ .../hadoop/hive/ql/optimizer/GenMapRedUtils.java   |  132 +++++-
+ .../TestGenMapRedUtilsCreateConditionalTask.java   |  196 +++++++++
+ 6 files changed, 862 insertions(+), 16 deletions(-)
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/conditional_task_optimization.q
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/conditional_task_optimization.q.out
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java
+
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/conditional_task_optimization.q b/itests/hive-blobstore/src/test/queries/clientpositive/conditional_task_optimization.q
+new file mode 100644
+index 0000000..89004ad
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/conditional_task_optimization.q
+@@ -0,0 +1,28 @@
++-- This test case verifies that the CONDITIONAL TASK added to the query plan is optimized;
++-- for blobstorage systems. The CONDITIONAL TASK usually has two concatenated renames (or MoveTask) on;
++-- HDFS systems, but it must have only one rename on Blobstorage;
++
++SET hive.blobstore.use.blobstore.as.scratchdir=true;
++
++DROP TABLE conditional;
++CREATE TABLE conditional (id int) LOCATION '${hiveconf:test.blobstore.path.unique}/conditional/';
++
++-- Disable optimization;
++SET hive.blobstore.optimizations.enabled=false;
++EXPLAIN INSERT INTO TABLE conditional VALUES (1);
++INSERT INTO TABLE conditional VALUES (1);
++SELECT * FROM conditional;
++EXPLAIN INSERT OVERWRITE TABLE conditional VALUES (11);
++INSERT OVERWRITE TABLE conditional VALUES (11);
++SELECT * FROM conditional;
++
++-- Enable optimization;
++SET hive.blobstore.optimizations.enabled=true;
++EXPLAIN INSERT INTO TABLE conditional VALUES (2);
++INSERT INTO TABLE conditional VALUES (2);
++SELECT * FROM conditional;
++EXPLAIN INSERT OVERWRITE TABLE conditional VALUES (22);
++INSERT OVERWRITE TABLE conditional VALUES (22);
++SELECT * FROM conditional;
++
++DROP TABLE conditional;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/conditional_task_optimization.q.out b/itests/hive-blobstore/src/test/results/clientpositive/conditional_task_optimization.q.out
+new file mode 100644
+index 0000000..d2b3af8
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/conditional_task_optimization.q.out
+@@ -0,0 +1,453 @@
++PREHOOK: query: DROP TABLE conditional
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE conditional
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/conditional
++PREHOOK: Output: database:default
++PREHOOK: Output: default@conditional
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/conditional
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@conditional
++PREHOOK: query: EXPLAIN INSERT INTO TABLE conditional VALUES (1)
++PREHOOK: type: QUERY
++POSTHOOK: query: EXPLAIN INSERT INTO TABLE conditional VALUES (1)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
++  Stage-4
++  Stage-0 depends on stages: Stage-4, Stage-3, Stage-6
++  Stage-2 depends on stages: Stage-0
++  Stage-3
++  Stage-5
++  Stage-6 depends on stages: Stage-5
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: values__tmp__table__1
++            Statistics: Num rows: 1 Data size: 2 Basic stats: COMPLETE Column stats: NONE
++            Select Operator
++              expressions: UDFToInteger(tmp_values_col1) (type: int)
++              outputColumnNames: _col0
++              Statistics: Num rows: 1 Data size: 2 Basic stats: COMPLETE Column stats: NONE
++              File Output Operator
++                compressed: false
++                Statistics: Num rows: 1 Data size: 2 Basic stats: COMPLETE Column stats: NONE
++                table:
++                    input format: org.apache.hadoop.mapred.TextInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                    name: default.conditional
++
++  Stage: Stage-7
++    Conditional Operator
++
++  Stage: Stage-4
++    Move Operator
++      files:
++          hdfs directory: true
++          destination: ### BLOBSTORE_STAGING_PATH ###
++
++  Stage: Stage-0
++    Move Operator
++      tables:
++          replace: false
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++  Stage: Stage-2
++    Stats-Aggr Operator
++
++  Stage: Stage-3
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-5
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-6
++    Move Operator
++      files:
++          hdfs directory: true
++          destination: ### BLOBSTORE_STAGING_PATH ###
++
++PREHOOK: query: INSERT INTO TABLE conditional VALUES (1)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__2
++PREHOOK: Output: default@conditional
++POSTHOOK: query: INSERT INTO TABLE conditional VALUES (1)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__2
++POSTHOOK: Output: default@conditional
++POSTHOOK: Lineage: conditional.id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SELECT * FROM conditional
++PREHOOK: type: QUERY
++PREHOOK: Input: default@conditional
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM conditional
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@conditional
++#### A masked pattern was here ####
++1
++PREHOOK: query: EXPLAIN INSERT OVERWRITE TABLE conditional VALUES (11)
++PREHOOK: type: QUERY
++POSTHOOK: query: EXPLAIN INSERT OVERWRITE TABLE conditional VALUES (11)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
++  Stage-4
++  Stage-0 depends on stages: Stage-4, Stage-3, Stage-6
++  Stage-2 depends on stages: Stage-0
++  Stage-3
++  Stage-5
++  Stage-6 depends on stages: Stage-5
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: values__tmp__table__3
++            Statistics: Num rows: 1 Data size: 3 Basic stats: COMPLETE Column stats: NONE
++            Select Operator
++              expressions: UDFToInteger(tmp_values_col1) (type: int)
++              outputColumnNames: _col0
++              Statistics: Num rows: 1 Data size: 3 Basic stats: COMPLETE Column stats: NONE
++              File Output Operator
++                compressed: false
++                Statistics: Num rows: 1 Data size: 3 Basic stats: COMPLETE Column stats: NONE
++                table:
++                    input format: org.apache.hadoop.mapred.TextInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                    name: default.conditional
++
++  Stage: Stage-7
++    Conditional Operator
++
++  Stage: Stage-4
++    Move Operator
++      files:
++          hdfs directory: true
++          destination: ### BLOBSTORE_STAGING_PATH ###
++
++  Stage: Stage-0
++    Move Operator
++      tables:
++          replace: true
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++  Stage: Stage-2
++    Stats-Aggr Operator
++
++  Stage: Stage-3
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-5
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-6
++    Move Operator
++      files:
++          hdfs directory: true
++          destination: ### BLOBSTORE_STAGING_PATH ###
++
++PREHOOK: query: INSERT OVERWRITE TABLE conditional VALUES (11)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__4
++PREHOOK: Output: default@conditional
++POSTHOOK: query: INSERT OVERWRITE TABLE conditional VALUES (11)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__4
++POSTHOOK: Output: default@conditional
++POSTHOOK: Lineage: conditional.id EXPRESSION [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SELECT * FROM conditional
++PREHOOK: type: QUERY
++PREHOOK: Input: default@conditional
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM conditional
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@conditional
++#### A masked pattern was here ####
++11
++PREHOOK: query: EXPLAIN INSERT INTO TABLE conditional VALUES (2)
++PREHOOK: type: QUERY
++POSTHOOK: query: EXPLAIN INSERT INTO TABLE conditional VALUES (2)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
++  Stage-4
++  Stage-2 depends on stages: Stage-0, Stage-4, Stage-6
++  Stage-3
++  Stage-0 depends on stages: Stage-3
++  Stage-5
++  Stage-6 depends on stages: Stage-5
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: values__tmp__table__5
++            Statistics: Num rows: 1 Data size: 2 Basic stats: COMPLETE Column stats: NONE
++            Select Operator
++              expressions: UDFToInteger(tmp_values_col1) (type: int)
++              outputColumnNames: _col0
++              Statistics: Num rows: 1 Data size: 2 Basic stats: COMPLETE Column stats: NONE
++              File Output Operator
++                compressed: false
++                Statistics: Num rows: 1 Data size: 2 Basic stats: COMPLETE Column stats: NONE
++                table:
++                    input format: org.apache.hadoop.mapred.TextInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                    name: default.conditional
++
++  Stage: Stage-7
++    Conditional Operator
++
++  Stage: Stage-4
++    Move Operator
++      tables:
++          replace: false
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++  Stage: Stage-2
++    Stats-Aggr Operator
++
++  Stage: Stage-3
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-0
++    Move Operator
++      tables:
++          replace: false
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++  Stage: Stage-5
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-6
++    Move Operator
++      tables:
++          replace: false
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++PREHOOK: query: INSERT INTO TABLE conditional VALUES (2)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__6
++PREHOOK: Output: default@conditional
++POSTHOOK: query: INSERT INTO TABLE conditional VALUES (2)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__6
++POSTHOOK: Output: default@conditional
++PREHOOK: query: SELECT * FROM conditional
++PREHOOK: type: QUERY
++PREHOOK: Input: default@conditional
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM conditional
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@conditional
++#### A masked pattern was here ####
++11
++2
++PREHOOK: query: EXPLAIN INSERT OVERWRITE TABLE conditional VALUES (22)
++PREHOOK: type: QUERY
++POSTHOOK: query: EXPLAIN INSERT OVERWRITE TABLE conditional VALUES (22)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
++  Stage-4
++  Stage-2 depends on stages: Stage-0, Stage-4, Stage-6
++  Stage-3
++  Stage-0 depends on stages: Stage-3
++  Stage-5
++  Stage-6 depends on stages: Stage-5
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: values__tmp__table__7
++            Statistics: Num rows: 1 Data size: 3 Basic stats: COMPLETE Column stats: NONE
++            Select Operator
++              expressions: UDFToInteger(tmp_values_col1) (type: int)
++              outputColumnNames: _col0
++              Statistics: Num rows: 1 Data size: 3 Basic stats: COMPLETE Column stats: NONE
++              File Output Operator
++                compressed: false
++                Statistics: Num rows: 1 Data size: 3 Basic stats: COMPLETE Column stats: NONE
++                table:
++                    input format: org.apache.hadoop.mapred.TextInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                    name: default.conditional
++
++  Stage: Stage-7
++    Conditional Operator
++
++  Stage: Stage-4
++    Move Operator
++      tables:
++          replace: true
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++  Stage: Stage-2
++    Stats-Aggr Operator
++
++  Stage: Stage-3
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-0
++    Move Operator
++      tables:
++          replace: true
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++  Stage: Stage-5
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            File Output Operator
++              compressed: false
++              table:
++                  input format: org.apache.hadoop.mapred.TextInputFormat
++                  output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                  serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                  name: default.conditional
++
++  Stage: Stage-6
++    Move Operator
++      tables:
++          replace: true
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.conditional
++
++PREHOOK: query: INSERT OVERWRITE TABLE conditional VALUES (22)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__8
++PREHOOK: Output: default@conditional
++POSTHOOK: query: INSERT OVERWRITE TABLE conditional VALUES (22)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__8
++POSTHOOK: Output: default@conditional
++PREHOOK: query: SELECT * FROM conditional
++PREHOOK: type: QUERY
++PREHOOK: Input: default@conditional
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM conditional
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@conditional
++#### A masked pattern was here ####
++22
++PREHOOK: query: DROP TABLE conditional
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@conditional
++PREHOOK: Output: default@conditional
++POSTHOOK: query: DROP TABLE conditional
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@conditional
++POSTHOOK: Output: default@conditional
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out
+index 3fd58cd..82b8933 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out
+@@ -20,7 +20,6 @@ POSTHOOK: query: INSERT INTO qtest VALUES (1), (10), (100), (1000)
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@values__tmp__table__1
+ POSTHOOK: Output: default@qtest
+-POSTHOOK: Lineage: qtest.value EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+ PREHOOK: query: INSERT INTO qtest VALUES (2), (20), (200), (2000)
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@values__tmp__table__2
+@@ -29,7 +28,6 @@ POSTHOOK: query: INSERT INTO qtest VALUES (2), (20), (200), (2000)
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@values__tmp__table__2
+ POSTHOOK: Output: default@qtest
+-POSTHOOK: Lineage: qtest.value EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+ PREHOOK: query: EXPLAIN EXTENDED INSERT INTO qtest VALUES (1), (10), (100), (1000)
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN EXTENDED INSERT INTO qtest VALUES (1), (10), (100), (1000)
+@@ -55,9 +53,9 @@ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+   Stage-4
+-  Stage-0 depends on stages: Stage-4, Stage-3, Stage-6
+-  Stage-2 depends on stages: Stage-0
++  Stage-2 depends on stages: Stage-0, Stage-4, Stage-6
+   Stage-3
++  Stage-0 depends on stages: Stage-3
+   Stage-5
+   Stage-6 depends on stages: Stage-5
+ 
+@@ -148,13 +146,6 @@ STAGE PLANS:
+ 
+   Stage: Stage-4
+     Move Operator
+-      files:
+-          hdfs directory: true
+-          source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### BLOBSTORE_STAGING_PATH ###
+-
+-  Stage: Stage-0
+-    Move Operator
+       tables:
+           replace: false
+           source: ### BLOBSTORE_STAGING_PATH ###
+@@ -272,6 +263,34 @@ STAGE PLANS:
+       Truncated Path -> Alias:
+         ### BLOBSTORE_STAGING_PATH ###
+ 
++  Stage: Stage-0
++    Move Operator
++      tables:
++          replace: false
++          source: ### BLOBSTORE_STAGING_PATH ###
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                COLUMN_STATS_ACCURATE true
++                bucket_count -1
++                columns value
++                columns.comments 
++                columns.types int
++#### A masked pattern was here ####
++                location ### test.blobstore.path ###/qtest
++                name default.qtest
++                numFiles 0
++                numRows 8
++                rawDataSize 20
++                serialization.ddl struct qtest { i32 value}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                totalSize 0
++#### A masked pattern was here ####
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.qtest
++
+   Stage: Stage-5
+     Map Reduce
+       Map Operator Tree:
+@@ -361,10 +380,31 @@ STAGE PLANS:
+ 
+   Stage: Stage-6
+     Move Operator
+-      files:
+-          hdfs directory: true
++      tables:
++          replace: false
+           source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### BLOBSTORE_STAGING_PATH ###
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                COLUMN_STATS_ACCURATE true
++                bucket_count -1
++                columns value
++                columns.comments 
++                columns.types int
++#### A masked pattern was here ####
++                location ### test.blobstore.path ###/qtest
++                name default.qtest
++                numFiles 0
++                numRows 8
++                rawDataSize 20
++                serialization.ddl struct qtest { i32 value}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                totalSize 0
++#### A masked pattern was here ####
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.qtest
+ 
+ PREHOOK: query: SELECT * FROM qtest
+ PREHOOK: type: QUERY
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out b/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out
+index c9fe96d..0b4b306 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out
+@@ -20,7 +20,6 @@ POSTHOOK: query: INSERT INTO parallel_directory_rename VALUES (1), (10), (100),
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@values__tmp__table__1
+ POSTHOOK: Output: default@parallel_directory_rename
+-POSTHOOK: Lineage: parallel_directory_rename.value EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+ PREHOOK: query: SELECT * FROM parallel_directory_rename
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@parallel_directory_rename
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+index 4b3069b..9b2a1ef 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+@@ -72,8 +72,10 @@
+ import org.apache.hadoop.hive.ql.io.orc.OrcFileStripeMergeInputFormat;
+ import org.apache.hadoop.hive.ql.io.orc.OrcInputFormat;
+ import org.apache.hadoop.hive.ql.io.rcfile.merge.RCFileBlockMergeInputFormat;
++import org.apache.hadoop.hive.ql.metadata.Hive;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.metadata.Partition;
++import org.apache.hadoop.hive.ql.metadata.Table;
+ import org.apache.hadoop.hive.ql.optimizer.GenMRProcContext.GenMRUnionCtx;
+ import org.apache.hadoop.hive.ql.optimizer.GenMRProcContext.GenMapRedCtx;
+ import org.apache.hadoop.hive.ql.optimizer.listbucketingpruner.ListBucketingPruner;
+@@ -94,6 +96,7 @@
+ import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
+ import org.apache.hadoop.hive.ql.plan.FilterDesc.sampleDesc;
+ import org.apache.hadoop.hive.ql.plan.LoadFileDesc;
++import org.apache.hadoop.hive.ql.plan.LoadTableDesc;
+ import org.apache.hadoop.hive.ql.plan.MapWork;
+ import org.apache.hadoop.hive.ql.plan.MapredLocalWork;
+ import org.apache.hadoop.hive.ql.plan.MapredWork;
+@@ -1385,11 +1388,138 @@ public static void addDependentMoveTasks(Task<MoveWork> mvTask, HiveConf hconf,
+           parentTask.addDependentTask(mvTask);
+         }
+       } else {
+-        parentTask.addDependentTask(mvTask);
++        if (BlobStorageUtils.areOptimizationsEnabled(hconf) && parentTask instanceof MoveTask && areMoveTasksOnSameBlobStorage(hconf, (Task<MoveWork>)parentTask, mvTask)) {
++          mergeMoveTasks((Task<MoveWork>)parentTask, mvTask);
++        } else {
++          parentTask.addDependentTask(mvTask);
++        }
+       }
+     }
+   }
+ 
++  /**
++   * Compare if moveTask1 source path is on the same filesystem as moveTask2 destination path.
++   *
++   * @param hconf Configuration object
++   * @param moveTask1 First MoveTask where the source will be compared.
++   * @param moveTask2 Second MoveTask where the destination will be compared.
++   * @return True if source/destination are on the same filesystem; False otherwise.
++   */
++  private static boolean areMoveTasksOnSameBlobStorage(HiveConf hconf, Task<MoveWork> moveTask1, Task<MoveWork> moveTask2) {
++    Path sourcePath1, targetPath2;
++
++    MoveWork moveWork1 = moveTask1.getWork();
++    MoveWork moveWork2 = moveTask2.getWork();
++
++    // Let's not merge the tasks in case both file and table work are present. This should not
++    // be configured this way, but the API allows you to do that.
++    if (moveWork1.getLoadFileWork() != null && moveWork1.getLoadTableWork() != null) { return false; }
++    if (moveWork2.getLoadFileWork() != null && moveWork2.getLoadTableWork() != null) { return false; }
++
++    if (moveWork1.getLoadFileWork() != null) {
++      sourcePath1 = moveWork1.getLoadFileWork().getSourcePath();
++    } else if (moveWork1.getLoadTableWork() != null) {
++      sourcePath1 = moveWork1.getLoadTableWork().getSourcePath();
++    } else {
++      // Multi-files is not supported on this optimization
++      return false;
++    }
++
++    if (moveWork2.getLoadFileWork() != null) {
++      targetPath2 = moveWork2.getLoadFileWork().getTargetDir();
++    } else if (moveWork2.getLoadTableWork() != null) {
++      targetPath2 = getTableLocationPath(hconf, moveWork2.getLoadTableWork().getTable());
++    } else {
++      // Multi-files is not supported on this optimization
++      return false;
++    }
++
++    if (sourcePath1 != null && targetPath2 != null && BlobStorageUtils.isBlobStoragePath(hconf, sourcePath1)) {
++      return sourcePath1.toUri().getScheme().equals(targetPath2.toUri().getScheme());
++    } else {
++      return false;
++    }
++  }
++
++  /**
++   * Returns the table location path from a TableDesc object.
++   *
++   * @param hconf Configuration object.
++   * @param tableDesc Table description from where to get the table name.
++   * @return The path where the table is located.
++   */
++  private static Path getTableLocationPath(final HiveConf hconf, final TableDesc tableDesc) {
++    Table table = null;
++    try {
++      Hive hive = Hive.get(hconf);
++      table = hive.getTable(tableDesc.getTableName());
++    } catch (HiveException e) {
++      LOG.warn("Unable to get the table location path for: " + tableDesc.getTableName(), e);
++    }
++
++    return (table != null) ? table.getPath() : null;
++  }
++
++  /**
++   * Creates a new MoveTask that uses the moveTask1 source and moveTask2 destination as new
++   * source/destination paths. This function is useful when two MoveTask are found on the
++   * execution plan, and they are join each other.
++   *
++   * @param moveTask1 First MoveTask where the source path will be used.
++   * @param moveTask2 Second MoveTask where the destination path will be used.
++   */
++  private static void mergeMoveTasks(Task<MoveWork> moveTask1, Task<MoveWork> moveTask2) {
++    Path sourcePath1;
++    LoadTableDesc loadTableDesc = null;
++    LoadFileDesc loadFileDesc = null;
++
++    MoveWork moveWork1 = moveTask1.getWork();
++    MoveWork moveWork2 = moveTask2.getWork();
++
++    // Let's not merge the tasks in case both file and table work are present. This should not
++    // be configured this way, but the API allows you to do that.
++    if (moveWork1.getLoadFileWork() != null && moveWork1.getLoadTableWork() != null) { return; }
++    if (moveWork2.getLoadFileWork() != null && moveWork2.getLoadTableWork() != null) { return; }
++
++    if (moveWork1.getLoadFileWork() != null) {
++      sourcePath1 = moveTask1.getWork().getLoadFileWork().getSourcePath();
++    } else if (moveWork1.getLoadTableWork() != null) {
++      sourcePath1 = moveTask1.getWork().getLoadTableWork().getSourcePath();
++    } else {
++      // Multi-files is not supported on this optimization
++      return;
++    }
++
++    if (moveTask2.getWork().getLoadFileWork() != null) {
++      loadFileDesc = new LoadFileDesc(
++          sourcePath1,
++          moveWork2.getLoadFileWork().getTargetDir(),
++          moveWork2.getLoadFileWork().getIsDfsDir(),
++          moveWork2.getLoadFileWork().getColumns(),
++          moveWork2.getLoadFileWork().getColumnTypes()
++      );
++    } else if (moveTask2.getWork().getLoadTableWork() != null) {
++      loadTableDesc = new LoadTableDesc(
++          sourcePath1,
++          moveWork2.getLoadTableWork().getTable(),
++          moveWork2.getLoadTableWork().getPartitionSpec(),
++          moveWork2.getLoadTableWork().getReplace(),
++          moveWork2.getLoadTableWork().getWriteType()
++      );
++    } else {
++      // Multi-files is not supported on this optimization
++      return;
++    }
++
++    moveWork1.setLoadTableWork(loadTableDesc);
++    moveWork1.setLoadFileWork(loadFileDesc);
++    moveWork1.setCheckFileFormat(moveWork2.getCheckFileFormat());
++
++    // Link task2 dependent tasks to MoveTask1
++    for (Task dependentTask : moveTask2.getDependentTasks()) {
++      moveTask1.addDependentTask(dependentTask);
++    }
++  }
+ 
+   /**
+    * Add the StatsTask as a dependent task of the MoveTask
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java b/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java
+new file mode 100644
+index 0000000..e9d61a9
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java
+@@ -0,0 +1,196 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.optimizer;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.exec.*;
++import org.apache.hadoop.hive.ql.exec.mr.MapRedTask;
++import org.apache.hadoop.hive.ql.io.HiveInputFormat;
++import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
++import org.apache.hadoop.hive.ql.parse.SemanticException;
++import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
++import org.apache.hadoop.hive.ql.plan.LoadFileDesc;
++import org.apache.hadoop.hive.ql.plan.MoveWork;
++import org.apache.hadoop.hive.ql.plan.TableDesc;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.Serializable;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Properties;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++public class TestGenMapRedUtilsCreateConditionalTask {
++  private static HiveConf hiveConf;
++
++  private Task dummyMRTask;
++
++  @BeforeClass
++  public static void initializeSessionState() {
++    hiveConf = new HiveConf();
++  }
++
++  @Before
++  public void setUp() {
++    dummyMRTask = new MapRedTask();
++  }
++
++  @Test
++  public void testConditionalMoveTaskIsOptimized() throws SemanticException {
++    hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname, "true");
++
++    Path sinkDirName = new Path("s3a://bucket/scratch/-ext-10002");
++    FileSinkOperator fileSinkOperator = createFileSinkOperator(sinkDirName);
++
++    Path finalDirName = new Path("s3a://bucket/scratch/-ext-10000");
++    Path tableLocation = new Path("s3a://bucket/warehouse/table");
++    Task<MoveWork> moveTask = createMoveTask(finalDirName, tableLocation);
++    List<Task<MoveWork>> moveTaskList = Arrays.asList(moveTask);
++
++    GenMapRedUtils.createMRWorkForMergingFiles(fileSinkOperator, finalDirName, null, moveTaskList, hiveConf, dummyMRTask);
++    ConditionalTask conditionalTask = (ConditionalTask)dummyMRTask.getChildTasks().get(0);
++    Task<? extends Serializable> moveOnlyTask = conditionalTask.getListTasks().get(0);
++    Task<? extends Serializable> mergeOnlyTask = conditionalTask.getListTasks().get(1);
++    Task<? extends Serializable> mergeAndMoveTask = conditionalTask.getListTasks().get(2);
++
++    /*
++     * OPTIMIZATION
++     * The ConditionalTask avoids linking 2 MoveTask that are expensive on blobstorage systems. Instead of
++     * linking, it creates one MoveTask where the source is the first MoveTask source, and target is the
++     * second MoveTask target.
++     */
++
++    // Verify moveOnlyTask is optimized
++    assertNull(moveOnlyTask.getChildTasks());
++    verifyMoveTask(moveOnlyTask, sinkDirName, tableLocation);
++
++    // Verify mergeOnlyTask is NOT optimized (a merge task writes directly to finalDirName, then a MoveTask is executed)
++    assertEquals(1, mergeOnlyTask.getChildTasks().size());
++    verifyMoveTask(mergeOnlyTask.getChildTasks().get(0), finalDirName, tableLocation);
++
++    // Verify mergeAndMoveTask is optimized
++    assertEquals(1, mergeAndMoveTask.getChildTasks().size());
++    assertNull(mergeAndMoveTask.getChildTasks().get(0).getChildTasks());
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0), sinkDirName, tableLocation);
++  }
++
++  @Test
++  public void testConditionalMoveTaskIsNotOptimized() throws SemanticException {
++    hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname, "false");
++
++    Path sinkDirName = new Path("s3a://bucket/scratch/-ext-10002");
++    FileSinkOperator fileSinkOperator = createFileSinkOperator(sinkDirName);
++
++    Path finalDirName = new Path("s3a://bucket/scratch/-ext-10000");
++    Path tableLocation = new Path("s3a://bucket/warehouse/table");
++    Task<MoveWork> moveTask = createMoveTask(finalDirName, tableLocation);
++    List<Task<MoveWork>> moveTaskList = Arrays.asList(moveTask);
++
++    GenMapRedUtils.createMRWorkForMergingFiles(fileSinkOperator, finalDirName, null, moveTaskList, hiveConf, dummyMRTask);
++    ConditionalTask conditionalTask = (ConditionalTask)dummyMRTask.getChildTasks().get(0);
++    Task<? extends Serializable> moveOnlyTask = conditionalTask.getListTasks().get(0);
++    Task<? extends Serializable> mergeOnlyTask = conditionalTask.getListTasks().get(1);
++    Task<? extends Serializable> mergeAndMoveTask = conditionalTask.getListTasks().get(2);
++
++    // Verify moveOnlyTask is NOT optimized
++    assertEquals(1, moveOnlyTask.getChildTasks().size());
++    verifyMoveTask(moveOnlyTask, sinkDirName, finalDirName);
++    verifyMoveTask(moveOnlyTask.getChildTasks().get(0), finalDirName, tableLocation);
++
++    // Verify mergeOnlyTask is NOT optimized
++    assertEquals(1, mergeOnlyTask.getChildTasks().size());
++    verifyMoveTask(mergeOnlyTask.getChildTasks().get(0), finalDirName, tableLocation);
++
++    // Verify mergeAndMoveTask is NOT optimized
++    assertEquals(1, mergeAndMoveTask.getChildTasks().size());
++    assertEquals(1, mergeAndMoveTask.getChildTasks().get(0).getChildTasks().size());
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0), sinkDirName, finalDirName);
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0).getChildTasks().get(0), finalDirName, tableLocation);
++  }
++
++  @Test
++  public void testConditionalMoveOnHdfsIsNotOptimized() throws SemanticException {
++    hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname, "true");
++
++    Path sinkDirName = new Path("hdfs://bucket/scratch/-ext-10002");
++    FileSinkOperator fileSinkOperator = createFileSinkOperator(sinkDirName);
++
++    Path finalDirName = new Path("hdfs://bucket/scratch/-ext-10000");
++    Path tableLocation = new Path("hdfs://bucket/warehouse/table");
++    Task<MoveWork> moveTask = createMoveTask(finalDirName, tableLocation);
++    List<Task<MoveWork>> moveTaskList = Arrays.asList(moveTask);
++
++    GenMapRedUtils.createMRWorkForMergingFiles(fileSinkOperator, finalDirName, null, moveTaskList, hiveConf, dummyMRTask);
++    ConditionalTask conditionalTask = (ConditionalTask)dummyMRTask.getChildTasks().get(0);
++    Task<? extends Serializable> moveOnlyTask = conditionalTask.getListTasks().get(0);
++    Task<? extends Serializable> mergeOnlyTask = conditionalTask.getListTasks().get(1);
++    Task<? extends Serializable> mergeAndMoveTask = conditionalTask.getListTasks().get(2);
++
++    // Verify moveOnlyTask is NOT optimized
++    assertEquals(1, moveOnlyTask.getChildTasks().size());
++    verifyMoveTask(moveOnlyTask, sinkDirName, finalDirName);
++    verifyMoveTask(moveOnlyTask.getChildTasks().get(0), finalDirName, tableLocation);
++
++    // Verify mergeOnlyTask is NOT optimized
++    assertEquals(1, mergeOnlyTask.getChildTasks().size());
++    verifyMoveTask(mergeOnlyTask.getChildTasks().get(0), finalDirName, tableLocation);
++
++    // Verify mergeAndMoveTask is NOT optimized
++    assertEquals(1, mergeAndMoveTask.getChildTasks().size());
++    assertEquals(1, mergeAndMoveTask.getChildTasks().get(0).getChildTasks().size());
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0), sinkDirName, finalDirName);
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0).getChildTasks().get(0), finalDirName, tableLocation);
++  }
++
++  private FileSinkOperator createFileSinkOperator(Path finalDirName) {
++    FileSinkOperator fileSinkOperator = mock(FileSinkOperator.class);
++
++    TableDesc tableDesc = new TableDesc(HiveInputFormat.class, HiveOutputFormat.class, new Properties());
++    FileSinkDesc fileSinkDesc = new FileSinkDesc(finalDirName, tableDesc, false);
++    fileSinkDesc.setDirName(finalDirName);
++
++    when(fileSinkOperator.getConf()).thenReturn(fileSinkDesc);
++    when(fileSinkOperator.getSchema()).thenReturn(mock(RowSchema.class));
++    fileSinkDesc.setTableInfo(tableDesc);
++
++    return fileSinkOperator;
++  }
++
++  private Task<MoveWork> createMoveTask(Path source, Path destination) {
++    Task<MoveWork> moveTask = mock(MoveTask.class);
++    MoveWork moveWork = new MoveWork();
++    moveWork.setLoadFileWork(new LoadFileDesc(source, destination, true, null, null));
++
++    when(moveTask.getWork()).thenReturn(moveWork);
++
++    return moveTask;
++  }
++
++  private void verifyMoveTask(Task<? extends Serializable> task, Path source, Path target) {
++    MoveTask moveTask = (MoveTask)task;
++    assertEquals(source, moveTask.getWork().getLoadFileWork().getSourcePath());
++    assertEquals(target, moveTask.getWork().getLoadFileWork().getTargetDir());
++  }
++}
+-- 
+1.7.9.5
+

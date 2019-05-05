@@ -1,0 +1,157 @@
+From b3941ae820dfdd55f04ba036570ef5b3bfa449b8 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Wed, 8 Mar 2017 12:46:43 -0500
+Subject: [PATCH 1014/1164] CDH51383: HIVE-15997: Resource leaks when query is
+ cancelled (Yongzhi Chen, reviewed by Chaoyu Tang)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+
+Change-Id: I0b51b03fc2e3881f60de13d6aef1c0ed8f09cbbc
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    1 -
+ .../apache/hadoop/hive/ql/exec/mr/ExecDriver.java  |   19 +++++++++++++++++++
+ .../hive/ql/exec/spark/LocalHiveSparkClient.java   |    5 +++++
+ .../hive/ql/exec/spark/RemoteHiveSparkClient.java  |    5 +++++
+ .../zookeeper/ZooKeeperHiveLockManager.java        |   20 +++++++++++++++++---
+ 5 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index c0cc2b7..406e21d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -626,7 +626,6 @@ private boolean isInterrupted() {
+     lDrvState.stateLock.lock();
+     try {
+       if (lDrvState.driverState == DriverState.INTERRUPT) {
+-        Thread.currentThread().interrupt();
+         return true;
+       } else {
+         return false;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+index f19e43f..e09ac8d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+@@ -223,6 +223,11 @@ public int execute(DriverContext driverContext) {
+     boolean ctxCreated = false;
+     Path emptyScratchDir;
+ 
++    if (driverContext.isShutdown()) {
++      LOG.warn("Task was cancelled");
++      return 5;
++    }
++
+     MapWork mWork = work.getMapWork();
+     ReduceWork rWork = work.getReduceWork();
+ 
+@@ -413,6 +418,10 @@ public int execute(DriverContext driverContext) {
+         TezSessionPoolManager.getInstance().close(session, true);
+       }
+ 
++      if (driverContext.isShutdown()) {
++        LOG.warn("Task was cancelled");
++        return 5;
++      }
+       HiveConfUtil.updateJobCredentialProviders(job);
+       // Finally SUBMIT the JOB!
+       rj = jc.submitJob(job);
+@@ -420,6 +429,16 @@ public int execute(DriverContext driverContext) {
+       if (pwd != null) {
+         HiveConf.setVar(job, HiveConf.ConfVars.METASTOREPWD, pwd);
+       }
++
++      if (driverContext.isShutdown()) {
++        LOG.warn("Task was cancelled");
++        if (rj != null) {
++          rj.killJob();
++          rj = null;
++        }
++        return 5;
++      }
++
+       this.jobID = rj.getJobID();
+ 
+       returnVal = jobExecHelper.progress(rj, jc, ctx.getHiveTxnManager());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/LocalHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/LocalHiveSparkClient.java
+index cf5b1eb..a2a16ad 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/LocalHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/LocalHiveSparkClient.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.hive.ql.exec.spark.status.impl.LocalSparkJobRef;
+ import org.apache.hadoop.hive.ql.exec.spark.status.impl.LocalSparkJobStatus;
+ import org.apache.hadoop.hive.ql.io.HiveKey;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.BaseWork;
+ import org.apache.hadoop.hive.ql.plan.SparkWork;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+@@ -135,6 +136,10 @@ public SparkJobRef execute(DriverContext driverContext, SparkWork sparkWork) thr
+       new SparkPlanGenerator(sc, ctx, jobConf, emptyScratchDir, sparkReporter);
+     SparkPlan plan = gen.generate(sparkWork);
+ 
++    if (driverContext.isShutdown()) {
++      throw new HiveException("Operation is cancelled.");
++    }
++
+     // Execute generated plan.
+     JavaPairRDD<HiveKey, BytesWritable> finalRDD = plan.generateGraph();
+     // We use Spark RDD async action to submit job as it's the only way to get jobId now.
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+index f7fca21..87546be 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+@@ -49,6 +49,7 @@
+ import org.apache.hadoop.hive.ql.exec.spark.status.impl.RemoteSparkJobRef;
+ import org.apache.hadoop.hive.ql.exec.spark.status.impl.RemoteSparkJobStatus;
+ import org.apache.hadoop.hive.ql.io.HiveKey;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.BaseWork;
+ import org.apache.hadoop.hive.ql.plan.SparkWork;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+@@ -205,6 +206,10 @@ private SparkJobRef submit(final DriverContext driverContext, final SparkWork sp
+     byte[] sparkWorkBytes = KryoSerializer.serialize(sparkWork);
+ 
+     JobStatusJob job = new JobStatusJob(jobConfBytes, scratchDirBytes, sparkWorkBytes);
++    if (driverContext.isShutdown()) {
++      throw new HiveException("Operation is cancelled.");
++    }
++
+     JobHandle<Serializable> jobHandle = remoteClient.submit(job);
+     RemoteSparkJobStatus sparkJobStatus = new RemoteSparkJobStatus(remoteClient, jobHandle, sparkClientTimtout);
+     return new RemoteSparkJobRef(hiveConf, jobHandle, sparkJobStatus);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java
+index 79de81c..887cd0d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java
+@@ -485,12 +485,26 @@ static void unlockPrimitive(HiveLock hiveLock, String parent, CuratorFramework c
+     HiveLockObject obj = zLock.getHiveLockObject();
+     String name  = getLastObjectName(parent, obj);
+     try {
+-      curatorFramework.delete().forPath(zLock.getPath());
++      //catch InterruptedException to make sure locks can be released when the query is cancelled.
++      try {
++        curatorFramework.delete().forPath(zLock.getPath());
++      } catch (InterruptedException ie) {
++        curatorFramework.delete().forPath(zLock.getPath());
++      }
+ 
+       // Delete the parent node if all the children have been deleted
+-      List<String> children = curatorFramework.getChildren().forPath(name);
++      List<String> children = null;
++      try {
++        children = curatorFramework.getChildren().forPath(name);
++      } catch (InterruptedException ie) {
++        children = curatorFramework.getChildren().forPath(name);
++      }
+       if (children == null || children.isEmpty()) {
+-        curatorFramework.delete().forPath(name);
++        try {
++          curatorFramework.delete().forPath(name);
++        } catch (InterruptedException ie) {
++          curatorFramework.delete().forPath(name);
++        }
+       }
+       Metrics metrics = MetricsFactory.getInstance();
+       if (metrics != null) {
+-- 
+1.7.9.5
+

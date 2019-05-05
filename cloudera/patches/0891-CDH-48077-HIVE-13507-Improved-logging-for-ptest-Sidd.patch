@@ -1,0 +1,229 @@
+From 4222c800613518e3778656e5ba216ed55bd8bd65 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Fri, 6 May 2016 10:06:25 -0500
+Subject: [PATCH 0891/1164] CDH-48077 : HIVE-13507: Improved logging for ptest
+ (Siddharth Seth, reviewd by Szehon Ho)
+
+Change-Id: I2d65f02866595845c8aaecef07b93e03cc15055a
+---
+ .../hive/ptest/execution/ExecutionPhase.java       |    2 +
+ .../apache/hive/ptest/execution/HostExecutor.java  |   48 ++++++++++++++++++--
+ .../apache/hive/ptest/execution/LocalCommand.java  |   31 +++++++++++--
+ .../org/apache/hive/ptest/execution/PrepPhase.java |    1 +
+ .../org/apache/hive/ptest/execution/conf/Host.java |    3 ++
+ 5 files changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
+index 3026ea0..6063afc 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
+@@ -86,6 +86,8 @@ public void execute() throws Throwable {
+         isolatedWorkQueue.add(batch);
+       }
+     }
++    logger.info("ParallelWorkQueueSize={}, IsolatedWorkQueueSize={}", parallelWorkQueue.size(),
++        isolatedWorkQueue.size());
+     try {
+       int expectedNumHosts = hostExecutors.size();
+       initalizeHosts();
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+index b05d2c2..735b261 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+@@ -29,6 +29,7 @@
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.TimeUnit;
+ 
++import com.google.common.base.Stopwatch;
+ import org.apache.hive.ptest.execution.conf.Host;
+ import org.apache.hive.ptest.execution.conf.TestBatch;
+ import org.apache.hive.ptest.execution.ssh.RSyncCommand;
+@@ -65,6 +66,8 @@
+   private final File mFailedTestLogDir;
+   private final long mNumPollSeconds;
+   private volatile boolean mShutdown;
++  private int numParallelBatchesProcessed = 0;
++  private int numIsolatedBatchesProcessed = 0;
+   
+   HostExecutor(Host host, String privateKey, ListeningExecutorService executor,
+       SSHCommandExecutor sshCommandExecutor,
+@@ -100,7 +103,18 @@
+     return mExecutor.submit(new Callable<Void>() {
+       @Override
+       public Void call() throws Exception {
+-        executeTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults);
++        Stopwatch stopwatch = Stopwatch.createStarted();
++        mLogger.info("Starting SubmitTests on host {}", getHost());
++        try {
++          executeTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults);
++        } finally {
++          stopwatch.stop();
++          mLogger.info("Finishing submitTests on host: {}. ElapsedTime(seconds)={}," +
++              " NumParallelBatchesProcessed={}, NumIsolatedBatchesProcessed={}",
++              new Object[]{getHost().toString(),
++                  stopwatch.elapsed(TimeUnit.SECONDS), numParallelBatchesProcessed,
++                  numIsolatedBatchesProcessed});
++        }
+         return null;
+       }
+ 
+@@ -143,6 +157,7 @@ private void executeTests(final BlockingQueue<TestBatch> parallelWorkQueue,
+         @Override
+         public Void call() throws Exception {
+           TestBatch batch = null;
++          Stopwatch sw = Stopwatch.createUnstarted();
+           try {
+             do {
+               batch = parallelWorkQueue.poll(mNumPollSeconds, TimeUnit.SECONDS);
+@@ -151,8 +166,16 @@ public Void call() throws Exception {
+                 return null;
+               }
+               if(batch != null) {
+-                if(!executeTestBatch(drone, batch, failedTestResults)) {
+-                  failedTestResults.add(batch);
++                numParallelBatchesProcessed++;
++                sw.reset().start();
++                try {
++                  if (!executeTestBatch(drone, batch, failedTestResults)) {
++                    failedTestResults.add(batch);
++                  }
++                } finally {
++                  sw.stop();
++                  mLogger.info("Finished processing parallel batch [{}] on host {}. ElapsedTime(seconds)={}",
++                      new Object[]{batch.getName(), getHost().toShortString(), sw.elapsed(TimeUnit.SECONDS)});
+                 }
+               }
+             } while(!mShutdown && !parallelWorkQueue.isEmpty());
+@@ -176,12 +199,22 @@ public Void call() throws Exception {
+     mLogger.info("Starting isolated execution on " + mHost.getName());
+     for(Drone drone : ImmutableList.copyOf(mDrones)) {
+       TestBatch batch = null;
++      Stopwatch sw = Stopwatch.createUnstarted();
+       try {
+         do {
++
+           batch = isolatedWorkQueue.poll(mNumPollSeconds, TimeUnit.SECONDS);
+           if(batch != null) {
+-            if(!executeTestBatch(drone, batch, failedTestResults)) {
+-              failedTestResults.add(batch);
++            numIsolatedBatchesProcessed++;
++            sw.reset().start();
++            try {
++              if (!executeTestBatch(drone, batch, failedTestResults)) {
++                failedTestResults.add(batch);
++              }
++            } finally {
++              sw.stop();
++              mLogger.info("Finished processing isolated batch [{}] on host {}. ElapsedTime(seconds)={}",
++                  new Object[]{batch.getName(), getHost().toShortString(), sw.elapsed(TimeUnit.SECONDS)});
+             }
+           }
+         } while(!mShutdown && !isolatedWorkQueue.isEmpty());
+@@ -215,10 +248,15 @@ private boolean executeTestBatch(Drone drone, TestBatch batch, Set<TestBatch> fa
+     Templates.writeTemplateResult("batch-exec.vm", script, templateVariables);
+     copyToDroneFromLocal(drone, script.getAbsolutePath(), "$localDir/$instanceName/scratch/" + scriptName);
+     script.delete();
++    Stopwatch sw = Stopwatch.createStarted();
+     mLogger.info(drone + " executing " + batch + " with " + command);
+     RemoteCommandResult sshResult = new SSHCommand(mSSHCommandExecutor, drone.getPrivateKey(), drone.getUser(),
+         drone.getHost(), drone.getInstance(), command, true).
+         call();
++    sw.stop();
++    mLogger.info("Completed executing tests for batch [{}] on host {}. ElapsedTime(seconds)={}",
++        new Object[]{batch.getName(),
++            getHost().toShortString(), sw.elapsed(TimeUnit.SECONDS)});
+     File batchLogDir = null;
+     if(sshResult.getExitCode() == Constants.EXIT_CODE_UNKNOWN) {
+       throw new AbortDroneException("Drone " + drone.toString() + " exited with " +
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java
+index ec99656..de9fe68 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/LocalCommand.java
+@@ -22,17 +22,28 @@
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
++import com.google.common.base.Stopwatch;
+ import org.slf4j.Logger;
+ 
+ public class LocalCommand {
+ 
++  private static final AtomicInteger localCommandCounter = new AtomicInteger(0);
++
++  private final Logger logger;
+   private final Process process;
+   private final StreamReader streamReader;
+   private Integer exitCode;
++  private final int commandId;
++  private final Stopwatch stopwatch = Stopwatch.createUnstarted();
+ 
+   public LocalCommand(Logger logger, OutputPolicy outputPolicy, String command) throws IOException {
+-    logger.info("Starting " + command);
++    this.commandId = localCommandCounter.incrementAndGet();
++    this.logger = logger;
++    logger.info("Starting LocalCommandId={}: {}" + commandId, command);
++    stopwatch.start();
+     process = new ProcessBuilder().command(new String[] {"bash", "-c", command}).redirectErrorStream(true).start();
+     streamReader = new StreamReader(outputPolicy, process.getInputStream());
+     streamReader.setName("StreamReader-[" + command + "]");
+@@ -42,13 +53,25 @@ public LocalCommand(Logger logger, OutputPolicy outputPolicy, String command) th
+ 
+   public int getExitCode() throws InterruptedException {
+     synchronized (process) {
+-      if(exitCode == null) {
++      awaitProcessCompletion();
++      return exitCode;
++    }
++  }
++
++  private void awaitProcessCompletion() throws InterruptedException {
++    synchronized (process) {
++      if (exitCode == null) {
+         exitCode = process.waitFor();
++        if (stopwatch.isRunning()) {
++          stopwatch.stop();
++          logger.info("Finished LocalCommandId={}. ElapsedTime(seconds)={}", commandId,
++              stopwatch.elapsed(
++                  TimeUnit.SECONDS));
++        }
+       }
+-      return exitCode;
+     }
+   }
+-  
++
+   public void kill() {
+     synchronized (process) {
+       process.destroy();
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PrepPhase.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PrepPhase.java
+index 825f0c0..8fef413 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PrepPhase.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PrepPhase.java
+@@ -62,6 +62,7 @@ public void execute() throws Exception {
+     // source prep
+     start = System.currentTimeMillis();
+     File sourcePrepScript = new File(mScratchDir, "source-prep.sh");
++    logger.info("Writing {} from template", sourcePrepScript);
+     Templates.writeTemplateResult("source-prep.vm", sourcePrepScript, getTemplateDefaults());
+     execLocally("bash " + sourcePrepScript.getPath());
+     logger.debug("Deleting " + sourcePrepScript + ": " + sourcePrepScript.delete());
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/Host.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/Host.java
+index c1216c1..a56824c 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/Host.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/Host.java
+@@ -47,6 +47,9 @@ public int getThreads() {
+   public String[] getLocalDirectories() {
+     return localDirectories;
+   }
++  public String toShortString() {
++    return name;
++  }
+   @Override
+   public String toString() {
+     return "Host [name=" + name + ", user=" + user + ", threads=" + threads
+-- 
+1.7.9.5
+

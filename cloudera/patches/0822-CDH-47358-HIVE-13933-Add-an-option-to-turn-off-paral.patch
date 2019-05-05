@@ -1,0 +1,426 @@
+From 5e93d36c2477865e2a904da81ef6fbf599f1833b Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Thu, 2 Jun 2016 16:07:53 -0700
+Subject: [PATCH 0822/1164] CDH-47358: HIVE-13933 : Add an option to turn off
+ parallel file moves (Ashutosh Chauhan via Hari
+ Sankar Subramaniyan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+(cherry picked from commit 47b759f84b876bc7b6dc92f0824546baadd6c69f)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+	shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+	shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+	shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+
+Change-Id: I0966a501fead27a831c0fd617a5a3d7c27b4cd63
+---
+ .../org/apache/hadoop/hive/common/FileUtils.java   |    6 +-
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    2 +-
+ .../org/apache/hadoop/hive/ql/exec/MoveTask.java   |    2 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |  198 ++++++++++++++------
+ .../apache/hadoop/hive/shims/Hadoop20SShims.java   |    6 +-
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |    6 +-
+ .../org/apache/hadoop/hive/shims/HadoopShims.java  |    2 +-
+ 7 files changed, 157 insertions(+), 65 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+index 0005128..5d33b93 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+@@ -530,7 +530,7 @@ public static boolean mkdir(FileSystem fs, Path f, boolean inheritPerms, Configu
+         HdfsFileStatus fullFileStatus = shim.getFullFileStatus(conf, fs, lastExistingParent);
+         try {
+           //set on the entire subtree
+-          shim.setFullFileStatus(conf, fullFileStatus, fs, firstNonExistentParent, true);
++          shim.setFullFileStatus(conf, fullFileStatus, null, fs, firstNonExistentParent, true);
+         } catch (Exception e) {
+           LOG.warn("Error setting permissions of " + firstNonExistentParent, e);
+         }
+@@ -577,7 +577,7 @@ public static boolean copy(FileSystem srcFS, Path src,
+     if (copied && inheritPerms) {
+       HdfsFileStatus fullFileStatus = shims.getFullFileStatus(conf, dstFS, dst);
+       try {
+-        shims.setFullFileStatus(conf, fullFileStatus, dstFS, dst, true);
++        shims.setFullFileStatus(conf, fullFileStatus, null, dstFS, dst, true);
+       } catch (Exception e) {
+         LOG.warn("Error setting permissions or group of " + dst, e);
+       }
+@@ -713,7 +713,7 @@ public static boolean renameWithPerms(FileSystem fs, Path sourcePath,
+         HadoopShims shims = ShimLoader.getHadoopShims();
+         HdfsFileStatus fullFileStatus = shims.getFullFileStatus(conf, fs, destPath.getParent());
+         try {
+-          shims.setFullFileStatus(conf, fullFileStatus, fs, destPath, true);
++          shims.setFullFileStatus(conf, fullFileStatus, null, fs, destPath, true);
+         } catch (Exception e) {
+           LOG.warn("Error setting permissions or group of " + destPath, e);
+         }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 4f6ef59..9002cad 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -4382,7 +4382,7 @@ private int truncateTable(Hive db, TruncateTableDesc truncateTableDesc) throws H
+         fs.delete(location, true);
+         fs.mkdirs(location);
+         try {
+-          shim.setFullFileStatus(conf, fullFileStatus, fs, location, true);
++          shim.setFullFileStatus(conf, fullFileStatus, null, fs, location, true);
+         } catch (Exception e) {
+           LOG.warn("Error setting permissions of " + location, e);
+         }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
+index f9e59c0..1508160 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
+@@ -181,7 +181,7 @@ private Path createTargetPath(Path targetPath, FileSystem fs) throws IOException
+       if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS)) {
+         try {
+           HadoopShims.HdfsFileStatus status = shims.getFullFileStatus(conf, fs, actualPath);
+-          shims.setFullFileStatus(conf, status, fs, actualPath, true);
++          shims.setFullFileStatus(conf, status, null, fs, actualPath, true);
+         } catch (Exception e) {
+           LOG.warn("Error setting permissions or group of " + actualPath, e);
+         }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 1ed7d74..3e48959 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -44,6 +44,7 @@
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -2496,10 +2497,9 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+     final boolean inheritPerms = HiveConf.getBoolVar(conf,
+         HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS);
+     final List<Future<ObjectPair<Path, Path>>> futures = new LinkedList<>();
+-    final ExecutorService pool = Executors.newFixedThreadPool(
+-        conf.getIntVar(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT),
+-        new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MoveDir-Thread-%d").build());
+-
++    final ExecutorService pool = conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25) > 0 ?
++        Executors.newFixedThreadPool(conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25),
++        new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Move-Thread-%d").build()) : null;
+     for (FileStatus src : srcs) {
+       FileStatus[] files;
+       if (src.isDirectory()) {
+@@ -2513,8 +2513,8 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+         files = new FileStatus[] {src};
+       }
+ 
+-      for (FileStatus srcFile : files) {
+-
++      final SessionState parentSession = SessionState.get();
++      for (final FileStatus srcFile : files) {
+         final Path srcP = srcFile.getPath();
+         final boolean needToCopy = needToCopy(srcP, destf, srcFs, destFs);
+         // Strip off the file type, if any so we don't make:
+@@ -2530,10 +2530,11 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+           name = itemName;
+           filetype = "";
+         }
+-        futures.add(pool.submit(new Callable<ObjectPair<Path, Path>>() {
+-          @Override
+-          public ObjectPair<Path, Path> call() throws Exception {
+-            Path destPath = new Path(destf, srcP.getName());
++
++        final String srcGroup = srcFile.getGroup();
++        if (null == pool) {
++          Path destPath = new Path(destf, srcP.getName());
++          try {
+             if (!needToCopy && !isSrcLocal) {
+               for (int counter = 1; !destFs.rename(srcP,destPath); counter++) {
+                 destPath = new Path(destf, name + ("_copy_" + counter) + filetype);
+@@ -2541,28 +2542,59 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+             } else {
+               destPath = mvFile(conf, srcP, destPath, isSrcLocal, srcFs, destFs, name, filetype);
+             }
+-
+-            if (inheritPerms) {
+-              ShimLoader.getHadoopShims().setFullFileStatus(conf, fullDestStatus, destFs, destf, false);
+-            }
+             if (null != newFiles) {
+               newFiles.add(destPath);
+             }
+-            return ObjectPair.create(srcP, destPath);
++          } catch (IOException ioe) {
++            LOG.error(String.format("Failed to move: {}", ioe.getMessage()));
++            throw new HiveException(ioe.getCause());
+           }
+-        }));
++        } else {
++          futures.add(pool.submit(new Callable<ObjectPair<Path, Path>>() {
++            @Override
++            public ObjectPair<Path, Path> call() throws Exception {
++              SessionState.setCurrentSessionState(parentSession);
++              Path destPath = new Path(destf, srcP.getName());
++              if (!needToCopy && !isSrcLocal) {
++                for (int counter = 1; !destFs.rename(srcP,destPath); counter++) {
++                  destPath = new Path(destf, name + ("_copy_" + counter) + filetype);
++                }
++              } else {
++                destPath = mvFile(conf, srcP, destPath, isSrcLocal, srcFs, destFs, name, filetype);
++              }
++
++              if (inheritPerms) {
++                ShimLoader.getHadoopShims().setFullFileStatus(conf, fullDestStatus, srcGroup, destFs, destPath, false);
++              }
++              if (null != newFiles) {
++                newFiles.add(destPath);
++              }
++              return ObjectPair.create(srcP, destPath);
++            }
++          }));
++        }
+       }
+     }
+-    pool.shutdown();
+-    for (Future<ObjectPair<Path, Path>> future : futures) {
+-      try {
+-        ObjectPair<Path, Path> pair = future.get();
+-        LOG.debug(String.format("Moved src: {}", pair.getFirst().toString(), ", to dest: {}",
+-                pair.getSecond().toString()));
+-      } catch (Exception e) {
+-        LOG.error("Failed to move: {}", e);
+-        pool.shutdownNow();
+-        throw new HiveException(e.getCause());
++    if (null == pool) {
++      if (inheritPerms) {
++        try {
++          ShimLoader.getHadoopShims().setFullFileStatus(conf, fullDestStatus, null, destFs, destf, true);
++        } catch (IOException e) {
++          LOG.error(String.format("Failed to move: {}", e.getMessage()));
++          throw new HiveException(e.getCause());
++        }
++      }
++    } else {
++      pool.shutdown();
++      for (Future<ObjectPair<Path, Path>> future : futures) {
++        try {
++          ObjectPair<Path, Path> pair = future.get();
++          LOG.debug(String.format("Moved src: {}", pair.getFirst().toString(), ", to dest: {}", pair.getSecond().toString()));
++        } catch (Exception e) {
++          LOG.error(String.format("Failed to move: {}", e.getMessage()));
++          pool.shutdownNow();
++          throw new HiveException(e.getCause());
++        }
+       }
+     }
+   }
+@@ -2728,7 +2760,7 @@ public static boolean moveFile(final HiveConf conf, Path srcf, final Path destf,
+         destFs.copyFromLocalFile(srcf, destf);
+         if (inheritPerms) {
+           try {
+-            ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, destFs, destf, true);
++            ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, null, destFs, destf, true);
+           } catch (IOException e) {
+             LOG.warn("Error setting permission of file " + destf + ": "+ e.getMessage(), e);
+           }
+@@ -2747,48 +2779,58 @@ public static boolean moveFile(final HiveConf conf, Path srcf, final Path destf,
+             FileStatus[] srcs = destFs.listStatus(srcf, FileUtils.HIDDEN_FILES_PATH_FILTER);
+ 
+             List<Future<Void>> futures = new LinkedList<>();
+-            final ExecutorService pool = Executors.newFixedThreadPool(
+-                conf.getIntVar(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT),
+-                new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MoveDir-Thread-%d").build());
++            final ExecutorService pool = conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25) > 0 ?
++                Executors.newFixedThreadPool(conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25),
++                new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Move-Thread-%d").build()) : null;
+             /* Move files one by one because source is a subdirectory of destination */
+-            for (final FileStatus status : srcs) {
+-              futures.add(pool.submit(new Callable<Void>() {
+-                @Override
+-                public Void call() throws Exception {
+-                  SessionState.setCurrentSessionState(parentSession);
+-                  Path destPath = new Path(destf, status.getPath().getName());
+-                  try {
+-                    if(destFs.rename(status.getPath(), destf)) {
++            for (final FileStatus srcStatus : srcs) {
++
++              if (null == pool) {
++                if(!destFs.rename(srcStatus.getPath(), destf)) {
++                  throw new IOException("rename for src path: " + srcStatus.getPath() + " to dest:"
++                      + destf + " returned false");
++                }
++              } else {
++                futures.add(pool.submit(new Callable<Void>() {
++                  @Override
++                  public Void call() throws Exception {
++                    SessionState.setCurrentSessionState(parentSession);
++                    final Path destPath = new Path(destf, srcStatus.getPath().getName());
++                    final String group = srcStatus.getGroup();
++                    if(destFs.rename(srcStatus.getPath(), destf)) {
+                       if (inheritPerms) {
+-                        ShimLoader.getHadoopShims().setFullFileStatus(conf, desiredStatus, destFs, destPath, false);
++                        ShimLoader.getHadoopShims().setFullFileStatus(conf, desiredStatus, null, destFs, destPath, false);
+                       }
+                     } else {
+-                      throw new IOException("rename for src path: " + status.getPath() + " to dest path:"
++                      throw new IOException("rename for src path: " + srcStatus.getPath() + " to dest path:"
+                           + destPath + " returned false");
+                     }
+-                  } catch (IOException ioe) {
+-                    LOG.error(String.format("Failed to rename/set permissions. Src path: {} Dest path: {}", status.getPath(), destPath));
+-                    throw ioe;
++                    return null;
+                   }
+-                  return null;
+-                }
+-              }));
++                }));
++              }
+             }
+-            pool.shutdown();
+-            for (Future<Void> future : futures) {
+-              try {
+-                future.get();
+-              } catch (Exception e) {
+-                LOG.debug(e.getMessage());
+-                pool.shutdownNow();
+-                throw new HiveException(e.getCause());
++            if (null == pool) {
++              if (inheritPerms) {
++                ShimLoader.getHadoopShims().setFullFileStatus(conf, desiredStatus, null, destFs, destf, true);
++              }
++            } else {
++              pool.shutdown();
++              for (Future<Void> future : futures) {
++                try {
++                  future.get();
++                } catch (Exception e) {
++                  LOG.debug(e.getMessage());
++                  pool.shutdownNow();
++                  throw new HiveException(e.getCause());
++                }
+               }
+             }
+             return true;
+           } else {
+             if (destFs.rename(srcf, destf)) {
+               if (inheritPerms) {
+-                ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, destFs, destf, true);
++                ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, null, destFs, destf, true);
+               }
+               return true;
+             }
+@@ -3051,6 +3093,52 @@ protected static void replaceFiles(Path tablePath, Path srcf, Path destf, Path o
+     }
+   }
+ 
++  /**
++   * Trashes or deletes all files under a directory. Leaves the directory as is.
++   * @param fs FileSystem to use
++   * @param f path of directory
++   * @param conf hive configuration
++   * @param forceDelete whether to force delete files if trashing does not succeed
++   * @return true if deletion successful
++   * @throws IOException
++   */
++  private boolean trashFilesUnderDir(final FileSystem fs, Path f, final Configuration conf)
++      throws IOException {
++    FileStatus[] statuses = fs.listStatus(f, FileUtils.HIDDEN_FILES_PATH_FILTER);
++    boolean result = true;
++    final List<Future<Boolean>> futures = new LinkedList<>();
++    final ExecutorService pool = conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25) > 0 ?
++        Executors.newFixedThreadPool(conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25),
++        new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Delete-Thread-%d").build()) : null;
++    final SessionState parentSession = SessionState.get();
++    for (final FileStatus status : statuses) {
++      if (null == pool) {
++        result &= FileUtils.moveToTrash(fs, status.getPath(), conf);
++      } else {
++        futures.add(pool.submit(new Callable<Boolean>() {
++          @Override
++          public Boolean call() throws Exception {
++            SessionState.setCurrentSessionState(parentSession);
++            return FileUtils.moveToTrash(fs, status.getPath(), conf);
++          }
++        }));
++      }
++    }
++    if (null != pool) {
++      pool.shutdown();
++      for (Future<Boolean> future : futures) {
++        try {
++          result &= future.get();
++        } catch (InterruptedException | ExecutionException e) {
++          LOG.error("Failed to delete: ",e);
++          pool.shutdownNow();
++          throw new IOException(e);
++        }
++      }
++    }
++    return result;
++  }
++
+   public static boolean isHadoop1() {
+     return ShimLoader.getMajorVersion().startsWith("0.20");
+   }
+diff --git a/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java b/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+index ebeb07f..85b0bb2 100644
+--- a/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
++++ b/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+@@ -482,7 +482,7 @@ public HdfsFileStatus getFullFileStatus(Configuration conf, FileSystem fs, Path
+ 
+   @Override
+   public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
+-    FileSystem fs, Path target, boolean recursive) throws IOException {
++    FileSystem fs, String targetGroup, Path target, boolean recursive) throws IOException {
+     String group = sourceStatus.getFileStatus().getGroup();
+     String permission = Integer.toString(sourceStatus.getFileStatus().getPermission().toShort(), 8);
+     //use FsShell to change group and permissions recursively
+@@ -497,7 +497,9 @@ public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
+       }
+     } else {
+       if (group != null && !group.isEmpty()) {
+-        fs.setOwner(target, null, group);
++        if (targetGroup == null || !group.equals(targetGroup)) {
++          fs.setOwner(target, null, group);
++        }
+       }
+       fs.setPermission(target, sourcePerm);
+     }
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index 3eb6a50..6247c7b 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -741,7 +741,7 @@ public HdfsFileStatus getFullFileStatus(Configuration conf, FileSystem fs,
+   }
+ 
+   @Override
+-  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
++  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup,
+     FileSystem fs, Path target, boolean recursive) throws IOException {
+     String group = sourceStatus.getFileStatus().getGroup();
+     //use FsShell to change group, permissions, and extended ACL's recursively
+@@ -794,7 +794,9 @@ public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
+       }
+     } else {
+       if (group != null && !group.isEmpty()) {
+-        fs.setOwner(target, null, group);
++        if (targetGroup == null || !group.equals(targetGroup)) {
++          fs.setOwner(target, null, group);
++        }
+       }
+       if (aclEnabled) {
+         if (null != aclEntries) {
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+index 74b35b9..64d69ed 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+@@ -301,7 +301,7 @@ RecordReader getRecordReader(JobConf job, CombineFileSplit split, Reporter repor
+    * @param target
+    * @throws IOException
+    */
+-  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
++  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup,
+     FileSystem fs, Path target, boolean recursive) throws IOException;
+ 
+   /**
+-- 
+1.7.9.5
+

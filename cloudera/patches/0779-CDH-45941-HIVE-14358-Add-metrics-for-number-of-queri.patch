@@ -1,0 +1,427 @@
+From 90c9fca9a92662e752192114e71fc04779e9dc45 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Mon, 26 Sep 2016 13:55:28 -0400
+Subject: [PATCH 0779/1164] CDH-45941: HIVE-14358: Add metrics for number of
+ queries executed for each execution engine (Barna
+ Zsombor Klara, reviewed by Gabor Szadovszky,
+ Yongzhi Chen)
+
+Change-Id: I191c99751f91fbfb9b83e082b2a0de5cbc618c14
+---
+ .../common/metrics/common/MetricsConstant.java     |   10 ++++-
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    7 +++
+ .../java/org/apache/hadoop/hive/ql/exec/Task.java  |    9 ++++
+ .../apache/hadoop/hive/ql/exec/mr/MapRedTask.java  |   11 +++++
+ .../hadoop/hive/ql/exec/mr/MapredLocalTask.java    |   10 +++++
+ .../hadoop/hive/ql/exec/spark/SparkTask.java       |   11 +++++
+ .../apache/hadoop/hive/ql/exec/tez/TezTask.java    |   12 +++++
+ .../hadoop/hive/ql/exec/mr/TestMapRedTask.java     |   47 ++++++++++++++++++++
+ .../hive/ql/exec/mr/TestMapredLocalTask.java       |   46 +++++++++++++++++++
+ .../hadoop/hive/ql/exec/spark/TestSparkTask.java   |   46 +++++++++++++++++++
+ .../hadoop/hive/ql/exec/tez/TestTezTask.java       |   17 +++++++
+ 11 files changed, 225 insertions(+), 1 deletion(-)
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapRedTask.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapredLocalTask.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/exec/spark/TestSparkTask.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+index 9e5171e..8d73cab 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+@@ -61,4 +61,12 @@
+   public static final String DELETE_TOTAL_PARTITIONS = "delete_total_count_partitions";
+ 
+   public static final String DIRECTSQL_ERRORS = "directsql_errors";
+-}
++
++  // The number of map reduce tasks executed by the HiveServer2 since the last restart
++  public static final String HIVE_MR_TASKS = "hive_mapred_tasks";
++  // The number of spark tasks executed by the HiveServer2 since the last restart
++  public static final String HIVE_SPARK_TASKS = "hive_spark_tasks";
++  // The number of tez tasks executed by the HiveServer2 since the last restart
++  public static final String HIVE_TEZ_TASKS = "hive_tez_tasks";
++
++}
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index a682e0a..e77bbf4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -41,6 +41,8 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.hive.common.ValidTxnList;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.conf.HiveVariableSource;
+@@ -1525,6 +1527,11 @@ public int execute() throws CommandNeedRetryException {
+         // incorrect results.
+         assert tsk.getParentTasks() == null || tsk.getParentTasks().isEmpty();
+         driverCxt.addToRunnable(tsk);
++
++        Metrics metrics = MetricsFactory.getInstance();
++        if (metrics != null) {
++          tsk.updateTaskMetrics(metrics);
++        }
+       }
+ 
+       perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.TIME_TO_SUBMIT);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
+index 9724c78..b69e020 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
+@@ -29,6 +29,8 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.DriverContext;
+ import org.apache.hadoop.hive.ql.QueryDisplay;
+@@ -532,6 +534,13 @@ protected void cloneConf() {
+     }
+   }
+ 
++  /**
++   * Provide metrics on the type and number of tasks executed by the HiveServer
++   * @param metrics
++   */
++  public void updateTaskMetrics(Metrics metrics) {
++    // no metrics gathered by default
++   }
+ 
+   public int getTaskTag() {
+     return taskTag;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+index de250d2..fe3c9f0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+@@ -33,6 +33,8 @@
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.io.CachingPrintStream;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.ql.Context;
+@@ -371,6 +373,15 @@ public boolean reduceDone() {
+     return runningViaChild ? done() : b;
+   }
+ 
++  @Override
++  public void updateTaskMetrics(Metrics metrics) {
++    try {
++      metrics.incrementCounter(MetricsConstant.HIVE_MR_TASKS);
++    } catch (IOException ex) {
++      LOG.warn("Could not increment metrics for " + this, ex);
++    }
++  }
++
+   /**
+    * Set the number of reducers for the mapred work.
+    */
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+index ecdcc85..0ee6f9d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+@@ -45,6 +45,8 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.LogUtils;
+ import org.apache.hadoop.hive.common.io.CachingPrintStream;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.ql.Context;
+@@ -119,6 +121,14 @@ public void setExecContext(ExecMapperContext execContext) {
+     this.execContext = execContext;
+   }
+ 
++  public void updateTaskMetrics(Metrics metrics) {
++    try {
++      metrics.incrementCounter(MetricsConstant.HIVE_MR_TASKS);
++    } catch (IOException ex) {
++      LOG.warn("Could not increment metrics for " + this, ex);
++    }
++  }
++
+   @Override
+   public void initialize(HiveConf conf, QueryPlan queryPlan, DriverContext driverContext) {
+     super.initialize(conf, queryPlan, driverContext);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+index 08b811a..d65f898 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+@@ -29,6 +29,8 @@
+ import java.util.Map;
+ 
+ import org.apache.hadoop.hive.common.StatsSetupConst;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+@@ -190,6 +192,15 @@ private int close(int rc) {
+   }
+ 
+   @Override
++  public void updateTaskMetrics(Metrics metrics) {
++    try {
++      metrics.incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
++    } catch (IOException ex) {
++      LOG.warn("Could not increment metrics for " + this, ex);
++    }
++  }
++
++  @Override
+   public boolean isMapRedTask() {
+     return true;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
+index 455f4cc..fcc80d4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.hive.ql.exec.tez;
+ 
++import java.io.IOException;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.EnumSet;
+@@ -30,6 +31,8 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.ql.Context;
+ import org.apache.hadoop.hive.ql.DriverContext;
+ import org.apache.hadoop.hive.ql.exec.Operator;
+@@ -416,6 +419,15 @@ int close(TezWork work, int rc) {
+   }
+ 
+   @Override
++  public void updateTaskMetrics(Metrics metrics) {
++    try {
++      metrics.incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
++    } catch (IOException ex) {
++      LOG.warn("Could not increment metrics for " + this, ex);
++    }
++  }
++
++  @Override
+   public boolean isMapRedTask() {
+     return true;
+   }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapRedTask.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapRedTask.java
+new file mode 100644
+index 0000000..5ec7c0d
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapRedTask.java
+@@ -0,0 +1,47 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.exec.mr;
++
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.apache.hadoop.hive.ql.exec.spark.SparkTask;
++import org.junit.Test;
++import org.mockito.Mockito;
++
++public class TestMapRedTask {
++
++  @Test
++  public void mrTask_updates_Metrics() throws IOException {
++
++    Metrics mockMetrics = Mockito.mock(Metrics.class);
++
++    MapRedTask mapRedTask = new MapRedTask();
++    mapRedTask.updateTaskMetrics(mockMetrics);
++
++    verify(mockMetrics, times(1)).incrementCounter(MetricsConstant.HIVE_MR_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
++  }
++
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapredLocalTask.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapredLocalTask.java
+new file mode 100644
+index 0000000..4a0fafe
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/mr/TestMapredLocalTask.java
+@@ -0,0 +1,46 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.exec.mr;
++
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.junit.Test;
++import org.mockito.Mockito;
++
++public class TestMapredLocalTask {
++
++  @Test
++  public void localMRTask_updates_Metrics() throws IOException {
++
++    Metrics mockMetrics = Mockito.mock(Metrics.class);
++
++    MapredLocalTask localMrTask = new MapredLocalTask();
++    localMrTask.updateTaskMetrics(mockMetrics);
++
++    verify(mockMetrics, times(1)).incrementCounter(MetricsConstant.HIVE_MR_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
++  }
++
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/spark/TestSparkTask.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/spark/TestSparkTask.java
+new file mode 100644
+index 0000000..4c7ec76
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/spark/TestSparkTask.java
+@@ -0,0 +1,46 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.exec.spark;
++
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.junit.Test;
++import org.mockito.Mockito;
++
++public class TestSparkTask {
++
++  @Test
++  public void sparkTask_updates_Metrics() throws IOException {
++
++    Metrics mockMetrics = Mockito.mock(Metrics.class);
++
++    SparkTask sparkTask = new SparkTask();
++    sparkTask.updateTaskMetrics(mockMetrics);
++
++    verify(mockMetrics, times(1)).incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_MR_TASKS);
++  }
++
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/tez/TestTezTask.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/tez/TestTezTask.java
+index d004a27..79ab62e 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/tez/TestTezTask.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/tez/TestTezTask.java
+@@ -27,6 +27,7 @@
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
++import static org.mockito.Mockito.never;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -39,6 +40,8 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.Context;
+ import org.apache.hadoop.hive.ql.exec.Operator;
+@@ -67,6 +70,7 @@
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.Mockito;
+ import org.mockito.invocation.InvocationOnMock;
+ import org.mockito.stubbing.Answer;
+ 
+@@ -273,4 +277,17 @@ public void testGetExtraLocalResources() throws Exception {
+ 
+     assertEquals(resMap, task.getExtraLocalResources(conf, path, inputOutputJars));
+   }
++
++  @Test
++  public void tezTask_updates_Metrics() throws IOException {
++
++    Metrics mockMetrics = Mockito.mock(Metrics.class);
++
++    TezTask tezTask = new TezTask();
++    tezTask.updateTaskMetrics(mockMetrics);
++
++    verify(mockMetrics, times(1)).incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
++    verify(mockMetrics, never()).incrementCounter(MetricsConstant.HIVE_MR_TASKS);
++  }
+ }
+-- 
+1.7.9.5
+

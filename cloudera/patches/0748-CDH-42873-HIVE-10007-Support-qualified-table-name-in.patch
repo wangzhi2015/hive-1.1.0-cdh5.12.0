@@ -1,0 +1,1029 @@
+From 29bc70820ad0de94460d0efed6c0c89af3a7ca5b Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@apache.org>
+Date: Tue, 24 Mar 2015 18:28:17 +0000
+Subject: [PATCH 0748/1164] CDH-42873 HIVE-10007 : Support qualified table
+ name in analyze table compute statistics for
+ columns (Chaoyu Tang via Szehon)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1668954 13f79535-47bb-0310-9956-ffa450edef68
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/parse/ColumnStatsSemanticAnalyzer.java
+
+Change-Id: I6033287e47c696aaa4c78c4b2dfe5888fd936273
+---
+ .../hadoop/hive/ql/exec/ColumnStatsTask.java       |    8 +-
+ .../hadoop/hive/ql/exec/ColumnStatsUpdateTask.java |    4 +-
+ .../hive/ql/parse/ColumnStatsSemanticAnalyzer.java |   14 +-
+ .../hadoop/hive/ql/parse/DDLSemanticAnalyzer.java  |    2 +-
+ .../clientpositive/alter_partition_update_status.q |   14 +-
+ .../clientpositive/alter_table_update_status.q     |   20 +-
+ .../queries/clientpositive/columnstats_partlvl.q   |   17 +
+ .../queries/clientpositive/columnstats_tbllvl.q    |   53 ++-
+ .../alter_partition_update_status.q.out            |   39 +++
+ .../clientpositive/alter_table_update_status.q.out |   52 +++
+ .../clientpositive/columnstats_partlvl.q.out       |   71 +++-
+ .../clientpositive/columnstats_partlvl_dp.q.out    |    8 +-
+ .../clientpositive/columnstats_tbllvl.q.out        |  361 +++++++++++++++++++-
+ .../clientpositive/display_colstats_tbllvl.q.out   |    6 +-
+ .../temp_table_display_colstats_tbllvl.q.out       |    6 +-
+ 15 files changed, 631 insertions(+), 44 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsTask.java
+index e2f696e..3414e9a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsTask.java
+@@ -267,7 +267,7 @@ private void unpackStructObject(ObjectInspector oi, Object o, String fName,
+ 
+   private List<ColumnStatistics> constructColumnStatsFromPackedRows() throws HiveException, MetaException, IOException {
+ 
+-    String dbName = SessionState.get().getCurrentDatabase();
++    String currentDb = SessionState.get().getCurrentDatabase();
+     String tableName = work.getColStats().getTableName();
+     String partName = null;
+     List<String> colName = work.getColStats().getColName();
+@@ -286,7 +286,7 @@ private void unpackStructObject(ObjectInspector oi, Object o, String fName,
+       List<? extends StructField> fields = soi.getAllStructFieldRefs();
+       List<Object> list = soi.getStructFieldsDataAsList(packedRow.o);
+ 
+-      Table tbl = db.getTable(dbName,tableName);
++      Table tbl = db.getTable(currentDb,tableName);
+       List<FieldSchema> partColSchema = tbl.getPartCols();
+       // Partition columns are appended at end, we only care about stats column
+       int numOfStatCols = isTblLevel ? fields.size() : fields.size() - partColSchema.size();
+@@ -313,8 +313,8 @@ private void unpackStructObject(ObjectInspector oi, Object o, String fName,
+         }
+         partName = Warehouse.makePartName(partColSchema, partVals);
+       }
+-
+-      ColumnStatisticsDesc statsDesc = getColumnStatsDesc(dbName, tableName, partName, isTblLevel);
++      String [] names = Utilities.getDbTableName(currentDb, tableName);
++      ColumnStatisticsDesc statsDesc = getColumnStatsDesc(names[0], names[1], partName, isTblLevel);
+       ColumnStatistics colStats = new ColumnStatistics();
+       colStats.setStatsDesc(statsDesc);
+       colStats.setStatsObj(statsObjs);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsUpdateTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsUpdateTask.java
+index 28c17b7..b85282c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsUpdateTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnStatsUpdateTask.java
+@@ -238,8 +238,8 @@ private ColumnStatistics constructColumnStatsFromInput()
+     } else {
+       throw new SemanticException("Unsupported type");
+     }
+-
+-    ColumnStatisticsDesc statsDesc = getColumnStatsDesc(dbName, tableName,
++    String [] names = Utilities.getDbTableName(dbName, tableName);
++    ColumnStatisticsDesc statsDesc = getColumnStatsDesc(names[0], names[1],
+         partName, partName == null);
+     ColumnStatistics colStat = new ColumnStatistics();
+     colStat.setStatsDesc(statsDesc);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ColumnStatsSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ColumnStatsSemanticAnalyzer.java
+index eadfe74..3a3f67a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ColumnStatsSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ColumnStatsSemanticAnalyzer.java
+@@ -98,13 +98,9 @@ private boolean isPartitionLevelStats(ASTNode tree) {
+ 
+   private Table getTable(ASTNode tree) throws SemanticException {
+     String tableName = getUnescapedName((ASTNode) tree.getChild(0).getChild(0));
+-    try {
+-      return db.getTable(tableName);
+-    } catch (InvalidTableException e) {
+-      throw new SemanticException(ErrorMsg.INVALID_TABLE.getMsg(tableName), e);
+-    } catch (HiveException e) {
+-      throw new SemanticException(e.getMessage(), e);
+-    }
++    String currentDb = SessionState.get().getCurrentDatabase();
++    String [] names = Utilities.getDbTableName(currentDb, tableName);
++    return getTable(names[0], names[1], true);
+   }
+ 
+   private Map<String,String> getPartKeyValuePairsFromAST(ASTNode tree) {
+@@ -339,6 +335,8 @@ private String genRewrittenQuery(List<String> colNames, int numBitVectors, Map<S
+       }
+     }
+     rewrittenQueryBuilder.append(" from ");
++    rewrittenQueryBuilder.append(tbl.getDbName());
++    rewrittenQueryBuilder.append(".");
+     rewrittenQueryBuilder.append(tbl.getTableName());
+     isRewritten = true;
+ 
+@@ -456,7 +454,7 @@ public void analyze(ASTNode ast, Context origCtx) throws SemanticException {
+       qb = getQB();
+       qb.setAnalyzeRewrite(true);
+       qbp = qb.getParseInfo();
+-      qbp.setTableName(tbl.getTableName());
++      qbp.setTableName(tbl.getDbName() + "." + tbl.getTableName());
+       qbp.setTblLvl(isTableLevel);
+       qbp.setColName(colNames);
+       qbp.setColType(colType);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
+index 69927a2..4b3b098 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
+@@ -510,7 +510,7 @@ private void analyzeAlterTableUpdateStats(ASTNode ast, String tblName, Map<Strin
+     if (colType == null)
+       throw new SemanticException("column type not found");
+ 
+-    ColumnStatsDesc cStatsDesc = new ColumnStatsDesc(tbl.getTableName(),
++    ColumnStatsDesc cStatsDesc = new ColumnStatsDesc(tbl.getDbName() + "." + tbl.getTableName(),
+         Arrays.asList(colName), Arrays.asList(colType), partSpec == null);
+     ColumnStatsUpdateTask cStatsUpdateTask = (ColumnStatsUpdateTask) TaskFactory
+         .get(new ColumnStatsUpdateWork(cStatsDesc, partName, mapProp), conf);
+diff --git a/ql/src/test/queries/clientpositive/alter_partition_update_status.q b/ql/src/test/queries/clientpositive/alter_partition_update_status.q
+index 1eee9a5..0d9c176 100644
+--- a/ql/src/test/queries/clientpositive/alter_partition_update_status.q
++++ b/ql/src/test/queries/clientpositive/alter_partition_update_status.q
+@@ -22,4 +22,16 @@ describe formatted src_stat_part_two.key PARTITION(px=1, py='a');
+ 
+ ALTER TABLE src_stat_part_two PARTITION(px=1, py='a') UPDATE STATISTICS for column key SET ('numDVs'='30','maxColLen'='40');
+ 
+-describe formatted src_stat_part_two.key PARTITION(px=1, py='a');
+\ No newline at end of file
++describe formatted src_stat_part_two.key PARTITION(px=1, py='a');
++
++create database if not exists dummydb;
++
++use dummydb;
++
++ALTER TABLE default.src_stat_part_two PARTITION(px=1, py='a') UPDATE STATISTICS for column key SET ('numDVs'='40','maxColLen'='50');
++
++describe formatted default.src_stat_part_two key PARTITION(px=1, py='a');
++
++use default;
++
++drop database dummydb;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/alter_table_update_status.q b/ql/src/test/queries/clientpositive/alter_table_update_status.q
+index fd45cd4..4cc1a18 100644
+--- a/ql/src/test/queries/clientpositive/alter_table_update_status.q
++++ b/ql/src/test/queries/clientpositive/alter_table_update_status.q
+@@ -27,4 +27,22 @@ describe formatted src_stat_int.key;
+ 
+ ALTER TABLE src_stat_int UPDATE STATISTICS for column key SET ('numDVs'='2222','lowValue'='333.22','highValue'='22.22');
+ 
+-describe formatted src_stat_int.key; 
+\ No newline at end of file
++describe formatted src_stat_int.key; 
++
++
++
++create database if not exists dummydb;
++
++use dummydb;
++
++ALTER TABLE default.src_stat UPDATE STATISTICS for column key SET ('numDVs'='3333','avgColLen'='2.222');
++
++describe formatted default.src_stat key;
++
++ALTER TABLE default.src_stat UPDATE STATISTICS for column value SET ('numDVs'='232','numNulls'='233','avgColLen'='2.34','maxColLen'='235');
++
++describe formatted default.src_stat value;
++
++use default;
++
++drop database dummydb;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/columnstats_partlvl.q b/ql/src/test/queries/clientpositive/columnstats_partlvl.q
+index 82a9e0f..bd41005 100644
+--- a/ql/src/test/queries/clientpositive/columnstats_partlvl.q
++++ b/ql/src/test/queries/clientpositive/columnstats_partlvl.q
+@@ -39,3 +39,20 @@ analyze table Employee_Part  compute statistics for columns;
+ analyze table Employee_Part  compute statistics for columns;
+ 
+ describe formatted Employee_Part.employeeID;
++
++set hive.analyze.stmt.collect.partlevel.stats=true;
++
++create database if not exists dummydb;
++
++use dummydb;
++
++analyze table default.Employee_Part partition (employeeSalary=2000.0) compute statistics for columns;
++
++describe formatted default.Employee_Part employeeID   partition (employeeSalary=2000.0);
++
++analyze table default.Employee_Part  compute statistics for columns;
++
++use default;
++
++drop database dummydb;
++
+diff --git a/ql/src/test/queries/clientpositive/columnstats_tbllvl.q b/ql/src/test/queries/clientpositive/columnstats_tbllvl.q
+index 07cc959..4c5d3e6 100644
+--- a/ql/src/test/queries/clientpositive/columnstats_tbllvl.q
++++ b/ql/src/test/queries/clientpositive/columnstats_tbllvl.q
+@@ -24,9 +24,9 @@ analyze table UserVisits_web_text_none compute statistics for columns sourceIP,
+ analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue;
+ 
+ explain 
+-analyze table UserVisits_web_text_none compute statistics for columns;
++analyze table default.UserVisits_web_text_none compute statistics for columns;
+ 
+-analyze table UserVisits_web_text_none compute statistics for columns;
++analyze table default.UserVisits_web_text_none compute statistics for columns;
+ 
+ describe formatted UserVisits_web_text_none destURL;
+ describe formatted UserVisits_web_text_none adRevenue;
+@@ -45,3 +45,52 @@ analyze table empty_tab compute statistics for columns a,b,c,d,e;
+ 
+ analyze table empty_tab compute statistics for columns a,b,c,d,e;
+ 
++create database if not exists dummydb;
++
++use dummydb;
++
++analyze table default.UserVisits_web_text_none compute statistics for columns destURL;
++
++describe formatted default.UserVisits_web_text_none destURL;
++
++CREATE TABLE UserVisits_in_dummy_db (
++  sourceIP string,
++  destURL string,
++  visitDate string,
++  adRevenue float,
++  userAgent string,
++  cCode string,
++  lCode string,
++  sKeyword string,
++  avgTimeOnSite int)
++row format delimited fields terminated by '|'  stored as textfile;
++
++LOAD DATA LOCAL INPATH "../../data/files/UserVisits.dat" INTO TABLE UserVisits_in_dummy_db;
++
++use default;
++
++explain 
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue;
++
++explain extended
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue;
++
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue;
++
++explain 
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns;
++
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns;
++
++describe formatted dummydb.UserVisits_in_dummy_db destURL;
++describe formatted dummydb.UserVisits_in_dummy_db adRevenue;
++describe formatted dummydb.UserVisits_in_dummy_db avgTimeOnSite;
++
++drop table dummydb.UserVisits_in_dummy_db;
++
++drop database dummydb;
++
++
++
++
++
+diff --git a/ql/src/test/results/clientpositive/alter_partition_update_status.q.out b/ql/src/test/results/clientpositive/alter_partition_update_status.q.out
+index 7e33a7e..49d5268 100644
+--- a/ql/src/test/results/clientpositive/alter_partition_update_status.q.out
++++ b/ql/src/test/results/clientpositive/alter_partition_update_status.q.out
+@@ -102,3 +102,42 @@ POSTHOOK: Input: default@src_stat_part_two
+ # col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
+ 	 	 	 	 	 	 	 	 	 	 
+ key                 	string              	                    	                    	0                   	30                  	1.72                	40                  	                    	                    	from deserializer   
++PREHOOK: query: create database if not exists dummydb
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: create database if not exists dummydb
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:dummydb
++PREHOOK: query: use dummydb
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:dummydb
++POSTHOOK: query: use dummydb
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:dummydb
++PREHOOK: query: ALTER TABLE default.src_stat_part_two PARTITION(px=1, py='a') UPDATE STATISTICS for column key SET ('numDVs'='40','maxColLen'='50')
++PREHOOK: type: ALTERTABLE_UPDATEPARTSTATS
++POSTHOOK: query: ALTER TABLE default.src_stat_part_two PARTITION(px=1, py='a') UPDATE STATISTICS for column key SET ('numDVs'='40','maxColLen'='50')
++POSTHOOK: type: ALTERTABLE_UPDATEPARTSTATS
++PREHOOK: query: describe formatted default.src_stat_part_two key PARTITION(px=1, py='a')
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@src_stat_part_two
++POSTHOOK: query: describe formatted default.src_stat_part_two key PARTITION(px=1, py='a')
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@src_stat_part_two
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++key                 	string              	                    	                    	0                   	40                  	1.72                	50                  	                    	                    	from deserializer   
++PREHOOK: query: use default
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:default
++POSTHOOK: query: use default
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:default
++PREHOOK: query: drop database dummydb
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:dummydb
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: drop database dummydb
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:dummydb
++POSTHOOK: Output: database:dummydb
+diff --git a/ql/src/test/results/clientpositive/alter_table_update_status.q.out b/ql/src/test/results/clientpositive/alter_table_update_status.q.out
+index 3613598..9345797 100644
+--- a/ql/src/test/results/clientpositive/alter_table_update_status.q.out
++++ b/ql/src/test/results/clientpositive/alter_table_update_status.q.out
+@@ -103,3 +103,55 @@ POSTHOOK: Input: default@src_stat_int
+ # col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
+ 	 	 	 	 	 	 	 	 	 	 
+ key                 	double              	333.22              	22.22               	10                  	2222                	                    	                    	                    	                    	from deserializer   
++PREHOOK: query: create database if not exists dummydb
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: create database if not exists dummydb
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:dummydb
++PREHOOK: query: use dummydb
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:dummydb
++POSTHOOK: query: use dummydb
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:dummydb
++PREHOOK: query: ALTER TABLE default.src_stat UPDATE STATISTICS for column key SET ('numDVs'='3333','avgColLen'='2.222')
++PREHOOK: type: ALTERTABLE_UPDATETABLESTATS
++POSTHOOK: query: ALTER TABLE default.src_stat UPDATE STATISTICS for column key SET ('numDVs'='3333','avgColLen'='2.222')
++POSTHOOK: type: ALTERTABLE_UPDATETABLESTATS
++PREHOOK: query: describe formatted default.src_stat key
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@src_stat
++POSTHOOK: query: describe formatted default.src_stat key
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@src_stat
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++key                 	string              	                    	                    	0                   	3333                	2.222               	3                   	                    	                    	from deserializer   
++PREHOOK: query: ALTER TABLE default.src_stat UPDATE STATISTICS for column value SET ('numDVs'='232','numNulls'='233','avgColLen'='2.34','maxColLen'='235')
++PREHOOK: type: ALTERTABLE_UPDATETABLESTATS
++POSTHOOK: query: ALTER TABLE default.src_stat UPDATE STATISTICS for column value SET ('numDVs'='232','numNulls'='233','avgColLen'='2.34','maxColLen'='235')
++POSTHOOK: type: ALTERTABLE_UPDATETABLESTATS
++PREHOOK: query: describe formatted default.src_stat value
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@src_stat
++POSTHOOK: query: describe formatted default.src_stat value
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@src_stat
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++value               	string              	                    	                    	233                 	232                 	2.34                	235                 	                    	                    	from deserializer   
++PREHOOK: query: use default
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:default
++POSTHOOK: query: use default
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:default
++PREHOOK: query: drop database dummydb
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:dummydb
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: drop database dummydb
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:dummydb
++POSTHOOK: Output: database:dummydb
+diff --git a/ql/src/test/results/clientpositive/columnstats_partlvl.q.out b/ql/src/test/results/clientpositive/columnstats_partlvl.q.out
+index a86c5fb..3c22d40 100644
+--- a/ql/src/test/results/clientpositive/columnstats_partlvl.q.out
++++ b/ql/src/test/results/clientpositive/columnstats_partlvl.q.out
+@@ -80,7 +80,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeID
+           Column Types: int
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: explain extended
+ analyze table Employee_Part partition (employeeSalary=2000.0) compute statistics for columns employeeID
+@@ -217,7 +217,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeID
+           Column Types: int
+-          Table: employee_part
++          Table: default.employee_part
+           Is Table Level Stats: false
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary=2000.0) compute statistics for columns employeeID
+@@ -280,7 +280,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeID
+           Column Types: int
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: explain extended
+ analyze table Employee_Part partition (employeeSalary=4000.0) compute statistics for columns employeeID
+@@ -417,7 +417,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeID
+           Column Types: int
+-          Table: employee_part
++          Table: default.employee_part
+           Is Table Level Stats: false
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary=4000.0) compute statistics for columns employeeID
+@@ -480,7 +480,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeid, employeename
+           Column Types: int, string
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary=2000.0) compute statistics for columns
+ PREHOOK: type: QUERY
+@@ -560,7 +560,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeid, employeename
+           Column Types: int, string
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part  compute statistics for columns
+ PREHOOK: type: QUERY
+@@ -635,7 +635,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeid, employeename
+           Column Types: int, string
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part  compute statistics for columns
+ PREHOOK: type: QUERY
+@@ -658,3 +658,60 @@ POSTHOOK: Input: default@employee_part
+ # col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
+ 	 	 	 	 	 	 	 	 	 	 
+ employeeID          	int                 	16                  	34                  	2                   	14                  	                    	                    	                    	                    	from deserializer   
++PREHOOK: query: create database if not exists dummydb
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: create database if not exists dummydb
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:dummydb
++PREHOOK: query: use dummydb
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:dummydb
++POSTHOOK: query: use dummydb
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:dummydb
++PREHOOK: query: analyze table default.Employee_Part partition (employeeSalary=2000.0) compute statistics for columns
++PREHOOK: type: QUERY
++PREHOOK: Input: default@employee_part
++PREHOOK: Input: default@employee_part@employeesalary=2000.0
++#### A masked pattern was here ####
++POSTHOOK: query: analyze table default.Employee_Part partition (employeeSalary=2000.0) compute statistics for columns
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@employee_part
++POSTHOOK: Input: default@employee_part@employeesalary=2000.0
++#### A masked pattern was here ####
++PREHOOK: query: describe formatted default.Employee_Part employeeID   partition (employeeSalary=2000.0)
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@employee_part
++POSTHOOK: query: describe formatted default.Employee_Part employeeID   partition (employeeSalary=2000.0)
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@employee_part
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++employeeID          	int                 	16                  	34                  	1                   	14                  	                    	                    	                    	                    	from deserializer   
++PREHOOK: query: analyze table default.Employee_Part  compute statistics for columns
++PREHOOK: type: QUERY
++PREHOOK: Input: default@employee_part
++PREHOOK: Input: default@employee_part@employeesalary=2000.0
++PREHOOK: Input: default@employee_part@employeesalary=4000.0
++#### A masked pattern was here ####
++POSTHOOK: query: analyze table default.Employee_Part  compute statistics for columns
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@employee_part
++POSTHOOK: Input: default@employee_part@employeesalary=2000.0
++POSTHOOK: Input: default@employee_part@employeesalary=4000.0
++#### A masked pattern was here ####
++PREHOOK: query: use default
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:default
++POSTHOOK: query: use default
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:default
++PREHOOK: query: drop database dummydb
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:dummydb
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: drop database dummydb
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:dummydb
++POSTHOOK: Output: database:dummydb
+diff --git a/ql/src/test/results/clientpositive/columnstats_partlvl_dp.q.out b/ql/src/test/results/clientpositive/columnstats_partlvl_dp.q.out
+index 073b387..18a6909 100644
+--- a/ql/src/test/results/clientpositive/columnstats_partlvl_dp.q.out
++++ b/ql/src/test/results/clientpositive/columnstats_partlvl_dp.q.out
+@@ -118,7 +118,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeName, employeeID
+           Column Types: string, int
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary='4000.0', country) compute statistics for columns employeeName, employeeID
+ PREHOOK: type: QUERY
+@@ -191,7 +191,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeID
+           Column Types: int
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary='2000.0') compute statistics for columns employeeID
+ PREHOOK: type: QUERY
+@@ -275,7 +275,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeID
+           Column Types: int
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary) compute statistics for columns employeeID
+ PREHOOK: type: QUERY
+@@ -356,7 +356,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: employeeid, employeename
+           Column Types: int, string
+-          Table: employee_part
++          Table: default.employee_part
+ 
+ PREHOOK: query: analyze table Employee_Part partition (employeeSalary,country) compute statistics for columns
+ PREHOOK: type: QUERY
+diff --git a/ql/src/test/results/clientpositive/columnstats_tbllvl.q.out b/ql/src/test/results/clientpositive/columnstats_tbllvl.q.out
+index 0ef04f5..002823c 100644
+--- a/ql/src/test/results/clientpositive/columnstats_tbllvl.q.out
++++ b/ql/src/test/results/clientpositive/columnstats_tbllvl.q.out
+@@ -81,7 +81,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceIP, avgTimeOnSite, adRevenue
+           Column Types: string, int, float
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+ 
+ PREHOOK: query: explain extended
+ analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
+@@ -204,7 +204,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceIP, avgTimeOnSite, adRevenue
+           Column Types: string, int, float
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+           Is Table Level Stats: true
+ 
+ PREHOOK: query: analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
+@@ -216,10 +216,10 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@uservisits_web_text_none
+ #### A masked pattern was here ####
+ PREHOOK: query: explain 
+-analyze table UserVisits_web_text_none compute statistics for columns
++analyze table default.UserVisits_web_text_none compute statistics for columns
+ PREHOOK: type: QUERY
+ POSTHOOK: query: explain 
+-analyze table UserVisits_web_text_none compute statistics for columns
++analyze table default.UserVisits_web_text_none compute statistics for columns
+ POSTHOOK: type: QUERY
+ STAGE DEPENDENCIES:
+   Stage-0 is a root stage
+@@ -258,13 +258,13 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceip, desturl, visitdate, adrevenue, useragent, ccode, lcode, skeyword, avgtimeonsite
+           Column Types: string, string, string, float, string, string, string, string, int
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+ 
+-PREHOOK: query: analyze table UserVisits_web_text_none compute statistics for columns
++PREHOOK: query: analyze table default.UserVisits_web_text_none compute statistics for columns
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@uservisits_web_text_none
+ #### A masked pattern was here ####
+-POSTHOOK: query: analyze table UserVisits_web_text_none compute statistics for columns
++POSTHOOK: query: analyze table default.UserVisits_web_text_none compute statistics for columns
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@uservisits_web_text_none
+ #### A masked pattern was here ####
+@@ -358,7 +358,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: a, b, c, d, e
+           Column Types: int, double, string, boolean, binary
+-          Table: empty_tab
++          Table: default.empty_tab
+ 
+ PREHOOK: query: analyze table empty_tab compute statistics for columns a,b,c,d,e
+ PREHOOK: type: QUERY
+@@ -368,3 +368,348 @@ POSTHOOK: query: analyze table empty_tab compute statistics for columns a,b,c,d,
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@empty_tab
+ #### A masked pattern was here ####
++PREHOOK: query: create database if not exists dummydb
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: create database if not exists dummydb
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:dummydb
++PREHOOK: query: use dummydb
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:dummydb
++POSTHOOK: query: use dummydb
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:dummydb
++PREHOOK: query: analyze table default.UserVisits_web_text_none compute statistics for columns destURL
++PREHOOK: type: QUERY
++PREHOOK: Input: default@uservisits_web_text_none
++#### A masked pattern was here ####
++POSTHOOK: query: analyze table default.UserVisits_web_text_none compute statistics for columns destURL
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@uservisits_web_text_none
++#### A masked pattern was here ####
++PREHOOK: query: describe formatted default.UserVisits_web_text_none destURL
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@uservisits_web_text_none
++POSTHOOK: query: describe formatted default.UserVisits_web_text_none destURL
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@uservisits_web_text_none
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++destURL             	string              	                    	                    	0                   	56                  	48.945454545454545  	96                  	                    	                    	from deserializer   
++PREHOOK: query: CREATE TABLE UserVisits_in_dummy_db (
++  sourceIP string,
++  destURL string,
++  visitDate string,
++  adRevenue float,
++  userAgent string,
++  cCode string,
++  lCode string,
++  sKeyword string,
++  avgTimeOnSite int)
++row format delimited fields terminated by '|'  stored as textfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:dummydb
++PREHOOK: Output: dummydb@UserVisits_in_dummy_db
++POSTHOOK: query: CREATE TABLE UserVisits_in_dummy_db (
++  sourceIP string,
++  destURL string,
++  visitDate string,
++  adRevenue float,
++  userAgent string,
++  cCode string,
++  lCode string,
++  sKeyword string,
++  avgTimeOnSite int)
++row format delimited fields terminated by '|'  stored as textfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:dummydb
++POSTHOOK: Output: dummydb@UserVisits_in_dummy_db
++PREHOOK: query: LOAD DATA LOCAL INPATH "../../data/files/UserVisits.dat" INTO TABLE UserVisits_in_dummy_db
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: dummydb@uservisits_in_dummy_db
++POSTHOOK: query: LOAD DATA LOCAL INPATH "../../data/files/UserVisits.dat" INTO TABLE UserVisits_in_dummy_db
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: dummydb@uservisits_in_dummy_db
++PREHOOK: query: use default
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:default
++POSTHOOK: query: use default
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:default
++PREHOOK: query: explain 
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
++PREHOOK: type: QUERY
++POSTHOOK: query: explain 
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++  Stage-1 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: uservisits_in_dummy_db
++            Select Operator
++              expressions: sourceip (type: string), avgtimeonsite (type: int), adrevenue (type: float)
++              outputColumnNames: sourceip, avgtimeonsite, adrevenue
++              Group By Operator
++                aggregations: compute_stats(sourceip, 16), compute_stats(avgtimeonsite, 16), compute_stats(adrevenue, 16)
++                mode: hash
++                outputColumnNames: _col0, _col1, _col2
++                Reduce Output Operator
++                  sort order: 
++                  value expressions: _col0 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col1 (type: struct<columntype:string,min:bigint,max:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col2 (type: struct<columntype:string,min:double,max:double,countnulls:bigint,bitvector:string,numbitvectors:int>)
++      Reduce Operator Tree:
++        Group By Operator
++          aggregations: compute_stats(VALUE._col0), compute_stats(VALUE._col1), compute_stats(VALUE._col2)
++          mode: mergepartial
++          outputColumnNames: _col0, _col1, _col2
++          File Output Operator
++            compressed: false
++            table:
++                input format: org.apache.hadoop.mapred.TextInputFormat
++                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-1
++    Column Stats Work
++      Column Stats Desc:
++          Columns: sourceIP, avgTimeOnSite, adRevenue
++          Column Types: string, int, float
++          Table: dummydb.uservisits_in_dummy_db
++
++PREHOOK: query: explain extended
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
++PREHOOK: type: QUERY
++POSTHOOK: query: explain extended
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
++POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_ANALYZE
++   TOK_TAB
++      TOK_TABNAME
++         dummydb
++         UserVisits_in_dummy_db
++   columns
++   TOK_TABCOLNAME
++      sourceIP
++      avgTimeOnSite
++      adRevenue
++
++
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++  Stage-1 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: uservisits_in_dummy_db
++            GatherStats: false
++            Select Operator
++              expressions: sourceip (type: string), avgtimeonsite (type: int), adrevenue (type: float)
++              outputColumnNames: sourceip, avgtimeonsite, adrevenue
++              Group By Operator
++                aggregations: compute_stats(sourceip, 16), compute_stats(avgtimeonsite, 16), compute_stats(adrevenue, 16)
++                mode: hash
++                outputColumnNames: _col0, _col1, _col2
++                Reduce Output Operator
++                  sort order: 
++                  tag: -1
++                  value expressions: _col0 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col1 (type: struct<columntype:string,min:bigint,max:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col2 (type: struct<columntype:string,min:double,max:double,countnulls:bigint,bitvector:string,numbitvectors:int>)
++                  auto parallelism: false
++      Path -> Alias:
++#### A masked pattern was here ####
++      Path -> Partition:
++#### A masked pattern was here ####
++          Partition
++            base file name: uservisits_in_dummy_db
++            input format: org.apache.hadoop.mapred.TextInputFormat
++            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++            properties:
++              COLUMN_STATS_ACCURATE true
++              bucket_count -1
++              columns sourceip,desturl,visitdate,adrevenue,useragent,ccode,lcode,skeyword,avgtimeonsite
++              columns.comments 
++              columns.types string:string:string:float:string:string:string:string:int
++              field.delim |
++#### A masked pattern was here ####
++              name dummydb.uservisits_in_dummy_db
++              numFiles 1
++              serialization.ddl struct uservisits_in_dummy_db { string sourceip, string desturl, string visitdate, float adrevenue, string useragent, string ccode, string lcode, string skeyword, i32 avgtimeonsite}
++              serialization.format |
++              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              totalSize 7060
++#### A masked pattern was here ####
++            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++          
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                COLUMN_STATS_ACCURATE true
++                bucket_count -1
++                columns sourceip,desturl,visitdate,adrevenue,useragent,ccode,lcode,skeyword,avgtimeonsite
++                columns.comments 
++                columns.types string:string:string:float:string:string:string:string:int
++                field.delim |
++#### A masked pattern was here ####
++                name dummydb.uservisits_in_dummy_db
++                numFiles 1
++                serialization.ddl struct uservisits_in_dummy_db { string sourceip, string desturl, string visitdate, float adrevenue, string useragent, string ccode, string lcode, string skeyword, i32 avgtimeonsite}
++                serialization.format |
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                totalSize 7060
++#### A masked pattern was here ####
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: dummydb.uservisits_in_dummy_db
++            name: dummydb.uservisits_in_dummy_db
++      Truncated Path -> Alias:
++        /dummydb.db/uservisits_in_dummy_db [uservisits_in_dummy_db]
++      Needs Tagging: false
++      Reduce Operator Tree:
++        Group By Operator
++          aggregations: compute_stats(VALUE._col0), compute_stats(VALUE._col1), compute_stats(VALUE._col2)
++          mode: mergepartial
++          outputColumnNames: _col0, _col1, _col2
++          File Output Operator
++            compressed: false
++            GlobalTableId: 0
++#### A masked pattern was here ####
++            NumFilesPerFileSink: 1
++#### A masked pattern was here ####
++            table:
++                input format: org.apache.hadoop.mapred.TextInputFormat
++                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                properties:
++                  columns _col0,_col1,_col2
++                  columns.types struct<columntype:string,maxlength:bigint,avglength:double,countnulls:bigint,numdistinctvalues:bigint>:struct<columntype:string,min:bigint,max:bigint,countnulls:bigint,numdistinctvalues:bigint>:struct<columntype:string,min:double,max:double,countnulls:bigint,numdistinctvalues:bigint>
++                  escape.delim \
++                  hive.serialization.extend.additional.nesting.levels true
++                  serialization.format 1
++                  serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++            TotalFiles: 1
++            GatherStats: false
++            MultiFileSpray: false
++
++  Stage: Stage-1
++    Column Stats Work
++      Column Stats Desc:
++          Columns: sourceIP, avgTimeOnSite, adRevenue
++          Column Types: string, int, float
++          Table: dummydb.uservisits_in_dummy_db
++          Is Table Level Stats: true
++
++PREHOOK: query: analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
++PREHOOK: type: QUERY
++PREHOOK: Input: dummydb@uservisits_in_dummy_db
++#### A masked pattern was here ####
++POSTHOOK: query: analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
++POSTHOOK: type: QUERY
++POSTHOOK: Input: dummydb@uservisits_in_dummy_db
++#### A masked pattern was here ####
++PREHOOK: query: explain 
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns
++PREHOOK: type: QUERY
++POSTHOOK: query: explain 
++analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++  Stage-1 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: uservisits_in_dummy_db
++            Select Operator
++              expressions: sourceip (type: string), desturl (type: string), visitdate (type: string), adrevenue (type: float), useragent (type: string), ccode (type: string), lcode (type: string), skeyword (type: string), avgtimeonsite (type: int)
++              outputColumnNames: sourceip, desturl, visitdate, adrevenue, useragent, ccode, lcode, skeyword, avgtimeonsite
++              Group By Operator
++                aggregations: compute_stats(sourceip, 16), compute_stats(desturl, 16), compute_stats(visitdate, 16), compute_stats(adrevenue, 16), compute_stats(useragent, 16), compute_stats(ccode, 16), compute_stats(lcode, 16), compute_stats(skeyword, 16), compute_stats(avgtimeonsite, 16)
++                mode: hash
++                outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8
++                Reduce Output Operator
++                  sort order: 
++                  value expressions: _col0 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col1 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col2 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col3 (type: struct<columntype:string,min:double,max:double,countnulls:bigint,bitvector:string,numbitvectors:int>), _col4 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col5 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col6 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col7 (type: struct<columntype:string,maxlength:bigint,sumlength:bigint,count:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>), _col8 (type: struct<columntype:string,min:bigint,max:bigint,countnulls:bigint,bitvector:string,numbitvectors:int>)
++      Reduce Operator Tree:
++        Group By Operator
++          aggregations: compute_stats(VALUE._col0), compute_stats(VALUE._col1), compute_stats(VALUE._col2), compute_stats(VALUE._col3), compute_stats(VALUE._col4), compute_stats(VALUE._col5), compute_stats(VALUE._col6), compute_stats(VALUE._col7), compute_stats(VALUE._col8)
++          mode: mergepartial
++          outputColumnNames: _col0, _col1, _col2, _col3, _col4, _col5, _col6, _col7, _col8
++          File Output Operator
++            compressed: false
++            table:
++                input format: org.apache.hadoop.mapred.TextInputFormat
++                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++
++  Stage: Stage-1
++    Column Stats Work
++      Column Stats Desc:
++          Columns: sourceip, desturl, visitdate, adrevenue, useragent, ccode, lcode, skeyword, avgtimeonsite
++          Column Types: string, string, string, float, string, string, string, string, int
++          Table: dummydb.uservisits_in_dummy_db
++
++PREHOOK: query: analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns
++PREHOOK: type: QUERY
++PREHOOK: Input: dummydb@uservisits_in_dummy_db
++#### A masked pattern was here ####
++POSTHOOK: query: analyze table dummydb.UserVisits_in_dummy_db compute statistics for columns
++POSTHOOK: type: QUERY
++POSTHOOK: Input: dummydb@uservisits_in_dummy_db
++#### A masked pattern was here ####
++PREHOOK: query: describe formatted dummydb.UserVisits_in_dummy_db destURL
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: dummydb@uservisits_in_dummy_db
++POSTHOOK: query: describe formatted dummydb.UserVisits_in_dummy_db destURL
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: dummydb@uservisits_in_dummy_db
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++destURL             	string              	                    	                    	0                   	56                  	48.945454545454545  	96                  	                    	                    	from deserializer   
++PREHOOK: query: describe formatted dummydb.UserVisits_in_dummy_db adRevenue
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: dummydb@uservisits_in_dummy_db
++POSTHOOK: query: describe formatted dummydb.UserVisits_in_dummy_db adRevenue
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: dummydb@uservisits_in_dummy_db
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++adRevenue           	float               	13.099044799804688  	492.98870849609375  	0                   	58                  	                    	                    	                    	                    	from deserializer   
++PREHOOK: query: describe formatted dummydb.UserVisits_in_dummy_db avgTimeOnSite
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: dummydb@uservisits_in_dummy_db
++POSTHOOK: query: describe formatted dummydb.UserVisits_in_dummy_db avgTimeOnSite
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: dummydb@uservisits_in_dummy_db
++# col_name            	data_type           	min                 	max                 	num_nulls           	distinct_count      	avg_col_len         	max_col_len         	num_trues           	num_falses          	comment             
++	 	 	 	 	 	 	 	 	 	 
++avgTimeOnSite       	int                 	1                   	9                   	0                   	11                  	                    	                    	                    	                    	from deserializer   
++PREHOOK: query: drop table dummydb.UserVisits_in_dummy_db
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: dummydb@uservisits_in_dummy_db
++PREHOOK: Output: dummydb@uservisits_in_dummy_db
++POSTHOOK: query: drop table dummydb.UserVisits_in_dummy_db
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: dummydb@uservisits_in_dummy_db
++POSTHOOK: Output: dummydb@uservisits_in_dummy_db
++PREHOOK: query: drop database dummydb
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:dummydb
++PREHOOK: Output: database:dummydb
++POSTHOOK: query: drop database dummydb
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:dummydb
++POSTHOOK: Output: database:dummydb
+diff --git a/ql/src/test/results/clientpositive/display_colstats_tbllvl.q.out b/ql/src/test/results/clientpositive/display_colstats_tbllvl.q.out
+index a176d9a..53f06d9 100644
+--- a/ql/src/test/results/clientpositive/display_colstats_tbllvl.q.out
++++ b/ql/src/test/results/clientpositive/display_colstats_tbllvl.q.out
+@@ -97,7 +97,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceIP, avgTimeOnSite, adRevenue
+           Column Types: string, int, float
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+ 
+ PREHOOK: query: explain extended
+ analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
+@@ -220,7 +220,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceIP, avgTimeOnSite, adRevenue
+           Column Types: string, int, float
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+           Is Table Level Stats: true
+ 
+ PREHOOK: query: analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
+@@ -330,7 +330,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: a, b, c, d, e
+           Column Types: int, double, string, boolean, binary
+-          Table: empty_tab
++          Table: default.empty_tab
+ 
+ PREHOOK: query: analyze table empty_tab compute statistics for columns a,b,c,d,e
+ PREHOOK: type: QUERY
+diff --git a/ql/src/test/results/clientpositive/temp_table_display_colstats_tbllvl.q.out b/ql/src/test/results/clientpositive/temp_table_display_colstats_tbllvl.q.out
+index 933d24b..3f63cbb 100644
+--- a/ql/src/test/results/clientpositive/temp_table_display_colstats_tbllvl.q.out
++++ b/ql/src/test/results/clientpositive/temp_table_display_colstats_tbllvl.q.out
+@@ -105,7 +105,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceIP, avgTimeOnSite, adRevenue
+           Column Types: string, int, float
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+ 
+ PREHOOK: query: explain extended
+ analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
+@@ -228,7 +228,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: sourceIP, avgTimeOnSite, adRevenue
+           Column Types: string, int, float
+-          Table: uservisits_web_text_none
++          Table: default.uservisits_web_text_none
+           Is Table Level Stats: true
+ 
+ PREHOOK: query: analyze table UserVisits_web_text_none compute statistics for columns sourceIP, avgTimeOnSite, adRevenue
+@@ -338,7 +338,7 @@ STAGE PLANS:
+       Column Stats Desc:
+           Columns: a, b, c, d, e
+           Column Types: int, double, string, boolean, binary
+-          Table: empty_tab
++          Table: default.empty_tab
+ 
+ PREHOOK: query: analyze table empty_tab compute statistics for columns a,b,c,d,e
+ PREHOOK: type: QUERY
+-- 
+1.7.9.5
+

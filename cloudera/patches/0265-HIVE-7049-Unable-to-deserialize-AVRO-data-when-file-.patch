@@ -1,0 +1,117 @@
+From c3ecd64ecf93145af534d0b315e04847ae909fbd Mon Sep 17 00:00:00 2001
+From: Gunther Hagleitner <gunther@apache.org>
+Date: Mon, 6 Apr 2015 21:05:22 +0000
+Subject: [PATCH 0265/1164] HIVE-7049: Unable to deserialize AVRO data when
+ file schema and record schema are different and
+ nullable (Daniel Dai, reviewed by Ashutosh
+ Chauhan)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1671695 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hadoop/hive/serde2/avro/AvroDeserializer.java  |    2 +-
+ .../hive/serde2/avro/TestAvroDeserializer.java     |   19 +++++++++++++++----
+ .../avro/TestAvroObjectInspectorGenerator.java     |    1 +
+ .../org/apache/hadoop/hive/serde2/avro/Utils.java  |    8 +++++++-
+ 4 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroDeserializer.java b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroDeserializer.java
+index 46ab513..4b85171 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroDeserializer.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroDeserializer.java
+@@ -188,7 +188,7 @@ public Object deserialize(List<String> columnNames, List<TypeInfo> columnTypes,
+       String columnName = columnNames.get(i);
+       Object datum = record.get(columnName);
+       Schema datumSchema = record.getSchema().getField(columnName).schema();
+-      Schema.Field field = fileSchema.getField(columnName);
++      Schema.Field field = AvroSerdeUtils.isNullableType(fileSchema)?AvroSerdeUtils.getOtherTypeFromNullableType(fileSchema).getField(columnName):fileSchema.getField(columnName);
+       objectRow.add(worker(datum, field == null ? null : field.schema(), datumSchema, columnType));
+     }
+ 
+diff --git a/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroDeserializer.java b/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroDeserializer.java
+index 15416a7..eb495b4 100644
+--- a/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroDeserializer.java
++++ b/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroDeserializer.java
+@@ -185,9 +185,7 @@ public void canDeserializeArrays() throws SerDeException, IOException {
+ 
+   }
+ 
+-  @Test
+-  public void canDeserializeRecords() throws SerDeException, IOException {
+-    Schema s = AvroSerdeUtils.getSchemaFor(TestAvroObjectInspectorGenerator.RECORD_SCHEMA);
++  public void canDeserializeRecordsInternal(Schema s, Schema fileSchema) throws SerDeException, IOException {
+     GenericData.Record record = new GenericData.Record(s);
+     GenericData.Record innerRecord = new GenericData.Record(s.getField("aRecord").schema());
+     innerRecord.put("int1", 42);
+@@ -196,7 +194,7 @@ public void canDeserializeRecords() throws SerDeException, IOException {
+     record.put("aRecord", innerRecord);
+     assertTrue(GENERIC_DATA.validate(s, record));
+ 
+-    AvroGenericRecordWritable garw = Utils.serializeAndDeserializeRecord(record);
++    AvroGenericRecordWritable garw = Utils.serializeAndDeserializeRecord(record, fileSchema);
+ 
+     AvroObjectInspectorGenerator aoig = new AvroObjectInspectorGenerator(s);
+ 
+@@ -232,6 +230,19 @@ public void canDeserializeRecords() throws SerDeException, IOException {
+     assertEquals(42432234234l, innerRecord2OI.getStructFieldData(innerRecord2, allStructFieldRefs1.get(2)));
+   }
+ 
++  @Test
++  public void canDeserializeRecords() throws SerDeException, IOException {
++    Schema s = AvroSerdeUtils.getSchemaFor(TestAvroObjectInspectorGenerator.RECORD_SCHEMA);
++    canDeserializeRecordsInternal(s, s);
++  }
++
++  @Test
++  public void canDeserializeNullableRecords() throws SerDeException, IOException {
++    Schema s = AvroSerdeUtils.getSchemaFor(TestAvroObjectInspectorGenerator.RECORD_SCHEMA);
++    Schema fileSchema = AvroSerdeUtils.getSchemaFor(TestAvroObjectInspectorGenerator.NULLABLE_RECORD_SCHEMA);
++    canDeserializeRecordsInternal(s, fileSchema);
++  }
++
+   private class ResultPair { // Because Pairs give Java the vapors.
+     public final ObjectInspector oi;
+     public final Object value;
+diff --git a/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroObjectInspectorGenerator.java b/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroObjectInspectorGenerator.java
+index 337b44e..c9e7d68 100644
+--- a/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroObjectInspectorGenerator.java
++++ b/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroObjectInspectorGenerator.java
+@@ -100,6 +100,7 @@
+       "    }\n" +
+       "  ]\n" +
+       "}";
++  public static final String NULLABLE_RECORD_SCHEMA = "[\"null\", " + RECORD_SCHEMA + "]";
+   public static final String UNION_SCHEMA = "{\n" +
+       "  \"namespace\": \"test.a.rossa\",\n" +
+       "  \"name\": \"oneUnion\",\n" +
+diff --git a/serde/src/test/org/apache/hadoop/hive/serde2/avro/Utils.java b/serde/src/test/org/apache/hadoop/hive/serde2/avro/Utils.java
+index 80595e5..6222eb3 100644
+--- a/serde/src/test/org/apache/hadoop/hive/serde2/avro/Utils.java
++++ b/serde/src/test/org/apache/hadoop/hive/serde2/avro/Utils.java
+@@ -24,6 +24,7 @@
+ import java.io.IOException;
+ import java.rmi.server.UID;
+ 
++import org.apache.avro.Schema;
+ import org.apache.avro.generic.GenericData;
+ 
+ class Utils {
+@@ -31,10 +32,15 @@
+   // chance to muck with the bytes and we're working against real Avro data.
+   public static AvroGenericRecordWritable
+   serializeAndDeserializeRecord(GenericData.Record record) throws IOException {
++    return serializeAndDeserializeRecord(record, record.getSchema());
++  }
++
++  public static AvroGenericRecordWritable
++  serializeAndDeserializeRecord(GenericData.Record record, Schema fileSchema) throws IOException {
+     AvroGenericRecordWritable garw = new AvroGenericRecordWritable(record);
+     garw.setRecordReaderID(new UID());
+     // Assuming file schema is the same as record schema for testing purpose.
+-    garw.setFileSchema(record.getSchema());
++    garw.setFileSchema(fileSchema);
+     ByteArrayOutputStream baos = new ByteArrayOutputStream();
+     DataOutputStream daos = new DataOutputStream(baos);
+     garw.write(daos);
+-- 
+1.7.9.5
+

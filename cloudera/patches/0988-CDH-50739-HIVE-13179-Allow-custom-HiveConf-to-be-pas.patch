@@ -1,0 +1,142 @@
+From 3446376bfaec34fea52f111df8ce88ec0a3a804e Mon Sep 17 00:00:00 2001
+From: Rajat Khandelwal <prongs@apache.org>
+Date: Sat, 5 Mar 2016 19:15:09 +0530
+Subject: [PATCH 0988/1164] CDH-50739: HIVE-13179 : Allow custom HiveConf to
+ be passed to Authentication Providers (Rajat
+ Khandelwal, reviewed by Amareshwari Sriramadasu
+
+Change-Id: I6c63461900b9a2649d9cd58bf307cb026fa2be6d
+---
+ .../auth/AuthenticationProviderFactory.java        |   12 +++++++++---
+ .../auth/CustomAuthenticationProviderImpl.java     |   13 ++++++++++---
+ .../auth/LdapAuthenticationProviderImpl.java       |    3 +--
+ .../auth/PamAuthenticationProviderImpl.java        |    3 +--
+ .../auth/TestLdapAtnProviderWithMiniDS.java        |    2 +-
+ .../auth/TestLdapAuthenticationProviderImpl.java   |    2 +-
+ 6 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/service/src/java/org/apache/hive/service/auth/AuthenticationProviderFactory.java b/service/src/java/org/apache/hive/service/auth/AuthenticationProviderFactory.java
+index 4b95503..89fcddf 100644
+--- a/service/src/java/org/apache/hive/service/auth/AuthenticationProviderFactory.java
++++ b/service/src/java/org/apache/hive/service/auth/AuthenticationProviderFactory.java
+@@ -19,6 +19,8 @@
+ 
+ import javax.security.sasl.AuthenticationException;
+ 
++import org.apache.hadoop.hive.conf.HiveConf;
++
+ /**
+  * This class helps select a {@link PasswdAuthenticationProvider} for a given {@code AuthMethod}.
+  */
+@@ -56,12 +58,16 @@ private AuthenticationProviderFactory() {
+ 
+   public static PasswdAuthenticationProvider getAuthenticationProvider(AuthMethods authMethod)
+     throws AuthenticationException {
++    return getAuthenticationProvider(authMethod, new HiveConf());
++  }
++  public static PasswdAuthenticationProvider getAuthenticationProvider(AuthMethods authMethod, HiveConf conf)
++    throws AuthenticationException {
+     if (authMethod == AuthMethods.LDAP) {
+-      return new LdapAuthenticationProviderImpl();
++      return new LdapAuthenticationProviderImpl(conf);
+     } else if (authMethod == AuthMethods.PAM) {
+-      return new PamAuthenticationProviderImpl();
++      return new PamAuthenticationProviderImpl(conf);
+     } else if (authMethod == AuthMethods.CUSTOM) {
+-      return new CustomAuthenticationProviderImpl();
++      return new CustomAuthenticationProviderImpl(conf);
+     } else if (authMethod == AuthMethods.NONE) {
+       return new AnonymousAuthenticationProviderImpl();
+     } else {
+diff --git a/service/src/java/org/apache/hive/service/auth/CustomAuthenticationProviderImpl.java b/service/src/java/org/apache/hive/service/auth/CustomAuthenticationProviderImpl.java
+index 3dc0aa8..3ea8e65 100644
+--- a/service/src/java/org/apache/hive/service/auth/CustomAuthenticationProviderImpl.java
++++ b/service/src/java/org/apache/hive/service/auth/CustomAuthenticationProviderImpl.java
+@@ -17,6 +17,8 @@
+  */
+ package org.apache.hive.service.auth;
+ 
++import java.lang.reflect.InvocationTargetException;
++
+ import javax.security.sasl.AuthenticationException;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -33,13 +35,18 @@
+   private final PasswdAuthenticationProvider customProvider;
+ 
+   @SuppressWarnings("unchecked")
+-  CustomAuthenticationProviderImpl() {
+-    HiveConf conf = new HiveConf();
++  CustomAuthenticationProviderImpl(HiveConf conf) {
+     Class<? extends PasswdAuthenticationProvider> customHandlerClass =
+       (Class<? extends PasswdAuthenticationProvider>) conf.getClass(
+         HiveConf.ConfVars.HIVE_SERVER2_CUSTOM_AUTHENTICATION_CLASS.varname,
+         PasswdAuthenticationProvider.class);
+-    customProvider = ReflectionUtils.newInstance(customHandlerClass, conf);
++    PasswdAuthenticationProvider customProvider;
++    try {
++      customProvider = customHandlerClass.getConstructor(HiveConf.class).newInstance(conf);
++    } catch (NoSuchMethodException | InstantiationException | IllegalAccessException | InvocationTargetException e) {
++      customProvider = ReflectionUtils.newInstance(customHandlerClass, conf);
++    }
++    this.customProvider = customProvider;
+   }
+ 
+   @Override
+diff --git a/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java b/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java
+index 618c42a..e614349 100644
+--- a/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java
++++ b/service/src/java/org/apache/hive/service/auth/LdapAuthenticationProviderImpl.java
+@@ -54,8 +54,7 @@
+   private static String groupMembership_attr;
+   private static String groupClass_attr;
+ 
+-  LdapAuthenticationProviderImpl() {
+-    HiveConf conf = new HiveConf();
++  LdapAuthenticationProviderImpl(HiveConf conf) {
+     init(conf);
+   }
+ 
+diff --git a/service/src/java/org/apache/hive/service/auth/PamAuthenticationProviderImpl.java b/service/src/java/org/apache/hive/service/auth/PamAuthenticationProviderImpl.java
+index 68f62c4..994950a 100644
+--- a/service/src/java/org/apache/hive/service/auth/PamAuthenticationProviderImpl.java
++++ b/service/src/java/org/apache/hive/service/auth/PamAuthenticationProviderImpl.java
+@@ -26,8 +26,7 @@
+ 
+   private final String pamServiceNames;
+ 
+-  PamAuthenticationProviderImpl() {
+-    HiveConf conf = new HiveConf();
++  PamAuthenticationProviderImpl(HiveConf conf) {
+     pamServiceNames = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PAM_SERVICES);
+   }
+ 
+diff --git a/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java b/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java
+index 31a063d..089a059 100644
+--- a/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java
++++ b/service/src/test/org/apache/hive/service/auth/TestLdapAtnProviderWithMiniDS.java
+@@ -224,7 +224,7 @@ public void shutdown() throws Exception {
+   public static void init() throws Exception {
+     hiveConf = new HiveConf();
+ 
+-    ldapProvider = new LdapAuthenticationProviderImpl();
++    ldapProvider = new LdapAuthenticationProviderImpl(hiveConf);
+     ldapProvider.init(hiveConf);
+   }
+ 
+diff --git a/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java b/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java
+index c7db3a9..7e80e1d 100644
+--- a/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java
++++ b/service/src/test/org/apache/hive/service/auth/TestLdapAuthenticationProviderImpl.java
+@@ -27,7 +27,7 @@ public void setUp() throws Exception {
+   }
+ 
+   public void testLdapEmptyPassword() {
+-    LdapAuthenticationProviderImpl ldapImpl = new LdapAuthenticationProviderImpl();
++    LdapAuthenticationProviderImpl ldapImpl = new LdapAuthenticationProviderImpl(hiveConf);
+     try {
+       ldapImpl.Authenticate("user", "");
+       assertFalse(true);
+-- 
+1.7.9.5
+

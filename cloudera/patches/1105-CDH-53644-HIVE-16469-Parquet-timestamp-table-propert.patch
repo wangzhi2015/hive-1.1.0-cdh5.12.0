@@ -1,0 +1,1438 @@
+From 41ceda53e17dfc8abb75dea8466e1b5de9b2be9d Mon Sep 17 00:00:00 2001
+From: Barna Zsombor Klara <zsombor.klara@cloudera.com>
+Date: Tue, 9 May 2017 10:06:19 -0500
+Subject: [PATCH 1105/1164] CDH-53644: HIVE-16469: Parquet timestamp table
+ property is not always taken into account (Barna
+ Zsombor Klara, reviewed by Sergio Pena, Ferdinand
+ Xu)
+
+(cherry picked from commit 78e29fc70dacec498c35dc556dd7403e4c9f48fe)
+
+Change-Id: I9e3a2222f755d4d0cda714831f3708db9fd2b642
+---
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |   15 +-
+ .../apache/hadoop/hive/ql/exec/FetchOperator.java  |    6 +
+ .../apache/hadoop/hive/ql/exec/StatsNoJobTask.java |    5 +
+ .../apache/hadoop/hive/ql/exec/mr/MapRedTask.java  |    2 +-
+ .../ql/io/parquet/MapredParquetInputFormat.java    |   49 ++
+ .../parquet/read/ParquetRecordReaderWrapper.java   |    3 +-
+ .../hive/ql/io/parquet/serde/ParquetHiveSerDe.java |    9 +
+ .../ql/io/parquet/serde/ParquetTableUtils.java     |   22 +
+ .../ql/io/parquet/timestamp/NanoTimeUtils.java     |    5 +-
+ .../ql/io/parquet/AbstractTestParquetDirect.java   |    7 +-
+ .../ql/io/parquet/TestParquetRowGroupFilter.java   |   13 +-
+ .../ql/io/parquet/timestamp/TestNanoTimeUtils.java |   12 +-
+ .../parquet_int96_alter_invalid_timezone.q         |    5 +
+ .../parquet_int96_create_invalid_timezone.q        |    3 +
+ .../clientpositive/parquet_int96_timestamp.q       |   21 +
+ .../parquet_int96_alter_invalid_timezone.q.out     |   13 +
+ .../parquet_int96_create_invalid_timezone.q.out    |    5 +
+ .../clientpositive/parquet_int96_timestamp.q.out   |  193 +++++-
+ .../spark/parquet_int96_timestamp.q.out            |  717 ++++++++++++++++++++
+ 19 files changed, 1090 insertions(+), 15 deletions(-)
+ create mode 100644 ql/src/test/queries/clientnegative/parquet_int96_alter_invalid_timezone.q
+ create mode 100644 ql/src/test/queries/clientnegative/parquet_int96_create_invalid_timezone.q
+ create mode 100644 ql/src/test/results/clientnegative/parquet_int96_alter_invalid_timezone.q.out
+ create mode 100644 ql/src/test/results/clientnegative/parquet_int96_create_invalid_timezone.q.out
+ create mode 100644 ql/src/test/results/clientpositive/spark/parquet_int96_timestamp.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index de62f4b..1c284f7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -102,6 +102,7 @@
+ import org.apache.hadoop.hive.ql.io.merge.MergeFileWork;
+ import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
+ import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
++import org.apache.hadoop.hive.ql.io.parquet.timestamp.NanoTimeUtils;
+ import org.apache.hadoop.hive.ql.io.rcfile.truncate.ColumnTruncateTask;
+ import org.apache.hadoop.hive.ql.io.rcfile.truncate.ColumnTruncateWork;
+ import org.apache.hadoop.hive.ql.lockmgr.DbLockManager;
+@@ -3540,6 +3541,10 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+       }
+       sd.setCols(alterTbl.getNewCols());
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.ADDPROPS) {
++      if(alterTbl.getProps().containsKey(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY)) {
++        NanoTimeUtils.validateTimeZone(
++            alterTbl.getProps().get(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY));
++      }
+       tbl.getTTable().getParameters().putAll(alterTbl.getProps());
+     } else if (alterTbl.getOp() == AlterTableDesc.AlterTableTypes.DROPPROPS) {
+       Iterator<String> keyItr = alterTbl.getProps().keySet().iterator();
+@@ -4145,13 +4150,15 @@ private int createTable(Hive db, CreateTableDesc crtTbl) throws HiveException {
+ 
+     // If HIVE_PARQUET_INT96_DEFAULT_UTC_WRITE_ZONE is set to True, then set new Parquet tables timezone
+     // to UTC by default (only if the table property is not set)
+-    if (tbl.getSerializationLib().equals(ParquetHiveSerDe.class.getName())) {
++    if (ParquetHiveSerDe.isParquetTable(tbl)) {
+       SessionState ss = SessionState.get();
+-      if (ss.getConf().getBoolVar(ConfVars.HIVE_PARQUET_INT96_DEFAULT_UTC_WRITE_ZONE)) {
+-        String parquetTimezone = tbl.getProperty(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY);
+-        if (parquetTimezone == null || parquetTimezone.isEmpty()) {
++      String parquetTimezone = tbl.getProperty(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY);
++      if (parquetTimezone == null || parquetTimezone.isEmpty()) {
++        if (ss.getConf().getBoolVar(ConfVars.HIVE_PARQUET_INT96_DEFAULT_UTC_WRITE_ZONE)) {
+           tbl.setProperty(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY, ParquetTableUtils.PARQUET_INT96_NO_ADJUSTMENT_ZONE);
+         }
++      } else {
++        NanoTimeUtils.validateTimeZone(parquetTimezone);
+       }
+     }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java
+index cc80c73..1f34ae1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java
+@@ -43,6 +43,9 @@
+ import org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader;
+ import org.apache.hadoop.hive.ql.io.HiveInputFormat;
+ import org.apache.hadoop.hive.ql.io.HiveRecordReader;
++import org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.metadata.VirtualColumn;
+ import org.apache.hadoop.hive.ql.parse.SplitSample;
+@@ -358,6 +361,9 @@ public boolean doNext(WritableComparable key, Writable value) throws IOException
+ 
+       Class<? extends InputFormat> formatter = currDesc.getInputFileFormatClass();
+       Utilities.copyTableJobPropertiesToConf(currDesc.getTableDesc(), job);
++      if (ParquetHiveSerDe.class.getName().equals(currDesc.getTableDesc().getSerdeClassName())) {
++        ParquetTableUtils.setParquetTimeZoneIfAbsent(job, currDesc.getTableDesc().getProperties());
++      }
+       InputFormat inputFormat = getInputFormatFromCache(formatter, job);
+ 
+       InputSplit[] splits = inputFormat.getSplits(job, 1);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsNoJobTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsNoJobTask.java
+index f089964..fa107af 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsNoJobTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/StatsNoJobTask.java
+@@ -28,6 +28,8 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -246,6 +248,9 @@ private int aggregateStats(ExecutorService threadPool) {
+                   table.getInputFormatClass(), jc);
+               InputSplit dummySplit = new FileSplit(file.getPath(), 0, 0, new String[] { table
+                   .getDataLocation().toString() });
++              if (ParquetHiveSerDe.isParquetTable(table)) {
++                ParquetTableUtils.setParquetTimeZoneIfAbsent(jc, table.getParameters());
++              }
+               org.apache.hadoop.mapred.RecordReader<?, ?> recordReader = (org.apache.hadoop.mapred.RecordReader<?, ?>) inputFormat
+                   .getRecordReader(dummySplit, jc, Reporter.NULL);
+               StatsProvidingRecordReader statsRR;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+index 347ea53..c65b278 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+@@ -68,7 +68,7 @@
+   static final String HIVE_DEBUG_RECURSIVE = "HIVE_DEBUG_RECURSIVE";
+   static final String HIVE_MAIN_CLIENT_DEBUG_OPTS = "HIVE_MAIN_CLIENT_DEBUG_OPTS";
+   static final String HIVE_CHILD_CLIENT_DEBUG_OPTS = "HIVE_CHILD_CLIENT_DEBUG_OPTS";
+-  static final String[] HIVE_SYS_PROP = {"build.dir", "build.dir.hive", "hive.query.id"};
++  static final String[] HIVE_SYS_PROP = {"build.dir", "build.dir.hive", "hive.query.id", "user.timezone"};
+ 
+   private transient ContentSummary inputSummary = null;
+   private transient boolean runningViaChild = false;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetInputFormat.java
+index 0391229..88a25af 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/MapredParquetInputFormat.java
+@@ -16,6 +16,16 @@
+ import java.io.IOException;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import java.util.Map;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.ql.exec.vector.VectorizedInputFormatInterface;
++import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
++import org.apache.hadoop.hive.ql.plan.MapWork;
++import org.apache.hadoop.hive.ql.plan.PartitionDesc;
++import org.apache.hadoop.mapred.FileSplit;
++import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.exec.vector.VectorizedInputFormatInterface;
+ import org.apache.hadoop.hive.ql.io.parquet.read.DataWritableReadSupport;
+@@ -58,6 +68,9 @@ protected MapredParquetInputFormat(final ParquetInputFormat<ArrayWritable> input
+       final org.apache.hadoop.mapred.JobConf job,
+       final org.apache.hadoop.mapred.Reporter reporter
+       ) throws IOException {
++
++    propagateParquetTimeZoneTablePorperty((FileSplit) split, job);
++
+     try {
+       if (Utilities.isVectorMode(job)) {
+         if (LOG.isDebugEnabled()) {
+@@ -76,4 +89,40 @@ protected MapredParquetInputFormat(final ParquetInputFormat<ArrayWritable> input
+       throw new RuntimeException("Cannot create a RecordReaderWrapper", e);
+     }
+   }
++
++  /**
++   * Tries to find the table belonging to the file path of the split.
++   * If the table can be determined, the parquet timezone property will be propagated
++   * to the job configuration to be used during reading.
++   * If the table cannot be determined, then do nothing.
++   * @param split file split being read
++   * @param job configuration to set the timezone property on
++   */
++  private void propagateParquetTimeZoneTablePorperty(FileSplit split, JobConf job) {
++    PartitionDesc part = null;
++    Path filePath = split.getPath();
++    try {
++      MapWork mapWork = Utilities.getMapWork(job);
++      if(mapWork != null) {
++        LOG.debug("Trying to find partition in MapWork for path " + filePath);
++        Map<String, PartitionDesc> pathToPartitionInfo = mapWork.getPathToPartitionInfo();
++
++        part = HiveFileFormatUtils
++            .getPartitionDescFromPathRecursively(pathToPartitionInfo, filePath, null);
++        LOG.debug("Partition found " + part);
++      }
++    } catch (AssertionError ae) {
++      LOG.warn("Cannot get partition description from " + filePath
++          + " because " + ae.getMessage());
++      part = null;
++    } catch (Exception e) {
++      LOG.warn("Cannot get partition description from " + filePath
++          + " because " + e.getMessage());
++      part = null;
++    }
++
++    if (part != null && part.getTableDesc() != null) {
++      ParquetTableUtils.setParquetTimeZoneIfAbsent(job, part.getTableDesc().getProperties());
++    }
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
+index fd9ed5b..1db62c6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetRecordReaderWrapper.java
+@@ -169,8 +169,7 @@ protected void setTimeZoneConversion(Configuration configuration, Path finalPath
+     } else {
+       // TABLE_PARQUET_INT96_TIMEZONE is a table property used to detect what timezone conversion
+       // to use when reading Parquet timestamps.
+-      timeZoneID = configuration.get(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY,
+-          TimeZone.getDefault().getID());
++      timeZoneID = configuration.get(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY);
+ 
+       NanoTimeUtils.validateTimeZone(timeZoneID);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveSerDe.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveSerDe.java
+index 8e13bf1..09a7755 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveSerDe.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetHiveSerDe.java
+@@ -19,6 +19,7 @@
+ import java.util.Properties;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.ql.metadata.Table;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.AbstractSerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+@@ -164,4 +165,12 @@ public SerDeStats getSerDeStats() {
+     }
+     return stats;
+   }
++
++  /**
++   * @param table
++   * @return true if the table has the parquet serde defined
++   */
++  public static boolean isParquetTable(Table table) {
++    return  table == null ? false : ParquetHiveSerDe.class.getName().equals(table.getSerializationLib());
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetTableUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetTableUtils.java
+index b339cc4..9196bd6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetTableUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ParquetTableUtils.java
+@@ -13,6 +13,11 @@
+  */
+ package org.apache.hadoop.hive.ql.io.parquet.serde;
+ 
++import org.apache.hadoop.mapred.JobConf;
++
++import java.util.Map;
++import java.util.TimeZone;
++
+ public class ParquetTableUtils {
+   // Parquet table properties
+   public static final String PARQUET_INT96_WRITE_ZONE_PROPERTY = "parquet.mr.int96.write.zone";
+@@ -20,4 +25,21 @@
+   // This is not a TimeZone we convert into and print out, rather a delta, an adjustment we use.
+   // More precisely the lack of an adjustment in case of UTC
+   public static final String PARQUET_INT96_NO_ADJUSTMENT_ZONE = "UTC";
++
++  /**
++   * Propagates the parquet timezone property to the job configuration from the table property
++   * or sets the default
++   * @param jc the job conf to set the parquet timezone property on
++   * @param tableProps the table properties which may contain the parquet timezone
++   */
++  public static void setParquetTimeZoneIfAbsent(JobConf jc, Map<?, ?> tableProps) {
++    if (tableProps != null && jc != null) {
++      if (tableProps.containsKey(PARQUET_INT96_WRITE_ZONE_PROPERTY)) {
++        jc.set(PARQUET_INT96_WRITE_ZONE_PROPERTY,
++            (String)tableProps.get(PARQUET_INT96_WRITE_ZONE_PROPERTY));
++      } else {
++        jc.set(PARQUET_INT96_WRITE_ZONE_PROPERTY, TimeZone.getDefault().getID());
++      }
++    }
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java
+index dbd6fb3..30f6494 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/timestamp/NanoTimeUtils.java
+@@ -165,9 +165,12 @@ public static Timestamp getTimestamp(NanoTime nt, Calendar calendar) {
+    * @param timeZoneID
+    */
+   public static void validateTimeZone(String timeZoneID) {
++    if(timeZoneID == null) {
++      throw new IllegalArgumentException("Missing timezone id for parquet int96 conversion!");
++    }
+     if (TimeZone.getTimeZone(timeZoneID).getID().equals("GMT")
+         && !"GMT".equals(timeZoneID)) {
+-      throw new IllegalStateException(
++      throw new IllegalArgumentException(
+           "Unexpected timezone id found for parquet int96 conversion: " + timeZoneID);
+     }
+   }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/AbstractTestParquetDirect.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/AbstractTestParquetDirect.java
+index 3a47673..6c2e72e 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/AbstractTestParquetDirect.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/AbstractTestParquetDirect.java
+@@ -9,10 +9,13 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Properties;
++import java.util.TimeZone;
++
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.io.ArrayWritable;
+ import org.apache.hadoop.io.Writable;
+@@ -122,10 +125,12 @@ public static void assertEquals(String message, ArrayWritable expected,
+   public static List<ArrayWritable> read(Path parquetFile) throws IOException {
+     List<ArrayWritable> records = new ArrayList<ArrayWritable>();
+ 
++    JobConf job = new JobConf();
++    job.set(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY, TimeZone.getDefault().getID());
+     RecordReader<Void, ArrayWritable> reader = new MapredParquetInputFormat().
+         getRecordReader(new FileSplit(
+                 parquetFile, 0, fileLength(parquetFile), (String[]) null),
+-            new JobConf(), null);
++            job, null);
+ 
+     Void alwaysNull = reader.createKey();
+     ArrayWritable record = reader.createValue();
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRowGroupFilter.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRowGroupFilter.java
+index 4ccb207..0090df7 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRowGroupFilter.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRowGroupFilter.java
+@@ -19,11 +19,21 @@
+ package org.apache.hadoop.hive.ql.io.parquet;
+ 
+ import com.google.common.collect.Lists;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.TimeZone;
++
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.io.parquet.read.ParquetRecordReaderWrapper;
+ import org.apache.hadoop.hive.ql.io.parquet.serde.ArrayWritableObjectInspector;
+-import org.apache.hadoop.hive.ql.plan.*;
++import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetTableUtils;
++import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
++import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
++import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
++import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
++import org.apache.hadoop.hive.ql.plan.TableScanDesc;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDFOPGreaterThan;
+ import org.apache.hadoop.hive.serde2.ColumnProjectionUtils;
+@@ -98,6 +108,7 @@ public void write(RecordConsumer consumer) {
+     ExprNodeGenericFuncDesc genericFuncDesc = new ExprNodeGenericFuncDesc(inspector, udf, children);
+     String searchArgumentStr = Utilities.serializeExpression(genericFuncDesc);
+     conf.set(TableScanDesc.FILTER_EXPR_CONF_STR, searchArgumentStr);
++    conf.set(ParquetTableUtils.PARQUET_INT96_WRITE_ZONE_PROPERTY, TimeZone.getDefault().getID());
+ 
+     ParquetRecordReaderWrapper recordReader = (ParquetRecordReaderWrapper)
+         new MapredParquetInputFormat().getRecordReader(
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java
+index 1e10dbf..5a66cd1 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/timestamp/TestNanoTimeUtils.java
+@@ -239,8 +239,18 @@ public void testTimeZoneValidationWithCorrectZoneId() {
+     NanoTimeUtils.validateTimeZone("Europe/Budapest");
+   }
+ 
+-  @Test(expected = IllegalStateException.class)
++  @Test(expected = IllegalArgumentException.class)
+   public void testTimeZoneValidationWithIncorrectZoneId() {
+     NanoTimeUtils.validateTimeZone("UCC");
+   }
++
++  @Test(expected = IllegalArgumentException.class)
++  public void testTimeZoneValidationWithMissingZoneId() {
++    NanoTimeUtils.validateTimeZone(null);
++  }
++
++  @Test(expected = IllegalArgumentException.class)
++  public void testTimeZoneValidationWithEmptyZoneId() {
++    NanoTimeUtils.validateTimeZone("");
++  }
+ }
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientnegative/parquet_int96_alter_invalid_timezone.q b/ql/src/test/queries/clientnegative/parquet_int96_alter_invalid_timezone.q
+new file mode 100644
+index 0000000..2de92ad
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/parquet_int96_alter_invalid_timezone.q
+@@ -0,0 +1,5 @@
++-- alter table to invalid table property
++create table timestamps (ts timestamp) stored as parquet;
++alter table timestamps set tblproperties ('parquet.mr.int96.write.zone'='Invalid');
++
++drop table timestamps;
+diff --git a/ql/src/test/queries/clientnegative/parquet_int96_create_invalid_timezone.q b/ql/src/test/queries/clientnegative/parquet_int96_create_invalid_timezone.q
+new file mode 100644
+index 0000000..ffba084
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/parquet_int96_create_invalid_timezone.q
+@@ -0,0 +1,3 @@
++-- create table with invalid table property
++create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='Invalid');
++
+diff --git a/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q b/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q
+index 6eadd1b..d0640fa 100644
+--- a/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q
++++ b/ql/src/test/queries/clientpositive/parquet_int96_timestamp.q
+@@ -37,10 +37,31 @@ drop table timestamps;
+ -- read/write timestamps with timezone specified in table properties
+ create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST');
+ insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1;
++insert into table timestamps values('2017-01-01 01:01:01');
++-- parquet timezone flag set in the fetch operator
+ select * from timestamps;
++-- parquet timezone flag set in MapredParquetInputFormat
++select * from timestamps order by ts;
++select * from timestamps where ts = cast('2016-01-01 01:01:01' as timestamp);
++-- using udfs
++select year(ts), day(ts), hour(ts), ts from timestamps;
+ describe formatted timestamps;
+ drop table timestamps;
+ 
++-- read timestamps with different timezones specified in two table properties
++create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST');
++insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1;
++insert into table timestamps values('2017-01-01 01:01:01');
++create table timestamps2 (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+2');
++insert into table timestamps2 select cast('2016-01-01 01:01:01' as timestamp) limit 1;
++insert into table timestamps2 values('2017-01-01 01:01:01');
++-- parquet timezone flag set in the MapredLocalTask
++select * from timestamps a inner join timestamps2 b on a.ts = b.ts;
++describe formatted timestamps;
++drop table timestamps;
++describe formatted timestamps2;
++drop table timestamps2;
++
+ -- read timestamps written by Impala
+ create table timestamps (ts timestamp) stored as parquet;
+ load data local inpath '../../data/files/impala_int96_timestamp.parq' overwrite into table timestamps;
+diff --git a/ql/src/test/results/clientnegative/parquet_int96_alter_invalid_timezone.q.out b/ql/src/test/results/clientnegative/parquet_int96_alter_invalid_timezone.q.out
+new file mode 100644
+index 0000000..97d61a2
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/parquet_int96_alter_invalid_timezone.q.out
+@@ -0,0 +1,13 @@
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: alter table timestamps set tblproperties ('parquet.mr.int96.write.zone'='Invalid')
++PREHOOK: type: ALTERTABLE_PROPERTIES
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Unexpected timezone id found for parquet int96 conversion: Invalid
+diff --git a/ql/src/test/results/clientnegative/parquet_int96_create_invalid_timezone.q.out b/ql/src/test/results/clientnegative/parquet_int96_create_invalid_timezone.q.out
+new file mode 100644
+index 0000000..d619ce6
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/parquet_int96_create_invalid_timezone.q.out
+@@ -0,0 +1,5 @@
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='Invalid')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Unexpected timezone id found for parquet int96 conversion: Invalid
+diff --git a/ql/src/test/results/clientpositive/parquet_int96_timestamp.q.out b/ql/src/test/results/clientpositive/parquet_int96_timestamp.q.out
+index 0f93164..2530775 100644
+--- a/ql/src/test/results/clientpositive/parquet_int96_timestamp.q.out
++++ b/ql/src/test/results/clientpositive/parquet_int96_timestamp.q.out
+@@ -309,6 +309,13 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: _dummy_database@_dummy_table
+ POSTHOOK: Output: default@timestamps
+ POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++PREHOOK: type: QUERY
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+ PREHOOK: query: select * from timestamps
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@timestamps
+@@ -318,6 +325,36 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@timestamps
+ #### A masked pattern was here ####
+ 2016-01-01 01:01:01
++2017-01-01 01:01:01
++PREHOOK: query: select * from timestamps order by ts
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps order by ts
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++2017-01-01 01:01:01
++PREHOOK: query: select * from timestamps where ts = cast('2016-01-01 01:01:01' as timestamp)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps where ts = cast('2016-01-01 01:01:01' as timestamp)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: select year(ts), day(ts), hour(ts), ts from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select year(ts), day(ts), hour(ts), ts from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016	1	1	2016-01-01 01:01:01
++2017	1	1	2017-01-01 01:01:01
+ PREHOOK: query: describe formatted timestamps
+ PREHOOK: type: DESCTABLE
+ PREHOOK: Input: default@timestamps
+@@ -337,11 +374,115 @@ Retention:          	0
+ Table Type:         	MANAGED_TABLE       	 
+ Table Parameters:	 	 
+ 	COLUMN_STATS_ACCURATE	true                
+-	numFiles            	1                   
+-	numRows             	1                   
++	numFiles            	2                   
++	numRows             	2                   
+ 	parquet.mr.int96.write.zone	PST                 
+-	rawDataSize         	1                   
+-	totalSize           	265                 
++	rawDataSize         	2                   
++	totalSize           	530                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++PREHOOK: type: QUERY
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION [(values__tmp__table__3)values__tmp__table__3.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: create table timestamps2 (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+2')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: create table timestamps2 (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+2')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps2
++PREHOOK: query: insert into table timestamps2 select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: insert into table timestamps2 select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps2
++POSTHOOK: Lineage: timestamps2.ts EXPRESSION []
++PREHOOK: query: insert into table timestamps2 values('2017-01-01 01:01:01')
++PREHOOK: type: QUERY
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: insert into table timestamps2 values('2017-01-01 01:01:01')
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@timestamps2
++POSTHOOK: Lineage: timestamps2.ts EXPRESSION [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: select * from timestamps a inner join timestamps2 b on a.ts = b.ts
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++PREHOOK: Input: default@timestamps2
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps a inner join timestamps2 b on a.ts = b.ts
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Input: default@timestamps2
++#### A masked pattern was here ####
++2016-01-01 01:01:01	2016-01-01 01:01:01
++2017-01-01 01:01:01	2017-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	2                   
++	numRows             	2                   
++	parquet.mr.int96.write.zone	PST                 
++	rawDataSize         	2                   
++	totalSize           	530                 
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -362,6 +503,50 @@ POSTHOOK: query: drop table timestamps
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@timestamps
+ POSTHOOK: Output: default@timestamps
++PREHOOK: query: describe formatted timestamps2
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps2
++POSTHOOK: query: describe formatted timestamps2
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps2
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	2                   
++	numRows             	2                   
++	parquet.mr.int96.write.zone	GMT+2               
++	rawDataSize         	2                   
++	totalSize           	530                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps2
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: drop table timestamps2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps2
++POSTHOOK: Output: default@timestamps2
+ PREHOOK: query: create table timestamps (ts timestamp) stored as parquet
+ PREHOOK: type: CREATETABLE
+ PREHOOK: Output: database:default
+diff --git a/ql/src/test/results/clientpositive/spark/parquet_int96_timestamp.q.out b/ql/src/test/results/clientpositive/spark/parquet_int96_timestamp.q.out
+new file mode 100644
+index 0000000..2530775
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/spark/parquet_int96_timestamp.q.out
+@@ -0,0 +1,717 @@
++PREHOOK: query: create table dummy (id int)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@dummy
++POSTHOOK: query: create table dummy (id int)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@dummy
++PREHOOK: query: insert into table dummy values (1)
++PREHOOK: type: QUERY
++PREHOOK: Output: default@dummy
++POSTHOOK: query: insert into table dummy values (1)
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@dummy
++POSTHOOK: Lineage: dummy.id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	1                   
++	numRows             	1                   
++	parquet.mr.int96.write.zone	UTC                 
++	rawDataSize         	1                   
++	totalSize           	265                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	1                   
++	numRows             	1                   
++	parquet.mr.int96.write.zone	PST                 
++	rawDataSize         	1                   
++	totalSize           	265                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	1                   
++	numRows             	1                   
++	rawDataSize         	1                   
++	totalSize           	265                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='CST')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='CST')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	1                   
++	numRows             	1                   
++	parquet.mr.int96.write.zone	CST                 
++	rawDataSize         	1                   
++	totalSize           	265                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++PREHOOK: type: QUERY
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++2017-01-01 01:01:01
++PREHOOK: query: select * from timestamps order by ts
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps order by ts
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++2017-01-01 01:01:01
++PREHOOK: query: select * from timestamps where ts = cast('2016-01-01 01:01:01' as timestamp)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps where ts = cast('2016-01-01 01:01:01' as timestamp)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: select year(ts), day(ts), hour(ts), ts from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select year(ts), day(ts), hour(ts), ts from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016	1	1	2016-01-01 01:01:01
++2017	1	1	2017-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	2                   
++	numRows             	2                   
++	parquet.mr.int96.write.zone	PST                 
++	rawDataSize         	2                   
++	totalSize           	530                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='PST')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION []
++PREHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++PREHOOK: type: QUERY
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: insert into table timestamps values('2017-01-01 01:01:01')
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@timestamps
++POSTHOOK: Lineage: timestamps.ts EXPRESSION [(values__tmp__table__3)values__tmp__table__3.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: create table timestamps2 (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+2')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: create table timestamps2 (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+2')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps2
++PREHOOK: query: insert into table timestamps2 select cast('2016-01-01 01:01:01' as timestamp) limit 1
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: insert into table timestamps2 select cast('2016-01-01 01:01:01' as timestamp) limit 1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++POSTHOOK: Output: default@timestamps2
++POSTHOOK: Lineage: timestamps2.ts EXPRESSION []
++PREHOOK: query: insert into table timestamps2 values('2017-01-01 01:01:01')
++PREHOOK: type: QUERY
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: insert into table timestamps2 values('2017-01-01 01:01:01')
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@timestamps2
++POSTHOOK: Lineage: timestamps2.ts EXPRESSION [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: select * from timestamps a inner join timestamps2 b on a.ts = b.ts
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++PREHOOK: Input: default@timestamps2
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps a inner join timestamps2 b on a.ts = b.ts
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Input: default@timestamps2
++#### A masked pattern was here ####
++2016-01-01 01:01:01	2016-01-01 01:01:01
++2017-01-01 01:01:01	2017-01-01 01:01:01
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	2                   
++	numRows             	2                   
++	parquet.mr.int96.write.zone	PST                 
++	rawDataSize         	2                   
++	totalSize           	530                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: describe formatted timestamps2
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps2
++POSTHOOK: query: describe formatted timestamps2
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps2
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	COLUMN_STATS_ACCURATE	true                
++	numFiles            	2                   
++	numRows             	2                   
++	parquet.mr.int96.write.zone	GMT+2               
++	rawDataSize         	2                   
++	totalSize           	530                 
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps2
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: drop table timestamps2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps2
++POSTHOOK: Output: default@timestamps2
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: load data local inpath '../../data/files/impala_int96_timestamp.parq' overwrite into table timestamps
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: load data local inpath '../../data/files/impala_int96_timestamp.parq' overwrite into table timestamps
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+10')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+10')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: load data local inpath '../../data/files/impala_int96_timestamp.parq' overwrite into table timestamps
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: load data local inpath '../../data/files/impala_int96_timestamp.parq' overwrite into table timestamps
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: select * from timestamps
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++POSTHOOK: query: select * from timestamps
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamps
++#### A masked pattern was here ####
++2016-01-01 01:01:01
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+10')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: create table timestamps (ts timestamp) stored as parquet tblproperties('parquet.mr.int96.write.zone'='GMT+10')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: create table timestamps2 like timestamps
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: create table timestamps2 like timestamps
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamps2
++PREHOOK: query: describe formatted timestamps
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps
++POSTHOOK: query: describe formatted timestamps
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	parquet.mr.int96.write.zone	GMT+10              
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: describe formatted timestamps2
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@timestamps2
++POSTHOOK: query: describe formatted timestamps2
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@timestamps2
++# col_name            	data_type           	comment             
++	 	 
++ts                  	timestamp           	                    
++	 	 
++# Detailed Table Information	 	 
++Database:           	default             	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	parquet.mr.int96.write.zone	GMT+10              
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	 
++InputFormat:        	org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: drop table timestamps
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps
++PREHOOK: Output: default@timestamps
++POSTHOOK: query: drop table timestamps
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps
++POSTHOOK: Output: default@timestamps
++PREHOOK: query: drop table timestamps2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamps2
++PREHOOK: Output: default@timestamps2
++POSTHOOK: query: drop table timestamps2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamps2
++POSTHOOK: Output: default@timestamps2
++PREHOOK: query: drop table if exists dummy
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@dummy
++PREHOOK: Output: default@dummy
++POSTHOOK: query: drop table if exists dummy
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@dummy
++POSTHOOK: Output: default@dummy
+-- 
+1.7.9.5
+

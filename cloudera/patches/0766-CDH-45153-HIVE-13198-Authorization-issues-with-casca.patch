@@ -1,0 +1,1449 @@
+From c76d9e41ebec9bfcbe0cf8111fd3490f946e3139 Mon Sep 17 00:00:00 2001
+From: Pengcheng Xiong <pxiong@apache.org>
+Date: Sun, 13 Mar 2016 12:04:29 -0700
+Subject: [PATCH 0766/1164] CDH-45153: HIVE-13198: Authorization issues with
+ cascading views (Pengcheng Xiong, reviewed by
+ Ashutosh Chauhan)
+
+Change-Id: I26c93410480f06a542d6644d99e685b3f1bc9ca5
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   66 ++++++++++----------
+ .../hadoop/hive/ql/exec/TableScanOperator.java     |   10 +++
+ .../calcite/reloperators/HiveTableScan.java        |   18 +++++-
+ .../optimizer/calcite/translator/ASTBuilder.java   |    9 +++
+ .../hadoop/hive/ql/parse/CalcitePlanner.java       |    2 +-
+ .../java/org/apache/hadoop/hive/ql/parse/QB.java   |   17 +++++
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   29 +++++++--
+ .../queries/clientnegative/authorization_view_5.q  |   16 +++++
+ .../queries/clientnegative/authorization_view_6.q  |   18 ++++++
+ .../queries/clientnegative/authorization_view_7.q  |   18 ++++++
+ .../authorization_view_disable_cbo_5.q             |   17 +++++
+ .../authorization_view_disable_cbo_6.q             |   19 ++++++
+ .../authorization_view_disable_cbo_7.q             |   19 ++++++
+ .../queries/clientpositive/authorization_view_2.q  |   16 +++++
+ .../queries/clientpositive/authorization_view_3.q  |   18 ++++++
+ .../queries/clientpositive/authorization_view_4.q  |   18 ++++++
+ .../authorization_view_disable_cbo_2.q             |   17 +++++
+ .../authorization_view_disable_cbo_3.q             |   19 ++++++
+ .../authorization_view_disable_cbo_4.q             |   19 ++++++
+ .../clientnegative/authorization_view_5.q.out      |   33 ++++++++++
+ .../clientnegative/authorization_view_6.q.out      |   43 +++++++++++++
+ .../clientnegative/authorization_view_7.q.out      |   43 +++++++++++++
+ .../authorization_view_disable_cbo_5.q.out         |   33 ++++++++++
+ .../authorization_view_disable_cbo_6.q.out         |   43 +++++++++++++
+ .../authorization_view_disable_cbo_7.q.out         |   43 +++++++++++++
+ .../clientpositive/authorization_view_2.q.out      |   64 +++++++++++++++++++
+ .../clientpositive/authorization_view_3.q.out      |   60 ++++++++++++++++++
+ .../clientpositive/authorization_view_4.q.out      |   62 ++++++++++++++++++
+ .../authorization_view_disable_cbo_2.q.out         |   64 +++++++++++++++++++
+ .../authorization_view_disable_cbo_3.q.out         |   60 ++++++++++++++++++
+ .../authorization_view_disable_cbo_4.q.out         |   62 ++++++++++++++++++
+ .../results/clientpositive/subquery_views.q.out    |    8 +--
+ .../results/clientpositive/tez/explainuser_1.q.out |    2 +-
+ 33 files changed, 939 insertions(+), 46 deletions(-)
+ create mode 100644 ql/src/test/queries/clientnegative/authorization_view_5.q
+ create mode 100644 ql/src/test/queries/clientnegative/authorization_view_6.q
+ create mode 100644 ql/src/test/queries/clientnegative/authorization_view_7.q
+ create mode 100644 ql/src/test/queries/clientnegative/authorization_view_disable_cbo_5.q
+ create mode 100644 ql/src/test/queries/clientnegative/authorization_view_disable_cbo_6.q
+ create mode 100644 ql/src/test/queries/clientnegative/authorization_view_disable_cbo_7.q
+ create mode 100644 ql/src/test/queries/clientpositive/authorization_view_2.q
+ create mode 100644 ql/src/test/queries/clientpositive/authorization_view_3.q
+ create mode 100644 ql/src/test/queries/clientpositive/authorization_view_4.q
+ create mode 100644 ql/src/test/queries/clientpositive/authorization_view_disable_cbo_2.q
+ create mode 100644 ql/src/test/queries/clientpositive/authorization_view_disable_cbo_3.q
+ create mode 100644 ql/src/test/queries/clientpositive/authorization_view_disable_cbo_4.q
+ create mode 100644 ql/src/test/results/clientnegative/authorization_view_5.q.out
+ create mode 100644 ql/src/test/results/clientnegative/authorization_view_6.q.out
+ create mode 100644 ql/src/test/results/clientnegative/authorization_view_7.q.out
+ create mode 100644 ql/src/test/results/clientnegative/authorization_view_disable_cbo_5.q.out
+ create mode 100644 ql/src/test/results/clientnegative/authorization_view_disable_cbo_6.q.out
+ create mode 100644 ql/src/test/results/clientnegative/authorization_view_disable_cbo_7.q.out
+ create mode 100644 ql/src/test/results/clientpositive/authorization_view_2.q.out
+ create mode 100644 ql/src/test/results/clientpositive/authorization_view_3.q.out
+ create mode 100644 ql/src/test/results/clientpositive/authorization_view_4.q.out
+ create mode 100644 ql/src/test/results/clientpositive/authorization_view_disable_cbo_2.q.out
+ create mode 100644 ql/src/test/results/clientpositive/authorization_view_disable_cbo_3.q.out
+ create mode 100644 ql/src/test/results/clientpositive/authorization_view_disable_cbo_4.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 789d4dc..c35d245 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -690,14 +690,14 @@ public static void doAuthorization(BaseSemanticAnalyzer sem, String command)
+         }
+       }
+ 
++      // column authorization is checked through table scan operators.
+       getTablePartitionUsedColumns(op, sem, tab2Cols, part2Cols, tableUsePartLevelAuth);
+ 
+-
+-
+       // cache the results for table authorization
+       Set<String> tableAuthChecked = new HashSet<String>();
+       for (ReadEntity read : inputs) {
+-        if (read.isDummy() || read.isPathType()) {
++        // if read is not direct, we do not need to check its autho.
++        if (read.isDummy() || read.isPathType() || !read.isDirect()) {
+           continue;
+         }
+         if (read.getType() == Entity.Type.DATABASE) {
+@@ -749,8 +749,7 @@ private static void getTablePartitionUsedColumns(HiveOperation op, BaseSemanticA
+     // for a select or create-as-select query, populate the partition to column
+     // (par2Cols) or
+     // table to columns mapping (tab2Cols)
+-    if (op.equals(HiveOperation.CREATETABLE_AS_SELECT)
+-        || op.equals(HiveOperation.QUERY)) {
++    if (op.equals(HiveOperation.CREATETABLE_AS_SELECT) || op.equals(HiveOperation.QUERY)) {
+       SemanticAnalyzer querySem = (SemanticAnalyzer) sem;
+       ParseContext parseCtx = querySem.getParseContext();
+ 
+@@ -759,43 +758,44 @@ private static void getTablePartitionUsedColumns(HiveOperation op, BaseSemanticA
+         Operator<? extends OperatorDesc> topOp = topOpMap.getValue();
+         if (topOp instanceof TableScanOperator) {
+           TableScanOperator tableScanOp = (TableScanOperator) topOp;
+-          Table tbl = tableScanOp.getConf().getTableMetadata();
+-          List<Integer> neededColumnIds = tableScanOp.getNeededColumnIDs();
+-          List<FieldSchema> columns = tbl.getCols();
+-          List<String> cols = new ArrayList<String>();
+-          for (int i = 0; i < neededColumnIds.size(); i++) {
+-            cols.add(columns.get(neededColumnIds.get(i)).getName());
+-          }
+-          //map may not contain all sources, since input list may have been optimized out
+-          //or non-existent tho such sources may still be referenced by the TableScanOperator
+-          //if it's null then the partition probably doesn't exist so let's use table permission
+-          if (tbl.isPartitioned() &&
+-              Boolean.TRUE.equals(tableUsePartLevelAuth.get(tbl.getTableName()))) {
+-            String alias_id = topOpMap.getKey();
+-
+-            PrunedPartitionList partsList = PartitionPruner.prune(tableScanOp,
+-                parseCtx, alias_id);
+-            Set<Partition> parts = partsList.getPartitions();
+-            for (Partition part : parts) {
+-              List<String> existingCols = part2Cols.get(part);
++          if (!tableScanOp.isInsideView()) {
++            Table tbl = tableScanOp.getConf().getTableMetadata();
++            List<Integer> neededColumnIds = tableScanOp.getNeededColumnIDs();
++            List<FieldSchema> columns = tbl.getCols();
++            List<String> cols = new ArrayList<String>();
++            for (int i = 0; i < neededColumnIds.size(); i++) {
++              cols.add(columns.get(neededColumnIds.get(i)).getName());
++            }
++            //map may not contain all sources, since input list may have been optimized out
++            //or non-existent tho such sources may still be referenced by the TableScanOperator
++            //if it's null then the partition probably doesn't exist so let's use table permission
++            if (tbl.isPartitioned() &&
++                Boolean.TRUE.equals(tableUsePartLevelAuth.get(tbl.getTableName()))) {
++              String alias_id = topOpMap.getKey();
++
++              PrunedPartitionList partsList = PartitionPruner.prune(tableScanOp,
++                  parseCtx, alias_id);
++              Set<Partition> parts = partsList.getPartitions();
++              for (Partition part : parts) {
++                List<String> existingCols = part2Cols.get(part);
++                if (existingCols == null) {
++                  existingCols = new ArrayList<String>();
++                }
++                existingCols.addAll(cols);
++                part2Cols.put(part, existingCols);
++              }
++            } else {
++              List<String> existingCols = tab2Cols.get(tbl);
+               if (existingCols == null) {
+                 existingCols = new ArrayList<String>();
+               }
+               existingCols.addAll(cols);
+-              part2Cols.put(part, existingCols);
+-            }
+-          } else {
+-            List<String> existingCols = tab2Cols.get(tbl);
+-            if (existingCols == null) {
+-              existingCols = new ArrayList<String>();
++              tab2Cols.put(tbl, existingCols);
+             }
+-            existingCols.addAll(cols);
+-            tab2Cols.put(tbl, existingCols);
+           }
+         }
+       }
+     }
+-
+   }
+ 
+   private static void doAuthorizationV2(SessionState ss, HiveOperation op, HashSet<ReadEntity> inputs,
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java
+index cb010fb..c55b9e1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java
+@@ -65,6 +65,8 @@
+ 
+   private transient int rowLimit = -1;
+   private transient int currCount = 0;
++  // insiderView will tell this TableScan is inside a view or not.
++  private transient boolean insideView;
+ 
+   private String defaultPartitionName;
+ 
+@@ -336,4 +338,12 @@ public boolean supportAutomaticSortMergeJoin() {
+     return ts;
+   }
+ 
++  public boolean isInsideView() {
++    return insideView;
++  }
++
++  public void setInsideView(boolean insiderView) {
++    this.insideView = insiderView;
++  }
++
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/reloperators/HiveTableScan.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/reloperators/HiveTableScan.java
+index 53021ea..40271e1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/reloperators/HiveTableScan.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/reloperators/HiveTableScan.java
+@@ -42,6 +42,9 @@
+  */
+ public class HiveTableScan extends TableScan implements HiveRelNode {
+ 
++  // insiderView will tell this TableScan is inside a view or not.
++  private final boolean insideView;
++
+   /**
+    * Creates a HiveTableScan.
+    *
+@@ -55,9 +58,10 @@
+    *          HiveDB table
+    */
+   public HiveTableScan(RelOptCluster cluster, RelTraitSet traitSet, RelOptHiveTable table,
+-      RelDataType rowtype) {
++      RelDataType rowtype, boolean insideView) {
+     super(cluster, TraitsUtil.getDefaultTraitSet(cluster), table);
+     assert getConvention() == HiveRelNode.CONVENTION;
++    this.insideView = insideView;
+   }
+ 
+   @Override
+@@ -89,4 +93,16 @@ public double getRows() {
+   public List<ColStatistics> getColStat(List<Integer> projIndxLst) {
+     return ((RelOptHiveTable) table).getColStat(projIndxLst);
+   }
++
++  public boolean isInsideView() {
++    return insideView;
++  }
++
++  // We need to include isInsideView inside digest to differentiate direct
++  // tables and tables inside view. Otherwise, Calcite will treat them as the same.
++  public String computeDigest() {
++    String digest = super.computeDigest();
++    return digest + "[" + this.isInsideView() + "]";
++  }
++
+ }
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/ASTBuilder.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/ASTBuilder.java
+index 4b1f5c1..c124134 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/ASTBuilder.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/ASTBuilder.java
+@@ -27,6 +27,7 @@
+ import org.apache.calcite.rex.RexLiteral;
+ import org.apache.calcite.sql.type.SqlTypeName;
+ import org.apache.hadoop.hive.ql.optimizer.calcite.RelOptHiveTable;
++import org.apache.hadoop.hive.ql.optimizer.calcite.reloperators.HiveTableScan;
+ import org.apache.hadoop.hive.ql.parse.ASTNode;
+ import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
+ import org.apache.hadoop.hive.ql.parse.HiveParser;
+@@ -58,6 +59,14 @@ static ASTNode table(TableScan scan) {
+         ASTBuilder.construct(HiveParser.TOK_TABNAME, "TOK_TABNAME")
+             .add(HiveParser.Identifier, hTbl.getHiveTableMD().getDbName())
+             .add(HiveParser.Identifier, hTbl.getHiveTableMD().getTableName()));
++    // we need to carry the insideView information from calcite into the ast.
++    if (((HiveTableScan) scan).isInsideView()) {
++      b.add(ASTBuilder.construct(HiveParser.TOK_TABLEPROPERTIES, "TOK_TABLEPROPERTIES").add(
++          ASTBuilder.construct(HiveParser.TOK_TABLEPROPLIST, "TOK_TABLEPROPLIST").add(
++              ASTBuilder.construct(HiveParser.TOK_TABLEPROPERTY, "TOK_TABLEPROPERTY")
++                  .add(HiveParser.StringLiteral, "\"insideView\"")
++                  .add(HiveParser.StringLiteral, "\"TRUE\""))));
++    }
+ 
+     // NOTE: Calcite considers tbls to be equal if their names are the same. Hence
+     // we need to provide Calcite the fully qualified table name (dbname.tblname)
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java
+index 168fda4..4e23c9e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java
+@@ -1261,7 +1261,7 @@ private RelNode genTableLogicalPlan(String tableAlias, QB qb) throws SemanticExc
+ 
+         // 5. Build Hive Table Scan Rel
+         tableRel = new HiveTableScan(cluster, cluster.traitSetOf(HiveRelNode.CONVENTION), optTable,
+-            rowType);
++            rowType, qb.isInsideView() || qb.getAliasInsideView().contains(tableAlias.toLowerCase()));
+ 
+         // 6. Add Schema(RR) to RelNode-Schema map
+         ImmutableMap<String, Integer> hiveToCalciteColMap = buildHiveToCalciteColumnMap(rr,
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
+index e205c7b..a572547 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/QB.java
+@@ -21,6 +21,7 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -58,6 +59,8 @@
+   private CreateTableDesc tblDesc = null; // table descriptor of the final
+   private List<Path> encryptedTargetTablePaths;
+   private CreateTableDesc directoryDesc = null ;
++  private boolean insideView;
++  private Set<String> aliasInsideView;
+ 
+   // used by PTFs
+   /*
+@@ -121,6 +124,7 @@ public QB(String outer_id, String alias, boolean isSubQ) {
+     ptfNodeToSpec = new LinkedHashMap<ASTNode, PTFInvocationSpec>();
+     destToWindowingSpec = new LinkedHashMap<String, WindowingSpec>();
+     id = getAppendedAliasFromId(outer_id, alias);
++    aliasInsideView = new HashSet<>();
+   }
+ 
+   // For sub-queries, the id. and alias should be appended since same aliases can be re-used
+@@ -406,4 +410,17 @@ void addEncryptedTargetTablePath(Path p) {
+     }
+     return encryptedTargetTablePaths;
+   }
++
++  public boolean isInsideView() {
++    return insideView;
++  }
++
++  public void setInsideView(boolean insideView) {
++    this.insideView = insideView;
++  }
++
++  public Set<String> getAliasInsideView() {
++    return aliasInsideView;
++  }
++
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 95ffe31..7a3c2b9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -427,14 +427,19 @@ public ParseContext getParseContext() {
+         reduceSinkOperatorsAddedByEnforceBucketingSorting, queryProperties);
+   }
+ 
+-  @SuppressWarnings("nls")
+   public void doPhase1QBExpr(ASTNode ast, QBExpr qbexpr, String id, String alias)
+       throws SemanticException {
++    doPhase1QBExpr(ast, qbexpr, id, alias, false);
++  }
++  @SuppressWarnings("nls")
++  public void doPhase1QBExpr(ASTNode ast, QBExpr qbexpr, String id, String alias, boolean insideView)
++      throws SemanticException {
+ 
+     assert (ast.getToken() != null);
+     switch (ast.getToken().getType()) {
+     case HiveParser.TOK_QUERY: {
+       QB qb = new QB(id, alias, true);
++      qb.setInsideView(insideView);
+       Phase1Ctx ctx_1 = initPhase1Ctx();
+       doPhase1(ast, qb, ctx_1, null);
+ 
+@@ -448,14 +453,14 @@ public void doPhase1QBExpr(ASTNode ast, QBExpr qbexpr, String id, String alias)
+       assert (ast.getChild(0) != null);
+       QBExpr qbexpr1 = new QBExpr(alias + "-subquery1");
+       doPhase1QBExpr((ASTNode) ast.getChild(0), qbexpr1, id + "-subquery1",
+-          alias + "-subquery1");
++          alias + "-subquery1", insideView);
+       qbexpr.setQBExpr1(qbexpr1);
+ 
+       // query 2
+       assert (ast.getChild(0) != null);
+       QBExpr qbexpr2 = new QBExpr(alias + "-subquery2");
+       doPhase1QBExpr((ASTNode) ast.getChild(1), qbexpr2, id + "-subquery2",
+-          alias + "-subquery2");
++          alias + "-subquery2", insideView);
+       qbexpr.setQBExpr2(qbexpr2);
+     }
+       break;
+@@ -644,6 +649,10 @@ private String processTable(QB qb, ASTNode tabref) throws SemanticException {
+     if (propsIndex >= 0) {
+       Tree propsAST = tabref.getChild(propsIndex);
+       Map<String, String> props = DDLSemanticAnalyzer.getProps((ASTNode) propsAST.getChild(0));
++      // We get the information from Calcite.
++      if ("TRUE".equals(props.get("insideView"))) {
++        qb.getAliasInsideView().add(alias.toLowerCase());
++      }
+       qb.setTabProps(alias, props);
+     }
+ 
+@@ -719,6 +728,9 @@ private String processTable(QB qb, ASTNode tabref) throws SemanticException {
+     }
+     // Insert this map into the stats
+     qb.setTabAlias(alias, tabIdName);
++    if (qb.isInsideView()) {
++      qb.getAliasInsideView().add(alias.toLowerCase());
++    }
+     qb.addAlias(alias);
+ 
+     qb.getParseInfo().setSrcForAlias(alias, tableTree);
+@@ -1552,8 +1564,8 @@ public void getMetaData(QB qb, ReadEntity parentInput) throws SemanticException
+           }
+           replaceViewReferenceWithDefinition(qb, tab, tab_name, alias);
+           // This is the last time we'll see the Table objects for views, so add it to the inputs
+-          // now
+-          ReadEntity viewInput = new ReadEntity(tab, parentInput);
++          // now. isInsideView will tell if this view is embedded in another view.
++          ReadEntity viewInput = new ReadEntity(tab, parentInput, !qb.isInsideView());
+           viewInput = PlanUtils.addInput(inputs, viewInput);
+           aliasToViewInfo.put(alias, new ObjectPair<String, ReadEntity>(fullViewName, viewInput));
+           String aliasId = getAliasId(alias, qb);
+@@ -1975,7 +1987,7 @@ public Object dispatch(Node nd, java.util.Stack<Node> stack,
+       throw new SemanticException(sb.toString(), e);
+     }
+     QBExpr qbexpr = new QBExpr(alias);
+-    doPhase1QBExpr(viewTree, qbexpr, qb.getId(), alias);
++    doPhase1QBExpr(viewTree, qbexpr, qb.getId(), alias, true);
+     qb.rewriteViewToSubq(alias, tab_name, qbexpr);
+   }
+ 
+@@ -9274,6 +9286,11 @@ private Operator genTablePlan(String alias, QB qb) throws SemanticException {
+       top = putOpInsertMap(OperatorFactory.get(tsDesc,
+           new RowSchema(rwsch.getColumnInfos())), rwsch);
+ 
++      if(top instanceof  TableScanOperator) {
++        // Set insiderView so that we can skip the column authorization for this.
++        ((TableScanOperator)top).setInsideView(qb.isInsideView() || qb.getAliasInsideView().contains(alias.toLowerCase()));
++      }
++
+       // Add this to the list of top operators - we always start from a table
+       // scan
+       topOps.put(alias_id, top);
+diff --git a/ql/src/test/queries/clientnegative/authorization_view_5.q b/ql/src/test/queries/clientnegative/authorization_view_5.q
+new file mode 100644
+index 0000000..3b042c3
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/authorization_view_5.q
+@@ -0,0 +1,16 @@
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table not grant to user
++
++--grant select on table v2 to user hive_test_user;
++
++select * from v2 order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientnegative/authorization_view_6.q b/ql/src/test/queries/clientnegative/authorization_view_6.q
+new file mode 100644
+index 0000000..38873a7
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/authorization_view_6.q
+@@ -0,0 +1,18 @@
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++--grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientnegative/authorization_view_7.q b/ql/src/test/queries/clientnegative/authorization_view_7.q
+new file mode 100644
+index 0000000..3740bf9
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/authorization_view_7.q
+@@ -0,0 +1,18 @@
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++--grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_5.q b/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_5.q
+new file mode 100644
+index 0000000..a0070c2
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_5.q
+@@ -0,0 +1,17 @@
++set hive.cbo.enable=false;
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table not grant to user
++
++--grant select on table v2 to user hive_test_user;
++
++select * from v2 order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_6.q b/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_6.q
+new file mode 100644
+index 0000000..bc0d547
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_6.q
+@@ -0,0 +1,19 @@
++set hive.cbo.enable=false;
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++--grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_7.q b/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_7.q
+new file mode 100644
+index 0000000..51b453d
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/authorization_view_disable_cbo_7.q
+@@ -0,0 +1,19 @@
++set hive.cbo.enable=false;
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++--grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientpositive/authorization_view_2.q b/ql/src/test/queries/clientpositive/authorization_view_2.q
+new file mode 100644
+index 0000000..8e6138d
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/authorization_view_2.q
+@@ -0,0 +1,16 @@
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++select * from v2 order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientpositive/authorization_view_3.q b/ql/src/test/queries/clientpositive/authorization_view_3.q
+new file mode 100644
+index 0000000..aaf971e
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/authorization_view_3.q
+@@ -0,0 +1,18 @@
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientpositive/authorization_view_4.q b/ql/src/test/queries/clientpositive/authorization_view_4.q
+new file mode 100644
+index 0000000..53ce350
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/authorization_view_4.q
+@@ -0,0 +1,18 @@
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_2.q b/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_2.q
+new file mode 100644
+index 0000000..03d4387
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_2.q
+@@ -0,0 +1,17 @@
++set hive.cbo.enable=false;
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++select * from v2 order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_3.q b/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_3.q
+new file mode 100644
+index 0000000..44f9503
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_3.q
+@@ -0,0 +1,19 @@
++set hive.cbo.enable=false;
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src_autho_test;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_4.q b/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_4.q
+new file mode 100644
+index 0000000..40424c4
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/authorization_view_disable_cbo_4.q
+@@ -0,0 +1,19 @@
++set hive.cbo.enable=false;
++set hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.DefaultHiveAuthorizationProvider;
++
++create table src_autho_test as select * from src;
++
++create view v1 as select * from src;
++
++create view v2 as select * from v1;
++
++set hive.security.authorization.enabled=true;
++
++--table grant to user
++
++grant select on table v2 to user hive_test_user;
++
++grant select(key) on table src_autho_test to user hive_test_user;
++
++select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10;
++
+diff --git a/ql/src/test/results/clientnegative/authorization_view_5.q.out b/ql/src/test/results/clientnegative/authorization_view_5.q.out
+new file mode 100644
+index 0000000..d2f47c2
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/authorization_view_5.q.out
+@@ -0,0 +1,33 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++Authorization failed:No privilege 'Select' found for inputs { database:default, table:v2}. Use SHOW GRANT to get more details.
+diff --git a/ql/src/test/results/clientnegative/authorization_view_6.q.out b/ql/src/test/results/clientnegative/authorization_view_6.q.out
+new file mode 100644
+index 0000000..22b2eb0
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/authorization_view_6.q.out
+@@ -0,0 +1,43 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++Authorization failed:No privilege 'Select' found for inputs { database:default, table:src_autho_test, columnName:key}. Use SHOW GRANT to get more details.
+diff --git a/ql/src/test/results/clientnegative/authorization_view_7.q.out b/ql/src/test/results/clientnegative/authorization_view_7.q.out
+new file mode 100644
+index 0000000..14285f6
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/authorization_view_7.q.out
+@@ -0,0 +1,43 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++Authorization failed:No privilege 'Select' found for inputs { database:default, table:src_autho_test, columnName:key}. Use SHOW GRANT to get more details.
+diff --git a/ql/src/test/results/clientnegative/authorization_view_disable_cbo_5.q.out b/ql/src/test/results/clientnegative/authorization_view_disable_cbo_5.q.out
+new file mode 100644
+index 0000000..d2f47c2
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/authorization_view_disable_cbo_5.q.out
+@@ -0,0 +1,33 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++Authorization failed:No privilege 'Select' found for inputs { database:default, table:v2}. Use SHOW GRANT to get more details.
+diff --git a/ql/src/test/results/clientnegative/authorization_view_disable_cbo_6.q.out b/ql/src/test/results/clientnegative/authorization_view_disable_cbo_6.q.out
+new file mode 100644
+index 0000000..22b2eb0
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/authorization_view_disable_cbo_6.q.out
+@@ -0,0 +1,43 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++Authorization failed:No privilege 'Select' found for inputs { database:default, table:src_autho_test, columnName:key}. Use SHOW GRANT to get more details.
+diff --git a/ql/src/test/results/clientnegative/authorization_view_disable_cbo_7.q.out b/ql/src/test/results/clientnegative/authorization_view_disable_cbo_7.q.out
+new file mode 100644
+index 0000000..14285f6
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/authorization_view_disable_cbo_7.q.out
+@@ -0,0 +1,43 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++Authorization failed:No privilege 'Select' found for inputs { database:default, table:src_autho_test, columnName:key}. Use SHOW GRANT to get more details.
+diff --git a/ql/src/test/results/clientpositive/authorization_view_2.q.out b/ql/src/test/results/clientpositive/authorization_view_2.q.out
+new file mode 100644
+index 0000000..1c4b191
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/authorization_view_2.q.out
+@@ -0,0 +1,64 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++PREHOOK: query: select * from v2 order by key limit 10
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Input: default@v2
++#### A masked pattern was here ####
++POSTHOOK: query: select * from v2 order by key limit 10
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Input: default@v2
++#### A masked pattern was here ####
++0	val_0
++0	val_0
++0	val_0
++10	val_10
++100	val_100
++100	val_100
++103	val_103
++103	val_103
++104	val_104
++104	val_104
+diff --git a/ql/src/test/results/clientpositive/authorization_view_3.q.out b/ql/src/test/results/clientpositive/authorization_view_3.q.out
+new file mode 100644
+index 0000000..f6fcf63
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/authorization_view_3.q.out
+@@ -0,0 +1,60 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++PREHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Input: default@v2
++#### A masked pattern was here ####
++POSTHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Input: default@v2
++#### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/authorization_view_4.q.out b/ql/src/test/results/clientpositive/authorization_view_4.q.out
+new file mode 100644
+index 0000000..0e59f90
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/authorization_view_4.q.out
+@@ -0,0 +1,62 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++PREHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Input: default@v2
++#### A masked pattern was here ####
++POSTHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Input: default@v2
++#### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/authorization_view_disable_cbo_2.q.out b/ql/src/test/results/clientpositive/authorization_view_disable_cbo_2.q.out
+new file mode 100644
+index 0000000..1c4b191
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/authorization_view_disable_cbo_2.q.out
+@@ -0,0 +1,64 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++PREHOOK: query: select * from v2 order by key limit 10
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Input: default@v2
++#### A masked pattern was here ####
++POSTHOOK: query: select * from v2 order by key limit 10
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Input: default@v2
++#### A masked pattern was here ####
++0	val_0
++0	val_0
++0	val_0
++10	val_10
++100	val_100
++100	val_100
++103	val_103
++103	val_103
++104	val_104
++104	val_104
+diff --git a/ql/src/test/results/clientpositive/authorization_view_disable_cbo_3.q.out b/ql/src/test/results/clientpositive/authorization_view_disable_cbo_3.q.out
+new file mode 100644
+index 0000000..f6fcf63
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/authorization_view_disable_cbo_3.q.out
+@@ -0,0 +1,60 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src_autho_test
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src_autho_test
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++PREHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Input: default@v2
++#### A masked pattern was here ####
++POSTHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Input: default@v2
++#### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/authorization_view_disable_cbo_4.q.out b/ql/src/test/results/clientpositive/authorization_view_disable_cbo_4.q.out
+new file mode 100644
+index 0000000..0e59f90
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/authorization_view_disable_cbo_4.q.out
+@@ -0,0 +1,62 @@
++PREHOOK: query: create table src_autho_test as select * from src
++PREHOOK: type: CREATETABLE_AS_SELECT
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: create table src_autho_test as select * from src
++POSTHOOK: type: CREATETABLE_AS_SELECT
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: create view v1 as select * from src
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v1
++POSTHOOK: query: create view v1 as select * from src
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v1
++PREHOOK: query: create view v2 as select * from v1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: default@src
++PREHOOK: Input: default@v1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@v2
++POSTHOOK: query: create view v2 as select * from v1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@v1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@v2
++PREHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@v2
++POSTHOOK: query: --table grant to user
++
++grant select on table v2 to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@v2
++PREHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++PREHOOK: type: GRANT_PRIVILEGE
++PREHOOK: Output: default@src_autho_test
++POSTHOOK: query: grant select(key) on table src_autho_test to user hive_test_user
++POSTHOOK: type: GRANT_PRIVILEGE
++POSTHOOK: Output: default@src_autho_test
++PREHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Input: default@src_autho_test
++PREHOOK: Input: default@v1
++PREHOOK: Input: default@v2
++#### A masked pattern was here ####
++POSTHOOK: query: select v2.key from v2 join (select key from src_autho_test)subq on v2.value=subq.key order by key limit 10
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Input: default@src_autho_test
++POSTHOOK: Input: default@v1
++POSTHOOK: Input: default@v2
++#### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/subquery_views.q.out b/ql/src/test/results/clientpositive/subquery_views.q.out
+index 41834a3..e9edc01 100644
+--- a/ql/src/test/results/clientpositive/subquery_views.q.out
++++ b/ql/src/test/results/clientpositive/subquery_views.q.out
+@@ -94,7 +94,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: b
++            alias: a
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: ((value > 'val_11') and (key is null or value is null)) (type: boolean)
+@@ -175,7 +175,7 @@ STAGE PLANS:
+               Map-reduce partition columns: _col0 (type: string), _col1 (type: string), _col0 (type: string)
+               Statistics: Num rows: 275 Data size: 2921 Basic stats: COMPLETE Column stats: NONE
+           TableScan
+-            alias: b
++            alias: a
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: ((value > 'val_11') and key is not null) (type: boolean)
+@@ -249,7 +249,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: b
++            alias: a
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: ((value > 'val_11') and (key is null or value is null)) (type: boolean)
+@@ -330,7 +330,7 @@ STAGE PLANS:
+               Map-reduce partition columns: _col0 (type: string), _col1 (type: string), _col0 (type: string)
+               Statistics: Num rows: 182 Data size: 1939 Basic stats: COMPLETE Column stats: NONE
+           TableScan
+-            alias: b
++            alias: a
+             Statistics: Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: NONE
+             Filter Operator
+               predicate: (((value > 'val_11') and (key < '11')) and key is not null) (type: boolean)
+diff --git a/ql/src/test/results/clientpositive/tez/explainuser_1.q.out b/ql/src/test/results/clientpositive/tez/explainuser_1.q.out
+index 2057a14..b179c53 100644
+--- a/ql/src/test/results/clientpositive/tez/explainuser_1.q.out
++++ b/ql/src/test/results/clientpositive/tez/explainuser_1.q.out
+@@ -3220,7 +3220,7 @@ Stage-0
+                            TableScan [TS_3]
+                               alias:b
+                               Statistics:Num rows: 500 Data size: 5312 Basic stats: COMPLETE Column stats: COMPLETE
+-PREHOOK: query: explain select * 
++PREHOOK: query: explain select *
+ from (select * 
+       from src_cbo b 
+       where exists 
+-- 
+1.7.9.5
+

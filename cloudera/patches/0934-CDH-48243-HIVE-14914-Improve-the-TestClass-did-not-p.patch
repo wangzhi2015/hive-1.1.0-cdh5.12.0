@@ -1,0 +1,503 @@
+From 85e1883e36a6fc87e93b20b97ed7bf263c6faf25 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Tue, 11 Oct 2016 22:17:54 -0700
+Subject: [PATCH 0934/1164] CDH-48243 : HIVE-14914 : Improve the 'TestClass'
+ did not produce a TEST-*.xml file message.
+ (Siddharth Seth, reviewed by  Prasanth
+ Jayachandran)
+
+Change-Id: I84d7539a8311a909e4463623ae9069c6bf6ea8dc
+---
+ .../hive/ptest/execution/ExecutionPhase.java       |   12 ++--
+ .../apache/hive/ptest/execution/HostExecutor.java  |    1 -
+ .../hive/ptest/execution/JUnitReportParser.java    |   74 +++++++++++++-------
+ .../org/apache/hive/ptest/execution/PTest.java     |    2 +-
+ .../hive/ptest/execution/conf/QFileTestBatch.java  |   13 ++--
+ .../hive/ptest/execution/conf/TestBatch.java       |   13 ++--
+ .../hive/ptest/execution/conf/UnitTestBatch.java   |   11 +--
+ .../hive/ptest/execution/TestExecutionPhase.java   |   30 +++++++-
+ ...estExecutionPhase.testFailingQFile.approved.txt |    8 +--
+ ...xecutionPhase.testPassingQFileTest.approved.txt |    8 +--
+ ...xecutionPhase.testTimedOutUnitTest.approved.txt |   14 ++++
+ .../hive/ptest/execution/TestReportParser.java     |    6 +-
+ .../ptest/execution/conf/TestQFileTestBatch.java   |    4 +-
+ 13 files changed, 133 insertions(+), 63 deletions(-)
+ create mode 100644 testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testTimedOutUnitTest.approved.txt
+
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
+index 65af6fa..8a64499 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
+@@ -115,11 +115,15 @@ public void execute() throws Throwable {
+           batchLogDir = new File(succeededLogDir, batch.getName());
+         }
+         JUnitReportParser parser = new JUnitReportParser(logger, batchLogDir);
+-        executedTests.addAll(parser.getExecutedTests());
+-        failedTests.addAll(parser.getFailedTests());
++        executedTests.addAll(parser.getAllExecutedTests());
++        failedTests.addAll(parser.getAllFailedTests());
+         // if the TEST*.xml was not generated or was corrupt, let someone know
+-        if (parser.getNumAttemptedTests() == 0) {
+-          failedTests.add(batch.getName() + " - did not produce a TEST-*.xml file");
++        if (parser.getTestClassesWithReportAvailable().size() < batch.getTestClasses().size()) {
++          Set<String> expTestClasses = new HashSet<>(batch.getTestClasses());
++          expTestClasses.removeAll(parser.getTestClassesWithReportAvailable());
++          for (String testClass : expTestClasses) {
++            failedTests.add(testClass + " - did not produce a TEST-*.xml file");
++          }
+         }
+       }
+     } finally {
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+index 123e310..f41253b 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+@@ -240,7 +240,6 @@ private boolean executeTestBatch(Drone drone, TestBatch batch, Set<TestBatch> fa
+     Map<String, String> templateVariables = Maps.newHashMap(mTemplateDefaults);
+     templateVariables.put("instanceName", drone.getInstanceName());
+     templateVariables.put("batchName", batch.getName());
+-    templateVariables.put("testClass", batch.getTestClass());
+     templateVariables.put("testArguments", batch.getTestArguments());
+     templateVariables.put("localDir", drone.getLocalDirectory());
+     templateVariables.put("logDir", drone.getLocalLogDirectory());
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/JUnitReportParser.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/JUnitReportParser.java
+index cc9f617..8fe56fe 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/JUnitReportParser.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/JUnitReportParser.java
+@@ -20,6 +20,7 @@
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.IOException;
++import java.util.Collections;
+ import java.util.Set;
+ 
+ import javax.xml.parsers.SAXParser;
+@@ -34,53 +35,53 @@
+ 
+ 
+ public class JUnitReportParser {
++
+   private final File directory;
+   private final Logger logger;
+   private final Set<String> executedTests;
+   private final Set<String> failedTests;
++  private final Set<String> testClassesWithAvailableReports;
++  private final Set<File> testOutputFiles;
+   private boolean parsed;
+   public JUnitReportParser(Logger logger, File directory) throws Exception {
+     this.logger = logger;
+     this.directory = directory;
+     executedTests = Sets.newHashSet();
+     failedTests =  Sets.newHashSet();
++    testOutputFiles = Sets.newHashSet();
++    testClassesWithAvailableReports = Sets.newHashSet();
+     parsed = false;
+   }
+ 
+-  private Set<File> getFiles(File directory) {
+-    Set<File> result = Sets.newHashSet();
+-    File[] files = directory.listFiles();
+-    if(files != null) {
+-      for(File file : files) {
+-        if(file.isFile()) {
+-          String name = file.getName();
+-          if(name.startsWith("TEST-") && name.endsWith(".xml")) {
+-            result.add(file);
+-          }
+-        }
+-      }
+-    }
+-    return result;
+-  }
+-  public Set<String> getExecutedTests() {
+-    if(!parsed) {
+-      parse();
+-      parsed = true;
+-    }
++  public Set<String> getAllExecutedTests() {
++    parseIfRequired();
+     return executedTests;
+   }
+-  public Set<String> getFailedTests() {
+-    if(!parsed) {
+-      parse();
+-      parsed = true;
+-    }
++
++  public Set<String> getAllFailedTests() {
++    parseIfRequired();
+     return failedTests;
+   }
++
++  public Set<String> getTestClassesWithReportAvailable() {
++    return Collections.unmodifiableSet(testClassesWithAvailableReports);
++  }
++
+   public int getNumAttemptedTests() {
+-    return getExecutedTests().size() + getFailedTests().size();
++    parseIfRequired();
++    return getAllExecutedTests().size() + getAllFailedTests().size();
++  }
++
++  private void parseIfRequired() {
++    if (!parsed) {
++      parse();
++      parsed = true;
++    }
+   }
++
+   private void parse() {
+-    for(File file : getFiles(directory)) {
++    populateTestFileList(directory);
++    for(File file : testOutputFiles) {
+       FileInputStream stream = null;
+       try {
+         stream = new FileInputStream(file);
+@@ -132,4 +133,23 @@ public void endElement(String uri, String localName, String qName)  {
+       }
+     }
+   }
++
++  private void populateTestFileList(File directory) {
++    File[] files = directory.listFiles();
++    if(files != null) {
++      for(File file : files) {
++        if(file.isFile()) {
++          String name = file.getName();
++          if(name.startsWith("TEST-") && name.endsWith(".xml")) {
++            testOutputFiles.add(file);
++            int idx = name.lastIndexOf("TEST-");
++            name = name.substring(idx + "TEST-".length());
++            String parts[] = name.split("\\.");
++            String testClass = parts[parts.length-2];
++            testClassesWithAvailableReports.add(testClass);
++          }
++        }
++      }
++    }
++  }
+ }
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+index 952c09b..76fcb8e 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+@@ -280,7 +280,7 @@ public static void main(String[] args) throws Exception {
+     options.addOption(null, REPOSITORY_NAME, true, "Overrides git repository *name* in properties file");
+     options.addOption(null, BRANCH, true, "Overrides git branch in properties file");
+     options.addOption(null, PATCH, true, "URI to patch, either file:/// or http(s)://");
+-    options.addOption(ANT_ARG, null, true, "Supplemntal ant arguments");
++    options.addOption(ANT_ARG, null, true, "Supplemental ant arguments");
+     options.addOption(null, JAVA_HOME, true, "Java Home for compiling and running tests (unless " + JAVA_HOME_TEST + " is specified)");
+     options.addOption(null, JAVA_HOME_TEST, true, "Java Home for running tests (optional)");
+     options.addOption(null, ANT_TEST_ARGS, true, "Arguments to ant test on slave nodes only");
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
+index fe4952c..405c44b 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
+@@ -18,6 +18,8 @@
+  */
+ package org.apache.hive.ptest.execution.conf;
+ 
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -42,7 +44,7 @@ public QFileTestBatch(AtomicInteger batchIdCounter, String testCasePropertyName,
+     this.driver = driver;
+     this.queryFilesProperty = queryFilesProperty;
+     this.tests = tests;
+-    String name = Joiner.on("-").join(driver, Joiner.on("-").join(
++    String name = Joiner.on("-").join(getBatchId(), driver, Joiner.on("-").join(
+         Iterators.toArray(Iterators.limit(tests.iterator(), 3), String.class)));
+     if(tests.size() > 3) {
+       name = Joiner.on("-").join(name, "and", (tests.size() - 3), "more");
+@@ -59,10 +61,6 @@ public String getName() {
+     return name;
+   }
+   @Override
+-  public String getTestClass() {
+-    return driver;
+-  }
+-  @Override
+   public String getTestArguments() {
+     return String.format("-D%s=%s -D%s=%s", testCasePropertyName, driver, queryFilesProperty,
+         Joiner.on(",").join(tests));
+@@ -91,6 +89,11 @@ public int getNumTestsInBatch() {
+   }
+ 
+   @Override
++  public Collection<String> getTestClasses() {
++    return Collections.singleton(driver);
++  }
++
++  @Override
+   public int hashCode() {
+     final int prime = 31;
+     int result = 1;
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
+index c537169..a83049d 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
+@@ -18,6 +18,7 @@
+  */
+ package org.apache.hive.ptest.execution.conf;
+ 
++import java.util.Collection;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ public abstract class TestBatch {
+@@ -26,13 +27,14 @@ public TestBatch(AtomicInteger BATCH_ID_GEN) {
+     this.batchId = BATCH_ID_GEN.getAndIncrement();
+   }
+ 
++  public final int getBatchId() {
++    return batchId;
++  }
++
+   private final int batchId;
+ 
+   public abstract String getTestArguments();
+ 
+-  // TODO Get rid of this.
+-  public abstract String getTestClass();
+-
+   public abstract String getName();
+ 
+   public abstract boolean isParallel();
+@@ -41,8 +43,7 @@ public TestBatch(AtomicInteger BATCH_ID_GEN) {
+ 
+   public abstract int getNumTestsInBatch();
+ 
+-  public final int getBatchId() {
+-    return batchId;
+-  }
++  /* Comma separated list of classes in a batch */
++  public abstract Collection<String> getTestClasses();
+ 
+ }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
+index cedc5a3..17c8abc 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
+@@ -18,6 +18,7 @@
+  */
+ package org.apache.hive.ptest.execution.conf;
+ 
++import java.util.Collection;
+ import java.util.List;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -59,11 +60,6 @@ public String getName() {
+     // Used for logDir, failure messages etc.
+     return batchName;
+   }
+-  @Override
+-  public String getTestClass() {
+-    // Used to identify the module name. Return any.
+-    return testList.get(0);
+-  }
+ 
+   @Override
+   public String toString() {
+@@ -87,6 +83,11 @@ public int getNumTestsInBatch() {
+   }
+ 
+   @Override
++  public Collection<String> getTestClasses() {
++    return testList;
++  }
++
++  @Override
+   public boolean equals(Object o) {
+     if (this == o) {
+       return true;
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
+index bb1bb3e..558d5ae 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
+@@ -20,6 +20,7 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+@@ -80,12 +81,28 @@ private void setupUnitTest() throws Exception {
+     testBatch = new UnitTestBatch(new AtomicInteger(1), "testcase", Arrays.asList(DRIVER), "fakemodule", false);
+     testBatches = Collections.singletonList(testBatch);
+   }
++  private void setupUnitTest(int nTests) throws Exception {
++    List<String> testList = new ArrayList<>();
++    for (int i = 0 ; i < nTests ; i++) {
++      testList.add("TestClass-" + i);
++    }
++    testBatch = new UnitTestBatch(new AtomicInteger(1), "testcase", testList, "fakemodule", false);
++    testBatches = Collections.singletonList(testBatch);
++  }
+   private void copyTestOutput(String resource, File directory, String name) throws Exception {
+     String junitOutput = Templates.readResource(resource);
+     File junitOutputFile = new File(Dirs.create(
+         new File(directory, name)), "TEST-SomeTest.xml");
+     Files.write(junitOutput.getBytes(Charsets.UTF_8), junitOutputFile);
+   }
++
++  private void copyTestOutput(String resource, File directory, String batchName,
++                              String outputName) throws Exception {
++    String junitOutput = Templates.readResource(resource);
++    File junitOutputFile = new File(Dirs.create(
++        new File(directory, batchName)), outputName);
++    Files.write(junitOutput.getBytes(Charsets.UTF_8), junitOutputFile);
++  }
+   @After
+   public void teardown() {
+     FileUtils.deleteQuietly(baseDir);
+@@ -103,7 +120,7 @@ public void testPassingQFileTest() throws Throwable {
+   public void testFailingQFile() throws Throwable {
+     setupQFile(true);
+     sshCommandExecutor.putFailure("bash " + LOCAL_DIR + "/" + HOST + "-" + USER +
+-        "-0/scratch/hiveptest-" + DRIVER + "-" + QFILENAME + ".sh", 1);
++        "-0/scratch/hiveptest-" + "1-" + DRIVER + "-" + QFILENAME + ".sh", 1);
+     copyTestOutput("SomeTest-failure.xml", failedLogDir, testBatch.getName());
+     getPhase().execute();
+     Assert.assertEquals(1, sshCommandExecutor.getMatchCount());
+@@ -132,4 +149,15 @@ public void testFailingUnitTest() throws Throwable {
+     Assert.assertEquals(Sets.newHashSet("SomeTest." + QFILENAME), executedTests);
+     Assert.assertEquals(Sets.newHashSet("SomeTest." + QFILENAME), failedTests);
+   }
++
++  @Test(timeout = 2000000)
++  public void testTimedOutUnitTest() throws Throwable {
++    setupUnitTest(3);
++    copyTestOutput("SomeTest-success.xml", succeededLogDir, testBatch.getName(), "TEST-TestClass-0.xml");
++    copyTestOutput("SomeTest-success.xml", succeededLogDir, testBatch.getName(), "TEST-TestClass-1.xml");
++    getPhase().execute();
++    Approvals.verify(getExecutedCommands());
++    Assert.assertEquals(1, failedTests.size());
++    Assert.assertEquals("TestClass-2 - did not produce a TEST-*.xml file", failedTests.iterator().next());
++  }
+ }
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingQFile.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingQFile.approved.txt
+index bb85e9e..108feb9 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingQFile.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingQFile.approved.txt
+@@ -1,9 +1,9 @@
+ /some/working/dir/ivy /some/local/dir/somehost-someuser-0
+ /some/working/dir/maven /some/local/dir/somehost-someuser-0
+ /some/working/dir/repositoryName-source /some/local/dir/somehost-someuser-0
+-/tmp/hive-ptest-units/TestExecutionPhase/logs/failed/driver-sometest /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-driver-sometest.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-sometest.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-sometest.sh
++/tmp/hive-ptest-units/TestExecutionPhase/logs/failed/1-driver-sometest /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-1-driver-sometest.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1-driver-sometest.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1-driver-sometest.sh
+ killall -q -9 java || true
+ mkdir -p /some/local/dir/somehost-someuser-0/logs /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-0/repositoryName-source
+ mkdir -p /some/local/dir/somehost-someuser-1/logs /some/local/dir/somehost-someuser-1/maven /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/ivy /some/local/dir/somehost-someuser-1/repositoryName-source
+@@ -11,4 +11,4 @@ rm -rf /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-some
+ rm -rf /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/logs
+ rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-1/
+ rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-1/
+-rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/repositoryName-source /some/local/dir/somehost-someuser-1/
++rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/repositoryName-source /some/local/dir/somehost-someuser-1/
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingQFileTest.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingQFileTest.approved.txt
+index 7f1dd9c..d97fced 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingQFileTest.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingQFileTest.approved.txt
+@@ -1,9 +1,9 @@
+ /some/working/dir/ivy /some/local/dir/somehost-someuser-0
+ /some/working/dir/maven /some/local/dir/somehost-someuser-0
+ /some/working/dir/repositoryName-source /some/local/dir/somehost-someuser-0
+-/tmp/hive-ptest-units/TestExecutionPhase/logs/succeeded/driver-sometest /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-driver-sometest.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-sometest.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-sometest.sh
++/tmp/hive-ptest-units/TestExecutionPhase/logs/succeeded/1-driver-sometest /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-1-driver-sometest.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1-driver-sometest.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1-driver-sometest.sh
+ killall -q -9 java || true
+ mkdir -p /some/local/dir/somehost-someuser-0/logs /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-0/repositoryName-source
+ mkdir -p /some/local/dir/somehost-someuser-1/logs /some/local/dir/somehost-someuser-1/maven /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/ivy /some/local/dir/somehost-someuser-1/repositoryName-source
+@@ -11,4 +11,4 @@ rm -rf /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-some
+ rm -rf /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/logs
+ rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-1/
+ rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-1/
+-rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/repositoryName-source /some/local/dir/somehost-someuser-1/
++rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/repositoryName-source /some/local/dir/somehost-someuser-1/
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testTimedOutUnitTest.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testTimedOutUnitTest.approved.txt
+new file mode 100644
+index 0000000..0afb74c
+--- /dev/null
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testTimedOutUnitTest.approved.txt
+@@ -0,0 +1,14 @@
++/some/working/dir/ivy /some/local/dir/somehost-someuser-0
++/some/working/dir/maven /some/local/dir/somehost-someuser-0
++/some/working/dir/repositoryName-source /some/local/dir/somehost-someuser-0
++/tmp/hive-ptest-units/TestExecutionPhase/logs/succeeded/1_UTBatch_fakemodule_3_tests /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-1_UTBatch_fakemodule_3_tests.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_UTBatch_fakemodule_3_tests.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_UTBatch_fakemodule_3_tests.sh
++killall -q -9 java || true
++mkdir -p /some/local/dir/somehost-someuser-0/logs /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-0/repositoryName-source
++mkdir -p /some/local/dir/somehost-someuser-1/logs /some/local/dir/somehost-someuser-1/maven /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/ivy /some/local/dir/somehost-someuser-1/repositoryName-source
++rm -rf /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-someuser-0/logs
++rm -rf /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/logs
++rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-1/
++rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-1/
++rsync -qaPe --delete --delete-during --force /some/local/dir/somehost-someuser-0/repositoryName-source /some/local/dir/somehost-someuser-1/
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestReportParser.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestReportParser.java
+index 8aca8b4..d6a7515 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestReportParser.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestReportParser.java
+@@ -59,12 +59,12 @@ public void test() throws Exception {
+       }
+     }
+     JUnitReportParser parser = new JUnitReportParser(LOG, baseDir);
+-    Assert.assertEquals(3, parser.getFailedTests().size());
++    Assert.assertEquals(3, parser.getAllFailedTests().size());
+     Assert.assertEquals(Sets.
+         newHashSet("org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_skewjoin_union_remove_1",
+             "org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_union_remove_9",
+             "org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_skewjoin"),
+-            parser.getFailedTests());
++            parser.getAllFailedTests());
+     Assert.assertEquals(Sets.
+         newHashSet("org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_shutdown", 
+             "org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_binary_constant", 
+@@ -83,6 +83,6 @@ public void test() throws Exception {
+             "org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_union_remove_9", 
+             "org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_skewjoin", 
+             "org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_multi_insert_gby"),
+-            parser.getExecutedTests());
++            parser.getAllExecutedTests());
+   }
+ }
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
+index fb7bee8..c419a82 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
+@@ -48,7 +48,7 @@ public void testParallel() throws Exception {
+         new QFileTestBatch(new AtomicInteger(1), "testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
+     Assert.assertTrue(batch.isParallel());
+     Assert.assertEquals(DRIVER, batch.getDriver());
+-    Assert.assertEquals(Joiner.on("-").join(DRIVER, "a", "b", "c"), batch.getName());
++    Assert.assertEquals(Joiner.on("-").join("1", DRIVER, "a", "b", "c"), batch.getName());
+     Assert.assertEquals(String.format("-Dtestcase=%s -D%s=a,b,c", DRIVER,
+         QUERY_FILES_PROPERTY), batch.getTestArguments());
+     Assert.assertEquals(TEST_MODULE_NAME, batch.getTestModuleRelativeDir());
+@@ -58,7 +58,7 @@ public void testMoreThanThreeTests() throws Exception {
+     Assert.assertTrue(tests.add("d"));
+     QFileTestBatch batch =
+         new QFileTestBatch(new AtomicInteger(1), "testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
+-    Assert.assertEquals(Joiner.on("-").join(DRIVER, "a", "b", "c", "and", "1", "more"),
++    Assert.assertEquals(Joiner.on("-").join("1", DRIVER, "a", "b", "c", "and", "1", "more"),
+         batch.getName());
+   }
+   @Test
+-- 
+1.7.9.5
+

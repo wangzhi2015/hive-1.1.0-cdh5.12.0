@@ -1,0 +1,81 @@
+From cf09d6d2323763e1fcb079bf466113903e21cd3d Mon Sep 17 00:00:00 2001
+From: Mohammad Kamrul Islam <mislam77@yahoo.com>
+Date: Wed, 2 Dec 2015 09:31:42 -0600
+Subject: [PATCH 0763/1164] CDH-45005: HIVE-12475: Parquet schema evolution
+ within array<struct<>> doesn't work (Mohammad
+ Kamrul Islam, reviewed by Sergio Pena)
+
+Change-Id: I69a1dbf2122ddb60cf867c1820877aaa8207692d
+---
+ .../serde/ArrayWritableObjectInspector.java        |    8 ++++++--
+ .../clientpositive/parquet_type_promotion.q        |    3 +++
+ .../clientpositive/parquet_type_promotion.q.out    |   19 +++++++++++++++++++
+ 3 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java
+index 3f5d12b..8d5e84e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/serde/ArrayWritableObjectInspector.java
+@@ -136,10 +136,14 @@ public Object getStructFieldData(final Object data, final StructField fieldRef)
+     if (data == null) {
+       return null;
+     }
+-
+     if (data instanceof ArrayWritable) {
+       final ArrayWritable arr = (ArrayWritable) data;
+-      return arr.get()[((StructFieldImpl) fieldRef).getIndex()];
++      final StructFieldImpl structField = (StructFieldImpl) fieldRef;
++      if (structField.getIndex() < arr.get().length) {
++        return arr.get()[structField.getIndex()];
++      } else {
++        return null;
++      }
+     }
+ 
+     //since setStructFieldData and create return a list, getStructFieldData should be able to
+diff --git a/ql/src/test/queries/clientpositive/parquet_type_promotion.q b/ql/src/test/queries/clientpositive/parquet_type_promotion.q
+index b740c0b..3f505c3 100644
+--- a/ql/src/test/queries/clientpositive/parquet_type_promotion.q
++++ b/ql/src/test/queries/clientpositive/parquet_type_promotion.q
+@@ -82,5 +82,8 @@ f2:int,f3:int>>) STORED AS PARQUET;
+ INSERT INTO TABLE arrays_of_struct_to_map select array(named_struct("c1",1,"c2",2)), array(named_struct("f1",
+ 77,"f2",88,"f3",99)) FROM parquet_type_promotion LIMIT 1;
+ SELECT * FROM arrays_of_struct_to_map;
++ALTER TABLE arrays_of_struct_to_map REPLACE COLUMNS (locations1 array<struct<c1:int,c2:int,c3:int>>, locations2
++array<struct<f1:int,f2:int,f3:int>>);
++SELECT * FROM arrays_of_struct_to_map;
+ ALTER TABLE arrays_of_struct_to_map REPLACE COLUMNS (locations1 map<int,bigint>, locations2 map<bigint,int>);
+ SELECT * FROM arrays_of_struct_to_map;
+diff --git a/ql/src/test/results/clientpositive/parquet_type_promotion.q.out b/ql/src/test/results/clientpositive/parquet_type_promotion.q.out
+index 6283d9a..dca81c0 100644
+--- a/ql/src/test/results/clientpositive/parquet_type_promotion.q.out
++++ b/ql/src/test/results/clientpositive/parquet_type_promotion.q.out
+@@ -246,6 +246,25 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@arrays_of_struct_to_map
+ #### A masked pattern was here ####
+ [{"c1":1,"c2":2}]	[{"f1":77,"f2":88,"f3":99}]
++PREHOOK: query: ALTER TABLE arrays_of_struct_to_map REPLACE COLUMNS (locations1 array<struct<c1:int,c2:int,c3:int>>, locations2
++array<struct<f1:int,f2:int,f3:int>>)
++PREHOOK: type: ALTERTABLE_REPLACECOLS
++PREHOOK: Input: default@arrays_of_struct_to_map
++PREHOOK: Output: default@arrays_of_struct_to_map
++POSTHOOK: query: ALTER TABLE arrays_of_struct_to_map REPLACE COLUMNS (locations1 array<struct<c1:int,c2:int,c3:int>>, locations2
++array<struct<f1:int,f2:int,f3:int>>)
++POSTHOOK: type: ALTERTABLE_REPLACECOLS
++POSTHOOK: Input: default@arrays_of_struct_to_map
++POSTHOOK: Output: default@arrays_of_struct_to_map
++PREHOOK: query: SELECT * FROM arrays_of_struct_to_map
++PREHOOK: type: QUERY
++PREHOOK: Input: default@arrays_of_struct_to_map
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM arrays_of_struct_to_map
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@arrays_of_struct_to_map
++#### A masked pattern was here ####
++[{"c1":1,"c2":2,"c3":null}]	[{"f1":77,"f2":88,"f3":99}]
+ PREHOOK: query: ALTER TABLE arrays_of_struct_to_map REPLACE COLUMNS (locations1 map<int,bigint>, locations2 map<bigint,int>)
+ PREHOOK: type: ALTERTABLE_REPLACECOLS
+ PREHOOK: Input: default@arrays_of_struct_to_map
+-- 
+1.7.9.5
+

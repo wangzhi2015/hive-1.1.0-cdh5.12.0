@@ -1,0 +1,452 @@
+From f6cfec44a62a991623db16432c1d09280ad3e80f Mon Sep 17 00:00:00 2001
+From: ctang <ctang@cloudera.com>
+Date: Fri, 2 Sep 2016 09:43:48 -0400
+Subject: [PATCH 0764/1164] CDH-41398: HIVE-14426: Extensive logging on info
+ level in WebHCat (Peter Vary via Chaoyu Tang)
+
+(cherry picked from commit 80156443db185ca85db0928e609f6cbe2f6ceb3f)
+
+Change-Id: I231394b237686dddc84fad27c3c3259912679c67
+---
+ .../org/apache/hadoop/hive/common/LogUtils.java    |   22 +++++
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   20 +----
+ .../org/apache/hadoop/hive/conf/HiveConfUtil.java  |   87 ++++++++++++++++++++
+ .../apache/hadoop/hive/common/TestLogUtils.java    |   34 ++++++++
+ .../apache/hive/hcatalog/templeton/AppConfig.java  |   15 +++-
+ .../hcatalog/templeton/tool/TempletonUtils.java    |    4 +-
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   23 ------
+ .../hadoop/hive/ql/exec/mr/MapredLocalTask.java    |    3 +-
+ .../hive/ql/exec/spark/HiveSparkClientFactory.java |   11 +--
+ .../apache/hadoop/hive/ql/exec/TestUtilities.java  |   12 ---
+ 10 files changed, 170 insertions(+), 61 deletions(-)
+ create mode 100644 common/src/test/org/apache/hadoop/hive/common/TestLogUtils.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/LogUtils.java b/common/src/java/org/apache/hadoop/hive/common/LogUtils.java
+index 9118675..28871b0 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/LogUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/LogUtils.java
+@@ -40,6 +40,12 @@
+   private static final String HIVE_EXEC_L4J = "hive-exec-log4j.properties";
+   private static final Log l4j = LogFactory.getLog(LogUtils.class);
+ 
++  /**
++   * Constants for log masking
++   */
++  private static String KEY_TO_MASK_WITH = "password";
++  private static String MASKED_VALUE = "###_MASKED_###";
++
+   @SuppressWarnings("serial")
+   public static class LogInitializationException extends Exception {
+     public LogInitializationException(String msg) {
+@@ -148,4 +154,20 @@ private static void logConfigLocation(HiveConf conf) throws LogInitializationExc
+         + conf.getHiveSiteLocation().getPath());
+     }
+   }
++
++  /**
++   * Returns MASKED_VALUE if the key contains KEY_TO_MASK_WITH or the original property otherwise.
++   * Used to mask environment variables, and properties in logs which contain passwords
++   * @param key The property key to check
++   * @param value The original value of the property
++   * @return The masked property value
++   */
++  public static String maskIfPassword(String key, String value) {
++    if (key!=null && value!=null) {
++      if (key.toLowerCase().indexOf(KEY_TO_MASK_WITH) != -1) {
++        return MASKED_VALUE;
++      }
++    }
++    return value;
++  }
+ }
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 5e7d1a9..cd6fdc2 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2774,8 +2774,8 @@ private void initialize(Class<?> cls) {
+ 
+     // setup list of conf vars that are not allowed to change runtime
+     setupRestrictList();
+-    setupHiddenSet();
+-
++    hiddenSet.clear();
++    hiddenSet.addAll(HiveConfUtil.getHiddenSet(this));
+   }
+ 
+   /**
+@@ -3082,25 +3082,11 @@ private void setupRestrictList() {
+     restrictList.add(ConfVars.HIVE_CONF_HIDDEN_LIST.varname);
+   }
+ 
+-  private void setupHiddenSet() {
+-    String hiddenListStr = this.getVar(ConfVars.HIVE_CONF_HIDDEN_LIST);
+-    hiddenSet.clear();
+-    if (hiddenListStr != null) {
+-      for (String entry : hiddenListStr.split(",")) {
+-        hiddenSet.add(entry.trim());
+-      }
+-    }
+-  }
+-
+   /**
+    * Strips hidden config entries from configuration
+    */
+   public void stripHiddenConfigurations(Configuration conf) {
+-    for (String name : hiddenSet) {
+-      if (conf.get(name) != null) {
+-        conf.set(name, "");
+-      }
+-    }
++    HiveConfUtil.stripConfigurations(conf, hiddenSet);
+   }
+ 
+   /**
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConfUtil.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConfUtil.java
+index 0d3b94c..16c2eaf 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConfUtil.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConfUtil.java
+@@ -18,8 +18,20 @@
+ 
+ package org.apache.hadoop.hive.conf;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience.Private;
+ 
++import java.io.File;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.StringTokenizer;
++
+ /**
+  * Hive Configuration utils
+  */
+@@ -35,4 +47,79 @@
+   public static boolean isEmbeddedMetaStore(String msUri) {
+     return (msUri == null) ? true : msUri.trim().isEmpty();
+   }
++
++  /**
++   * Dumps all HiveConf for debugging.  Convenient to dump state at process start up and log it
++   * so that in later analysis the values of all variables is known
++   */
++  public static StringBuilder dumpConfig(HiveConf conf) {
++    StringBuilder sb = new StringBuilder("START========\"HiveConf()\"========\n");
++    sb.append("hiveDefaultUrl=").append(conf.getHiveDefaultLocation()).append('\n');
++    sb.append("hiveSiteURL=").append(HiveConf.getHiveSiteLocation()).append('\n');
++    sb.append("hiveServer2SiteUrl=").append(HiveConf.getHiveServer2SiteLocation()).append('\n');
++    sb.append("hivemetastoreSiteUrl=").append(HiveConf.getMetastoreSiteLocation()).append('\n');
++    dumpConfig(conf, sb);
++    return sb.append("END========\"new HiveConf()\"========\n");
++  }
++
++  /**
++   * Getting the set of the hidden configurations
++   * @param configuration The original configuration
++   * @return The list of the configuration values to hide
++   */
++  public static Set<String> getHiddenSet(Configuration configuration) {
++    Set<String> hiddenSet = new HashSet<String>();
++    String hiddenListStr = HiveConf.getVar(configuration, HiveConf.ConfVars.HIVE_CONF_HIDDEN_LIST);
++    if (hiddenListStr != null) {
++      for (String entry : hiddenListStr.split(",")) {
++        hiddenSet.add(entry.trim());
++      }
++    }
++    return hiddenSet;
++  }
++
++  /**
++   * Strips hidden config entries from configuration
++   * @param conf The configuration to strip from
++   * @param hiddenSet The values to strip
++   */
++  public static void stripConfigurations(Configuration conf, Set<String> hiddenSet) {
++    for (String name : hiddenSet) {
++      if (conf.get(name) != null) {
++        conf.set(name, "");
++      }
++    }
++  }
++
++  public static void dumpConfig(Configuration originalConf, StringBuilder sb) {
++    Set<String> hiddenSet = getHiddenSet(originalConf);
++    sb.append("Values omitted for security reason if present: ").append(hiddenSet).append("\n");
++    Configuration conf = new Configuration(originalConf);
++    stripConfigurations(conf, hiddenSet);
++
++    Iterator<Map.Entry<String, String>> configIter = conf.iterator();
++    List<Map.Entry<String, String>> configVals = new ArrayList<>();
++    while(configIter.hasNext()) {
++      configVals.add(configIter.next());
++    }
++    Collections.sort(configVals, new Comparator<Map.Entry<String, String>>() {
++      @Override
++      public int compare(Map.Entry<String, String> ent, Map.Entry<String, String> ent2) {
++        return ent.getKey().compareTo(ent2.getKey());
++      }
++    });
++    for(Map.Entry<String, String> entry : configVals) {
++      //use get() to make sure variable substitution works
++      if(entry.getKey().toLowerCase().contains("path")) {
++        StringTokenizer st = new StringTokenizer(conf.get(entry.getKey()), File.pathSeparator);
++        sb.append(entry.getKey()).append("=\n");
++        while(st.hasMoreTokens()) {
++          sb.append("    ").append(st.nextToken()).append(File.pathSeparator).append('\n');
++        }
++      }
++      else {
++        sb.append(entry.getKey()).append('=').append(conf.get(entry.getKey())).append('\n');
++      }
++    }
++  }
+ }
+diff --git a/common/src/test/org/apache/hadoop/hive/common/TestLogUtils.java b/common/src/test/org/apache/hadoop/hive/common/TestLogUtils.java
+new file mode 100644
+index 0000000..923ac2d
+--- /dev/null
++++ b/common/src/test/org/apache/hadoop/hive/common/TestLogUtils.java
+@@ -0,0 +1,34 @@
++package org.apache.hadoop.hive.common;
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++import org.junit.Assert;
++import org.junit.Test;
++
++public class TestLogUtils {
++  @Test
++  public void testMaskIfPassword() {
++    Assert.assertNull(LogUtils.maskIfPassword("",null));
++    Assert.assertNull(LogUtils.maskIfPassword(null,null));
++    Assert.assertEquals("test", LogUtils.maskIfPassword(null,"test"));
++    Assert.assertEquals("test2", LogUtils.maskIfPassword("any","test2"));
++    Assert.assertEquals("###_MASKED_###", LogUtils.maskIfPassword("password","test3"));
++    Assert.assertEquals("###_MASKED_###", LogUtils.maskIfPassword("a_passWord","test4"));
++    Assert.assertEquals("###_MASKED_###", LogUtils.maskIfPassword("password_a","test5"));
++    Assert.assertEquals("###_MASKED_###", LogUtils.maskIfPassword("a_PassWord_a","test6"));
++  }
++}
+diff --git a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/AppConfig.java b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/AppConfig.java
+index 8fa8728..63dec1c 100644
+--- a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/AppConfig.java
++++ b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/AppConfig.java
+@@ -184,14 +184,19 @@ private void init() {
+    * been installed.  We need pass some properties to that client to make sure it connects to the
+    * right Metastore, configures Tez, etc.  Here we look for such properties in hive config,
+    * and set a comma-separated list of key values in {@link #HIVE_PROPS_NAME}.
++   * The HIVE_CONF_HIDDEN_LIST should be handled separately too - this also should be copied from
++   * the hive config to the webhcat config if not defined there.
+    * Note that the user may choose to set the same keys in HIVE_PROPS_NAME directly, in which case
+    * those values should take precedence.
+    */
+   private void handleHiveProperties() {
+     HiveConf hiveConf = new HiveConf();//load hive-site.xml from classpath
+     List<String> interestingPropNames = Arrays.asList(
+-      "hive.metastore.uris","hive.metastore.sasl.enabled",
+-      "hive.metastore.execute.setugi","hive.execution.engine");
++        HiveConf.ConfVars.METASTOREURIS.varname,
++        HiveConf.ConfVars.METASTORE_USE_THRIFT_SASL.varname,
++        HiveConf.ConfVars.METASTORE_EXECUTE_SET_UGI.varname,
++        HiveConf.ConfVars.HIVE_EXECUTION_ENGINE.varname,
++        HiveConf.ConfVars.HIVE_CONF_HIDDEN_LIST.varname);
+ 
+     //each items is a "key=value" format
+     List<String> webhcatHiveProps = new ArrayList<String>(hiveProps());
+@@ -216,6 +221,12 @@ private void handleHiveProperties() {
+       hiveProps.append(hiveProps.length() > 0 ? "," : "").append(StringUtils.escapeString(whProp));
+     }
+     set(HIVE_PROPS_NAME, hiveProps.toString());
++    // Setting the hidden list
++    String hiddenProperties = hiveConf.get(HiveConf.ConfVars.HIVE_CONF_HIDDEN_LIST.varname);
++    if (this.get(HiveConf.ConfVars.HIVE_CONF_HIDDEN_LIST.varname) == null
++        && hiddenProperties!=null) {
++      set(HiveConf.ConfVars.HIVE_CONF_HIDDEN_LIST.varname, hiddenProperties);
++    }
+   }
+ 
+   private static void logConfigLoadAttempt(String path) {
+diff --git a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/TempletonUtils.java b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/TempletonUtils.java
+index a7c6137..74f3ffc 100644
+--- a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/TempletonUtils.java
++++ b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/TempletonUtils.java
+@@ -44,6 +44,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.common.LogUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -483,7 +484,8 @@ public static StringBuilder dumpPropMap(String header, Map<String, String> map)
+         }
+       }
+       else {
+-        sb.append(propKey).append('=').append(map.get(propKey)).append('\n');
++        sb.append(propKey).append('=').append(LogUtils.maskIfPassword(propKey, map.get(propKey)));
++        sb.append('\n');
+       }
+     }
+     return sb.append("END").append(header).append('\n');
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 0bbb316..d45fd9a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -216,13 +216,6 @@
+   public static final String HIVE_ADDED_JARS = "hive.added.jars";
+ 
+   /**
+-   * Constants for log masking
+-   */
+-  private static String KEY_TO_MASK_WITH = "password";
+-  private static String MASKED_VALUE = "###_MASKED_###";
+-
+-
+-  /**
+    * ReduceField:
+    * KEY: record key
+    * VALUE: record value
+@@ -3805,20 +3798,4 @@ public static String getQualifiedPath(HiveConf conf, Path path) throws HiveExcep
+   public static boolean isDefaultNameNode(HiveConf conf) {
+     return !conf.getChangedProperties().containsKey(HiveConf.ConfVars.HADOOPFS.varname);
+   }
+-
+-  /**
+-   * Returns MASKED_VALUE if the key contains KEY_TO_MASK_WITH or the original property otherwise.
+-   * Used to mask environment variables, and properties in logs which contain passwords
+-   * @param key The property key to check
+-   * @param value The original value of the property
+-   * @return The masked property value
+-   */
+-  public static String maskIfPassword(String key, String value) {
+-    if (key!=null && value!=null) {
+-      if (key.toLowerCase().indexOf(KEY_TO_MASK_WITH) != -1) {
+-        return MASKED_VALUE;
+-      }
+-    }
+-    return value;
+-  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+index 39ceea7..ecdcc85 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+@@ -43,6 +43,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.LogUtils;
+ import org.apache.hadoop.hive.common.io.CachingPrintStream;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+@@ -305,7 +306,7 @@ public int executeInChildVM(DriverContext driverContext) {
+         String name = entry.getKey();
+         String value = entry.getValue();
+         env[pos++] = name + "=" + value;
+-        LOG.debug("Setting env: " + name + "=" + Utilities.maskIfPassword(name, value));
++        LOG.debug("Setting env: " + name + "=" + LogUtils.maskIfPassword(name, value));
+       }
+ 
+       LOG.info("Executing: " + cmdLine);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
+index 8218e00..91e0d72 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
+@@ -29,6 +29,7 @@
+ import org.apache.commons.compress.utils.CharsetNames;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.common.LogUtils;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+@@ -97,7 +98,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+             sparkConf.put(propertyName, properties.getProperty(propertyName));
+             LOG.info(String.format(
+               "load spark property from %s (%s -> %s).",
+-              SPARK_DEFAULT_CONF_FILE, propertyName, Utilities.maskIfPassword(propertyName,value)));
++              SPARK_DEFAULT_CONF_FILE, propertyName, LogUtils.maskIfPassword(propertyName,value)));
+           }
+         }
+       }
+@@ -134,7 +135,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         sparkConf.put(propertyName, value);
+         LOG.info(String.format(
+           "load spark property from hive configuration (%s -> %s).",
+-          propertyName, Utilities.maskIfPassword(propertyName,value)));
++          propertyName, LogUtils.maskIfPassword(propertyName,value)));
+       } else if (propertyName.startsWith("yarn") &&
+         (sparkMaster.equals("yarn-client") || sparkMaster.equals("yarn-cluster"))) {
+         String value = hiveConf.get(propertyName);
+@@ -144,7 +145,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         sparkConf.put("spark.hadoop." + propertyName, value);
+         LOG.info(String.format(
+           "load yarn property from hive configuration in %s mode (%s -> %s).",
+-          sparkMaster, propertyName, Utilities.maskIfPassword(propertyName,value)));
++          sparkMaster, propertyName, LogUtils.maskIfPassword(propertyName,value)));
+       } else if (propertyName.equals(HiveConf.ConfVars.HADOOPFS.varname)) {
+         String value = hiveConf.get(propertyName);
+         if (value != null && !value.isEmpty()) {
+@@ -157,7 +158,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         String value = hiveConf.get(propertyName);
+         sparkConf.put("spark.hadoop." + propertyName, value);
+         LOG.info(String.format(
+-          "load HBase configuration (%s -> %s).", propertyName, Utilities.maskIfPassword(propertyName,value)));
++          "load HBase configuration (%s -> %s).", propertyName, LogUtils.maskIfPassword(propertyName,value)));
+       }
+ 
+       if (RpcConfiguration.HIVE_SPARK_RSC_CONFIGS.contains(propertyName)) {
+@@ -165,7 +166,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         sparkConf.put(propertyName, value);
+         LOG.info(String.format(
+           "load RPC property from hive configuration (%s -> %s).",
+-          propertyName, Utilities.maskIfPassword(propertyName,value)));
++          propertyName, LogUtils.maskIfPassword(propertyName,value)));
+       }
+     }
+ 
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+index ffd380d..f33a035 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+@@ -134,18 +134,6 @@ public void testgetDbTableName() throws HiveException{
+     }
+   }
+ 
+-
+-  public void testMaskIfPassword() {
+-    Assert.assertNull(Utilities.maskIfPassword("",null));
+-    Assert.assertNull(Utilities.maskIfPassword(null,null));
+-    Assert.assertEquals("test",Utilities.maskIfPassword(null,"test"));
+-    Assert.assertEquals("test2",Utilities.maskIfPassword("any","test2"));
+-    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("password","test3"));
+-    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("a_passWord","test4"));
+-    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("password_a","test5"));
+-    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("a_PassWord_a","test6"));
+-  }
+-
+   /**
+    * Check that calling {@link Utilities#getInputPaths(JobConf, MapWork, Path, Context, boolean)}
+    * can process two different empty tables without throwing any exceptions.
+-- 
+1.7.9.5
+

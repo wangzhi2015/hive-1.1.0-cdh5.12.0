@@ -1,0 +1,218 @@
+From 83d676339c49afdbf3f13898db2d18846ec29495 Mon Sep 17 00:00:00 2001
+From: Eugene Koifman <ekoifman@hortonworks.com>
+Date: Thu, 14 May 2015 10:29:00 -0700
+Subject: [PATCH 0160/1164] HIVE-10630:Renaming tables across encryption zones
+ renames table even though the operation throws
+ error (Eugene Koifman, reviewed by Sergio Pena
+ and Ashutosh Chauhan)
+
+---
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |   10 ++++-
+ .../hadoop/hive/metastore/HiveAlterHandler.java    |   28 ++++++++++---
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |    2 +-
+ .../queries/clientpositive/encryption_move_tbl.q   |   18 ++++++++
+ .../encrypted/encryption_move_tbl.q.out            |   43 ++++++++++++++++++++
+ 6 files changed, 96 insertions(+), 8 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/encryption_move_tbl.q
+ create mode 100644 ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index f20a690..45321d3 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -311,7 +311,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_select_read_only_encrypted_tbl.q,\
+   encryption_select_read_only_unencrypted_tbl.q,\
+   encryption_load_data_to_encrypted_tables.q, \
+-  encryption_unencrypted_nonhdfs_external_tables.q
++  encryption_unencrypted_nonhdfs_external_tables.q \
++  encryption_move_tbl.q
+ 
+ beeline.positive.exclude=add_part_exist.q,\
+   alter1.q,\
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index f60d7d0..e8fe79a 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -1028,7 +1028,7 @@ private int executeClientInternal(String commands) {
+         rc = cliDriver.processLine(command);
+       }
+ 
+-      if (rc != 0) {
++      if (rc != 0 && !ignoreErrors()) {
+         break;
+       }
+       command = "";
+@@ -1039,6 +1039,14 @@ private int executeClientInternal(String commands) {
+     return rc;
+   }
+ 
++  /**
++   * This allows a .q file to continue executing after a statement runs into an error which is convenient
++   * if you want to use another hive cmd after the failure to sanity check the state of the system.
++   */
++  private boolean ignoreErrors() {
++    return conf.getBoolVar(HiveConf.ConfVars.CLIIGNOREERRORS);
++  }
++
+   private boolean isHiveCommand(String command) {
+     String[] cmd = command.trim().split("\\s+");
+     if (HiveCommand.find(cmd) != null) {
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java
+index 50ec1e8..a3f2359 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveAlterHandler.java
+@@ -45,6 +45,7 @@
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.Table;
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
++import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hive.common.util.HiveStringUtils;
+ 
+ import com.google.common.collect.Lists;
+@@ -260,17 +261,18 @@ public void alterTable(RawStore msdb, Warehouse wh, String dbname,
+         // rename the src to destination
+         try {
+           if (srcFs.exists(srcPath) && !srcFs.rename(srcPath, destPath)) {
+-            throw new IOException("Renaming " + srcPath + " to " + destPath + " is failed");
++            throw new IOException("Renaming " + srcPath + " to " + destPath + " failed");
+           }
+         } catch (IOException e) {
++          LOG.error("Alter Table operation for " + dbname + "." + name + " failed.", e);
+           boolean revertMetaDataTransaction = false;
+           try {
+             msdb.openTransaction();
+-            msdb.alterTable(dbname, newt.getTableName(), oldt);
++            msdb.alterTable(newt.getDbName(), newt.getTableName(), oldt);
+             for (ObjectPair<Partition, String> pair : altps) {
+               Partition part = pair.getFirst();
+               part.getSd().setLocation(pair.getSecond());
+-              msdb.alterPartition(dbname, name, part.getValues(), part);
++              msdb.alterPartition(newt.getDbName(), name, part.getValues(), part);
+             }
+             revertMetaDataTransaction = msdb.commitTransaction();
+           } catch (Exception e1) {
+@@ -288,8 +290,8 @@ public void alterTable(RawStore msdb, Warehouse wh, String dbname,
+               msdb.rollbackTransaction();
+             }
+           }
+-          throw new InvalidOperationException("Unable to access old location "
+-              + srcPath + " for table " + dbname + "." + name);
++          throw new InvalidOperationException("Alter Table operation for " + dbname + "." + name +
++            " failed to move data due to: '" + getSimpleMessage(e) + "' See hive log file for details.");
+         }
+       }
+     }
+@@ -298,6 +300,22 @@ public void alterTable(RawStore msdb, Warehouse wh, String dbname,
+     }
+   }
+ 
++  /**
++   * RemoteExceptionS from hadoop RPC wrap the stack trace into e.getMessage() which makes
++   * logs/stack traces confusing.
++   * @param ex
++   * @return
++   */
++  String getSimpleMessage(IOException ex) {
++    if(ex instanceof RemoteException) {
++      String msg = ex.getMessage();
++      if(msg == null || !msg.contains("\n")) {
++        return msg;
++      }
++      return msg.substring(0, msg.indexOf('\n'));
++    }
++    return ex.getMessage();
++  }
+   public Partition alterPartition(final RawStore msdb, Warehouse wh, final String dbname,
+       final String name, final List<String> part_vals, final Partition new_part)
+       throws InvalidOperationException, InvalidObjectException, AlreadyExistsException,
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index 271f8c0..d201e09 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -2758,7 +2758,7 @@ public void alterTable(String dbname, String name, Table newTable)
+ 
+       MTable oldt = getMTable(dbname, name);
+       if (oldt == null) {
+-        throw new MetaException("table " + name + " doesn't exist");
++        throw new MetaException("table " + dbname + "." + name + " doesn't exist");
+       }
+ 
+       // For now only alter name, owner, parameters, cols, bucketcols are allowed
+diff --git a/ql/src/test/queries/clientpositive/encryption_move_tbl.q b/ql/src/test/queries/clientpositive/encryption_move_tbl.q
+new file mode 100644
+index 0000000..1168c6c
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/encryption_move_tbl.q
+@@ -0,0 +1,18 @@
++-- SORT_QUERY_RESULTS;
++
++-- we're setting this so that TestNegaiveCliDriver.vm doesn't stop processing after ALTER TABLE fails;
++
++set hive.cli.errors.ignore=true;
++
++DROP TABLE IF EXISTS encrypted_table;
++CREATE TABLE encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table';
++CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
++CRYPTO CREATE_ZONE --keyName key_128 --path ${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table;
++
++INSERT OVERWRITE TABLE encrypted_table SELECT * FROM src;
++SHOW TABLES;
++ALTER TABLE default.encrypted_table RENAME TO default.plain_table;
++SHOW TABLES;
++
++CRYPTO DELETE_KEY --keyName key_128;
++
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out
+new file mode 100644
+index 0000000..d18827e
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out
+@@ -0,0 +1,43 @@
++PREHOOK: query: DROP TABLE IF EXISTS encrypted_table
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS encrypted_table
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@encrypted_table
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@encrypted_table
++Encryption key created: 'key_128'
++Encryption zone created: '/build/ql/test/data/warehouse/default/encrypted_table' using key: 'key_128'
++PREHOOK: query: INSERT OVERWRITE TABLE encrypted_table SELECT * FROM src
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@encrypted_table
++POSTHOOK: query: INSERT OVERWRITE TABLE encrypted_table SELECT * FROM src
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@encrypted_table
++POSTHOOK: Lineage: encrypted_table.key EXPRESSION [(src)src.FieldSchema(name:key, type:string, comment:default), ]
++POSTHOOK: Lineage: encrypted_table.value SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
++PREHOOK: query: SHOW TABLES
++PREHOOK: type: SHOWTABLES
++POSTHOOK: query: SHOW TABLES
++POSTHOOK: type: SHOWTABLES
++encrypted_table
++src
++PREHOOK: query: ALTER TABLE default.encrypted_table RENAME TO default.plain_table
++PREHOOK: type: ALTERTABLE_RENAME
++PREHOOK: Input: default@encrypted_table
++PREHOOK: Output: default@encrypted_table
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Unable to alter table. Alter Table operation for default.encrypted_table failed to move data due to: '/build/ql/test/data/warehouse/default/encrypted_table can't be moved from an encryption zone.' See hive log file for details.
++PREHOOK: query: SHOW TABLES
++PREHOOK: type: SHOWTABLES
++POSTHOOK: query: SHOW TABLES
++POSTHOOK: type: SHOWTABLES
++encrypted_table
++src
+-- 
+1.7.9.5
+

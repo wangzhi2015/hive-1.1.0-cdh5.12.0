@@ -1,0 +1,244 @@
+From c31344deebb84ae3b4b9572205854cb8486b8c96 Mon Sep 17 00:00:00 2001
+From: Sahil Takiar <takiar.sahil@gmail.com>
+Date: Tue, 24 Jan 2017 16:47:25 -0600
+Subject: [PATCH 0946/1164] CDH-48817: HIVE-15546: Optimize
+ Utilities.getInputPaths() so each listStatus of a
+ partition is done in parallel (Sahil Takiar,
+ reviewed by Sergio Pena)
+
+(cherry picked from commit 20210dec94148c9b529132b1545df3dd7be083c3)
+
+Change-Id: I29c5528967d1e035e74e75ae31cf93dc5c2a86a0
+---
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   96 ++++++++++++++++----
+ .../apache/hadoop/hive/ql/exec/TestUtilities.java  |   64 +++++++++++++
+ 2 files changed, 142 insertions(+), 18 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index af93b43..9fcc1ae 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -65,6 +65,7 @@
+ import java.util.Random;
+ import java.util.Set;
+ import java.util.UUID;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+@@ -79,6 +80,7 @@
+ import java.util.zip.DeflaterOutputStream;
+ import java.util.zip.InflaterInputStream;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.antlr.runtime.CommonToken;
+ import org.apache.commons.codec.binary.Base64;
+@@ -3346,6 +3348,19 @@ public static double getHighestSamplePercentage (MapWork work) {
+   public static List<Path> getInputPaths(JobConf job, MapWork work, Path hiveScratchDir,
+       Context ctx, boolean skipDummy) throws Exception {
+ 
++    int numThreads = job.getInt("mapred.dfsclient.parallelism.max", 0);
++    ExecutorService pool = null;
++    if (numThreads > 1) {
++      pool = Executors.newFixedThreadPool(numThreads,
++              new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Get-Input-Paths-%d").build());
++    }
++    return getInputPaths(job, work, hiveScratchDir, ctx, skipDummy, pool);
++  }
++
++  @VisibleForTesting
++  static List<Path> getInputPaths(JobConf job, MapWork work, Path hiveScratchDir,
++      Context ctx, boolean skipDummy, ExecutorService pool) throws Exception {
++
+     Set<Path> pathsProcessed = new HashSet<Path>();
+     List<Path> pathsToAdd = new LinkedList<Path>();
+     // AliasToWork contains all the aliases
+@@ -3353,28 +3368,29 @@ public static double getHighestSamplePercentage (MapWork work) {
+       LOG.info("Processing alias " + alias);
+ 
+       // The alias may not have any path
+-      Path path = null;
+-      for (String file : new LinkedList<String>(work.getPathToAliases().keySet())) {
+-        List<String> aliases = work.getPathToAliases().get(file);
++      boolean isEmptyTable = true;
++      // Note: this copies the list because createDummyFileForEmptyPartition may modify the map.
++      for (String fileString : new LinkedList<String>(work.getPathToAliases().keySet())) {
++        List<String> aliases = work.getPathToAliases().get(fileString);
+         if (aliases.contains(alias)) {
+-          path = new Path(file);
++          if (fileString != null) {
++            isEmptyTable = false;
++          } else {
++            LOG.warn("Found a null path for alias " + alias);
++            continue;
++          }
++          Path file = new Path(fileString);
+ 
+           // Multiple aliases can point to the same path - it should be
+           // processed only once
+-          if (pathsProcessed.contains(path)) {
++          if (pathsProcessed.contains(file)) {
+             continue;
+           }
+ 
+-          pathsProcessed.add(path);
++          pathsProcessed.add(file);
+ 
+-          LOG.info("Adding input file " + path);
+-          if (!skipDummy
+-              && isEmptyPath(job, path, ctx)) {
+-            path = createDummyFileForEmptyPartition(path, job, work,
+-                 hiveScratchDir);
+-
+-          }
+-          pathsToAdd.add(path);
++          LOG.info("Adding input file " + file);
++          pathsToAdd.add(file);
+         }
+       }
+ 
+@@ -3386,12 +3402,56 @@ public static double getHighestSamplePercentage (MapWork work) {
+       // T2) x;
+       // If T is empty and T2 contains 100 rows, the user expects: 0, 100 (2
+       // rows)
+-      if (path == null && !skipDummy) {
+-        path = createDummyFileForEmptyTable(job, work, hiveScratchDir, alias);
+-        pathsToAdd.add(path);
++      if (isEmptyTable && !skipDummy) {
++        pathsToAdd.add(createDummyFileForEmptyTable(job, work, hiveScratchDir, alias));
++      }
++    }
++
++    List<Path> finalPathsToAdd = new LinkedList<>();
++    List<Future<Path>> futures = new LinkedList<>();
++    for (final Path path : pathsToAdd) {
++      if (pool == null) {
++        finalPathsToAdd.add(new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy).call());
++      } else {
++        futures.add(pool.submit(new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy)));
++      }
++    }
++
++    if (pool != null) {
++      for (Future<Path> future : futures) {
++        finalPathsToAdd.add(future.get());
++      }
++    }
++
++    return finalPathsToAdd;
++  }
++
++  private static class GetInputPathsCallable implements Callable<Path> {
++
++    private final Path path;
++    private final JobConf job;
++    private final MapWork work;
++    private final Path hiveScratchDir;
++    private final Context ctx;
++    private final boolean skipDummy;
++
++    private GetInputPathsCallable(Path path, JobConf job, MapWork work, Path hiveScratchDir,
++      Context ctx, boolean skipDummy) {
++      this.path = path;
++      this.job = job;
++      this.work = work;
++      this.hiveScratchDir = hiveScratchDir;
++      this.ctx = ctx;
++      this.skipDummy = skipDummy;
++    }
++
++    @Override
++    public Path call() throws Exception {
++      if (!this.skipDummy && isEmptyPath(this.job, this.path, this.ctx)) {
++        return createDummyFileForEmptyPartition(this.path, this.job, this.work, this.hiveScratchDir);
+       }
++      return this.path;
+     }
+-    return pathsToAdd;
+   }
+ 
+   @SuppressWarnings({"rawtypes", "unchecked"})
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+index 837e064..e7c72ef 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+@@ -33,6 +33,8 @@
+ import java.util.List;
+ import java.util.Properties;
+ import java.util.UUID;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ 
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.Lists;
+@@ -259,4 +261,66 @@ private Path setupTempDirWithSingleOutputFile(Configuration hconf) throws IOExce
+     FileSystem.getLocal(hconf).create(taskOutputPath).close();
+     return tempDirPath;
+   }
++
++  /**
++   * Test for {@link Utilities#getInputPaths(JobConf, MapWork, Path, Context, boolean, ExecutorService)} with a single
++   * threaded {@link ExecutorService}.
++   */
++  @Test
++  public void testGetInputPathsWithPool() throws Exception {
++    ExecutorService pool = Executors.newSingleThreadExecutor();
++
++    JobConf jobConf = new JobConf();
++    MapWork mapWork = new MapWork();
++    Path scratchDir = new Path(HiveConf.getVar(jobConf, HiveConf.ConfVars.LOCALSCRATCHDIR));
++
++    String testTableName = "testTable";
++    String testPartitionName = "testPartition";
++
++    Path testTablePath = new Path(testTableName);
++    Path testPartitionPath = new Path(testTablePath, testPartitionName);
++    Path testFileTablePath = new Path(testTablePath, "test.txt");
++    Path testFilePartitionPath = new Path(testPartitionPath, "test.txt");
++
++    TableDesc mockTableDesc = mock(TableDesc.class);
++
++    when(mockTableDesc.isNonNative()).thenReturn(false);
++    when(mockTableDesc.getProperties()).thenReturn(new Properties());
++
++    LinkedHashMap<String, ArrayList<String>> pathToAliasTable = new LinkedHashMap<>();
++    pathToAliasTable.put(testTablePath.toString(), Lists.newArrayList(testTableName));
++    mapWork.setPathToAliases(pathToAliasTable);
++
++    mapWork.getAliasToWork().put(testTableName, (Operator<?>) mock(Operator.class));
++
++    FileSystem fs = FileSystem.getLocal(jobConf);
++    try {
++      fs.mkdirs(testTablePath);
++      fs.create(testFileTablePath).close();
++
++      // Run a test with an un-partitioned table with a single file as the input
++      List<Path> tableInputPaths = Utilities.getInputPaths(jobConf, mapWork, scratchDir, mock(Context.class), false,
++              pool);
++      assertEquals(tableInputPaths.size(), 1);
++      assertEquals(tableInputPaths.get(0), testTablePath);
++
++      LinkedHashMap<String, ArrayList<String>> pathToAliasPartition = new LinkedHashMap<>();
++      pathToAliasPartition.put(testPartitionPath.toString(), Lists.newArrayList(testTableName));
++      mapWork.setPathToAliases(pathToAliasPartition);
++
++      fs.delete(testFileTablePath, false);
++      fs.mkdirs(testPartitionPath);
++      fs.create(testFilePartitionPath).close();
++
++      // Run a test with a partitioned table with a single partition and a single file as the input
++      List<Path> tablePartitionInputPaths = Utilities.getInputPaths(jobConf, mapWork, scratchDir, mock(Context.class),
++              false, pool);
++      assertEquals(tablePartitionInputPaths.size(), 1);
++      assertEquals(tablePartitionInputPaths.get(0), testPartitionPath);
++    } finally {
++      if (fs.exists(testTablePath)) {
++        fs.delete(testTablePath, true);
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,339 @@
+From baa68353df5551ddd888967e5f65d2eedfbba1ff Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Mon, 16 Mar 2015 17:36:17 +0000
+Subject: [PATCH 0319/1164] HIVE-9858: Create cbrt (cube root) UDF (Alexander
+ Pivovarov via Jason Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1667080 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    1 +
+ .../hadoop/hive/ql/udf/generic/GenericUDF.java     |   23 ++++++
+ .../hadoop/hive/ql/udf/generic/GenericUDFCbrt.java |   80 ++++++++++++++++++++
+ .../hive/ql/udf/generic/TestGenericUDFCbrt.java    |   58 ++++++++++++++
+ ql/src/test/queries/clientpositive/udf_cbrt.q      |   13 ++++
+ .../results/clientpositive/show_functions.q.out    |    2 +
+ ql/src/test/results/clientpositive/udf_cbrt.q.out  |   58 ++++++++++++++
+ 7 files changed, 235 insertions(+)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCbrt.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFCbrt.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_cbrt.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_cbrt.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 20811ab..d084d16 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -188,6 +188,7 @@
+     system.registerGenericUDF("round", GenericUDFRound.class);
+     system.registerGenericUDF("floor", GenericUDFFloor.class);
+     system.registerUDF("sqrt", UDFSqrt.class, false);
++    system.registerGenericUDF("cbrt", GenericUDFCbrt.class);
+     system.registerGenericUDF("ceil", GenericUDFCeil.class);
+     system.registerGenericUDF("ceiling", GenericUDFCeil.class);
+     system.registerUDF("rand", UDFRand.class, false);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
+index 9c2af3c..ce98123 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
+@@ -33,6 +33,7 @@
+ import org.apache.hadoop.hive.ql.udf.UDFType;
+ import org.apache.hadoop.hive.serde2.io.ByteWritable;
+ import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.io.DoubleWritable;
+ import org.apache.hadoop.hive.serde2.io.ShortWritable;
+ import org.apache.hadoop.hive.serde2.io.TimestampWritable;
+ import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
+@@ -363,6 +364,17 @@ protected void obtainLongConverter(ObjectInspector[] arguments, int i,
+     inputTypes[i] = inputType;
+   }
+ 
++  protected void obtainDoubleConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++    Converter converter = ObjectInspectorConverters.getConverter(
++        (PrimitiveObjectInspector) arguments[i],
++        PrimitiveObjectInspectorFactory.writableDoubleObjectInspector);
++    converters[i] = converter;
++    inputTypes[i] = inputType;
++  }
++
+   protected void obtainDateConverter(ObjectInspector[] arguments, int i,
+       PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
+     PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
+@@ -440,6 +452,17 @@ protected Long getLongValue(DeferredObject[] arguments, int i, Converter[] conve
+     return v;
+   }
+ 
++  protected Double getDoubleValue(DeferredObject[] arguments, int i, Converter[] converters)
++      throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    Object writableValue = converters[i].convert(obj);
++    double v = ((DoubleWritable) writableValue).get();
++    return v;
++  }
++
+   protected Date getDateValue(DeferredObject[] arguments, int i, PrimitiveCategory[] inputTypes,
+       Converter[] converters) throws HiveException {
+     Object obj;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCbrt.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCbrt.java
+new file mode 100644
+index 0000000..732ce8a
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFCbrt.java
+@@ -0,0 +1,80 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.NUMERIC_GROUP;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.serde2.io.DoubleWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++
++/**
++ * GenericUDFCbrt.
++ *
++ */
++@Description(
++    name = "cbrt",
++    value = "_FUNC_(double) - Returns the cube root of a double value.",
++    extended = "Example:\n > SELECT _FUNC_(27.0);\n 3.0")
++public class GenericUDFCbrt extends GenericUDF {
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[1];
++  private transient Converter[] converters = new Converter[1];
++  private final DoubleWritable output = new DoubleWritable();
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    checkArgsSize(arguments, 1, 1);
++
++    checkArgPrimitive(arguments, 0);
++
++    checkArgGroups(arguments, 0, inputTypes, NUMERIC_GROUP);
++
++    obtainDoubleConverter(arguments, 0, inputTypes, converters);
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableDoubleObjectInspector;
++    return outputOI;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    Double val = getDoubleValue(arguments, 0, converters);
++    if (val == null) {
++      return null;
++    }
++
++    double cbrt = Math.cbrt(val);
++    output.set(cbrt);
++    return output;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "cbrt";
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFCbrt.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFCbrt.java
+new file mode 100644
+index 0000000..ac3f57c
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFCbrt.java
+@@ -0,0 +1,58 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.io.DoubleWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++
++public class TestGenericUDFCbrt extends TestCase {
++
++  public void testCbrt() throws HiveException {
++    GenericUDFCbrt udf = new GenericUDFCbrt();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableDoubleObjectInspector;
++    ObjectInspector[] arguments = { valueOI0 };
++
++    udf.initialize(arguments);
++
++    runAndVerify(0.0, 0.0, udf);
++    runAndVerify(1.0, 1.0, udf);
++    runAndVerify(-1.0, -1.0, udf);
++    runAndVerify(27.0, 3.0, udf);
++    runAndVerify(-27.0, -3.0, udf);
++    runAndVerify(87860583272930481.0, 444561.0, udf);
++    runAndVerify(null, null, udf);
++  }
++
++  private void runAndVerify(Double in, Double expResult, GenericUDF udf) throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(in != null ? new DoubleWritable(in) : null);
++    DeferredObject[] args = { valueObj0 };
++    DoubleWritable output = (DoubleWritable) udf.evaluate(args);
++    if (expResult == null) {
++      assertNull("cbrt() test", output);
++    } else {
++      assertNotNull("cbrt() test", output);
++      assertEquals("cbrt() test", expResult.doubleValue(), output.get(), 1E-10);
++    }
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_cbrt.q b/ql/src/test/queries/clientpositive/udf_cbrt.q
+new file mode 100644
+index 0000000..f066cbc
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_cbrt.q
+@@ -0,0 +1,13 @@
++DESCRIBE FUNCTION cbrt;
++DESC FUNCTION EXTENDED cbrt;
++
++explain select cbrt(27.0);
++
++select
++cbrt(0.0),
++cbrt(1.0),
++cbrt(-1),
++cbrt(27),
++cbrt(-27.0),
++cbrt(87860583272930481),
++cbrt(cast(null as double));
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index f2bec47..fd78ad3 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -34,6 +34,7 @@ base64
+ between
+ bin
+ case
++cbrt
+ ceil
+ ceiling
+ coalesce
+@@ -217,6 +218,7 @@ PREHOOK: type: SHOWFUNCTIONS
+ POSTHOOK: query: SHOW FUNCTIONS '^c.*'
+ POSTHOOK: type: SHOWFUNCTIONS
+ case
++cbrt
+ ceil
+ ceiling
+ coalesce
+diff --git a/ql/src/test/results/clientpositive/udf_cbrt.q.out b/ql/src/test/results/clientpositive/udf_cbrt.q.out
+new file mode 100644
+index 0000000..4cdaf15
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_cbrt.q.out
+@@ -0,0 +1,58 @@
++PREHOOK: query: DESCRIBE FUNCTION cbrt
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION cbrt
++POSTHOOK: type: DESCFUNCTION
++cbrt(double) - Returns the cube root of a double value.
++PREHOOK: query: DESC FUNCTION EXTENDED cbrt
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED cbrt
++POSTHOOK: type: DESCFUNCTION
++cbrt(double) - Returns the cube root of a double value.
++Example:
++ > SELECT cbrt(27.0);
++ 3.0
++PREHOOK: query: explain select cbrt(27.0)
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select cbrt(27.0)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 3.0 (type: double)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++cbrt(0.0),
++cbrt(1.0),
++cbrt(-1),
++cbrt(27),
++cbrt(-27.0),
++cbrt(87860583272930481),
++cbrt(cast(null as double))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++cbrt(0.0),
++cbrt(1.0),
++cbrt(-1),
++cbrt(27),
++cbrt(-27.0),
++cbrt(87860583272930481),
++cbrt(cast(null as double))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++0.0	1.0	-1.0	3.0	-3.0	444561.0	NULL
+-- 
+1.7.9.5
+

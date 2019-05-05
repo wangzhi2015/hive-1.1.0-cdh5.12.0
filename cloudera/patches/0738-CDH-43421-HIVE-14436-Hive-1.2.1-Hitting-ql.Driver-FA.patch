@@ -1,0 +1,161 @@
+From aaacf2892e71296e01755f4f2ecc816f73b96e46 Mon Sep 17 00:00:00 2001
+From: Daniel Dai <daijy@hortonworks.com>
+Date: Tue, 9 Aug 2016 22:55:52 -0700
+Subject: [PATCH 0738/1164] CDH-43421 HIVE-14436: Hive 1.2.1/Hitting
+ "ql.Driver: FAILED: IllegalArgumentException
+ Error: , expected at the end of 'decimal(9'"
+ after enabling hive.optimize.skewjoin and with MR
+ engine (Daniel Dai, reviewed by Ashutosh Chauhan)
+
+Change-Id: Ie282b62ebb087d1052ff8883746ac45fd9754ea1
+---
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   12 ++-
+ .../test/queries/clientpositive/decimal_skewjoin.q |   21 ++++++
+ .../results/clientpositive/decimal_skewjoin.q.out  |   77 ++++++++++++++++++++
+ 3 files changed, 103 insertions(+), 7 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/decimal_skewjoin.q
+ create mode 100644 ql/src/test/results/clientpositive/decimal_skewjoin.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 92e1a08..0bbb316 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -166,6 +166,8 @@
+ import org.apache.hadoop.hive.serde2.SerDeUtils;
+ import org.apache.hadoop.hive.serde2.Serializer;
+ import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.io.SequenceFile;
+@@ -2287,13 +2289,9 @@ public static String formatBinaryString(byte[] array, int start, int length) {
+   public static List<String> getColumnTypes(Properties props) {
+     List<String> names = new ArrayList<String>();
+     String colNames = props.getProperty(serdeConstants.LIST_COLUMN_TYPES);
+-    String[] cols = colNames.trim().split(",");
+-    if (cols != null) {
+-      for (String col : cols) {
+-        if (col != null && !col.trim().equals("")) {
+-          names.add(col);
+-        }
+-      }
++    ArrayList<TypeInfo> cols = TypeInfoUtils.getTypeInfosFromTypeString(colNames);
++    for (TypeInfo col : cols) {
++      names.add(col.getTypeName());
+     }
+     return names;
+   }
+diff --git a/ql/src/test/queries/clientpositive/decimal_skewjoin.q b/ql/src/test/queries/clientpositive/decimal_skewjoin.q
+new file mode 100644
+index 0000000..cac0d89
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/decimal_skewjoin.q
+@@ -0,0 +1,21 @@
++
++set hive.execution.engine=mr;
++set hive.optimize.skewjoin=true;
++set hive.auto.convert.join=false;
++
++drop table if exists decimal_skewjoin_1;
++drop table if exists decimal_skewjoin_2;
++
++create table decimal_skewjoin_1 (t decimal(4,2), u decimal(5), v decimal);
++create table decimal_skewjoin_2 (t decimal(4,2), u decimal(5), v decimal);
++
++insert overwrite table decimal_skewjoin_1
++  select cast('17.29' as decimal(4,2)), 3.1415926BD, 3115926.54321BD from src tablesample (1 rows);
++
++insert overwrite table decimal_skewjoin_2
++  select cast('17.29' as decimal(4,2)), 3.1415926BD, 3115926.54321BD from src tablesample (1 rows);
++
++select a.u from decimal_skewjoin_1 a INNER JOIN decimal_skewjoin_2 b ON a.t=b.t;
++
++drop table decimal_skewjoin_1;
++drop table decimal_skewjoin_2;
+diff --git a/ql/src/test/results/clientpositive/decimal_skewjoin.q.out b/ql/src/test/results/clientpositive/decimal_skewjoin.q.out
+new file mode 100644
+index 0000000..a335aef
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/decimal_skewjoin.q.out
+@@ -0,0 +1,77 @@
++PREHOOK: query: drop table if exists decimal_skewjoin_1
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists decimal_skewjoin_1
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists decimal_skewjoin_2
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists decimal_skewjoin_2
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: create table decimal_skewjoin_1 (t decimal(4,2), u decimal(5), v decimal)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@decimal_skewjoin_1
++POSTHOOK: query: create table decimal_skewjoin_1 (t decimal(4,2), u decimal(5), v decimal)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@decimal_skewjoin_1
++PREHOOK: query: create table decimal_skewjoin_2 (t decimal(4,2), u decimal(5), v decimal)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@decimal_skewjoin_2
++POSTHOOK: query: create table decimal_skewjoin_2 (t decimal(4,2), u decimal(5), v decimal)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@decimal_skewjoin_2
++PREHOOK: query: insert overwrite table decimal_skewjoin_1
++  select cast('17.29' as decimal(4,2)), 3.1415926BD, 3115926.54321BD from src tablesample (1 rows)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@decimal_skewjoin_1
++POSTHOOK: query: insert overwrite table decimal_skewjoin_1
++  select cast('17.29' as decimal(4,2)), 3.1415926BD, 3115926.54321BD from src tablesample (1 rows)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@decimal_skewjoin_1
++POSTHOOK: Lineage: decimal_skewjoin_1.t EXPRESSION []
++POSTHOOK: Lineage: decimal_skewjoin_1.u EXPRESSION []
++POSTHOOK: Lineage: decimal_skewjoin_1.v EXPRESSION []
++PREHOOK: query: insert overwrite table decimal_skewjoin_2
++  select cast('17.29' as decimal(4,2)), 3.1415926BD, 3115926.54321BD from src tablesample (1 rows)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@decimal_skewjoin_2
++POSTHOOK: query: insert overwrite table decimal_skewjoin_2
++  select cast('17.29' as decimal(4,2)), 3.1415926BD, 3115926.54321BD from src tablesample (1 rows)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@decimal_skewjoin_2
++POSTHOOK: Lineage: decimal_skewjoin_2.t EXPRESSION []
++POSTHOOK: Lineage: decimal_skewjoin_2.u EXPRESSION []
++POSTHOOK: Lineage: decimal_skewjoin_2.v EXPRESSION []
++PREHOOK: query: select a.u from decimal_skewjoin_1 a INNER JOIN decimal_skewjoin_2 b ON a.t=b.t
++PREHOOK: type: QUERY
++PREHOOK: Input: default@decimal_skewjoin_1
++PREHOOK: Input: default@decimal_skewjoin_2
++#### A masked pattern was here ####
++POSTHOOK: query: select a.u from decimal_skewjoin_1 a INNER JOIN decimal_skewjoin_2 b ON a.t=b.t
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@decimal_skewjoin_1
++POSTHOOK: Input: default@decimal_skewjoin_2
++#### A masked pattern was here ####
++3
++PREHOOK: query: drop table decimal_skewjoin_1
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@decimal_skewjoin_1
++PREHOOK: Output: default@decimal_skewjoin_1
++POSTHOOK: query: drop table decimal_skewjoin_1
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@decimal_skewjoin_1
++POSTHOOK: Output: default@decimal_skewjoin_1
++PREHOOK: query: drop table decimal_skewjoin_2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@decimal_skewjoin_2
++PREHOOK: Output: default@decimal_skewjoin_2
++POSTHOOK: query: drop table decimal_skewjoin_2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@decimal_skewjoin_2
++POSTHOOK: Output: default@decimal_skewjoin_2
+-- 
+1.7.9.5
+

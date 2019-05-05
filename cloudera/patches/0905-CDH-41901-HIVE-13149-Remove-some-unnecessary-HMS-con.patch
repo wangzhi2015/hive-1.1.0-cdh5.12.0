@@ -1,0 +1,338 @@
+From 0586562f4048f917fde6ace996a4d1d0654f379c Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Fri, 22 Apr 2016 10:58:59 -0400
+Subject: [PATCH 0905/1164] CDH-41901: HIVE-13149: Remove some unnecessary HMS
+ connections from HS2 (Reviewed by Jimmy Xiang,
+ Szehon Ho, Chaoyu Tang)
+
+Change-Id: Ibeae4a5bb11fa09e566014a3cf1f4f38fbfd288c
+---
+ .../hive/metastore/TestMetastoreVersion.java       |    7 ++---
+ .../org/apache/hive/jdbc/TestJdbcWithMiniHS2.java  |   27 +++++++++++++++-----
+ .../apache/hadoop/hive/hbase/HBaseQTestUtil.java   |    7 +++++
+ .../apache/hadoop/hive/hbase/HBaseTestSetup.java   |    3 ---
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |   24 ++++++++++-------
+ .../hadoop/hive/metastore/HiveMetaStoreClient.java |    8 +++---
+ .../hadoop/hive/ql/session/SessionState.java       |    6 ++---
+ 7 files changed, 54 insertions(+), 28 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+index 5514228..ecae3ff 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+@@ -19,7 +19,6 @@
+ 
+ import java.io.File;
+ import java.lang.reflect.Field;
+-import java.util.Random;
+ 
+ import junit.framework.TestCase;
+ 
+@@ -32,6 +31,7 @@
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.ObjectStore;
+ import org.apache.hadoop.hive.ql.Driver;
++import org.apache.hadoop.hive.ql.metadata.Hive;
+ import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ 
+@@ -99,8 +99,9 @@ public void testVersionRestriction () throws Exception {
+     // session creation should fail since the schema didn't get created
+     try {
+       SessionState.start(new CliSessionState(hiveConf));
+-      fail("Expected exception");
+-    } catch (RuntimeException re) {
++      Hive.get(hiveConf).getMSC();
++      fail("An exception is expected since schema is not created.");
++    } catch (Exception re) {
+       LOG.info("Exception in testVersionRestriction: " + re, re);
+       String msg = HiveStringUtils.stringifyException(re);
+       assertTrue("Expected 'Version information not found in metastore' in: " + msg, msg
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+index 9aa453c..9363ec4 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+@@ -82,9 +82,8 @@ public static void beforeTest() throws Exception {
+     miniHS2.start(confOverlay);
+   }
+ 
+-  @Before
+-  public void setUp() throws Exception {
+-    hs2Conn = getConnection(miniHS2.getJdbcURL(), System.getProperty("user.name"), "bar");
++  private Connection getConnection() throws Exception {
++    return getConnection(miniHS2.getJdbcURL(), System.getProperty("user.name"), "bar");
+   }
+ 
+   private Connection getConnection(String jdbcURL, String user, String pwd) throws SQLException {
+@@ -95,7 +94,9 @@ private Connection getConnection(String jdbcURL, String user, String pwd) throws
+ 
+   @After
+   public void tearDown() throws Exception {
+-    hs2Conn.close();
++    if (hs2Conn != null) {
++      hs2Conn.close();
++    }
+   }
+ 
+   @AfterClass
+@@ -108,6 +109,7 @@ public static void afterTest() throws Exception {
+   @Test
+   public void testConnection() throws Exception {
+     String tableName = "testTab1";
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+ 
+     // create table
+@@ -129,6 +131,7 @@ public void testConnection() throws Exception {
+   @Test
+   public void testConcurrentStatements() throws Exception {
+     String tableName = "testConcurrentStatements";
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+ 
+     // create table
+@@ -307,6 +310,7 @@ public void testURIDatabaseName() throws Exception{
+     stmt.execute(" drop table if exists table_in_non_default_schema");
+     expected = stmt.execute("DROP DATABASE "+ dbName);
+     stmt.close();
++    hs2Conn.close();
+ 
+     hs2Conn  = getConnection(jdbcUri+"default",System.getProperty("user.name"),"bar");
+     stmt = hs2Conn .createStatement();
+@@ -340,6 +344,7 @@ public void testConnectionSchemaAPIs() throws Exception {
+      * get/set Schema are new in JDK7 and not available in java.sql.Connection in JDK6.
+      * Hence the test uses HiveConnection object to call these methods so that test will run with older JDKs
+      */
++    hs2Conn = getConnection();
+     HiveConnection hiveConn = (HiveConnection)hs2Conn;
+ 
+     assertEquals("default", hiveConn.getSchema());
+@@ -373,6 +378,7 @@ public void testConnectionSchemaAPIs() throws Exception {
+    */
+   private void verifyCurrentDB(String expectedDbName, Connection hs2Conn) throws Exception {
+     String verifyTab = "miniHS2DbVerificationTable";
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+     stmt.execute("DROP TABLE IF EXISTS " + expectedDbName + "." + verifyTab);
+     stmt.execute("CREATE TABLE " + expectedDbName + "." + verifyTab + "(id INT)");
+@@ -472,6 +478,7 @@ public void testSessionScratchDirs() throws Exception {
+     // Downloaded resources dir
+     scratchDirPath = new Path(HiveConf.getVar(conf, HiveConf.ConfVars.DOWNLOADED_RESOURCES_DIR));
+     verifyScratchDir(conf, fs, scratchDirPath, expectedFSPermission, userName, true);
++    hs2Conn.close();
+ 
+     // 2. Test with doAs=true
+     // Restart HiveServer2 with doAs=true
+@@ -498,6 +505,7 @@ public void testSessionScratchDirs() throws Exception {
+     // Downloaded resources dir
+     scratchDirPath = new Path(HiveConf.getVar(conf, HiveConf.ConfVars.DOWNLOADED_RESOURCES_DIR));
+     verifyScratchDir(conf, fs, scratchDirPath, expectedFSPermission, userName, true);
++    hs2Conn.close();
+ 
+     // Test for user "trinity"
+     userName = "trinity";
+@@ -529,6 +537,7 @@ public void testUdfWhiteList() throws Exception {
+     HiveConf testConf = new HiveConf();
+     assertTrue(testConf.getVar(ConfVars.HIVE_SERVER2_BUILTIN_UDF_WHITELIST).isEmpty());
+     // verify that udf in default whitelist can be executed
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+     stmt.executeQuery("SELECT substr('foobar', 4) ");
+     hs2Conn.close();
+@@ -570,10 +579,11 @@ public void testUdfWhiteList() throws Exception {
+   public void testUdfBlackList() throws Exception {
+     HiveConf testConf = new HiveConf();
+     assertTrue(testConf.getVar(ConfVars.HIVE_SERVER2_BUILTIN_UDF_BLACKLIST).isEmpty());
+-
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+     // verify that udf in default whitelist can be executed
+     stmt.executeQuery("SELECT substr('foobar', 4) ");
++    hs2Conn.close();
+ 
+     miniHS2.stop();
+     testConf.setVar(ConfVars.HIVE_SERVER2_BUILTIN_UDF_BLACKLIST, "reflect");
+@@ -595,6 +605,9 @@ public void testUdfBlackList() throws Exception {
+    */
+   @Test
+   public void testUdfBlackListOverride() throws Exception {
++    if (miniHS2.isStarted()) {
++      miniHS2.stop();
++    }
+     // setup whitelist
+     HiveConf testConf = new HiveConf();
+ 
+@@ -649,6 +662,8 @@ public void testRootScratchDir() throws Exception {
+     // HDFS scratch dir
+     scratchDirPath = new Path(HiveConf.getVar(conf, HiveConf.ConfVars.SCRATCHDIR));
+     verifyScratchDir(conf, fs, scratchDirPath, expectedFSPermission, userName, false);
++    hs2Conn.close();
++
+     // Test with multi-level scratch dir path
+     // Stop HiveServer2
+     if (miniHS2.isStarted()) {
+@@ -729,4 +744,4 @@ private int getReflectionUtilsCacheSize() {
+     }
+     return -1;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
+index 9c20f90..2740f94 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
+@@ -39,12 +39,15 @@
+   /** A handle to this harness's cluster */
+   private final HConnection conn;
+ 
++  private HBaseTestSetup hbaseSetup = null;
++
+   public HBaseQTestUtil(
+     String outDir, String logDir, MiniClusterType miniMr, HBaseTestSetup setup,
+     String initScript, String cleanupScript)
+     throws Exception {
+ 
+     super(outDir, logDir, miniMr, null, initScript, cleanupScript);
++    hbaseSetup = setup;
+     setup.preTest(conf);
+     this.conn = setup.getConnection();
+     super.init();
+@@ -69,6 +72,10 @@ public void init() throws Exception {
+   }
+ 
+   @Override
++  protected void initConfFromSetup() throws Exception {
++    super.initConfFromSetup();
++    hbaseSetup.preTest(conf);
++  }
+   public void createSources() throws Exception {
+     super.createSources();
+ 
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java
+index 42f85c8..4f8fa05 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java
+@@ -22,9 +22,6 @@
+ import java.net.ServerSocket;
+ import java.util.Arrays;
+ 
+-import junit.extensions.TestSetup;
+-import junit.framework.Test;
+-
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index 781eef8..c40663b 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -464,6 +464,7 @@ public void shutdown() throws Exception {
+       dfs.shutdown();
+       dfs = null;
+     }
++    Hive.closeCurrent();
+   }
+ 
+   public String readEntireFileIntoString(File queryFile) throws IOException {
+@@ -688,6 +689,9 @@ public void clearTablesCreatedDuringTests() throws Exception {
+       return;
+     }
+ 
++    conf.set("hive.metastore.filter.hook",
++        "org.apache.hadoop.hive.metastore.DefaultMetaStoreFilterHookImpl");
++    db = Hive.get(conf);
+     // Delete any tables other than the source tables
+     // and any databases other than the default database.
+     for (String dbName : db.getAllDatabases()) {
+@@ -749,18 +753,20 @@ public void clearTestSideEffects() throws Exception {
+       return;
+     }
+ 
++    // allocate and initialize a new conf since a test can
++    // modify conf by using 'set' commands
++    conf = new HiveConf(Driver.class);
++    initConf();
++    initConfFromSetup();
++
++    // renew the metastore since the cluster type is unencrypted
++    db = Hive.get(conf);  // propagate new conf to meta store
++
+     clearTablesCreatedDuringTests();
+     clearKeysCreatedInTests();
++  }
+ 
+-    if (clusterType != MiniClusterType.encrypted) {
+-      // allocate and initialize a new conf since a test can
+-      // modify conf by using 'set' commands
+-      conf = new HiveConf (Driver.class);
+-      initConf();
+-      // renew the metastore since the cluster type is unencrypted
+-      db = Hive.get(conf);  // propagate new conf to meta store
+-    }
+-
++  protected void initConfFromSetup() throws Exception {
+     setup.preTest(conf);
+   }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+index f2c00e8..b3ceb86 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+@@ -167,7 +167,7 @@
+   private boolean isConnected = false;
+   private URI metastoreUris[];
+   private final HiveMetaHookLoader hookLoader;
+-  protected final HiveConf conf;
++  protected final HiveConf conf;  // Keep a copy of HiveConf so if Session conf changes, we may need to get a new HMS client.
+   private String tokenStrForm;
+   private final boolean localMetaStore;
+   private final MetaStoreFilterHook filterHook;
+@@ -193,8 +193,10 @@ public HiveMetaStoreClient(HiveConf conf, HiveMetaHookLoader hookLoader)
+     this.hookLoader = hookLoader;
+     if (conf == null) {
+       conf = new HiveConf(HiveMetaStoreClient.class);
++      this.conf = conf;
++    } else {
++      this.conf = new HiveConf(conf);
+     }
+-    this.conf = conf;
+     filterHook = loadFilterHooks();
+ 
+     String msUri = conf.getVar(HiveConf.ConfVars.METASTOREURIS);
+@@ -202,7 +204,7 @@ public HiveMetaStoreClient(HiveConf conf, HiveMetaHookLoader hookLoader)
+     if (localMetaStore) {
+       // instantiate the metastore server handler directly instead of connecting
+       // through the network
+-      client = HiveMetaStore.newRetryingHMSHandler("hive client", conf, true);
++      client = HiveMetaStore.newRetryingHMSHandler("hive client", this.conf, true);
+       isConnected = true;
+       snapshotActiveConf();
+       return;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index 56afa6a..bfa0359 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -523,10 +523,6 @@ public static SessionState start(SessionState startSs) {
+     // Get the following out of the way when you start the session these take a
+     // while and should be done when we start up.
+     try {
+-      // Hive object instance should be created with a copy of the conf object. If the conf is
+-      // shared with SessionState, other parts of the code might update the config, but
+-      // Hive.get(HiveConf) would not recognize the case when it needs refreshing
+-      Hive.get(new HiveConf(startSs.conf)).getMSC();
+       UserGroupInformation sessionUGI = Utils.getUGI();
+       FileSystem.get(startSs.conf);
+ 
+@@ -550,6 +546,8 @@ public static SessionState start(SessionState startSs) {
+           throw new RuntimeException(e);
+         }
+       }
++    } catch (RuntimeException e) {
++      throw e;
+     } catch (Exception e) {
+       // Catch-all due to some exec time dependencies on session state
+       // that would cause ClassNoFoundException otherwise
+-- 
+1.7.9.5
+

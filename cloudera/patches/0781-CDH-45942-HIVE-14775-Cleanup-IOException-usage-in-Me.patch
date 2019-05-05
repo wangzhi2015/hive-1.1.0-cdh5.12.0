@@ -1,0 +1,1123 @@
+From 6a51297ac199588dff1adb982541849be9cf1cc6 Mon Sep 17 00:00:00 2001
+From: Mohit Sabharwal <mohit@cloudera.com>
+Date: Fri, 30 Sep 2016 15:13:14 -0400
+Subject: [PATCH 0781/1164] CDH-45942: HIVE-14775: Cleanup IOException usage
+ in Metrics APIs (Barna Zsombor Klara reviewed by
+ Peter Vary, Gabor Szadovszky, Szehon Ho, Mohit
+ Sabharwal)
+
+Change-Id: I3cbf853979cd71a705e9d3a1bd66744b14fbb21e
+---
+ .../hadoop/hive/common/metrics/LegacyMetrics.java  |   96 ++++++++++--------
+ .../hadoop/hive/common/metrics/MetricsMBean.java   |   13 +--
+ .../hive/common/metrics/MetricsMBeanImpl.java      |   16 +--
+ .../hadoop/hive/common/metrics/common/Metrics.java |   31 ++----
+ .../common/metrics/metrics2/CodahaleMetrics.java   |   73 +++++++-------
+ .../org/apache/hadoop/hive/ql/log/PerfLogger.java  |   33 +++----
+ .../hive/common/metrics/TestLegacyMetrics.java     |  103 ++++++--------------
+ .../hadoop/hive/metastore/HMSMetricsListener.java  |   52 ++--------
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   13 +--
+ .../apache/hadoop/hive/ql/exec/mr/MapRedTask.java  |    6 +-
+ .../hadoop/hive/ql/exec/mr/MapredLocalTask.java    |    6 +-
+ .../hadoop/hive/ql/exec/spark/SparkTask.java       |    6 +-
+ .../apache/hadoop/hive/ql/exec/tez/TezTask.java    |    6 +-
+ .../hive/service/cli/operation/Operation.java      |   22 ++---
+ 14 files changed, 177 insertions(+), 299 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
+index 9be9b50..ba2267b 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
+@@ -21,11 +21,13 @@
+ import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+-import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+ import java.util.HashMap;
+ 
++import javax.management.JMException;
+ import javax.management.MBeanServer;
+ import javax.management.MalformedObjectNameException;
+ import javax.management.ObjectName;
+@@ -47,6 +49,8 @@
+  */
+ public class LegacyMetrics implements Metrics {
+ 
++  private static final Logger LOG = LoggerFactory.getLogger(LegacyMetrics.class);
++
+   private LegacyMetrics() {
+     // block
+   }
+@@ -59,12 +63,12 @@ private LegacyMetrics() {
+    */
+   public static class LegacyMetricsScope implements MetricsScope {
+ 
+-    final LegacyMetrics metrics;
++    private final LegacyMetrics metrics;
+ 
+-    final String name;
+-    final String numCounter;
+-    final String timeCounter;
+-    final String avgTimeCounter;
++    private final String name;
++    private final String numCounter;
++    private final String timeCounter;
++    private final String avgTimeCounter;
+ 
+     private boolean isOpen = false;
+     private Long startTime = null;
+@@ -72,9 +76,8 @@ private LegacyMetrics() {
+     /**
+      * Instantiates a named scope - intended to only be called by Metrics, so locally scoped.
+      * @param name - name of the variable
+-     * @throws IOException
+      */
+-    private LegacyMetricsScope(String name, LegacyMetrics metrics) throws IOException {
++    private LegacyMetricsScope(String name, LegacyMetrics metrics) {
+       this.metrics = metrics;
+       this.name = name;
+       this.numCounter = name + ".n";
+@@ -83,33 +86,41 @@ private LegacyMetricsScope(String name, LegacyMetrics metrics) throws IOExceptio
+       open();
+     }
+ 
+-    public Long getNumCounter() throws IOException {
+-      return (Long) metrics.get(numCounter);
++    public Long getNumCounter() {
++      try {
++        return (Long) metrics.get(numCounter);
++      } catch (JMException e) {
++        LOG.warn("Could not find counter value for " + numCounter + ", returning null instead. ", e);
++        return null;
++      }
+     }
+ 
+-    public Long getTimeCounter() throws IOException {
+-      return (Long) metrics.get(timeCounter);
++    public Long getTimeCounter() {
++      try {
++        return (Long) metrics.get(timeCounter);
++      } catch (JMException e) {
++        LOG.warn("Could not find timer value for " + timeCounter + ", returning null instead. ", e);
++        return null;
++      }
+     }
+ 
+     /**
+      * Opens scope, and makes note of the time started, increments run counter
+-     * @throws IOException
+      *
+      */
+-    public void open() throws IOException {
++    public void open() {
+       if (!isOpen) {
+         isOpen = true;
+         startTime = System.currentTimeMillis();
+       } else {
+-        throw new IOException("Scope named " + name + " is not closed, cannot be opened.");
++        LOG.warn("Scope named " + name + " is not closed, cannot be opened.");
+       }
+     }
+ 
+     /**
+      * Closes scope, and records the time taken
+-     * @throws IOException
+      */
+-    public void close() throws IOException {
++    public void close() {
+       if (isOpen) {
+         Long endTime = System.currentTimeMillis();
+         synchronized(metrics) {
+@@ -120,7 +131,7 @@ public void close() throws IOException {
+           }
+         }
+       } else {
+-        throw new IOException("Scope named " + name + " is not open, cannot be closed.");
++        LOG.warn("Scope named " + name + " is not open, cannot be closed.");
+       }
+       isOpen = false;
+     }
+@@ -128,9 +139,8 @@ public void close() throws IOException {
+ 
+     /**
+      * Closes scope if open, and reopens it
+-     * @throws IOException
+      */
+-    public void reopen() throws IOException {
++    public void reopen() {
+       if(isOpen) {
+         close();
+       }
+@@ -164,37 +174,47 @@ public LegacyMetrics(HiveConf conf) throws Exception {
+     mbs.registerMBean(metrics, oname);
+   }
+ 
+-  public Long incrementCounter(String name) throws IOException {
++  public Long incrementCounter(String name) {
+     return incrementCounter(name,Long.valueOf(1));
+   }
+ 
+-  public Long incrementCounter(String name, long increment) throws IOException {
+-    Long value;
++  public Long incrementCounter(String name, long increment) {
++    Long value = null;
+     synchronized(metrics) {
+       if (!metrics.hasKey(name)) {
+         value = Long.valueOf(increment);
+         set(name, value);
+       } else {
+-        value = ((Long)get(name)) + increment;
+-        set(name, value);
++        try {
++          value = ((Long)get(name)) + increment;
++          set(name, value);
++        } catch (JMException e) {
++          LOG.warn("Could not find counter value for " + name
++              + ", increment operation skipped.", e);
++        }
+       }
+     }
+     return value;
+   }
+ 
+-  public Long decrementCounter(String name) throws IOException{
++  public Long decrementCounter(String name) {
+     return decrementCounter(name, Long.valueOf(1));
+   }
+ 
+-  public Long decrementCounter(String name, long decrement) throws IOException {
+-    Long value;
++  public Long decrementCounter(String name, long decrement) {
++    Long value = null;
+     synchronized(metrics) {
+       if (!metrics.hasKey(name)) {
+         value = Long.valueOf(decrement);
+         set(name, -value);
+       } else {
+-        value = ((Long)get(name)) - decrement;
+-        set(name, value);
++        try {
++          value = ((Long)get(name)) - decrement;
++          set(name, value);
++        } catch (JMException e) {
++          LOG.warn("Could not find counter value for " + name
++              + ", decrement operation skipped.", e);
++        }
+       }
+     }
+     return value;
+@@ -205,15 +225,15 @@ public void addGauge(String name, MetricsVariable variable) {
+     //Not implemented.
+   }
+ 
+-  public void set(String name, Object value) throws IOException{
++  public void set(String name, Object value) {
+     metrics.put(name,value);
+   }
+ 
+-  public Object get(String name) throws IOException{
++  public Object get(String name) throws JMException {
+     return metrics.get(name);
+   }
+ 
+-  public void startStoredScope(String name) throws IOException{
++  public void startStoredScope(String name) {
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).open();
+     } else {
+@@ -221,25 +241,25 @@ public void startStoredScope(String name) throws IOException{
+     }
+   }
+ 
+-  public MetricsScope getStoredScope(String name) throws IOException {
++  public MetricsScope getStoredScope(String name) throws IllegalStateException {
+     if (threadLocalScopes.get().containsKey(name)) {
+       return threadLocalScopes.get().get(name);
+     } else {
+-      throw new IOException("No metrics scope named " + name);
++      throw new IllegalStateException("No metrics scope named " + name);
+     }
+   }
+ 
+-  public void endStoredScope(String name) throws IOException{
++  public void endStoredScope(String name) {
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).close();
+     }
+   }
+ 
+-  public MetricsScope createScope(String name) throws IOException {
++  public MetricsScope createScope(String name) {
+     return new LegacyMetricsScope(name, this);
+   }
+ 
+-  public void endScope(MetricsScope scope) throws IOException {
++  public void endScope(MetricsScope scope) {
+     ((LegacyMetricsScope) scope).close();
+   }
+ 
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBean.java b/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBean.java
+index 19946d9..130d8aa 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBean.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBean.java
+@@ -17,9 +17,8 @@
+  */
+ package org.apache.hadoop.hive.common.metrics;
+ 
+-import java.io.IOException;
+-
+ import javax.management.DynamicMBean;
++import javax.management.JMException;
+ 
+ /**
+  * MBean definition for metrics tracking from jmx
+@@ -36,21 +35,19 @@
+      * Add a key/metric and its value to track
+      * @param name Name of the key/metric
+      * @param value value associated with the key
+-     * @throws Exception
+      */
+-    public abstract void put(String name, Object value) throws IOException;
++    public abstract void put(String name, Object value);
+ 
+     /**
+      *
+      * @param name
+      * @return value associated with the key
+-     * @throws Exception
++     * @throws JMException
+      */
+-    public abstract Object get(String name) throws IOException;
+-    
++    public abstract Object get(String name) throws JMException;
+ 
+     /**
+-     * Removes all the keys and values from this MetricsMBean. 
++     * Removes all the keys and values from this MetricsMBean.
+      */
+     void clear();
+ }
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBeanImpl.java b/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBeanImpl.java
+index a973155..9e9b85c 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBeanImpl.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/MetricsMBeanImpl.java
+@@ -17,7 +17,6 @@
+  */
+ package org.apache.hadoop.hive.common.metrics;
+ 
+-import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+@@ -25,6 +24,7 @@
+ import javax.management.AttributeList;
+ import javax.management.AttributeNotFoundException;
+ import javax.management.InvalidAttributeValueException;
++import javax.management.JMException;
+ import javax.management.MBeanAttributeInfo;
+ import javax.management.MBeanConstructorInfo;
+ import javax.management.MBeanException;
+@@ -137,7 +137,7 @@ public boolean hasKey(String name) {
+     }
+ 
+     @Override
+-    public void put(String name, Object value) throws IOException {
++    public void put(String name, Object value) {
+       synchronized(metricsMap) {
+         if (!metricsMap.containsKey(name)) {
+           dirtyAttributeInfoCache = true;
+@@ -147,16 +147,8 @@ public void put(String name, Object value) throws IOException {
+     }
+ 
+     @Override
+-    public Object get(String name) throws IOException {
+-        try {
+-          return getAttribute(name);
+-        } catch (AttributeNotFoundException e) {
+-            throw new IOException(e);
+-        } catch (MBeanException e) {
+-            throw new IOException(e);
+-        } catch (ReflectionException e) {
+-            throw new IOException(e);
+-        }
++    public Object get(String name) throws JMException {
++      return getAttribute(name);
+     }
+ 
+     public void reset() {
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
+index 4297233..9b263d9 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
+@@ -17,12 +17,6 @@
+  */
+ package org.apache.hadoop.hive.common.metrics.common;
+ 
+-import java.io.IOException;
+-
+-import org.apache.hadoop.hive.conf.HiveConf;
+-
+-import java.io.IOException;
+-
+ /**
+  * Generic Metics interface.
+  */
+@@ -36,32 +30,28 @@
+   /**
+    *
+    * @param name starts a scope of a given name.  Scopes is stored as thread-local variable.
+-   * @throws IOException
+    */
+-  public void startStoredScope(String name) throws IOException;
++  public void startStoredScope(String name);
+ 
+   /**
+    * Closes the stored scope of a given name.
+    * Note that this must be called on the same thread as where the scope was started.
+    * @param name
+-   * @throws IOException
+    */
+-  public void endStoredScope(String name) throws IOException;
++  public void endStoredScope(String name);
+ 
+   /**
+    * Create scope with given name and returns it.
+    * @param name
+    * @return
+-   * @throws IOException
+    */
+-  public MetricsScope createScope(String name) throws IOException;
++  public MetricsScope createScope(String name);
+ 
+   /**
+    * Close the given scope.
+    * @param scope
+-   * @throws IOException
+    */
+-  public void endScope(MetricsScope scope) throws IOException;
++  public void endScope(MetricsScope scope);
+ 
+   //Counter-related methods
+ 
+@@ -69,43 +59,38 @@
+    * Increments a counter of the given name by 1.
+    * @param name
+    * @return
+-   * @throws IOException
+    */
+-  public Long incrementCounter(String name) throws IOException;
++  public Long incrementCounter(String name);
+ 
+   /**
+    * Increments a counter of the given name by "increment"
+    * @param name
+    * @param increment
+    * @return
+-   * @throws IOException
+    */
+-  public Long incrementCounter(String name, long increment) throws IOException;
++  public Long incrementCounter(String name, long increment);
+ 
+ 
+   /**
+    * Decrements a counter of the given name by 1.
+    * @param name
+    * @return
+-   * @throws IOException
+    */
+-  public Long decrementCounter(String name) throws IOException;
++  public Long decrementCounter(String name);
+ 
+   /**
+    * Decrements a counter of the given name by "decrement"
+    * @param name
+    * @param decrement
+    * @return
+-   * @throws IOException
+    */
+-  public Long decrementCounter(String name, long decrement) throws IOException;
++  public Long decrementCounter(String name, long decrement);
+ 
+ 
+   /**
+    * Adds a metrics-gauge to track variable.  For example, number of open database connections.
+    * @param name name of gauge
+    * @param variable variable to track.
+-   * @throws IOException
+    */
+   public void addGauge(String name, final MetricsVariable variable);
+ }
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+index 179d096..a041ee5 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+@@ -71,6 +71,7 @@
+  * Codahale-backed Metrics implementation.
+  */
+ public class CodahaleMetrics implements org.apache.hadoop.hive.common.metrics.common.Metrics {
++
+   public static final String API_PREFIX = "api_";
+   public static final String ACTIVE_CALLS = "active_calls_";
+ 
+@@ -96,64 +97,59 @@
+     }
+   };
+ 
+-  public static class CodahaleMetricsScope implements MetricsScope {
++  public class CodahaleMetricsScope implements MetricsScope {
+ 
+-    final String name;
+-    final Timer timer;
+-    Timer.Context timerContext;
+-    CodahaleMetrics metrics;
++    private final String name;
++    private final Timer timer;
++    private Timer.Context timerContext;
+ 
+     private boolean isOpen = false;
+ 
+     /**
+      * Instantiates a named scope - intended to only be called by Metrics, so locally scoped.
+      * @param name - name of the variable
+-     * @throws IOException
+      */
+-    private CodahaleMetricsScope(String name, CodahaleMetrics metrics) throws IOException {
++    private CodahaleMetricsScope(String name) {
+       this.name = name;
+-      this.metrics = metrics;
+-      this.timer = metrics.getTimer(name);
++      this.timer = CodahaleMetrics.this.getTimer(name);
+       open();
+     }
+ 
+     /**
+      * Opens scope, and makes note of the time started, increments run counter
+-     * @throws IOException
+      *
+      */
+-    public void open() throws IOException {
++    public void open() {
+       if (!isOpen) {
+         isOpen = true;
+         this.timerContext = timer.time();
+-        metrics.incrementCounter(ACTIVE_CALLS + name);
++        CodahaleMetrics.this.incrementCounter(ACTIVE_CALLS + name);
+       } else {
+-        throw new IOException("Scope named " + name + " is not closed, cannot be opened.");
++        LOGGER.warn("Scope named " + name + " is not closed, cannot be opened.");
+       }
+     }
+ 
+     /**
+      * Closes scope, and records the time taken
+-     * @throws IOException
+      */
+-    public void close() throws IOException {
++    public void close() {
+       if (isOpen) {
+         timerContext.close();
+-        metrics.decrementCounter(ACTIVE_CALLS + name);
++        CodahaleMetrics.this.decrementCounter(ACTIVE_CALLS + name);
+       } else {
+-        throw new IOException("Scope named " + name + " is not open, cannot be closed.");
++        LOGGER.warn("Scope named " + name + " is not open, cannot be closed.");
+       }
+       isOpen = false;
+     }
+   }
+ 
+-  public CodahaleMetrics(HiveConf conf) throws Exception {
++  public CodahaleMetrics(HiveConf conf) {
+     this.conf = conf;
+     //Codahale artifacts are lazily-created.
+     timers = CacheBuilder.newBuilder().build(
+       new CacheLoader<String, com.codahale.metrics.Timer>() {
+         @Override
+-        public com.codahale.metrics.Timer load(String key) throws Exception {
++        public com.codahale.metrics.Timer load(String key) {
+           Timer timer = new Timer(new ExponentiallyDecayingReservoir());
+           metricRegistry.register(key, timer);
+           return timer;
+@@ -163,7 +159,7 @@ public CodahaleMetrics(HiveConf conf) throws Exception {
+     counters = CacheBuilder.newBuilder().build(
+       new CacheLoader<String, Counter>() {
+         @Override
+-        public Counter load(String key) throws Exception {
++        public Counter load(String key) {
+           Counter counter = new Counter();
+           metricRegistry.register(key, counter);
+           return counter;
+@@ -211,17 +207,17 @@ public void close() throws Exception {
+   }
+ 
+   @Override
+-  public void startStoredScope(String name) throws IOException {
++  public void startStoredScope(String name) {
+     name = API_PREFIX + name;
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).open();
+     } else {
+-      threadLocalScopes.get().put(name, new CodahaleMetricsScope(name, this));
++      threadLocalScopes.get().put(name, new CodahaleMetricsScope(name));
+     }
+   }
+ 
+   @Override
+-  public void endStoredScope(String name) throws IOException {
++  public void endStoredScope(String name) {
+     name = API_PREFIX + name;
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).close();
+@@ -229,53 +225,56 @@ public void endStoredScope(String name) throws IOException {
+     }
+   }
+ 
+-  public MetricsScope getStoredScope(String name) throws IOException {
++  public MetricsScope getStoredScope(String name) throws IllegalArgumentException {
+     if (threadLocalScopes.get().containsKey(name)) {
+       return threadLocalScopes.get().get(name);
+     } else {
+-      throw new IOException("No metrics scope named " + name);
++      throw new IllegalArgumentException("No metrics scope named " + name);
+     }
+   }
+ 
+-  public MetricsScope createScope(String name) throws IOException {
++  public MetricsScope createScope(String name) {
+     name = API_PREFIX + name;
+-    return new CodahaleMetricsScope(name, this);
++    return new CodahaleMetricsScope(name);
+   }
+ 
+-  public void endScope(MetricsScope scope) throws IOException {
++  public void endScope(MetricsScope scope) {
+     ((CodahaleMetricsScope) scope).close();
+   }
+ 
+   @Override
+-  public Long incrementCounter(String name) throws IOException {
++  public Long incrementCounter(String name) {
+     return incrementCounter(name, 1L);
+   }
+ 
+-  public Long incrementCounter(String name, long increment) throws IOException {
++  @Override
++  public Long incrementCounter(String name, long increment) {
+     String key = name;
+     try {
+       countersLock.lock();
+       counters.get(key).inc(increment);
+       return counters.get(key).getCount();
+     } catch(ExecutionException ee) {
+-      throw new RuntimeException(ee);
++      throw new IllegalStateException("Error retrieving counter from the metric registry ", ee);
+     } finally {
+       countersLock.unlock();
+     }
+   }
+ 
+-  public Long decrementCounter(String name) throws IOException {
++  @Override
++  public Long decrementCounter(String name) {
+     return decrementCounter(name, 1L);
+   }
+ 
+-  public Long decrementCounter(String name, long decrement) throws IOException {
++  @Override
++  public Long decrementCounter(String name, long decrement) {
+     String key = name;
+     try {
+       countersLock.lock();
+       counters.get(key).dec(decrement);
+       return counters.get(key).getCount();
+     } catch(ExecutionException ee) {
+-      throw new RuntimeException(ee);
++      throw new IllegalStateException("Error retrieving counter from the metric registry ", ee);
+     } finally {
+       countersLock.unlock();
+     }
+@@ -304,14 +303,14 @@ public Object getValue() {
+   }
+ 
+   // This method is necessary to synchronize lazy-creation to the timers.
+-  private Timer getTimer(String name) throws IOException {
++  private Timer getTimer(String name) {
+     String key = name;
+     try {
+       timersLock.lock();
+       Timer timer = timers.get(key);
+       return timer;
+     } catch (ExecutionException e) {
+-      throw new IOException(e);
++      throw new IllegalStateException("Error retrieving timer from the metric registry ", e);
+     } finally {
+       timersLock.unlock();
+     }
+@@ -342,7 +341,7 @@ public String dumpJson() throws Exception {
+   /**
+    * Should be only called once to initialize the reporters
+    */
+-  private void initReporting(Set<MetricsReporting> reportingSet) throws Exception {
++  private void initReporting(Set<MetricsReporting> reportingSet) {
+     for (MetricsReporting reporting : reportingSet) {
+       switch(reporting) {
+         case CONSOLE:
+diff --git a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+index 188b786..442de38 100644
+--- a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
++++ b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+@@ -219,27 +219,20 @@ public Long getDuration(String method) {
+ 
+   private void beginMetrics(String method) {
+     Metrics metrics = MetricsFactory.getInstance();
+-    try {
+-      if (metrics != null) {
+-        MetricsScope scope = metrics.createScope(method);
+-        openScopes.put(method, scope);
+-      }
+-    } catch (IOException e) {
+-      LOG.warn("Error recording metrics", e);
++    if (metrics != null) {
++      MetricsScope scope = metrics.createScope(method);
++      openScopes.put(method, scope);
+     }
++
+   }
+ 
+   private void endMetrics(String method) {
+     Metrics metrics = MetricsFactory.getInstance();
+-    try {
+-      if (metrics != null) {
+-        MetricsScope scope = openScopes.remove(method);
+-        if (scope != null) {
+-          metrics.endScope(scope);
+-        }
++    if (metrics != null) {
++      MetricsScope scope = openScopes.remove(method);
++      if (scope != null) {
++        metrics.endScope(scope);
+       }
+-    } catch (IOException e) {
+-      LOG.warn("Error recording metrics", e);
+     }
+   }
+ 
+@@ -248,14 +241,10 @@ private void endMetrics(String method) {
+    */
+   public void cleanupPerfLogMetrics() {
+     Metrics metrics = MetricsFactory.getInstance();
+-    try {
+-      if (metrics != null) {
+-        for (MetricsScope openScope : openScopes.values()) {
+-          metrics.endScope(openScope);
+-        }
++    if (metrics != null) {
++      for (MetricsScope openScope : openScopes.values()) {
++        metrics.endScope(openScope);
+       }
+-    } catch (IOException e) {
+-      LOG.warn("Error cleaning up metrics", e);
+     }
+     openScopes.clear();
+   }
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java b/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java
+index a3fb04f..2e4fff1 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java
+@@ -17,7 +17,6 @@
+  */
+ package org.apache.hadoop.hive.common.metrics;
+ 
+-import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutorService;
+@@ -32,7 +31,6 @@
+ import javax.management.ObjectName;
+ 
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+-import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -113,56 +111,23 @@ public void testMetricsMBean() throws Exception {
+     assertEquals(Long.valueOf(0), v);
+   }
+ 
+-  private <T> void expectIOE(Callable<T> c) throws Exception {
+-    try {
+-      T t = c.call();
+-      fail("IOE expected but ["+t+"] was returned.");
+-    } catch (IOException ioe) {
+-      // ok, expected
+-    }
+-  }
+-
+   @Test
+   public void testScopeSingleThread() throws Exception {
+     metrics.startStoredScope(scopeName);
+     final LegacyMetrics.LegacyMetricsScope fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
+     // the time and number counters become available only after the 1st
+     // scope close:
+-    expectIOE(new Callable<Long>() {
+-      @Override
+-      public Long call() throws Exception {
+-        Long num = fooScope.getNumCounter();
+-        return num;
+-      }
+-    });
+-    expectIOE(new Callable<Long>() {
+-      @Override
+-      public Long call() throws Exception {
+-        Long time = fooScope.getTimeCounter();
+-        return time;
+-      }
+-    });
+-    // cannot open scope that is already open:
+-    expectIOE(new Callable<Void>() {
+-      @Override
+-      public Void call() throws Exception {
+-        fooScope.open();
+-        return null;
+-      }
+-    });
++    Long num = fooScope.getNumCounter();
++    assertNull(num);
++
++    Long time = fooScope.getTimeCounter();
++    assertNull(time);
+ 
+     assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs+ 1);
+     // 1st close:
+     // closing of open scope should be ok:
+     metrics.endStoredScope(scopeName);
+-    expectIOE(new Callable<Void>() {
+-      @Override
+-      public Void call() throws Exception {
+-        metrics.endStoredScope(scopeName); // closing of closed scope not allowed
+-        return null;
+-      }
+-    });
+ 
+     assertEquals(Long.valueOf(1), fooScope.getNumCounter());
+     final long t1 = fooScope.getTimeCounter().longValue();
+@@ -172,14 +137,6 @@ public Void call() throws Exception {
+ 
+    // opening allowed after closing:
+     metrics.startStoredScope(scopeName);
+-    // opening of already open scope not allowed:
+-    expectIOE(new Callable<Void>() {
+-      @Override
+-      public Void call() throws Exception {
+-        metrics.startStoredScope(scopeName);
+-        return null;
+-      }
+-    });
+ 
+     assertEquals(Long.valueOf(1), fooScope.getNumCounter());
+     assertEquals(t1, fooScope.getTimeCounter().longValue());
+@@ -229,17 +186,34 @@ public Void call() throws Exception {
+     metrics.endStoredScope(scopeName);
+   }
+ 
++  @Test
++  public void testScopeIncorrectOpenOrder() throws Exception {
++    metrics.startStoredScope(scopeName);
++    LegacyMetrics.LegacyMetricsScope fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
++    assertEquals(null, fooScope.getNumCounter());
++    fooScope.close();
++    assertEquals(Long.valueOf(1), fooScope.getNumCounter());
++
++    for (int i=0; i<10; i++) {
++      fooScope.open();
++      fooScope.close();
++    }
++    // scope opened/closed 10 times
++    assertEquals(Long.valueOf(11), fooScope.getNumCounter());
++
++    for (int i=0; i<10; i++) {
++      fooScope.open();
++    }
++    for (int i=0; i<10; i++) {
++      fooScope.close();
++    }
++    // scope opened/closed once (multiple opens do not count)
++    assertEquals(Long.valueOf(12), fooScope.getNumCounter());
++  }
++
+   void testScopeImpl(int n) throws Exception {
+     metrics.startStoredScope(scopeName);
+     final LegacyMetrics.LegacyMetricsScope fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
+-      // cannot open scope that is already open:
+-    expectIOE(new Callable<Void>() {
+-      @Override
+-      public Void call() throws Exception {
+-        fooScope.open();
+-        return null;
+-      }
+-    });
+ 
+     assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs+ 1);
+@@ -250,14 +224,6 @@ public Void call() throws Exception {
+     final long t1 = fooScope.getTimeCounter().longValue();
+     assertTrue(t1 > periodMs);
+ 
+-    expectIOE(new Callable<Void>() {
+-      @Override
+-      public Void call() throws Exception {
+-        metrics.endStoredScope(scopeName); // closing of closed scope not allowed
+-        return null;
+-      }
+-    });
+-
+     assertSame(fooScope, metrics.getStoredScope(scopeName));
+ 
+    // opening allowed after closing:
+@@ -266,15 +232,6 @@ public Void call() throws Exception {
+     assertTrue(fooScope.getNumCounter().longValue() >= 1);
+     assertTrue(fooScope.getTimeCounter().longValue() >= t1);
+ 
+-   // opening of already open scope not allowed:
+-    expectIOE(new Callable<Void>() {
+-      @Override
+-      public Void call() throws Exception {
+-        metrics.startStoredScope(scopeName);
+-        return null;
+-      }
+-    });
+-
+     assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs + 1);
+     // Reopening (close + open) allowed in opened state:
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HMSMetricsListener.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HMSMetricsListener.java
+index 6830cf7..98288a0 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HMSMetricsListener.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HMSMetricsListener.java
+@@ -30,8 +30,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import java.io.IOException;
+-
+ /**
+  * Report metrics of metadata added, deleted by this Hive Metastore.
+  */
+@@ -47,67 +45,37 @@ public HMSMetricsListener(Configuration config, Metrics metrics) {
+ 
+   @Override
+   public void onCreateDatabase(CreateDatabaseEvent dbEvent) throws MetaException {
+-    if (metrics != null) {
+-      try {
+-        metrics.incrementCounter(MetricsConstant.CREATE_TOTAL_DATABASES);
+-      } catch (IOException e) {
+-        LOGGER.warn("Error updating metadata metrics", e);
+-      }
+-    }
++    incrementCounterInternal(MetricsConstant.CREATE_TOTAL_DATABASES);
+   }
+ 
+   @Override
+   public void onDropDatabase(DropDatabaseEvent dbEvent) throws MetaException {
+-    if (metrics != null) {
+-      try {
+-        metrics.incrementCounter(MetricsConstant.DELETE_TOTAL_DATABASES);
+-      } catch (IOException e) {
+-        LOGGER.warn("Error updating metadata metrics", e);
+-      }
+-    }
++    incrementCounterInternal(MetricsConstant.DELETE_TOTAL_DATABASES);
+   }
+ 
+   @Override
+   public void onCreateTable(CreateTableEvent tableEvent) throws MetaException {
+-    if (metrics != null) {
+-      try {
+-        metrics.incrementCounter(MetricsConstant.CREATE_TOTAL_TABLES);
+-      } catch (IOException e) {
+-        LOGGER.warn("Error updating metadata metrics", e);
+-      }
+-    }
++    incrementCounterInternal(MetricsConstant.CREATE_TOTAL_TABLES);
+   }
+ 
+   @Override
+   public void onDropTable(DropTableEvent tableEvent) throws MetaException {
+-    if (metrics != null) {
+-      try {
+-        metrics.incrementCounter(MetricsConstant.DELETE_TOTAL_TABLES);
+-      } catch (IOException e) {
+-        LOGGER.warn("Error updating metadata metrics", e);
+-      }
+-    }
++    incrementCounterInternal(MetricsConstant.DELETE_TOTAL_TABLES);
+   }
+ 
+   @Override
+   public void onDropPartition(DropPartitionEvent partitionEvent) throws MetaException {
+-    if (metrics != null) {
+-      try {
+-        metrics.incrementCounter(MetricsConstant.DELETE_TOTAL_PARTITIONS);
+-      } catch (IOException e) {
+-        LOGGER.warn("Error updating metadata metrics", e);
+-      }
+-    }
++    incrementCounterInternal(MetricsConstant.DELETE_TOTAL_PARTITIONS);
+   }
+ 
+   @Override
+   public void onAddPartition(AddPartitionEvent partitionEvent) throws MetaException {
++    incrementCounterInternal(MetricsConstant.CREATE_TOTAL_PARTITIONS);
++  }
++
++  private void incrementCounterInternal(String name) {
+     if (metrics != null) {
+-      try {
+-        metrics.incrementCounter(MetricsConstant.CREATE_TOTAL_PARTITIONS);
+-      } catch (IOException e) {
+-        LOGGER.warn("Error updating metadata metrics", e);
+-      }
++      metrics.incrementCounter(name);
+     }
+   }
+ }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index cd4da6e..9801186 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -807,12 +807,7 @@ private String startFunction(String function, String extraLogInfo) {
+       logInfo((getIpAddress() == null ? "" : "source:" + getIpAddress() + " ") +
+           function + extraLogInfo);
+       if (MetricsFactory.getInstance() != null) {
+-        try {
+-          MetricsFactory.getInstance().startStoredScope(function);
+-        } catch (IOException e) {
+-          LOG.debug("Exception when starting metrics scope"
+-            + e.getClass().getName() + " " + e.getMessage(), e);
+-        }
++        MetricsFactory.getInstance().startStoredScope(function);
+       }
+       return function;
+     }
+@@ -851,11 +846,7 @@ private void endFunction(String function, boolean successful, Exception e,
+ 
+     private void endFunction(String function, MetaStoreEndFunctionContext context) {
+       if (MetricsFactory.getInstance() != null) {
+-        try {
+-          MetricsFactory.getInstance().endStoredScope(function);
+-        } catch (IOException e) {
+-          LOG.debug("Exception when closing metrics scope" + e);
+-        }
++        MetricsFactory.getInstance().endStoredScope(function);
+       }
+ 
+       for (MetaStoreEndFunctionListener listener : endFunctionListeners) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+index fe3c9f0..7716644 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapRedTask.java
+@@ -375,11 +375,7 @@ public boolean reduceDone() {
+ 
+   @Override
+   public void updateTaskMetrics(Metrics metrics) {
+-    try {
+-      metrics.incrementCounter(MetricsConstant.HIVE_MR_TASKS);
+-    } catch (IOException ex) {
+-      LOG.warn("Could not increment metrics for " + this, ex);
+-    }
++    metrics.incrementCounter(MetricsConstant.HIVE_MR_TASKS);
+   }
+ 
+   /**
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+index 0ee6f9d..085f363 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+@@ -122,11 +122,7 @@ public void setExecContext(ExecMapperContext execContext) {
+   }
+ 
+   public void updateTaskMetrics(Metrics metrics) {
+-    try {
+-      metrics.incrementCounter(MetricsConstant.HIVE_MR_TASKS);
+-    } catch (IOException ex) {
+-      LOG.warn("Could not increment metrics for " + this, ex);
+-    }
++    metrics.incrementCounter(MetricsConstant.HIVE_MR_TASKS);
+   }
+ 
+   @Override
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+index d65f898..a718057 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+@@ -193,11 +193,7 @@ private int close(int rc) {
+ 
+   @Override
+   public void updateTaskMetrics(Metrics metrics) {
+-    try {
+-      metrics.incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
+-    } catch (IOException ex) {
+-      LOG.warn("Could not increment metrics for " + this, ex);
+-    }
++    metrics.incrementCounter(MetricsConstant.HIVE_SPARK_TASKS);
+   }
+ 
+   @Override
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
+index fcc80d4..2b7d4cc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
+@@ -420,11 +420,7 @@ int close(TezWork work, int rc) {
+ 
+   @Override
+   public void updateTaskMetrics(Metrics metrics) {
+-    try {
+-      metrics.incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
+-    } catch (IOException ex) {
+-      LOG.warn("Could not increment metrics for " + this, ex);
+-    }
++    metrics.incrementCounter(MetricsConstant.HIVE_TEZ_TASKS);
+   }
+ 
+   @Override
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index 9644995..2ab772e 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -430,19 +430,15 @@ protected static MetricsScope setMetrics(MetricsScope stateScope, String operati
+       String completedOperationPrefix, OperationState state) {
+     Metrics metrics = MetricsFactory.getInstance();
+     if (metrics != null) {
+-      try {
+-        if (stateScope != null) {
+-          metrics.endScope(stateScope);
+-          stateScope = null;
+-        }
+-        if (scopeStates.contains(state)) {
+-          stateScope = metrics.createScope(operationPrefix + state);
+-        }
+-        if (terminalStates.contains(state)) {
+-          metrics.incrementCounter(completedOperationPrefix + state);
+-        }
+-      } catch (IOException e) {
+-        LOG.warn("Error metrics", e);
++      if (stateScope != null) {
++        metrics.endScope(stateScope);
++        stateScope = null;
++      }
++      if (scopeStates.contains(state)) {
++        stateScope = metrics.createScope(operationPrefix + state);
++      }
++      if (terminalStates.contains(state)) {
++        metrics.incrementCounter(completedOperationPrefix + state);
+       }
+     }
+     return stateScope;
+-- 
+1.7.9.5
+

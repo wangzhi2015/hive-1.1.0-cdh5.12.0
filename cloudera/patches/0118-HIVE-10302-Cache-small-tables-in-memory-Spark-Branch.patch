@@ -1,0 +1,208 @@
+From de7472c2ce4d272a03d15575a04692c6838b4b6c Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@cloudera.com>
+Date: Mon, 13 Apr 2015 11:09:23 -0700
+Subject: [PATCH 0118/1164] HIVE-10302: Cache small tables in memory [Spark
+ Branch] (Jimmy, reviewed by Xuefu)
+
+---
+ .../hadoop/hive/ql/exec/MapJoinOperator.java       |    7 +-
+ .../hadoop/hive/ql/exec/spark/HashTableLoader.java |   23 +++++-
+ .../ql/exec/spark/HivePairFlatMapFunction.java     |    1 +
+ .../hadoop/hive/ql/exec/spark/SmallTableCache.java |   73 ++++++++++++++++++++
+ .../hadoop/hive/ql/exec/spark/SparkUtilities.java  |    7 +-
+ 5 files changed, 105 insertions(+), 6 deletions(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SmallTableCache.java
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
+index ff42591..ff93a3d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
+@@ -25,6 +25,8 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.ql.HashTableLoaderFactory;
+ import org.apache.hadoop.hive.ql.exec.mapjoin.MapJoinMemoryExhaustionHandler;
+ import org.apache.hadoop.hive.ql.exec.persistence.MapJoinKey;
+@@ -34,6 +36,7 @@
+ import org.apache.hadoop.hive.ql.exec.persistence.MapJoinTableContainer.ReusableGetAdaptor;
+ import org.apache.hadoop.hive.ql.exec.persistence.MapJoinTableContainerSerDe;
+ import org.apache.hadoop.hive.ql.exec.persistence.UnwrapRowContainer;
++import org.apache.hadoop.hive.ql.exec.spark.SparkUtilities;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.MapJoinDesc;
+@@ -324,7 +327,9 @@ public void closeOp(boolean abort) throws HiveException {
+     }
+     if ((this.getExecContext() != null) && (this.getExecContext().getLocalWork() != null)
+         && (this.getExecContext().getLocalWork().getInputFileChangeSensitive())
+-        && mapJoinTables != null) {
++        && mapJoinTables != null
++        && !(HiveConf.getVar(hconf, ConfVars.HIVE_EXECUTION_ENGINE).equals("spark")
++            && SparkUtilities.isDedicatedCluster(hconf))) {
+       for (MapJoinTableContainer tableContainer : mapJoinTables) {
+         if (tableContainer != null) {
+           tableContainer.clear();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HashTableLoader.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HashTableLoader.java
+index 129e97b..70b411c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HashTableLoader.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HashTableLoader.java
+@@ -111,15 +111,32 @@ public void load(
+         }
+         String fileName = localWork.getBucketFileName(bigInputPath);
+         Path path = Utilities.generatePath(baseDir, desc.getDumpFilePrefix(), (byte) pos, fileName);
+-        LOG.info("\tLoad back all hashtable files from tmp folder uri:" + path);
+-        mapJoinTables[pos] = mapJoinTableSerdes[pos].load(fs, path);
++        mapJoinTables[pos] = load(fs, path, mapJoinTableSerdes[pos]);
+       }
+     } catch (Exception e) {
+       throw new HiveException(e);
+     }
+   }
+ 
+-  @SuppressWarnings("unchecked")
++  private MapJoinTableContainer load(FileSystem fs, Path path,
++      MapJoinTableContainerSerDe mapJoinTableSerde) throws HiveException {
++    LOG.info("\tLoad back all hashtable files from tmp folder uri:" + path);
++    if (!SparkUtilities.isDedicatedCluster(hconf)) {
++      return mapJoinTableSerde.load(fs, path);
++    }
++    MapJoinTableContainer mapJoinTable = SmallTableCache.get(path);
++    if (mapJoinTable == null) {
++      synchronized (path.toString().intern()) {
++        mapJoinTable = SmallTableCache.get(path);
++        if (mapJoinTable == null) {
++          mapJoinTable = mapJoinTableSerde.load(fs, path);
++          SmallTableCache.cache(path, mapJoinTable);
++        }
++      }
++    }
++    return mapJoinTable;
++  }
++
+   private void loadDirectly(MapJoinTableContainer[] mapJoinTables, String inputFileName)
+       throws Exception {
+     MapredLocalWork localWork = context.getLocalWork();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HivePairFlatMapFunction.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HivePairFlatMapFunction.java
+index 2f137f9..7df626b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HivePairFlatMapFunction.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HivePairFlatMapFunction.java
+@@ -48,6 +48,7 @@ public HivePairFlatMapFunction(byte[] buffer, SparkReporter sparkReporter) {
+   protected void initJobConf() {
+     if (jobConf == null) {
+       jobConf = KryoSerializer.deserializeJobConf(this.buffer);
++      SmallTableCache.initialize(jobConf);
+       setupMRLegacyConfigs();
+     }
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SmallTableCache.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SmallTableCache.java
+new file mode 100644
+index 0000000..1992d16
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SmallTableCache.java
+@@ -0,0 +1,73 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.exec.spark;
++
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.exec.persistence.MapJoinTableContainer;
++
++public class SmallTableCache {
++  private static final Log LOG = LogFactory.getLog(SmallTableCache.class.getName());
++
++  private static final ConcurrentHashMap<Path, MapJoinTableContainer>
++    tableContainerMap = new ConcurrentHashMap<Path, MapJoinTableContainer>();
++  private static volatile String queryId;
++
++  /**
++   * Check if this is a new query. If so, clean up the cache
++   * that is for the previous query, and reset the current query id.
++   */
++  public static void initialize(Configuration conf) {
++    String currentQueryId = conf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
++    if (!currentQueryId.equals(queryId)) {
++      if (!tableContainerMap.isEmpty()) {
++        synchronized (tableContainerMap) {
++          if (!currentQueryId.equals(queryId) && !tableContainerMap.isEmpty()) {
++            for (MapJoinTableContainer tableContainer: tableContainerMap.values()) {
++              tableContainer.clear();
++            }
++            tableContainerMap.clear();
++            if (LOG.isDebugEnabled()) {
++              LOG.debug("Cleaned up small table cache for query " + queryId);
++            }
++          }
++        }
++      }
++      queryId = currentQueryId;
++    }
++  }
++
++  public static void cache(Path path, MapJoinTableContainer tableContainer) {
++    if (tableContainerMap.putIfAbsent(path, tableContainer) == null && LOG.isDebugEnabled()) {
++      LOG.debug("Cached small table file " + path + " for query " + queryId);
++    }
++  }
++
++  public static MapJoinTableContainer get(Path path) {
++    MapJoinTableContainer tableContainer = tableContainerMap.get(path);
++    if (tableContainer != null && LOG.isDebugEnabled()) {
++      LOG.debug("Loaded small table file " + path + " from cache for query " + queryId);
++    }
++    return tableContainer;
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+index 91d83f3..2f01859 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+@@ -19,10 +19,8 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
+-import java.net.MalformedURLException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+-import java.net.URL;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -101,6 +99,11 @@ private static String getFileName(URI uri) {
+     return  splits[splits.length-1];
+   }
+ 
++  public static boolean isDedicatedCluster(Configuration conf) {
++    String master = conf.get("spark.master");
++    return master.startsWith("yarn-") || master.startsWith("local");
++  }
++
+   public static SparkSession getSparkSession(HiveConf conf,
+       SparkSessionManager sparkSessionManager) throws HiveException {
+     SparkSession sparkSession = SessionState.get().getSparkSession();
+-- 
+1.7.9.5
+

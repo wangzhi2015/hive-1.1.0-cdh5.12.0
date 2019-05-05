@@ -1,0 +1,170 @@
+From 63722ce0ecfcd5495d3117e2c256373e24d448aa Mon Sep 17 00:00:00 2001
+From: Sahil Takiar <takiar.sahil@gmail.com>
+Date: Mon, 25 Jul 2016 10:17:16 -0500
+Subject: [PATCH 0702/1164] CDH-23407: HIVE-12646: beeline and HIVE CLI do not
+ parse ; in quote properly (Sahil Takiar, reviewed
+ by Sergio Pena)
+
+(cherry picked from commit 9938d45da0d6bbd74e0adf72ca3e19e58a03c9dd)
+
+Change-Id: Ia3c2268aefabad66d676099135869d33e47b384b
+---
+ .../src/java/org/apache/hive/beeline/Commands.java |   90 ++++++++++++++++----
+ .../apache/hive/beeline/TestBeeLineWithArgs.java   |   21 +++++
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    2 +-
+ 3 files changed, 96 insertions(+), 17 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index e364c66..36e808d 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -1103,22 +1103,7 @@ private boolean execute(String line, boolean call, boolean entireLineAsCommand)
+     }
+ 
+     line = line.trim();
+-    List<String> cmdList = new ArrayList<String>();
+-    if (entireLineAsCommand) {
+-      cmdList.add(line);
+-    } else {
+-      StringBuffer command = new StringBuffer();
+-      for (String cmdpart: line.split(";")) {
+-        if (cmdpart.endsWith("\\")) {
+-          command.append(cmdpart.substring(0, cmdpart.length() -1)).append(";");
+-          continue;
+-        } else {
+-          command.append(cmdpart);
+-        }
+-        cmdList.add(command.toString());
+-        command.setLength(0);
+-      }
+-    }
++    List<String> cmdList = getCmdList(line, entireLineAsCommand);
+     for (int i = 0; i < cmdList.size(); i++) {
+       String sql = cmdList.get(i).trim();
+       if (sql.length() != 0) {
+@@ -1144,6 +1129,79 @@ private boolean execute(String line, boolean call, boolean entireLineAsCommand)
+     return true;
+   }
+ 
++  /**
++   * Helper method to parse input from Beeline and convert it to a {@link List} of commands that
++   * can be executed. This method contains logic for handling semicolons that are placed within
++   * quotations. It iterates through each character in the line and checks to see if it is a ;, ',
++   * or "
++   */
++  private List<String> getCmdList(String line, boolean entireLineAsCommand) {
++    List<String> cmdList = new ArrayList<String>();
++    if (entireLineAsCommand) {
++      cmdList.add(line);
++    } else {
++      StringBuffer command = new StringBuffer();
++
++      boolean hasUnterminatedDoubleQuote = false;
++      boolean hasUntermindatedSingleQuote = false;
++
++      int lastSemiColonIndex = 0;
++      char[] lineChars = line.toCharArray();
++
++      boolean wasPrevEscape = false;
++      int index = 0;
++      for (; index < lineChars.length; index++) {
++        switch (lineChars[index]) {
++          case '\'':
++            if (!hasUnterminatedDoubleQuote && !wasPrevEscape) {
++              hasUntermindatedSingleQuote = !hasUntermindatedSingleQuote;
++            }
++            wasPrevEscape = false;
++            break;
++          case '\"':
++            if (!hasUntermindatedSingleQuote && !wasPrevEscape) {
++              hasUnterminatedDoubleQuote = !hasUnterminatedDoubleQuote;
++            }
++            wasPrevEscape = false;
++            break;
++          case ';':
++            if (!hasUnterminatedDoubleQuote && !hasUntermindatedSingleQuote) {
++              addCmdPart(cmdList, command, line.substring(lastSemiColonIndex, index));
++              lastSemiColonIndex = index + 1;
++            }
++            wasPrevEscape = false;
++            break;
++          case '\\':
++            wasPrevEscape = true;
++            break;
++          default:
++            wasPrevEscape = false;
++            break;
++        }
++      }
++      // if the line doesn't end with a ; or if the line is empty, add the cmd part
++      if (lastSemiColonIndex != index || lineChars.length == 0) {
++        addCmdPart(cmdList, command, line.substring(lastSemiColonIndex, index));
++      }
++    }
++    return cmdList;
++  }
++
++  /**
++   * Given a cmdpart (e.g. if a command spans multiple lines), add to the current command, and if
++   * applicable add that command to the {@link List} of commands
++   */
++  private void addCmdPart(List<String> cmdList, StringBuffer command, String cmdpart) {
++    if (cmdpart.endsWith("\\")) {
++      command.append(cmdpart.substring(0, cmdpart.length() - 1)).append(";");
++      return;
++    } else {
++      command.append(cmdpart);
++    }
++    cmdList.add(command.toString());
++    command.setLength(0);
++  }
++
+   private Runnable createLogRunnable(Statement statement) {
+     if (statement instanceof HiveStatement) {
+       final HiveStatement hiveStatement = (HiveStatement) statement;
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+index 126dbbb..6e4e6ba 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+@@ -789,4 +789,25 @@ public void testConnectionWithURLParams() throws Throwable {
+ 
+     testScriptFile( SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
++
++  /**
++   * Test that Beeline queries don't treat semicolons inside quotations as query-ending characters.
++   */
++  @Test
++  public void testQueryNonEscapedSemiColon() throws Throwable {
++    String SCRIPT_TEXT = "drop table if exists nonEscapedSemiColon;create table nonEscapedSemiColon "
++            + "(key int) ROW FORMAT DELIMITED FIELDS TERMINATED BY ';';show tables;";
++    final String EXPECTED_PATTERN = " nonEscapedSemiColon ";
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++  }
++
++  @Test
++  public void testSelectQueryWithNonEscapedSemiColon() throws Throwable {
++    String SCRIPT_TEXT = "select ';', \"';'\", '\";\"', '\\';', ';\\'', '\\\";', ';\\\"' from " + tableName + ";";
++    final String EXPECTED_PATTERN = ";\t';'\t\";\"\t';\t;'\t\";\t;\"";
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    argList.add("--outputformat=tsv2");
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index b6ef65a..1e4a594 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -4411,7 +4411,7 @@ private String escapeHiveCommand(String str) {
+     StringBuilder sb = new StringBuilder();
+     for (int i = 0; i < str.length(); i ++) {
+       char c = str.charAt(i);
+-      if (c == '\'' || c == ';') {
++      if (c == '\'') {
+         sb.append('\\');
+       }
+       sb.append(c);
+-- 
+1.7.9.5
+

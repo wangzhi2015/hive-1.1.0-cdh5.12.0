@@ -1,0 +1,256 @@
+From 8efda40d62035c2ab01ff8e477d87ccd3dacf888 Mon Sep 17 00:00:00 2001
+From: Vihang Karajgaonkar <vihang@cloudera.com>
+Date: Wed, 28 Dec 2016 14:12:57 -0800
+Subject: [PATCH 0895/1164] Revert "HIVE-15008 : Cleanup local workDir when
+ MiniHS2 starts up in FS_ONLY mode. (Siddharth
+ Seth, reviewed by Prasanth Jayachandran)"
+
+This reverts commit bc36b1988b7a1ec3f1d79f6b270f7fe7c99f4464.
+
+Change-Id: I752597d72cfb4f1aa3755b32d3f5ec18ab1ee2be
+---
+ .../java/org/apache/hive/jdbc/miniHS2/MiniHS2.java |   58 +++++---------------
+ .../org/apache/hive/jdbc/TestJdbcWithMiniHS2.java  |   10 ----
+ .../test/java/org/apache/hive/jdbc/TestSSL.java    |    9 +--
+ 3 files changed, 14 insertions(+), 63 deletions(-)
+
+diff --git a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+index bbdb992..5502f9b 100644
+--- a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
++++ b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+@@ -19,13 +19,12 @@
+ package org.apache.hive.jdbc.miniHS2;
+ 
+ import java.io.File;
+-import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+-import com.google.common.base.Preconditions;
+ import org.apache.commons.io.FileUtils;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -44,13 +43,10 @@
+ import org.apache.hive.service.cli.thrift.ThriftCLIServiceClient;
+ import org.apache.hive.service.cli.thrift.ThriftHttpCLIService;
+ import org.apache.hive.service.server.HiveServer2;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ 
+-public class MiniHS2 extends AbstractHiveService {
+-
+-  private static final Logger LOG = LoggerFactory.getLogger(MiniHS2.class);
++import com.google.common.io.Files;
+ 
++public class MiniHS2 extends AbstractHiveService {
+   public static final String HS2_BINARY_MODE = "binary";
+   public static final String HS2_HTTP_MODE = "http";
+   private static final String driverName = "org.apache.hive.jdbc.HiveDriver";
+@@ -59,7 +55,7 @@
+   private static final String tmpDir = System.getProperty("test.tmp.dir");
+   private HiveServer2 hiveServer2 = null;
+   private final File baseDir;
+-  private final Path baseFsDir;
++  private final Path baseDfsDir;
+   private MiniMrShim mr;
+   private MiniDFSShim dfs;
+   private FileSystem localFS;
+@@ -68,12 +64,10 @@
+   private final String serverPrincipal;
+   private final String serverKeytab;
+   private final boolean isMetastoreRemote;
+-  private final boolean cleanupLocalDirOnStartup;
+ 
+   public static class Builder {
+     private HiveConf hiveConf = new HiveConf();
+     private boolean useMiniMR = false;
+-    private boolean cleanupLocalDirOnStartup = true;
+     private boolean useMiniKdc = false;
+     private String serverPrincipal;
+     private String serverKeytab;
+@@ -120,10 +114,6 @@ public Builder withHTTPTransport(){
+       return this;
+     }
+ 
+-    public Builder cleanupLocalDirOnStartup(boolean val) {
+-      this.cleanupLocalDirOnStartup = val;
+-      return this;
+-    }
+ 
+     public MiniHS2 build() throws Exception {
+       if (useMiniMR && useMiniKdc) {
+@@ -135,7 +125,7 @@ public MiniHS2 build() throws Exception {
+         hiveConf.setVar(ConfVars.HIVE_SERVER2_TRANSPORT_MODE, HS2_BINARY_MODE);
+       }
+       return new MiniHS2(hiveConf, useMiniMR, useMiniKdc, serverPrincipal, serverKeytab,
+-          isMetastoreRemote, authType, cleanupLocalDirOnStartup);
++          isMetastoreRemote, authType);
+     }
+   }
+ 
+@@ -172,18 +162,16 @@ public boolean isUseMiniKdc() {
+   }
+ 
+   private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+-      String serverPrincipal, String serverKeytab, boolean isMetastoreRemote, String authType, boolean cleanupLocalDirOnStartup) throws Exception {
++      String serverPrincipal, String serverKeytab, boolean isMetastoreRemote, String authType) throws Exception {
+     super(hiveConf, "localhost", MetaStoreUtils.findFreePort(), MetaStoreUtils.findFreePort());
+     this.useMiniMR = useMiniMR;
+     this.useMiniKdc = useMiniKdc;
+     this.serverPrincipal = serverPrincipal;
+     this.serverKeytab = serverKeytab;
+     this.isMetastoreRemote = isMetastoreRemote;
+-    this.cleanupLocalDirOnStartup = cleanupLocalDirOnStartup;
+-    baseDir = getBaseDir();
++    baseDir = new File(tmpDir + "/local_base");
+     localFS = FileSystem.getLocal(hiveConf);
+     FileSystem fs;
+-
+     if (useMiniMR) {
+       dfs = ShimLoader.getHadoopShims().getMiniDfs(hiveConf, 4, true, null);
+       fs = dfs.getFileSystem();
+@@ -191,16 +179,10 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+           fs.getUri().toString(), 1);
+       // store the config in system properties
+       mr.setupConfiguration(getHiveConf());
+-      baseFsDir =  new Path(new Path(fs.getUri()), "/base");
++      baseDfsDir =  new Path(new Path(fs.getUri()), "/base");
+     } else {
+       fs = FileSystem.getLocal(hiveConf);
+-      baseFsDir = new Path("file://"+ baseDir.toURI().getPath());
+-      if (cleanupLocalDirOnStartup) {
+-        // Cleanup baseFsDir since it can be shared across tests.
+-        LOG.info("Attempting to cleanup baseFsDir: {} while setting up MiniHS2", baseDir);
+-        Preconditions.checkState(baseFsDir.depth() >= 3); // Avoid "/tmp", directories closer to "/"
+-        fs.delete(baseFsDir, true);
+-      }
++      baseDfsDir = new Path("file://"+ baseDir.toURI().getPath());
+     }
+     if (useMiniKdc) {
+       hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL, serverPrincipal);
+@@ -210,8 +192,8 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+     String metaStoreURL =
+         "jdbc:derby:;databaseName=" + baseDir.getAbsolutePath() + File.separator
+             + "test_metastore;create=true";
+-    fs.mkdirs(baseFsDir);
+-    Path wareHouseDir = new Path(baseFsDir, "warehouse");
++    fs.mkdirs(baseDfsDir);
++    Path wareHouseDir = new Path(baseDfsDir, "warehouse");
+     // Create warehouse with 777, so that user impersonation has no issues.
+     FileSystem.mkdirs(fs, wareHouseDir, FULL_PERM);
+ 
+@@ -225,7 +207,7 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+     hiveConf.setIntVar(ConfVars.HIVE_SERVER2_THRIFT_PORT, getBinaryPort());
+     hiveConf.setIntVar(ConfVars.HIVE_SERVER2_THRIFT_HTTP_PORT, getHttpPort());
+ 
+-    Path scratchDir = new Path(baseFsDir, "scratch");
++    Path scratchDir = new Path(baseDfsDir, "scratch");
+     // Create root scratchdir with write all, so that user impersonation has no issues.
+     Utilities.createDirsWithPermission(hiveConf, scratchDir, WRITE_ALL_PERM, true);
+     System.setProperty(HiveConf.ConfVars.SCRATCHDIR.varname, scratchDir.toString());
+@@ -241,7 +223,7 @@ public MiniHS2(HiveConf hiveConf) throws Exception {
+   }
+ 
+   public MiniHS2(HiveConf hiveConf, boolean useMiniMR) throws Exception {
+-    this(hiveConf, useMiniMR, false, null, null, false, "KERBEROS", true);
++    this(hiveConf, useMiniMR, false, null, null, false, "KERBEROS");
+   }
+ 
+   public void start(Map<String, String> confOverlay) throws Exception {
+@@ -414,18 +396,4 @@ private void waitForStartup() throws Exception {
+       break;
+     } while (true);
+   }
+-
+-  static File getBaseDir() {
+-    File baseDir = new File(tmpDir + "/local_base");
+-    return baseDir;
+-  }
+-
+-  public static void cleanupLocalDir() throws IOException {
+-    File baseDir = getBaseDir();
+-    try {
+-      org.apache.hadoop.hive.common.FileUtils.deleteDirectory(baseDir);
+-    } catch (FileNotFoundException e) {
+-      // Ignore. Safe if it does not exist.
+-    }
+-  }
+ }
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+index 351285e..9aa453c 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+@@ -24,7 +24,6 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+-import java.io.IOException;
+ import java.lang.reflect.Method;
+ import java.sql.Connection;
+ import java.sql.DriverManager;
+@@ -74,7 +73,6 @@
+   @BeforeClass
+   public static void beforeTest() throws Exception {
+     Class.forName(MiniHS2.getJdbcDriverName());
+-    MiniHS2.cleanupLocalDir();
+     HiveConf conf = new HiveConf();
+     conf.setBoolVar(ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+     miniHS2 = new MiniHS2(conf);
+@@ -105,14 +103,6 @@ public static void afterTest() throws Exception {
+     if (miniHS2.isStarted()) {
+       miniHS2.stop();
+     }
+-    cleanupMiniHS2();
+-  }
+-
+-  private static void cleanupMiniHS2() throws IOException {
+-    if (miniHS2 != null) {
+-      miniHS2.cleanup();
+-    }
+-    MiniHS2.cleanupLocalDir();
+   }
+ 
+   @Test
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java
+index 2a65add..e4c48fa 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestSSL.java
+@@ -37,7 +37,6 @@
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hive.jdbc.miniHS2.MiniHS2;
+ import org.junit.After;
+-import org.junit.AfterClass;
+ import org.junit.Assert;
+ import org.junit.Assume;
+ import org.junit.Before;
+@@ -70,15 +69,9 @@
+ 
+   @BeforeClass
+   public static void beforeTest() throws Exception {
+-    MiniHS2.cleanupLocalDir();
+     Class.forName(MiniHS2.getJdbcDriverName());
+   }
+ 
+-  @AfterClass
+-  public static void afterClass() throws Exception {
+-    MiniHS2.cleanupLocalDir();
+-  }
+-
+   @Before
+   public void setUp() throws Exception {
+     DriverManager.setLoginTimeout(0);
+@@ -86,7 +79,7 @@ public void setUp() throws Exception {
+       dataFileDir = System.getProperty("test.data.files");
+     }
+     dataFileDir = dataFileDir.replace('\\', '/').replace("c:", "");
+-    miniHS2 = new MiniHS2.Builder().withConf(conf).cleanupLocalDirOnStartup(false).build();
++    miniHS2 = new MiniHS2(conf);
+     confOverlay = new HashMap<String, String>();
+   }
+ 
+-- 
+1.7.9.5
+

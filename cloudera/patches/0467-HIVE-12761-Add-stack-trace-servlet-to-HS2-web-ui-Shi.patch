@@ -1,0 +1,231 @@
+From 00ee913020088a7b1e3a1dbbdf0d436285b246f7 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Mon, 11 Jan 2016 08:08:43 -0800
+Subject: [PATCH 0467/1164] HIVE-12761: Add stack trace servlet to HS2 web ui
+ (Shinichi Yamashita via Jimmy Xiang)
+
+Change-Id: If84df36d47ef4e12fe3c02a05599889e973bb547
+---
+ .../src/java/org/apache/hive/http/HttpServer.java  |    1 +
+ .../java/org/apache/hive/http/StackServlet.java    |  103 ++++++++++++++++++++
+ .../hive-webapps/hiveserver2/hiveserver2.jsp       |    1 +
+ .../hive/service/server/TestHS2HttpServer.java     |   73 ++++++++++++++
+ 4 files changed, 178 insertions(+)
+ create mode 100644 common/src/java/org/apache/hive/http/StackServlet.java
+ create mode 100644 service/src/test/org/apache/hive/service/server/TestHS2HttpServer.java
+
+diff --git a/common/src/java/org/apache/hive/http/HttpServer.java b/common/src/java/org/apache/hive/http/HttpServer.java
+index 4276692..74796ef 100644
+--- a/common/src/java/org/apache/hive/http/HttpServer.java
++++ b/common/src/java/org/apache/hive/http/HttpServer.java
+@@ -370,6 +370,7 @@ void initializeWebServer(Builder b) {
+ 
+     addServlet("jmx", "/jmx", JMXJsonServlet.class);
+     addServlet("conf", "/conf", ConfServlet.class);
++    addServlet("stacks", "/stacks", StackServlet.class);
+ 
+     ServletContextHandler staticCtx =
+       new ServletContextHandler(contexts, "/static");
+diff --git a/common/src/java/org/apache/hive/http/StackServlet.java b/common/src/java/org/apache/hive/http/StackServlet.java
+new file mode 100644
+index 0000000..610b391
+--- /dev/null
++++ b/common/src/java/org/apache/hive/http/StackServlet.java
+@@ -0,0 +1,103 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.http;
++
++import java.io.IOException;
++import java.io.PrintStream;
++import java.lang.management.ManagementFactory;
++import java.lang.management.ThreadInfo;
++import java.lang.management.ThreadMXBean;
++
++import javax.servlet.ServletException;
++import javax.servlet.http.HttpServlet;
++import javax.servlet.http.HttpServletRequest;
++import javax.servlet.http.HttpServletResponse;
++
++/**
++ * A servlet to print out the current stack traces.
++ */
++public class StackServlet extends HttpServlet {
++  private static final long serialVersionUID = 1L;
++  private static ThreadMXBean threadBean =
++      ManagementFactory.getThreadMXBean();
++
++  @Override
++  public void doGet(HttpServletRequest request, HttpServletResponse response)
++    throws ServletException, IOException {
++    if (!HttpServer.isInstrumentationAccessAllowed(getServletContext(),
++        request, response)) {
++      return;
++    }
++    response.setContentType("text/plain; charset=UTF-8");
++    try (PrintStream out = new PrintStream(
++        response.getOutputStream(), false, "UTF-8")) {
++      printThreadInfo(out, "");
++    }
++  }
++
++  /**
++   * Print all of the thread's information and stack traces.
++   *
++   * @param stream the stream to
++   * @param title a string title for the stack trace
++   */
++  private synchronized void printThreadInfo(
++      PrintStream stream, String title) {
++    final int STACK_DEPTH = 20;
++    boolean contention = threadBean.isThreadContentionMonitoringEnabled();
++    long[] threadIds = threadBean.getAllThreadIds();
++    stream.println("Process Thread Dump: " + title);
++    stream.println(threadIds.length + " active threads");
++    for (long tid : threadIds) {
++      ThreadInfo info = threadBean.getThreadInfo(tid, STACK_DEPTH);
++      if (info == null) {
++        stream.println("  Inactive");
++        continue;
++      }
++      stream.println("Thread " +
++          getTaskName(info.getThreadId(), info.getThreadName()) + ":");
++      Thread.State state = info.getThreadState();
++      stream.println("  State: " + state);
++      stream.println("  Blocked count: " + info.getBlockedCount());
++      stream.println("  Wtaited count: " + info.getWaitedCount());
++      if (contention) {
++        stream.println("  Blocked time: " + info.getBlockedTime());
++        stream.println("  Waited time: " + info.getWaitedTime());
++      }
++      if (state == Thread.State.WAITING) {
++        stream.println("  Waiting on " + info.getLockName());
++      } else if (state == Thread.State.BLOCKED) {
++        stream.println("  Blocked on " + info.getLockName());
++        stream.println("  Blocked by " +
++            getTaskName(info.getLockOwnerId(), info.getLockOwnerName()));
++      }
++      stream.println("  Stack:");
++      for (StackTraceElement frame : info.getStackTrace()) {
++        stream.println("    " + frame.toString());
++      }
++    }
++    stream.flush();
++  }
++
++  private String getTaskName(long id, String name) {
++    if (name == null) {
++      return Long.toString(id);
++    }
++    return id + " (" + name + ")";
++  }
++}
+diff --git a/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp b/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
+index 4fad63c..0b437dd 100644
+--- a/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
++++ b/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
+@@ -70,6 +70,7 @@ SessionManager sessionManager =
+                 <li><a href="/logs/">Local logs</a></li>
+                 <li><a href="/jmx">Metrics Dump</a></li>
+                 <li><a href="/conf">Hive Configuration</a></li>
++                <li><a href="/stacks">Stack Trace</a></li>
+             </ul>
+           </div><!--/.nav-collapse -->
+         </div>
+diff --git a/service/src/test/org/apache/hive/service/server/TestHS2HttpServer.java b/service/src/test/org/apache/hive/service/server/TestHS2HttpServer.java
+new file mode 100644
+index 0000000..c06ea26
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/server/TestHS2HttpServer.java
+@@ -0,0 +1,73 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.service.server;
++
++import java.io.BufferedReader;
++import java.io.InputStreamReader;
++import java.net.HttpURLConnection;
++import java.net.URL;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
++import org.junit.AfterClass;
++import org.junit.Assert;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++/**
++ * TestHS2HttpServer -- executes tests of HiveServer2 HTTP Server
++ */
++public class TestHS2HttpServer {
++
++  private static HiveServer2 hiveServer2 = null;
++
++  @BeforeClass
++  public static void beforeTests() throws Exception {
++    HiveConf hiveConf = new HiveConf();
++    hiveConf.setBoolVar(ConfVars.HIVE_IN_TEST, false);
++    hiveServer2 = new HiveServer2();
++    hiveServer2.init(hiveConf);
++    hiveServer2.start();
++    Thread.sleep(5000);
++  }
++
++  @Test
++  public void testStackServket() throws Exception {
++    String baseURL = "http://localhost:"
++      + ConfVars.HIVE_SERVER2_WEBUI_PORT.getDefaultValue() + "/stacks";
++    URL url = new URL(baseURL);
++    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
++    Assert.assertEquals(HttpURLConnection.HTTP_OK, conn.getResponseCode());
++    BufferedReader reader =
++        new BufferedReader(new InputStreamReader(conn.getInputStream()));
++    boolean contents = false;
++    String line;
++    while ((line = reader.readLine()) != null) {
++      if (line.contains("Process Thread Dump:")) {
++        contents = true;
++      }
++    }
++    Assert.assertTrue(contents);
++  }
++
++  @AfterClass
++  public static void afterTests() throws Exception {
++    hiveServer2.stop();
++  }
++}
+-- 
+1.7.9.5
+

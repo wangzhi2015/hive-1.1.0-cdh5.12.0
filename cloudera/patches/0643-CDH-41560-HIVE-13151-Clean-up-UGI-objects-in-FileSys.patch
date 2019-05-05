@@ -1,0 +1,252 @@
+From 669889d5231549e65feffd19d5472abb4ac88acf Mon Sep 17 00:00:00 2001
+From: Wei Zheng <weiz@apache.org>
+Date: Thu, 24 Mar 2016 22:38:39 -0700
+Subject: [PATCH 0643/1164] CDH-41560 HIVE-13151 : Clean up UGI objects in
+ FileSystem cache for transactions (Wei Zheng,
+ reviewed by Eugene Koifman)
+
+Conflicts:
+	ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
+
+Change-Id: I2b76aaac5c1d73fdc38f4a3b1b5f5e6b0014095b
+---
+ .../hive/hcatalog/streaming/HiveEndPoint.java      |   11 +++
+ .../hadoop/hive/ql/txn/compactor/Cleaner.java      |    6 ++
+ .../hive/ql/txn/compactor/CompactorThread.java     |    5 ++
+ .../hadoop/hive/ql/txn/compactor/Initiator.java    |    9 ++-
+ .../hadoop/hive/ql/txn/compactor/Worker.java       |    7 ++
+ .../apache/hadoop/hive/ql/TestTxnCommands2.java    |   73 +++++++++++++++++++-
+ 6 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/hcatalog/streaming/src/java/org/apache/hive/hcatalog/streaming/HiveEndPoint.java b/hcatalog/streaming/src/java/org/apache/hive/hcatalog/streaming/HiveEndPoint.java
+index a08f2f9..3306ce8 100644
+--- a/hcatalog/streaming/src/java/org/apache/hive/hcatalog/streaming/HiveEndPoint.java
++++ b/hcatalog/streaming/src/java/org/apache/hive/hcatalog/streaming/HiveEndPoint.java
+@@ -20,6 +20,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.hive.cli.CliSessionState;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+@@ -295,6 +296,11 @@ public Void run() throws Exception {
+                 return null;
+               }
+             } );
++        try {
++          FileSystem.closeAllForUGI(ugi);
++        } catch (IOException exception) {
++          LOG.error("Could not clean up file-system handles for UGI: " + ugi, exception);
++        }
+       } catch (IOException e) {
+         LOG.error("Error closing connection to " + endPt, e);
+       } catch (InterruptedException e) {
+@@ -813,6 +819,11 @@ public Void run() throws StreamingException {
+                   }
+                 }
+         );
++        try {
++          FileSystem.closeAllForUGI(ugi);
++        } catch (IOException exception) {
++          LOG.error("Could not clean up file-system handles for UGI: " + ugi, exception);
++        }
+       } catch (IOException e) {
+         throw new ImpersonationFailed("Failed closing Txn Batch as user '" + username +
+                 "' on  endPoint :" + endPt, e);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Cleaner.java b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Cleaner.java
+index 0fb39f7..5a226d5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Cleaner.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Cleaner.java
+@@ -198,6 +198,12 @@ public Object run() throws Exception {
+             return null;
+           }
+         });
++        try {
++          FileSystem.closeAllForUGI(ugi);
++        } catch (IOException exception) {
++          LOG.error("Could not clean up file-system handles for UGI: " + ugi + " for " +
++              ci.getFullPartitionName(), exception);
++        }
+       }
+ 
+     } catch (Exception e) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorThread.java b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorThread.java
+index 7d097fd..b33a9af 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorThread.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorThread.java
+@@ -171,6 +171,11 @@ public Object run() throws Exception {
+           return null;
+         }
+       });
++      try {
++        FileSystem.closeAllForUGI(ugi);
++      } catch (IOException exception) {
++        LOG.error("Could not clean up file-system handles for UGI: " + ugi, exception);
++      }
+ 
+       if (wrapper.size() == 1) {
+         LOG.debug("Running job as " + wrapper.get(0));
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Initiator.java b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Initiator.java
+index 0249a1c..01e5bc7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Initiator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Initiator.java
+@@ -185,12 +185,19 @@ private CompactionType checkForCompaction(final CompactionInfo ci,
+       LOG.info("Going to initiate as user " + runAs);
+       UserGroupInformation ugi = UserGroupInformation.createProxyUser(runAs,
+         UserGroupInformation.getLoginUser());
+-      return ugi.doAs(new PrivilegedExceptionAction<CompactionType>() {
++      CompactionType compactionType = ugi.doAs(new PrivilegedExceptionAction<CompactionType>() {
+         @Override
+         public CompactionType run() throws Exception {
+           return determineCompactionType(ci, txns, sd);
+         }
+       });
++      try {
++        FileSystem.closeAllForUGI(ugi);
++      } catch (IOException exception) {
++        LOG.error("Could not clean up file-system handles for UGI: " + ugi + " for " +
++            ci.getFullPartitionName(), exception);
++      }
++      return compactionType;
+     }
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Worker.java b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Worker.java
+index 8cfa37e..7376137 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Worker.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/Worker.java
+@@ -19,6 +19,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.hive.common.ValidTxnList;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+@@ -156,6 +157,12 @@ public Object run() throws Exception {
+                 return null;
+               }
+             });
++            try {
++              FileSystem.closeAllForUGI(ugi);
++            } catch (IOException exception) {
++              LOG.error("Could not clean up file-system handles for UGI: " + ugi + " for " +
++                  ci.getFullPartitionName(), exception);
++            }
+           }
+           txnHandler.markCompacted(ci);
+         } catch (Exception e) {
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java b/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
+index f5140c4..3cf98fd 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
+@@ -1,14 +1,18 @@
+ package org.apache.hadoop.hive.ql;
+ 
+ import org.apache.commons.io.FileUtils;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.txn.TxnDbUtil;
+ import org.apache.hadoop.hive.ql.io.AcidUtils;
+ import org.apache.hadoop.hive.ql.io.orc.FileDump;
+ import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.txn.compactor.Cleaner;
++import org.apache.hadoop.hive.ql.txn.compactor.Worker;
+ import org.junit.After;
+ import org.junit.Assert;
+ import org.junit.Before;
+@@ -18,13 +22,15 @@
+ import org.junit.rules.TestName;
+ 
+ import java.io.File;
+-import java.io.FileNotFoundException;
+-import java.io.FileOutputStream;
+-import java.io.FilenameFilter;
++import java.lang.reflect.Field;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Comparator;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ /**
+  * TODO: this should be merged with TestTxnCommands once that is checked in
+@@ -164,6 +170,67 @@ public void testInsertOverwriteWithSelfJoin() throws Exception {
+     //insert overwrite not supported for ACID tables
+   }
+   /**
++   * Make sure there's no FileSystem$Cache$Key leak due to UGI use
++   * @throws Exception
++   */
++  @Test
++  public void testFileSystemUnCaching() throws Exception {
++    int cacheSizeBefore;
++    int cacheSizeAfter;
++
++    // get the size of cache BEFORE
++    cacheSizeBefore = getFileSystemCacheSize();
++
++    // Insert a row to ACID table
++    runStatementOnDriver("insert into " + Table.ACIDTBL + " values(1,2)");
++
++    // Perform a major compaction
++    runStatementOnDriver("alter table " + Table.ACIDTBL + " compact 'major'");
++    runWorker(hiveConf);
++    runCleaner(hiveConf);
++
++    // get the size of cache AFTER
++    cacheSizeAfter = getFileSystemCacheSize();
++
++    Assert.assertEquals(cacheSizeBefore, cacheSizeAfter);
++  }
++  private int getFileSystemCacheSize() throws Exception {
++    try {
++      Field cache = FileSystem.class.getDeclaredField("CACHE");
++      cache.setAccessible(true);
++      Object o = cache.get(null); // FileSystem.CACHE
++
++      Field mapField = o.getClass().getDeclaredField("map");
++      mapField.setAccessible(true);
++      Map map = (HashMap)mapField.get(o); // FileSystem.CACHE.map
++
++      return map.size();
++    } catch (NoSuchFieldException e) {
++      System.out.println(e);
++    }
++    return 0;
++  }
++
++  public static void runWorker(HiveConf hiveConf) throws MetaException {
++    AtomicBoolean stop = new AtomicBoolean(true);
++    Worker t = new Worker();
++    t.setThreadId((int) t.getId());
++    t.setHiveConf(hiveConf);
++    AtomicBoolean looped = new AtomicBoolean();
++    t.init(stop, looped);
++    t.run();
++  }
++  public static void runCleaner(HiveConf hiveConf) throws MetaException {
++    AtomicBoolean stop = new AtomicBoolean(true);
++    Cleaner t = new Cleaner();
++    t.setThreadId((int) t.getId());
++    t.setHiveConf(hiveConf);
++    AtomicBoolean looped = new AtomicBoolean();
++    t.init(stop, looped);
++    t.run();
++  }
++
++  /**
+    * takes raw data and turns it into a string as if from Driver.getResults()
+    * sorts rows in dictionary order
+    */
+-- 
+1.7.9.5
+

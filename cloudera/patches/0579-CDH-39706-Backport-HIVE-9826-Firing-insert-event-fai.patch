@@ -1,0 +1,79 @@
+From 097af712e768d6debfb2e312f69bd7fbaa347021 Mon Sep 17 00:00:00 2001
+From: Sushanth Sowmyan <khorgath@apache.org>
+Date: Wed, 4 Mar 2015 22:26:06 +0000
+Subject: [PATCH 0579/1164] CDH-39706: Backport HIVE-9826 : Firing insert
+ event fails on temporary table
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1664171 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 88b9228db7e077e4682615b20a81c2391d003f46)
+
+Change-Id: I2423e7428ae86d840f3b943023f6be7053b13e4e
+---
+ .../listener/TestDbNotificationListener.java       |   35 ++++++++++++++++++++
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |    4 +++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+index bc073ca..91cc03e 100644
+--- a/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
++++ b/itests/hcatalog-unit/src/test/java/org/apache/hive/hcatalog/listener/TestDbNotificationListener.java
+@@ -465,6 +465,41 @@ public void sqlInsertTable() throws Exception {
+   }
+ 
+   @Test
++  public void sqlCTAS() throws Exception {
++
++    driver.run("create table ctas_source (c int)");
++    driver.run("insert into table ctas_source values (1)");
++    driver.run("create table ctas_target as select c from ctas_source");
++
++    NotificationEventResponse rsp = msClient.getNextNotification(firstEventId, 0, null);
++
++    assertEquals(6, rsp.getEventsSize());
++    NotificationEvent event = rsp.getEvents().get(0);
++    assertEquals(firstEventId + 1, event.getEventId());
++    assertEquals(HCatConstants.HCAT_CREATE_TABLE_EVENT, event.getEventType());
++    event = rsp.getEvents().get(2);
++    assertEquals(firstEventId + 3, event.getEventId());
++    assertEquals(HCatConstants.HCAT_INSERT_EVENT, event.getEventType());
++    // Make sure the files are listed in the insert
++    assertTrue(event.getMessage().matches(".*\"files\":\\[\"pfile.*"));
++    event = rsp.getEvents().get(4);
++    assertEquals(firstEventId + 5, event.getEventId());
++    assertEquals(HCatConstants.HCAT_CREATE_TABLE_EVENT, event.getEventType());
++  }
++
++  @Test
++  public void sqlTempTable() throws Exception {
++
++    LOG.info("XXX Starting temp table");
++    driver.run("create temporary table tmp1 (c int)");
++    driver.run("insert into table tmp1 values (1)");
++
++    NotificationEventResponse rsp = msClient.getNextNotification(firstEventId, 0, null);
++
++    assertEquals(0, rsp.getEventsSize());
++  }
++
++  @Test
+   public void sqlDb() throws Exception {
+ 
+     driver.run("create database sd");
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 912017d..cca6187 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -1953,6 +1953,10 @@ private void fireInsertEvent(Table tbl, Map<String, String> partitionSpec, List<
+       throws HiveException {
+     if (conf.getBoolVar(ConfVars.FIRE_EVENTS_FOR_DML)) {
+       LOG.debug("Firing dml insert event");
++      if (tbl.isTemporary()) {
++        LOG.debug("Not firing dml insert event as " + tbl.getTableName() + " is temporary");
++        return;
++      }
+       FireEventRequestData data = new FireEventRequestData();
+       InsertEventRequestData insertData = new InsertEventRequestData();
+       data.setInsertData(insertData);
+-- 
+1.7.9.5
+

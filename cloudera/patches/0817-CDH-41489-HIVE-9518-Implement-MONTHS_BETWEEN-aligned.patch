@@ -1,0 +1,797 @@
+From 18afcbb982b8114cb18bc57fcb635ca8245e04f1 Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Tue, 7 Apr 2015 22:12:44 +0000
+Subject: [PATCH 0817/1164] CDH-41489 HIVE-9518: Implement MONTHS_BETWEEN
+ aligned with Oracle one (Alex Pivovarov via Jason
+ Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1671960 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 6b577dff6822afc58c6b518241544d5a9bebe77e)
+
+Change-Id: I0b20e7698fbde010d9070a0521d1cdd698842a34
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    1 +
+ .../hadoop/hive/ql/udf/generic/GenericUDF.java     |    4 +
+ .../ql/udf/generic/GenericUDFMonthsBetween.java    |  156 ++++++++++++++
+ .../udf/generic/TestGenericUDFMonthsBetween.java   |  228 ++++++++++++++++++++
+ .../queries/clientpositive/udf_months_between.q    |   88 ++++++++
+ .../results/clientpositive/show_functions.q.out    |    2 +
+ .../clientpositive/udf_months_between.q.out        |  225 +++++++++++++++++++
+ 7 files changed, 704 insertions(+)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFMonthsBetween.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFMonthsBetween.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_months_between.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_months_between.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 1d577d1..050c155 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -275,6 +275,7 @@
+     system.registerGenericUDF("date_sub", GenericUDFDateSub.class);
+     system.registerGenericUDF("datediff", GenericUDFDateDiff.class);
+     system.registerGenericUDF("add_months", GenericUDFAddMonths.class);
++    system.registerGenericUDF("months_between", GenericUDFMonthsBetween.class);
+ 
+     system.registerUDF("get_json_object", UDFJson.class, false);
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
+index 8df4d5e..20bf9ad 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDF.java
+@@ -516,6 +516,10 @@ protected Date getTimestampValue(DeferredObject[] arguments, int i, Converter[]
+       return null;
+     }
+     Object writableValue = converters[i].convert(obj);
++    // if string can not be parsed converter will return null
++    if (writableValue == null) {
++      return null;
++    }
+     Timestamp ts = ((TimestampWritable) writableValue).getTimestamp();
+     return ts;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFMonthsBetween.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFMonthsBetween.java
+new file mode 100644
+index 0000000..35dc51a
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFMonthsBetween.java
+@@ -0,0 +1,156 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import static java.math.BigDecimal.ROUND_HALF_UP;
++import static java.util.Calendar.DATE;
++import static java.util.Calendar.HOUR_OF_DAY;
++import static java.util.Calendar.MINUTE;
++import static java.util.Calendar.MONTH;
++import static java.util.Calendar.SECOND;
++import static java.util.Calendar.YEAR;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.DATE_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
++import java.math.BigDecimal;
++import java.util.Calendar;
++import java.util.Date;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.serde2.io.DoubleWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++
++/**
++ * UDFMonthsBetween.
++ *
++ */
++@Description(name = "months_between", value = "_FUNC_(date1, date2) - returns number of months between dates date1 and date2",
++    extended = "If date1 is later than date2, then the result is positive. "
++    + "If date1 is earlier than date2, then the result is negative. "
++    + "If date1 and date2 are either the same days of the month or both last days of months, "
++    + "then the result is always an integer. "
++    + "Otherwise the UDF calculates the fractional portion of the result based on a 31-day "
++    + "month and considers the difference in time components date1 and date2.\n"
++    + "date1 and date2 type can be date, timestamp or string in the format "
++    + "'yyyy-MM-dd' or 'yyyy-MM-dd HH:mm:ss'. "
++    + "The result is rounded to 8 decimal places.\n"
++    + " Example:\n"
++    + "  > SELECT _FUNC_('1997-02-28 10:30:00', '1996-10-30');\n 3.94959677")
++public class GenericUDFMonthsBetween extends GenericUDF {
++  private transient Converter[] tsConverters = new Converter[2];
++  private transient PrimitiveCategory[] tsInputTypes = new PrimitiveCategory[2];
++  private transient Converter[] dtConverters = new Converter[2];
++  private transient PrimitiveCategory[] dtInputTypes = new PrimitiveCategory[2];
++  private final Calendar cal1 = Calendar.getInstance();
++  private final Calendar cal2 = Calendar.getInstance();
++  private final DoubleWritable output = new DoubleWritable();
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    checkArgsSize(arguments, 2, 2);
++
++    checkArgPrimitive(arguments, 0);
++    checkArgPrimitive(arguments, 1);
++
++    // the function should support both short date and full timestamp format
++    // time part of the timestamp should not be skipped
++    checkArgGroups(arguments, 0, tsInputTypes, STRING_GROUP, DATE_GROUP);
++    checkArgGroups(arguments, 1, tsInputTypes, STRING_GROUP, DATE_GROUP);
++
++    checkArgGroups(arguments, 0, dtInputTypes, STRING_GROUP, DATE_GROUP);
++    checkArgGroups(arguments, 1, dtInputTypes, STRING_GROUP, DATE_GROUP);
++
++    obtainTimestampConverter(arguments, 0, tsInputTypes, tsConverters);
++    obtainTimestampConverter(arguments, 1, tsInputTypes, tsConverters);
++
++    obtainDateConverter(arguments, 0, dtInputTypes, dtConverters);
++    obtainDateConverter(arguments, 1, dtInputTypes, dtConverters);
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableDoubleObjectInspector;
++    return outputOI;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    // the function should support both short date and full timestamp format
++    // time part of the timestamp should not be skipped
++    Date date1 = getTimestampValue(arguments, 0, tsConverters);
++    if (date1 == null) {
++      date1 = getDateValue(arguments, 0, dtInputTypes, dtConverters);
++      if (date1 == null) {
++        return null;
++      }
++    }
++
++    Date date2 = getTimestampValue(arguments, 1, tsConverters);
++    if (date2 == null) {
++      date2 = getDateValue(arguments, 1, dtInputTypes, dtConverters);
++      if (date2 == null) {
++        return null;
++      }
++    }
++
++    cal1.setTime(date1);
++    cal2.setTime(date2);
++
++    // skip day/time part if both dates are end of the month
++    // or the same day of the month
++    int monDiffInt = (cal1.get(YEAR) - cal2.get(YEAR)) * 12 + (cal1.get(MONTH) - cal2.get(MONTH));
++    if (cal1.get(DATE) == cal2.get(DATE)
++        || (cal1.get(DATE) == cal1.getActualMaximum(DATE) && cal2.get(DATE) == cal2
++            .getActualMaximum(DATE))) {
++      output.set(monDiffInt);
++      return output;
++    }
++
++    int sec1 = getDayPartInSec(cal1);
++    int sec2 = getDayPartInSec(cal2);
++
++    // 1 sec is 0.000000373 months (1/2678400). 1 month is 31 days.
++    // there should be no adjustments for leap seconds
++    double monBtwDbl = monDiffInt + (sec1 - sec2) / 2678400D;
++    // Round a double to 8 decimal places.
++    double result = BigDecimal.valueOf(monBtwDbl).setScale(8, ROUND_HALF_UP).doubleValue();
++    output.set(result);
++    return output;
++  }
++
++  protected int getDayPartInSec(Calendar cal) {
++    int dd = cal.get(DATE);
++    int HH = cal.get(HOUR_OF_DAY);
++    int mm = cal.get(MINUTE);
++    int ss = cal.get(SECOND);
++    int dayInSec = dd * 86400 + HH * 3600 + mm * 60 + ss;
++    return dayInSec;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "months_between";
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFMonthsBetween.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFMonthsBetween.java
+new file mode 100644
+index 0000000..4e650b5
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFMonthsBetween.java
+@@ -0,0 +1,228 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import java.sql.Date;
++import java.sql.Timestamp;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDFMonthsBetween;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.io.DoubleWritable;
++import org.apache.hadoop.io.Text;
++
++import junit.framework.TestCase;
++
++public class TestGenericUDFMonthsBetween extends TestCase {
++
++  public void testMonthsBetweenForString() throws HiveException {
++    GenericUDFMonthsBetween udf = new GenericUDFMonthsBetween();
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector valueOI2 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    ObjectInspector[] arguments = { valueOI1, valueOI2 };
++
++    udf.initialize(arguments);
++
++    // test month diff with fraction considering time components
++    runTestStr("1995-02-02", "1995-01-01", 1.03225806, udf);
++    runTestStr("2003-07-17", "2005-07-06", -23.64516129, udf);
++    // test the last day of month
++    runTestStr("2001-06-30", "2000-05-31", 13.0, udf);
++    // test the same day of month
++    runTestStr("2000-06-01", "2004-07-01", -49.0, udf);
++    // test February of non-leap year, 2/28
++    runTestStr("2002-02-28", "2002-03-01", -0.12903226, udf);
++    // test February of non-leap year, 2/31 is viewd as 3/3 due to 3 days diff
++    // from 2/31 to 2/28
++    runTestStr("2002-02-31", "2002-03-01", 0.06451613, udf);
++
++    // test Feb of leap year, 2/29
++    runTestStr("2012-02-29", "2012-03-01", -0.09677419, udf);
++    // test february of leap year, 2/31 is viewed as 3/2 due to 2 days diff from
++    // 2/31 to 2/29
++    runTestStr("2012-02-31", "2012-03-01", 0.03225806, udf);
++
++    // time part
++    // test that there is no lead second adjustment
++    runTestStr("1976-01-01 00:00:00", "1975-12-31 23:59:59", 0.00000037, udf);
++    // test UDF considers the difference in time components date1 and date2
++    runTestStr("1997-02-28 10:30:00", "1996-10-30", 3.94959677, udf);
++    runTestStr("1996-10-30", "1997-02-28 10:30:00", -3.94959677, udf);
++
++    // if both are last day of the month then time part should be ignored
++    runTestStr("2002-03-31", "2002-02-28", 1.0, udf);
++    runTestStr("2002-03-31", "2002-02-28 10:30:00", 1.0, udf);
++    runTestStr("2002-03-31 10:30:00", "2002-02-28", 1.0, udf);
++    // if the same day of the month then time part should be ignored
++    runTestStr("2002-03-24", "2002-02-24", 1.0, udf);
++    runTestStr("2002-03-24", "2002-02-24 10:30:00", 1.0, udf);
++    runTestStr("2002-03-24 10:30:00", "2002-02-24", 1.0, udf);
++
++    // partial time. time part will be skipped
++    runTestStr("1995-02-02 10:39", "1995-01-01", 1.03225806, udf);
++    runTestStr("1995-02-02", "1995-01-01 10:39", 1.03225806, udf);
++    // no leading 0 for month and day should work
++    runTestStr("1995-02-2", "1995-1-01", 1.03225806, udf);
++    runTestStr("1995-2-02", "1995-01-1", 1.03225806, udf);
++    // short year should work
++    runTestStr("495-2-02", "495-01-1", 1.03225806, udf);
++    runTestStr("95-2-02", "95-01-1", 1.03225806, udf);
++    runTestStr("5-2-02", "5-01-1", 1.03225806, udf);
++
++    // Test with null args
++    runTestStr(null, "2002-03-01", null, udf);
++    runTestStr("2002-02-28", null, null, udf);
++    runTestStr(null, null, null, udf);
++
++    // string dates without day should be parsed to null
++    runTestStr("2002-03", "2002-02-24", null, udf);
++    runTestStr("2002-03-24", "2002-02", null, udf);
++  }
++
++  public void testMonthsBetweenForTimestamp() throws HiveException {
++    GenericUDFMonthsBetween udf = new GenericUDFMonthsBetween();
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++    ObjectInspector valueOI2 = PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++    ObjectInspector[] arguments = { valueOI1, valueOI2 };
++
++    udf.initialize(arguments);
++
++    // test month diff with fraction considering time components
++    runTestTs("1995-02-02 00:00:00", "1995-01-01 00:00:00", 1.03225806, udf);
++    runTestTs("2003-07-17 00:00:00", "2005-07-06 00:00:00", -23.64516129, udf);
++    // test the last day of month
++    runTestTs("2001-06-30 00:00:00", "2000-05-31 00:00:00", 13.0, udf);
++    // test the same day of month
++    runTestTs("2000-06-01 00:00:00", "2004-07-01 00:00:00", -49.0, udf);
++    // test February of non-leap year, 2/28
++    runTestTs("2002-02-28 00:00:00", "2002-03-01 00:00:00", -0.12903226, udf);
++    // test February of non-leap year, 2/31 is viewd as 3/3 due to 3 days diff
++    // from 2/31 to 2/28
++    runTestTs("2002-02-31 00:00:00", "2002-03-01 00:00:00", 0.06451613, udf);
++
++    // test Feb of leap year, 2/29
++    runTestTs("2012-02-29 00:00:00", "2012-03-01 00:00:00", -0.09677419, udf);
++    // test february of leap year, 2/31 is viewed as 3/2 due to 2 days diff from
++    // 2/31 to 2/29
++    runTestTs("2012-02-31 00:00:00", "2012-03-01 00:00:00", 0.03225806, udf);
++
++    // time part
++    // test that there is no lead second adjustment
++    runTestTs("1976-01-01 00:00:00", "1975-12-31 23:59:59", 0.00000037, udf);
++    // test UDF considers the difference in time components date1 and date2
++    runTestTs("1997-02-28 10:30:00", "1996-10-30 00:00:00", 3.94959677, udf);
++    runTestTs("1996-10-30 00:00:00", "1997-02-28 10:30:00", -3.94959677, udf);
++
++    // if both are last day of the month then time part should be ignored
++    runTestTs("2002-03-31 00:00:00", "2002-02-28 00:00:00", 1.0, udf);
++    runTestTs("2002-03-31 00:00:00", "2002-02-28 10:30:00", 1.0, udf);
++    runTestTs("2002-03-31 10:30:00", "2002-02-28 00:00:00", 1.0, udf);
++    // if the same day of the month then time part should be ignored
++    runTestTs("2002-03-24 00:00:00", "2002-02-24 00:00:00", 1.0, udf);
++    runTestTs("2002-03-24 00:00:00", "2002-02-24 10:30:00", 1.0, udf);
++    runTestTs("2002-03-24 10:30:00", "2002-02-24 00:00:00", 1.0, udf);
++
++    // Test with null args
++    runTestTs(null, "2002-03-01 00:00:00", null, udf);
++    runTestTs("2002-02-28 00:00:00", null, null, udf);
++    runTestTs(null, null, null, udf);
++  }
++
++  public void testMonthsBetweenForDate() throws HiveException {
++    GenericUDFMonthsBetween udf = new GenericUDFMonthsBetween();
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++    ObjectInspector valueOI2 = PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++    ObjectInspector[] arguments = { valueOI1, valueOI2 };
++
++    udf.initialize(arguments);
++
++    // test month diff with fraction considering time components
++    runTestDt("1995-02-02", "1995-01-01", 1.03225806, udf);
++    runTestDt("2003-07-17", "2005-07-06", -23.64516129, udf);
++    // test the last day of month
++    runTestDt("2001-06-30", "2000-05-31", 13.0, udf);
++    // test the same day of month
++    runTestDt("2000-06-01", "2004-07-01", -49.0, udf);
++    // test February of non-leap year, 2/28
++    runTestDt("2002-02-28", "2002-03-01", -0.12903226, udf);
++    // test February of non-leap year, 2/31 is viewd as 3/3 due to 3 days diff
++    // from 2/31 to 2/28
++    runTestDt("2002-02-31", "2002-03-01", 0.06451613, udf);
++
++    // test Feb of leap year, 2/29
++    runTestDt("2012-02-29", "2012-03-01", -0.09677419, udf);
++    // test february of leap year, 2/31 is viewed as 3/2 due to 2 days diff from
++    // 2/31 to 2/29
++    runTestDt("2012-02-31", "2012-03-01", 0.03225806, udf);
++    // Test with null args
++    runTestDt(null, "2002-03-01", null, udf);
++    runTestDt("2002-02-28", null, null, udf);
++    runTestDt(null, null, null, udf);
++  }
++
++  protected void runTestStr(String date1, String date2, Double expDiff, GenericUDFMonthsBetween udf)
++      throws HiveException {
++    DeferredJavaObject valueObj1 = new DeferredJavaObject(date1 == null ? null : new Text(date1));
++    DeferredJavaObject valueObj2 = new DeferredJavaObject(date2 == null ? null : new Text(date2));
++    DeferredObject[] args = new DeferredObject[] { valueObj1, valueObj2 };
++    DoubleWritable output = (DoubleWritable) udf.evaluate(args);
++    if (expDiff == null) {
++      assertNull("months_between() test for NULL STRING failed", output);
++    } else {
++      assertNotNull("months_between() test for NOT NULL STRING failed", output);
++      assertEquals("months_between() test for STRING failed", expDiff, output.get(), 0.00000001D);
++    }
++  }
++
++  protected void runTestTs(String ts1, String ts2, Double expDiff, GenericUDFMonthsBetween udf)
++      throws HiveException {
++    TimestampWritable tsWr1 = ts1 == null ? null : new TimestampWritable(Timestamp.valueOf(ts1));
++    TimestampWritable tsWr2 = ts2 == null ? null : new TimestampWritable(Timestamp.valueOf(ts2));
++    DeferredJavaObject valueObj1 = new DeferredJavaObject(tsWr1);
++    DeferredJavaObject valueObj2 = new DeferredJavaObject(tsWr2);
++    DeferredObject[] args = new DeferredObject[] { valueObj1, valueObj2 };
++    DoubleWritable output = (DoubleWritable) udf.evaluate(args);
++    if (expDiff == null) {
++      assertNull("months_between() test for NULL TIMESTAMP failed", output);
++    } else {
++      assertNotNull("months_between() test for NOT NULL TIMESTAMP failed", output);
++      assertEquals("months_between() test for TIMESTAMP failed", expDiff, output.get(), 0.00000001D);
++    }
++  }
++
++  protected void runTestDt(String dt1, String dt2, Double expDiff, GenericUDFMonthsBetween udf)
++      throws HiveException {
++    DateWritable dtWr1 = dt1 == null ? null : new DateWritable(Date.valueOf(dt1));
++    DateWritable dtWr2 = dt2 == null ? null : new DateWritable(Date.valueOf(dt2));
++    DeferredJavaObject valueObj1 = new DeferredJavaObject(dtWr1);
++    DeferredJavaObject valueObj2 = new DeferredJavaObject(dtWr2);
++    DeferredObject[] args = new DeferredObject[] { valueObj1, valueObj2 };
++    DoubleWritable output = (DoubleWritable) udf.evaluate(args);
++    if (expDiff == null) {
++      assertNull("months_between() test for NULL DATE failed", output);
++    } else {
++      assertNotNull("months_between() test for NOT NULL DATE failed", output);
++      assertEquals("months_between() test for DATE failed", expDiff, output.get(), 0.00000001D);
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/udf_months_between.q b/ql/src/test/queries/clientpositive/udf_months_between.q
+new file mode 100644
+index 0000000..9c7196f
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_months_between.q
+@@ -0,0 +1,88 @@
++describe function months_between;
++desc function extended months_between;
++
++--test string format
++explain select months_between('1995-02-02', '1995-01-01');
++
++select
++  months_between('1995-02-02', '1995-01-01'),
++  months_between('2003-07-17', '2005-07-06'),
++  months_between('2001-06-30', '2000-05-31'),
++  months_between('2000-06-01', '2004-07-01'),
++  months_between('2002-02-28', '2002-03-01'),
++  months_between('2002-02-31', '2002-03-01'),
++  months_between('2012-02-29', '2012-03-01'),
++  months_between('2012-02-31', '2012-03-01'),
++  months_between('1976-01-01 00:00:00', '1975-12-31 23:59:59'),
++  months_between('1976-01-01', '1975-12-31 23:59:59'),
++  months_between('1997-02-28 10:30:00', '1996-10-30'),
++  -- if both are last day of the month then time part should be ignored
++  months_between('2002-03-31', '2002-02-28'),
++  months_between('2002-03-31', '2002-02-28 10:30:00'),
++  months_between('2002-03-31 10:30:00', '2002-02-28'),
++  -- if the same day of the month then time part should be ignored
++  months_between('2002-03-24', '2002-02-24'),
++  months_between('2002-03-24', '2002-02-24 10:30:00'),
++  months_between('2002-03-24 10:30:00', '2002-02-24'),
++  -- partial time. time part will be skipped
++  months_between('1995-02-02 10:39', '1995-01-01'),
++  months_between('1995-02-02', '1995-01-01 10:39'),
++  -- no leading 0 for month and day should work
++  months_between('1995-02-2', '1995-1-01'),
++  months_between('1995-2-02', '1995-01-1'),
++  -- short year should work
++  months_between('495-2-02', '495-01-1'),
++  months_between('95-2-02', '95-01-1'),
++  months_between('5-2-02', '5-01-1');
++
++--test timestamp format
++select
++  months_between(cast('1995-02-02 00:00:00' as timestamp), cast('1995-01-01 00:00:00' as timestamp)),
++  months_between(cast('2003-07-17 00:00:00' as timestamp), cast('2005-07-06 00:00:00' as timestamp)),
++  months_between(cast('2001-06-30 00:00:00' as timestamp), cast('2000-05-31 00:00:00' as timestamp)),
++  months_between(cast('2000-06-01 00:00:00' as timestamp), cast('2004-07-01 00:00:00' as timestamp)),
++  months_between(cast('2002-02-28 00:00:00' as timestamp), cast('2002-03-01 00:00:00' as timestamp)),
++  months_between(cast('2002-02-31 00:00:00' as timestamp), cast('2002-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-29 00:00:00' as timestamp), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-31 00:00:00' as timestamp), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('1976-01-01 00:00:00' as timestamp), cast('1975-12-31 23:59:59' as timestamp)),
++  months_between(cast('1976-01-01' as date), cast('1975-12-31 23:59:59' as timestamp)),
++  months_between(cast('1997-02-28 10:30:00' as timestamp), cast('1996-10-30' as date)),
++  -- if both are last day of the month then time part should be ignored
++  months_between(cast('2002-03-31 00:00:00' as timestamp), cast('2002-02-28 00:00:00' as timestamp)),
++  months_between(cast('2002-03-31 00:00:00' as timestamp), cast('2002-02-28 10:30:00' as timestamp)),
++  months_between(cast('2002-03-31 10:30:00' as timestamp), cast('2002-02-28 00:00:00' as timestamp)),
++  -- if the same day of the month then time part should be ignored
++  months_between(cast('2002-03-24 00:00:00' as timestamp), cast('2002-02-24 00:00:00' as timestamp)),
++  months_between(cast('2002-03-24 00:00:00' as timestamp), cast('2002-02-24 10:30:00' as timestamp)),
++  months_between(cast('2002-03-24 10:30:00' as timestamp), cast('2002-02-24 00:00:00' as timestamp));
++
++--test date format
++select
++  months_between(cast('1995-02-02' as date), cast('1995-01-01' as date)),
++  months_between(cast('2003-07-17' as date), cast('2005-07-06' as date)),
++  months_between(cast('2001-06-30' as date), cast('2000-05-31' as date)),
++  months_between(cast('2000-06-01' as date), cast('2004-07-01' as date)),
++  months_between(cast('2002-02-28' as date), cast('2002-03-01' as date)),
++  months_between(cast('2002-02-31' as date), cast('2002-03-01' as date)),
++  months_between(cast('2012-02-29' as date), cast('2012-03-01' as date)),
++  months_between(cast('2012-02-31' as date), cast('2012-03-01' as date));
++
++--test misc with null
++select
++  months_between(cast(null as string), '2012-03-01'),
++  months_between('2012-02-31', cast(null as timestamp)),
++  months_between(cast(null as timestamp), cast(null as date)),
++  months_between(cast(null as string), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-31 00:00:00' as timestamp), cast(null as string)),
++  months_between(cast(null as timestamp), cast('2012-03-01' as string)),
++  months_between(cast('2012-02-31' as date), cast(null as string)),
++  months_between('2012-02-10', cast(null as string)),
++  months_between(cast(null as string), '2012-02-10'),
++  months_between(cast(null as string), cast(null as string)),
++  months_between('2012-02-10', cast(null as timestamp)),
++  months_between(cast(null as timestamp), '2012-02-10'),
++  months_between(cast(null as timestamp), cast(null as timestamp)),
++  -- string dates without day should be parsed to null
++  months_between('2012-03', '2012-02-24'),
++  months_between('2012-03-24', '2012-02');
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index ebcdd06..868c80d 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -126,6 +126,7 @@ md5
+ min
+ minute
+ month
++months_between
+ named_struct
+ negative
+ next_day
+@@ -329,6 +330,7 @@ md5
+ min
+ minute
+ month
++months_between
+ xpath
+ xpath_boolean
+ xpath_double
+diff --git a/ql/src/test/results/clientpositive/udf_months_between.q.out b/ql/src/test/results/clientpositive/udf_months_between.q.out
+new file mode 100644
+index 0000000..95f756f
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_months_between.q.out
+@@ -0,0 +1,225 @@
++PREHOOK: query: describe function months_between
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: describe function months_between
++POSTHOOK: type: DESCFUNCTION
++months_between(date1, date2) - returns number of months between dates date1 and date2
++PREHOOK: query: desc function extended months_between
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: desc function extended months_between
++POSTHOOK: type: DESCFUNCTION
++months_between(date1, date2) - returns number of months between dates date1 and date2
++If date1 is later than date2, then the result is positive. If date1 is earlier than date2, then the result is negative. If date1 and date2 are either the same days of the month or both last days of months, then the result is always an integer. Otherwise the UDF calculates the fractional portion of the result based on a 31-day month and considers the difference in time components date1 and date2.
++date1 and date2 type can be date, timestamp or string in the format 'yyyy-MM-dd' or 'yyyy-MM-dd HH:mm:ss'. The result is rounded to 8 decimal places.
++ Example:
++  > SELECT months_between('1997-02-28 10:30:00', '1996-10-30');
++ 3.94959677
++PREHOOK: query: --test string format
++explain select months_between('1995-02-02', '1995-01-01')
++PREHOOK: type: QUERY
++POSTHOOK: query: --test string format
++explain select months_between('1995-02-02', '1995-01-01')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 1.03225806 (type: double)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++  months_between('1995-02-02', '1995-01-01'),
++  months_between('2003-07-17', '2005-07-06'),
++  months_between('2001-06-30', '2000-05-31'),
++  months_between('2000-06-01', '2004-07-01'),
++  months_between('2002-02-28', '2002-03-01'),
++  months_between('2002-02-31', '2002-03-01'),
++  months_between('2012-02-29', '2012-03-01'),
++  months_between('2012-02-31', '2012-03-01'),
++  months_between('1976-01-01 00:00:00', '1975-12-31 23:59:59'),
++  months_between('1976-01-01', '1975-12-31 23:59:59'),
++  months_between('1997-02-28 10:30:00', '1996-10-30'),
++  -- if both are last day of the month then time part should be ignored
++  months_between('2002-03-31', '2002-02-28'),
++  months_between('2002-03-31', '2002-02-28 10:30:00'),
++  months_between('2002-03-31 10:30:00', '2002-02-28'),
++  -- if the same day of the month then time part should be ignored
++  months_between('2002-03-24', '2002-02-24'),
++  months_between('2002-03-24', '2002-02-24 10:30:00'),
++  months_between('2002-03-24 10:30:00', '2002-02-24'),
++  -- partial time. time part will be skipped
++  months_between('1995-02-02 10:39', '1995-01-01'),
++  months_between('1995-02-02', '1995-01-01 10:39'),
++  -- no leading 0 for month and day should work
++  months_between('1995-02-2', '1995-1-01'),
++  months_between('1995-2-02', '1995-01-1'),
++  -- short year should work
++  months_between('495-2-02', '495-01-1'),
++  months_between('95-2-02', '95-01-1'),
++  months_between('5-2-02', '5-01-1')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++  months_between('1995-02-02', '1995-01-01'),
++  months_between('2003-07-17', '2005-07-06'),
++  months_between('2001-06-30', '2000-05-31'),
++  months_between('2000-06-01', '2004-07-01'),
++  months_between('2002-02-28', '2002-03-01'),
++  months_between('2002-02-31', '2002-03-01'),
++  months_between('2012-02-29', '2012-03-01'),
++  months_between('2012-02-31', '2012-03-01'),
++  months_between('1976-01-01 00:00:00', '1975-12-31 23:59:59'),
++  months_between('1976-01-01', '1975-12-31 23:59:59'),
++  months_between('1997-02-28 10:30:00', '1996-10-30'),
++  -- if both are last day of the month then time part should be ignored
++  months_between('2002-03-31', '2002-02-28'),
++  months_between('2002-03-31', '2002-02-28 10:30:00'),
++  months_between('2002-03-31 10:30:00', '2002-02-28'),
++  -- if the same day of the month then time part should be ignored
++  months_between('2002-03-24', '2002-02-24'),
++  months_between('2002-03-24', '2002-02-24 10:30:00'),
++  months_between('2002-03-24 10:30:00', '2002-02-24'),
++  -- partial time. time part will be skipped
++  months_between('1995-02-02 10:39', '1995-01-01'),
++  months_between('1995-02-02', '1995-01-01 10:39'),
++  -- no leading 0 for month and day should work
++  months_between('1995-02-2', '1995-1-01'),
++  months_between('1995-2-02', '1995-01-1'),
++  -- short year should work
++  months_between('495-2-02', '495-01-1'),
++  months_between('95-2-02', '95-01-1'),
++  months_between('5-2-02', '5-01-1')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++1.03225806	-23.64516129	13.0	-49.0	-0.12903226	0.06451613	-0.09677419	0.03225806	3.7E-7	3.7E-7	3.94959677	1.0	1.0	1.0	1.0	1.0	1.0	1.03225806	1.03225806	1.03225806	1.03225806	1.03225806	1.03225806	1.03225806
++PREHOOK: query: --test timestamp format
++select
++  months_between(cast('1995-02-02 00:00:00' as timestamp), cast('1995-01-01 00:00:00' as timestamp)),
++  months_between(cast('2003-07-17 00:00:00' as timestamp), cast('2005-07-06 00:00:00' as timestamp)),
++  months_between(cast('2001-06-30 00:00:00' as timestamp), cast('2000-05-31 00:00:00' as timestamp)),
++  months_between(cast('2000-06-01 00:00:00' as timestamp), cast('2004-07-01 00:00:00' as timestamp)),
++  months_between(cast('2002-02-28 00:00:00' as timestamp), cast('2002-03-01 00:00:00' as timestamp)),
++  months_between(cast('2002-02-31 00:00:00' as timestamp), cast('2002-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-29 00:00:00' as timestamp), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-31 00:00:00' as timestamp), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('1976-01-01 00:00:00' as timestamp), cast('1975-12-31 23:59:59' as timestamp)),
++  months_between(cast('1976-01-01' as date), cast('1975-12-31 23:59:59' as timestamp)),
++  months_between(cast('1997-02-28 10:30:00' as timestamp), cast('1996-10-30' as date)),
++  -- if both are last day of the month then time part should be ignored
++  months_between(cast('2002-03-31 00:00:00' as timestamp), cast('2002-02-28 00:00:00' as timestamp)),
++  months_between(cast('2002-03-31 00:00:00' as timestamp), cast('2002-02-28 10:30:00' as timestamp)),
++  months_between(cast('2002-03-31 10:30:00' as timestamp), cast('2002-02-28 00:00:00' as timestamp)),
++  -- if the same day of the month then time part should be ignored
++  months_between(cast('2002-03-24 00:00:00' as timestamp), cast('2002-02-24 00:00:00' as timestamp)),
++  months_between(cast('2002-03-24 00:00:00' as timestamp), cast('2002-02-24 10:30:00' as timestamp)),
++  months_between(cast('2002-03-24 10:30:00' as timestamp), cast('2002-02-24 00:00:00' as timestamp))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --test timestamp format
++select
++  months_between(cast('1995-02-02 00:00:00' as timestamp), cast('1995-01-01 00:00:00' as timestamp)),
++  months_between(cast('2003-07-17 00:00:00' as timestamp), cast('2005-07-06 00:00:00' as timestamp)),
++  months_between(cast('2001-06-30 00:00:00' as timestamp), cast('2000-05-31 00:00:00' as timestamp)),
++  months_between(cast('2000-06-01 00:00:00' as timestamp), cast('2004-07-01 00:00:00' as timestamp)),
++  months_between(cast('2002-02-28 00:00:00' as timestamp), cast('2002-03-01 00:00:00' as timestamp)),
++  months_between(cast('2002-02-31 00:00:00' as timestamp), cast('2002-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-29 00:00:00' as timestamp), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-31 00:00:00' as timestamp), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('1976-01-01 00:00:00' as timestamp), cast('1975-12-31 23:59:59' as timestamp)),
++  months_between(cast('1976-01-01' as date), cast('1975-12-31 23:59:59' as timestamp)),
++  months_between(cast('1997-02-28 10:30:00' as timestamp), cast('1996-10-30' as date)),
++  -- if both are last day of the month then time part should be ignored
++  months_between(cast('2002-03-31 00:00:00' as timestamp), cast('2002-02-28 00:00:00' as timestamp)),
++  months_between(cast('2002-03-31 00:00:00' as timestamp), cast('2002-02-28 10:30:00' as timestamp)),
++  months_between(cast('2002-03-31 10:30:00' as timestamp), cast('2002-02-28 00:00:00' as timestamp)),
++  -- if the same day of the month then time part should be ignored
++  months_between(cast('2002-03-24 00:00:00' as timestamp), cast('2002-02-24 00:00:00' as timestamp)),
++  months_between(cast('2002-03-24 00:00:00' as timestamp), cast('2002-02-24 10:30:00' as timestamp)),
++  months_between(cast('2002-03-24 10:30:00' as timestamp), cast('2002-02-24 00:00:00' as timestamp))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++1.03225806	-23.64516129	13.0	-49.0	-0.12903226	0.06451613	-0.09677419	0.03225806	3.7E-7	3.7E-7	3.94959677	1.0	1.0	1.0	1.0	1.0	1.0
++PREHOOK: query: --test date format
++select
++  months_between(cast('1995-02-02' as date), cast('1995-01-01' as date)),
++  months_between(cast('2003-07-17' as date), cast('2005-07-06' as date)),
++  months_between(cast('2001-06-30' as date), cast('2000-05-31' as date)),
++  months_between(cast('2000-06-01' as date), cast('2004-07-01' as date)),
++  months_between(cast('2002-02-28' as date), cast('2002-03-01' as date)),
++  months_between(cast('2002-02-31' as date), cast('2002-03-01' as date)),
++  months_between(cast('2012-02-29' as date), cast('2012-03-01' as date)),
++  months_between(cast('2012-02-31' as date), cast('2012-03-01' as date))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --test date format
++select
++  months_between(cast('1995-02-02' as date), cast('1995-01-01' as date)),
++  months_between(cast('2003-07-17' as date), cast('2005-07-06' as date)),
++  months_between(cast('2001-06-30' as date), cast('2000-05-31' as date)),
++  months_between(cast('2000-06-01' as date), cast('2004-07-01' as date)),
++  months_between(cast('2002-02-28' as date), cast('2002-03-01' as date)),
++  months_between(cast('2002-02-31' as date), cast('2002-03-01' as date)),
++  months_between(cast('2012-02-29' as date), cast('2012-03-01' as date)),
++  months_between(cast('2012-02-31' as date), cast('2012-03-01' as date))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++1.03225806	-23.64516129	13.0	-49.0	-0.12903226	0.06451613	-0.09677419	0.03225806
++PREHOOK: query: --test misc with null
++select
++  months_between(cast(null as string), '2012-03-01'),
++  months_between('2012-02-31', cast(null as timestamp)),
++  months_between(cast(null as timestamp), cast(null as date)),
++  months_between(cast(null as string), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-31 00:00:00' as timestamp), cast(null as string)),
++  months_between(cast(null as timestamp), cast('2012-03-01' as string)),
++  months_between(cast('2012-02-31' as date), cast(null as string)),
++  months_between('2012-02-10', cast(null as string)),
++  months_between(cast(null as string), '2012-02-10'),
++  months_between(cast(null as string), cast(null as string)),
++  months_between('2012-02-10', cast(null as timestamp)),
++  months_between(cast(null as timestamp), '2012-02-10'),
++  months_between(cast(null as timestamp), cast(null as timestamp)),
++  -- string dates without day should be parsed to null
++  months_between('2012-03', '2012-02-24'),
++  months_between('2012-03-24', '2012-02')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --test misc with null
++select
++  months_between(cast(null as string), '2012-03-01'),
++  months_between('2012-02-31', cast(null as timestamp)),
++  months_between(cast(null as timestamp), cast(null as date)),
++  months_between(cast(null as string), cast('2012-03-01 00:00:00' as timestamp)),
++  months_between(cast('2012-02-31 00:00:00' as timestamp), cast(null as string)),
++  months_between(cast(null as timestamp), cast('2012-03-01' as string)),
++  months_between(cast('2012-02-31' as date), cast(null as string)),
++  months_between('2012-02-10', cast(null as string)),
++  months_between(cast(null as string), '2012-02-10'),
++  months_between(cast(null as string), cast(null as string)),
++  months_between('2012-02-10', cast(null as timestamp)),
++  months_between(cast(null as timestamp), '2012-02-10'),
++  months_between(cast(null as timestamp), cast(null as timestamp)),
++  -- string dates without day should be parsed to null
++  months_between('2012-03', '2012-02-24'),
++  months_between('2012-03-24', '2012-02')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+-- 
+1.7.9.5
+

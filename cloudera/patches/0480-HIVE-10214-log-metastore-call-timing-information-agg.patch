@@ -1,0 +1,348 @@
+From 84dbb85daf6a33d875325c4aba240008191cfe44 Mon Sep 17 00:00:00 2001
+From: Thejas Nair <thejas@apache.org>
+Date: Wed, 8 Apr 2015 00:16:28 +0000
+Subject: [PATCH 0480/1164] HIVE-10214 : log metastore call timing information
+ aggregated at query level (Thejas Nair, reviewed
+ by Vaibhav Gumashta)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1671981 13f79535-47bb-0310-9956-ffa450edef68
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+
+Change-Id: I508e6aea8d7283cfd6a9e4debe427d85facbfdaa
+---
+ .../hive/metastore/RetryingMetaStoreClient.java    |   57 +++++++++++++++++---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   19 +++++--
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   38 ++++++++++++-
+ .../apache/hadoop/hive/ql/metadata/TestHive.java   |   49 ++++++++++++++++-
+ 4 files changed, 150 insertions(+), 13 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
+index 3f08ebf..f9a5c40 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
+@@ -24,13 +24,13 @@
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
+ import java.lang.reflect.UndeclaredThrowableException;
++import java.util.Map;
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+-import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.thrift.TApplicationException;
+ import org.apache.thrift.TException;
+@@ -51,14 +51,17 @@
+   private final IMetaStoreClient base;
+   private final int retryLimit;
+   private final long retryDelaySeconds;
++  private final Map<String, Long> metaCallTimeMap;
++
+ 
+ 
+ 
+   protected RetryingMetaStoreClient(HiveConf hiveConf, HiveMetaHookLoader hookLoader,
+-      Class<? extends IMetaStoreClient> msClientClass) throws MetaException {
++      Map<String, Long> metaCallTimeMap, Class<? extends IMetaStoreClient> msClientClass) throws MetaException {
+     this.retryLimit = hiveConf.getIntVar(HiveConf.ConfVars.METASTORETHRIFTFAILURERETRIES);
+     this.retryDelaySeconds = hiveConf.getTimeVar(
+         HiveConf.ConfVars.METASTORE_CLIENT_CONNECT_RETRY_DELAY, TimeUnit.SECONDS);
++    this.metaCallTimeMap = metaCallTimeMap;
+ 
+     reloginExpiringKeytabUser();
+     this.base = MetaStoreUtils.newInstance(msClientClass, new Class[] {
+@@ -67,14 +70,20 @@ protected RetryingMetaStoreClient(HiveConf hiveConf, HiveMetaHookLoader hookLoad
+ 
+   public static IMetaStoreClient getProxy(HiveConf hiveConf, HiveMetaHookLoader hookLoader,
+       String mscClassName) throws MetaException {
++    return getProxy(hiveConf, hookLoader, null, mscClassName);
++  }
++
++  public static IMetaStoreClient getProxy(HiveConf hiveConf, HiveMetaHookLoader hookLoader,
++      Map<String, Long> metaCallTimeMap, String mscClassName) throws MetaException {
+ 
+-    Class<? extends IMetaStoreClient> baseClass = (Class<? extends IMetaStoreClient>)
+-        MetaStoreUtils.getClass(mscClassName);
++    Class<? extends IMetaStoreClient> baseClass = (Class<? extends IMetaStoreClient>) MetaStoreUtils
++        .getClass(mscClassName);
+ 
+-    RetryingMetaStoreClient handler = new RetryingMetaStoreClient(hiveConf, hookLoader, baseClass);
++    RetryingMetaStoreClient handler = new RetryingMetaStoreClient(hiveConf, hookLoader,
++        metaCallTimeMap, baseClass);
+ 
+-    return (IMetaStoreClient) Proxy.newProxyInstance(RetryingMetaStoreClient.class.getClassLoader(),
+-        baseClass.getInterfaces(), handler);
++    return (IMetaStoreClient) Proxy.newProxyInstance(
++        RetryingMetaStoreClient.class.getClassLoader(), baseClass.getInterfaces(), handler);
+   }
+ 
+   @Override
+@@ -88,7 +97,15 @@ public Object invoke(Object proxy, Method method, Object[] args) throws Throwabl
+         if(retriesMade > 0){
+           base.reconnect();
+         }
+-        ret = method.invoke(base, args);
++        if (metaCallTimeMap == null) {
++          ret = method.invoke(base, args);
++        } else {
++          // need to capture the timing
++          long startTime = System.currentTimeMillis();
++          ret = method.invoke(base, args);
++          long timeTaken = System.currentTimeMillis() - startTime;
++          addMethodTime(method, timeTaken);
++        }
+         break;
+       } catch (UndeclaredThrowableException e) {
+         throw e.getCause();
+@@ -129,6 +146,30 @@ public Object invoke(Object proxy, Method method, Object[] args) throws Throwabl
+     return ret;
+   }
+ 
++  private void addMethodTime(Method method, long timeTaken) {
++    String methodStr = getMethodString(method);
++    Long curTime = metaCallTimeMap.get(methodStr);
++    if (curTime != null) {
++      timeTaken += curTime;
++    }
++    metaCallTimeMap.put(methodStr, timeTaken);
++  }
++
++  /**
++   * @param method
++   * @return String representation with arg types. eg getDatabase_(String, )
++   */
++  private String getMethodString(Method method) {
++    StringBuilder methodSb = new StringBuilder(method.getName());
++    methodSb.append("_(");
++    for (Class<?> paramClass : method.getParameterTypes()) {
++      methodSb.append(paramClass.getSimpleName());
++      methodSb.append(", ");
++    }
++    methodSb.append(")");
++    return methodSb.toString();
++  }
++
+   /**
+    * Relogin if login user is logged in using keytab
+    * Relogin is actually done by ugi code only if sufficient time has passed
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 0a4904d..0c5a403 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -503,7 +503,6 @@ public int compile(String command, boolean resetTaskIds) {
+               + explainOutput);
+         }
+       }
+-
+       return 0;
+     } catch (Exception e) {
+       ErrorMsg error = ErrorMsg.getErrorMsg(e.getMessage());
+@@ -526,11 +525,21 @@ public int compile(String command, boolean resetTaskIds) {
+       return error.getErrorCode();
+     } finally {
+       double duration = perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.COMPILE)/1000.00;
++      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.COMPILE);
++      dumpMetaCallTimingWithoutEx("compilation");
+       restoreSession(queryState);
+       LOG.info("Completed compiling command(queryId=" + queryId + "); Time taken: " + duration + " seconds");
+     }
+   }
+ 
++  private void dumpMetaCallTimingWithoutEx(String phase) {
++    try {
++      Hive.get().dumpAndClearMetaCallTiming(phase);
++    } catch (HiveException he) {
++      LOG.warn("Caught exception attempting to write metadata call information " + he, he);
++    }
++  }
++
+   /**
+    * Returns EXPLAIN EXTENDED output for a semantically
+    * analyzed query.
+@@ -1282,7 +1291,6 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+         return createProcessorResponse(ret);
+       }
+     }
+-
+     ret = execute();
+     if (ret != 0) {
+       //if needRequireLock is false, the release here will do nothing because there is no lock
+@@ -1406,7 +1414,6 @@ private boolean validateConfVariables() {
+   public int execute() throws CommandNeedRetryException {
+     PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.DRIVER_EXECUTE);
+-
+     boolean noName = StringUtils.isEmpty(conf.getVar(HiveConf.ConfVars.HADOOPJOBNAME));
+     int maxlen = conf.getIntVar(HiveConf.ConfVars.HIVEJOBNAMELENGTH);
+ 
+@@ -1419,6 +1426,10 @@ public int execute() throws CommandNeedRetryException {
+ 
+     try {
+       LOG.info("Executing command(queryId=" + queryId + "): " + queryStr);
++      // compile and execute can get called from different threads in case of HS2
++      // so clear timing in this thread's Hive object before proceeding.
++      Hive.get().clearMetaCallTiming();
++
+       plan.setStarted();
+ 
+       if (SessionState.get() != null) {
+@@ -1647,6 +1658,8 @@ public int execute() throws CommandNeedRetryException {
+         conf.setVar(HiveConf.ConfVars.HADOOPJOBNAME, "");
+       }
+       double duration = perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.DRIVER_EXECUTE)/1000.00;
++      dumpMetaCallTimingWithoutEx("execution");
++      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.DRIVER_EXECUTE);
+ 
+       Map<String, MapRedStats> stats = SessionState.get().getMapRedStats();
+       if (stats != null && !stats.isEmpty()) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 9939e9d..677807c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -140,6 +140,9 @@
+   private IMetaStoreClient metaStoreClient;
+   private UserGroupInformation owner;
+ 
++  // metastore calls timing information
++  private final Map<String, Long> metaCallTimeMap = new HashMap<String, Long>();
++
+   private static ThreadLocal<Hive> hiveDB = new ThreadLocal<Hive>() {
+     @Override
+     protected synchronized Hive initialValue() {
+@@ -2928,7 +2931,7 @@ public HiveMetaHook getHook(
+           }
+         }
+       };
+-    return RetryingMetaStoreClient.getProxy(conf, hookLoader,
++    return RetryingMetaStoreClient.getProxy(conf, hookLoader, metaCallTimeMap,
+         SessionHiveMetaStoreClient.class.getName());
+   }
+ 
+@@ -3202,4 +3205,37 @@ public String getMetaConf(String propName) throws HiveException {
+       throw new HiveException(te);
+     }
+   }
++
++  public void clearMetaCallTiming() {
++    metaCallTimeMap.clear();
++  }
++
++  public void dumpAndClearMetaCallTiming(String phase) {
++    boolean phaseInfoLogged = false;
++    if (LOG.isDebugEnabled()) {
++      phaseInfoLogged = logDumpPhase(phase);
++      LOG.debug("Total time spent in each metastore function (ms): " + metaCallTimeMap);
++    }
++
++    if (LOG.isInfoEnabled()) {
++      // print information about calls that took longer time at INFO level
++      for (Entry<String, Long> callTime : metaCallTimeMap.entrySet()) {
++        // dump information if call took more than 1 sec (1000ms)
++        if (callTime.getValue() > 1000) {
++          if (!phaseInfoLogged) {
++            phaseInfoLogged = logDumpPhase(phase);
++          }
++          LOG.info("Total time spent in this metastore function was greater than 1000ms : "
++              + callTime);
++        }
++      }
++    }
++    metaCallTimeMap.clear();
++  }
++
++  private boolean logDumpPhase(String phase) {
++    LOG.info("Dumping metastore api call timing information for : " + phase + " phase");
++    return true;
++  }
++
+ };
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
+index c115ec6..c8c38a4 100755
+--- a/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/metadata/TestHive.java
+@@ -20,6 +20,7 @@
+ 
+ import static org.apache.hadoop.hive.metastore.MetaStoreUtils.DEFAULT_DATABASE_NAME;
+ 
++import java.io.StringWriter;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -28,7 +29,6 @@
+ import java.util.Map;
+ import java.util.regex.Pattern;
+ 
+-import com.google.common.collect.ImmutableMap;
+ import junit.framework.TestCase;
+ 
+ import org.apache.hadoop.fs.FileStatus;
+@@ -56,7 +56,14 @@
+ import org.apache.hadoop.mapred.SequenceFileOutputFormat;
+ import org.apache.hadoop.mapred.TextInputFormat;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.log4j.Level;
++import org.apache.log4j.Logger;
++import org.apache.log4j.PatternLayout;
++import org.apache.log4j.WriterAppender;
+ import org.apache.thrift.protocol.TBinaryProtocol;
++import org.junit.Assert;
++
++import com.google.common.collect.ImmutableMap;
+ 
+ /**
+  * TestHive.
+@@ -234,6 +241,46 @@ public void testThriftTable() throws Throwable {
+     }
+   }
+ 
++
++  /**
++   * Test logging of timing for metastore api calls
++   *
++   * @throws Throwable
++   */
++  public void testMetaStoreApiTiming() throws Throwable {
++    // set log level to DEBUG, as this is logged at debug level
++    Logger logger = Logger.getLogger("hive.ql.metadata.Hive");
++    Level origLevel = logger.getLevel();
++    logger.setLevel(Level.DEBUG);
++
++    // create an appender to capture the logs in a string
++    StringWriter writer = new StringWriter();
++    WriterAppender appender = new WriterAppender(new PatternLayout(), writer);
++
++    try {
++      logger.addAppender(appender);
++
++      hm.clearMetaCallTiming();
++      hm.getAllDatabases();
++      hm.dumpAndClearMetaCallTiming("test");
++      String logStr = writer.toString();
++      String expectedString = "getAllDatabases_()=";
++      Assert.assertTrue(logStr + " should contain <" + expectedString,
++          logStr.contains(expectedString));
++
++      // reset the log buffer, verify new dump without any api call does not contain func
++      writer.getBuffer().setLength(0);
++      hm.dumpAndClearMetaCallTiming("test");
++      logStr = writer.toString();
++      Assert.assertFalse(logStr + " should not contain <" + expectedString,
++          logStr.contains(expectedString));
++
++    } finally {
++      logger.setLevel(origLevel);
++      logger.removeAppender(appender);
++    }
++  }
++
+   /**
+    * Gets a table from the metastore and compares it to the original Table
+    *
+-- 
+1.7.9.5
+

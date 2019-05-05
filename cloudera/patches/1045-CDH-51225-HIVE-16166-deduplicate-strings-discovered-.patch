@@ -1,0 +1,255 @@
+From 0217a3e3e80e4d9772888c63d56a05dee382126a Mon Sep 17 00:00:00 2001
+From: Misha Dmitriev <misha@cloudera.com>
+Date: Mon, 6 Mar 2017 13:46:56 -0800
+Subject: [PATCH 1045/1164] CDH-51225 HIVE-16166 : deduplicate strings
+ discovered in Citi simulation workloads.
+
+Change-Id: Id247c60ef8ebca00097803c7bed2d631ec910012
+---
+ .../hadoop/hive/common/StringInternUtils.java      |   16 ++++++++++++----
+ .../org/apache/hadoop/hive/ql/exec/ColumnInfo.java |    7 ++++---
+ .../apache/hadoop/hive/ql/hooks/LineageInfo.java   |    3 ++-
+ .../hadoop/hive/ql/plan/ExprNodeConstantDesc.java  |    6 +++++-
+ .../org/apache/hadoop/hive/ql/plan/TableDesc.java  |    4 +++-
+ .../apache/hadoop/hive/serde2/avro/AvroSerDe.java  |    5 +++--
+ .../objectinspector/ObjectInspectorFactory.java    |   11 +++++++----
+ .../StandardStructObjectInspector.java             |    2 +-
+ 8 files changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java b/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java
+index 828e45d..3bc4fac 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java
+@@ -104,13 +104,21 @@ public static Path internUriStringsInPath(Path path) {
+    * This method interns all the strings in the given list in place. That is,
+    * it iterates over the list, replaces each element with the interned copy
+    * and eventually returns the same list.
++   *
++   * Note that the provided List implementation should return an iterator
++   * (via list.listIterator()) method, and that iterator should implement
++   * the set(Object) method. That's what all List implementations in the JDK
++   * provide. However, if some custom List implementation doesn't have this
++   * functionality, this method will return without interning its elements.
+    */
+   public static List<String> internStringsInList(List<String> list) {
+     if (list != null) {
+-      ListIterator<String> it = list.listIterator();
+-      while (it.hasNext()) {
+-        it.set(it.next().intern());
+-      }
++      try {
++        ListIterator<String> it = list.listIterator();
++        while (it.hasNext()) {
++          it.set(it.next().intern());
++        }
++      } catch (UnsupportedOperationException e) { } // set() not implemented - ignore
+     }
+     return list;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java
+index e3da7f0..bb8dcbb 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ColumnInfo.java
+@@ -20,6 +20,7 @@
+ 
+ import java.io.Serializable;
+ 
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+@@ -96,7 +97,7 @@ public ColumnInfo(String internalName, ObjectInspector objectInspector,
+     this.tabAlias = tabAlias;
+     this.isVirtualCol = isVirtualCol;
+     this.isHiddenVirtualCol = isHiddenVirtualCol;
+-    this.typeName = getType().getTypeName();
++    setTypeName(getType().getTypeName());
+   }
+ 
+   public ColumnInfo(ColumnInfo columnInfo) {
+@@ -114,7 +115,7 @@ public String getTypeName() {
+   }
+ 
+   public void setTypeName(String typeName) {
+-    this.typeName = typeName;
++    this.typeName = StringInternUtils.internIfNotNull(typeName);
+   }
+ 
+   public TypeInfo getType() {
+@@ -160,7 +161,7 @@ public String toString() {
+   }
+ 
+   public void setAlias(String col_alias) {
+-    alias = col_alias;
++    alias = StringInternUtils.internIfNotNull(col_alias);
+   }
+ 
+   public String getAlias() {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/hooks/LineageInfo.java b/ql/src/java/org/apache/hadoop/hive/ql/hooks/LineageInfo.java
+index 2806c54..7305436 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/hooks/LineageInfo.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/hooks/LineageInfo.java
+@@ -27,6 +27,7 @@
+ 
+ import org.apache.commons.collections.SetUtils;
+ import org.apache.commons.lang.StringUtils;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.Table;
+@@ -403,7 +404,7 @@ public String getExpr() {
+      * @param expr the expr to set
+      */
+     public void setExpr(String expr) {
+-      this.expr = expr;
++      this.expr = StringInternUtils.internIfNotNull(expr);
+     }
+ 
+     /**
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
+index 2674fe3..0dab867 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
+@@ -21,6 +21,7 @@
+ import java.io.Serializable;
+ 
+ import org.apache.commons.lang.builder.HashCodeBuilder;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils;
+@@ -64,7 +65,7 @@ public ExprNodeConstantDesc() {
+ 
+   public ExprNodeConstantDesc(TypeInfo typeInfo, Object value) {
+     super(typeInfo);
+-    this.value = value;
++    setValue(value);
+   }
+ 
+   public ExprNodeConstantDesc(Object value) {
+@@ -73,6 +74,9 @@ public ExprNodeConstantDesc(Object value) {
+   }
+ 
+   public void setValue(Object value) {
++    if (value instanceof String) {
++      value = StringInternUtils.internIfNotNull((String) value);
++    }
+     this.value = value;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/TableDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/TableDesc.java
+index 0e34aee..88fc5d1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/TableDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/TableDesc.java
+@@ -25,6 +25,7 @@
+ import java.util.Properties;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
+@@ -61,7 +62,7 @@ public TableDesc(
+     this.inputFileFormatClass = inputFormatClass;
+     outputFileFormatClass = HiveFileFormatUtils
+         .getOutputFormatSubstitute(outputFormatClass);
+-    this.properties = properties;
++    setProperties(properties);
+   }
+ 
+   public Class<? extends Deserializer> getDeserializerClass() {
+@@ -123,6 +124,7 @@ public Map getPropertiesExplain() {
+   }
+ 
+   public void setProperties(final Properties properties) {
++    StringInternUtils.internValuesInMap((Map) properties);
+     this.properties = properties;
+   }
+ 
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerDe.java b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerDe.java
+index 0e4e4c6..ec7a530 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerDe.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroSerDe.java
+@@ -26,6 +26,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.AbstractSerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+@@ -103,7 +104,7 @@ public void initialize(Configuration configuration, Properties properties) throw
+       schema = determineSchemaOrReturnErrorSchema(configuration, properties);
+     } else {
+       // Get column names and sort order
+-      columnNames = Arrays.asList(columnNameProperty.split(","));
++      columnNames = StringInternUtils.internStringsInList(Arrays.asList(columnNameProperty.split(",")));
+       columnTypes = TypeInfoUtils.getTypeInfosFromTypeString(columnTypeProperty);
+ 
+       schema = getSchemaFromCols(properties, columnNames, columnTypes, columnCommentProperty);
+@@ -124,7 +125,7 @@ public void initialize(Configuration configuration, Properties properties) throw
+     badSchema = schema.equals(SchemaResolutionProblem.SIGNAL_BAD_SCHEMA);
+ 
+     AvroObjectInspectorGenerator aoig = new AvroObjectInspectorGenerator(schema);
+-    this.columnNames = aoig.getColumnNames();
++    this.columnNames = StringInternUtils.internStringsInList(aoig.getColumnNames());
+     this.columnTypes = aoig.getColumnTypes();
+     this.oi = aoig.getObjectInspector();
+   }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorFactory.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorFactory.java
+index b9af0a3..7601a2d 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorFactory.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/ObjectInspectorFactory.java
+@@ -29,6 +29,7 @@
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
+ import org.apache.thrift.TUnion;
+@@ -303,8 +304,8 @@ public static StandardUnionObjectInspector getStandardUnionObjectInspector(
+     return result;
+   }
+ 
+-  static ConcurrentHashMap<ArrayList<List<?>>, StandardStructObjectInspector> cachedStandardStructObjectInspector =
+-      new ConcurrentHashMap<ArrayList<List<?>>, StandardStructObjectInspector>();
++  private static ConcurrentHashMap<ArrayList<List<?>>, StandardStructObjectInspector>
++      cachedStandardStructObjectInspector = new ConcurrentHashMap<ArrayList<List<?>>, StandardStructObjectInspector>();
+ 
+   public static StandardStructObjectInspector getStandardStructObjectInspector(
+       List<String> structFieldNames,
+@@ -317,13 +318,15 @@ public static StandardStructObjectInspector getStandardStructObjectInspector(
+       List<ObjectInspector> structFieldObjectInspectors,
+       List<String> structComments) {
+     ArrayList<List<?>> signature = new ArrayList<List<?>>(3);
++    StringInternUtils.internStringsInList(structFieldNames);
+     signature.add(structFieldNames);
+     signature.add(structFieldObjectInspectors);
+-    if(structComments != null) {
++    if (structComments != null) {
++      StringInternUtils.internStringsInList(structComments);
+       signature.add(structComments);
+     }
+     StandardStructObjectInspector result = cachedStandardStructObjectInspector.get(signature);
+-    if(result == null) {
++    if (result == null) {
+       result = new StandardStructObjectInspector(structFieldNames, structFieldObjectInspectors, structComments);
+       StandardStructObjectInspector prev =
+         cachedStandardStructObjectInspector.putIfAbsent(signature, result);
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/StandardStructObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/StandardStructObjectInspector.java
+index c96fc2d..53fe16a 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/StandardStructObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/objectinspector/StandardStructObjectInspector.java
+@@ -55,7 +55,7 @@ protected MyField() {
+     public MyField(int fieldID, String fieldName,
+         ObjectInspector fieldObjectInspector) {
+       this.fieldID = fieldID;
+-      this.fieldName = fieldName.toLowerCase();
++      this.fieldName = fieldName.toLowerCase().intern();
+       this.fieldObjectInspector = fieldObjectInspector;
+     }
+ 
+-- 
+1.7.9.5
+

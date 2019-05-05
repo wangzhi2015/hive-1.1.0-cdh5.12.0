@@ -1,0 +1,669 @@
+From f3bb6321a523097b70717380bb24e93510ed5df1 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <(aihuaxu@gmail.com)>
+Date: Mon, 11 May 2015 13:03:00 -0700
+Subject: [PATCH 0262/1164] HIVE-10643 : Refactoring Windowing for sum() to
+ pass WindowFrameDef instead of two numbers (1 for
+ number of preceding and 1 for number of
+ following) (Aihua Xu via Ashutosh Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/BoundaryDef.java
+---
+ .../apache/hadoop/hive/ql/parse/PTFTranslator.java |    5 +-
+ .../hadoop/hive/ql/plan/ptf/BoundaryDef.java       |   13 +++-
+ .../hadoop/hive/ql/plan/ptf/WindowFrameDef.java    |   20 +++--
+ .../hive/ql/udf/generic/GenericUDAFAverage.java    |   43 ++++-------
+ .../hive/ql/udf/generic/GenericUDAFFirstValue.java |   20 ++---
+ .../hive/ql/udf/generic/GenericUDAFLastValue.java  |   18 ++---
+ .../hadoop/hive/ql/udf/generic/GenericUDAFMax.java |   20 ++---
+ .../udf/generic/GenericUDAFStreamingEvaluator.java |   77 +++++++++++++++-----
+ .../hadoop/hive/ql/udf/generic/GenericUDAFSum.java |   41 +++--------
+ .../hadoop/hive/ql/udaf/TestStreamingSum.java      |    6 +-
+ 10 files changed, 143 insertions(+), 120 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/PTFTranslator.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/PTFTranslator.java
+index af9791b..fb03d6e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/PTFTranslator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/PTFTranslator.java
+@@ -537,10 +537,7 @@ private WindowFrameDef translate(ShapeDetails inpShape,
+           "Window range invalid, start boundary is greater than end boundary: %s", spec));
+     }
+ 
+-    WindowFrameDef wfDef = new WindowFrameDef();
+-    wfDef.setStart(translate(inpShape, s));
+-    wfDef.setEnd(translate(inpShape, e));
+-    return wfDef;
++    return new WindowFrameDef(translate(inpShape, s), translate(inpShape, e));
+   }
+ 
+   private BoundaryDef translate(ShapeDetails inpShape, BoundarySpec bndSpec)
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/BoundaryDef.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/BoundaryDef.java
+index 07590c0..2a57293 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/BoundaryDef.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/BoundaryDef.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.hive.ql.plan.ptf;
+ 
++import org.apache.hadoop.hive.ql.parse.WindowingSpec.BoundarySpec;
+ import org.apache.hadoop.hive.ql.parse.WindowingSpec.Direction;
+ 
+ public abstract class BoundaryDef {
+@@ -32,4 +33,14 @@ public void setDirection(Direction direction) {
+   }
+ 
+   public abstract int getAmt();
+-}
+\ No newline at end of file
++
++  public boolean isUnbounded() {
++    return this.getAmt() == BoundarySpec.UNBOUNDED_AMOUNT;
++  }
++
++  @Override
++  public String toString() {
++    return direction == null ? "" :
++        direction + "(" + (getAmt() == Integer.MAX_VALUE ? "MAX" : getAmt()) + ")";
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/WindowFrameDef.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/WindowFrameDef.java
+index 949ed10..150ee4c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/WindowFrameDef.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ptf/WindowFrameDef.java
+@@ -23,19 +23,27 @@
+   private BoundaryDef start;
+   private BoundaryDef end;
+ 
++  public WindowFrameDef(BoundaryDef start, BoundaryDef end) {
++    this.start = start;
++    this.end = end;
++  }
+   public BoundaryDef getStart() {
+     return start;
+   }
+ 
+-  public void setStart(BoundaryDef start) {
+-    this.start = start;
+-  }
+-
+   public BoundaryDef getEnd() {
+     return end;
+   }
+ 
+-  public void setEnd(BoundaryDef end) {
+-    this.end = end;
++  public boolean isStartUnbounded() {
++    return start.isUnbounded();
++  }
++
++  public boolean isEndUnbounded() {
++    return end.isUnbounded();
++  }
++
++  public int getWindowSize() {
++    return end.getAmt() + start.getAmt() + 1;
+   }
+ }
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFAverage.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFAverage.java
+index 12a327f..9f78449 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFAverage.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFAverage.java
+@@ -157,13 +157,9 @@ public AggregationBuffer getNewAggregationBuffer() throws HiveException {
+     }
+ 
+     @Override
+-    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
++    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrameDef) {
+ 
+-      BoundaryDef start = wFrmDef.getStart();
+-      BoundaryDef end = wFrmDef.getEnd();
+-
+-      return new GenericUDAFStreamingEvaluator.SumAvgEnhancer<DoubleWritable, Object[]>(this,
+-          start.getAmt(), end.getAmt()) {
++      return new GenericUDAFStreamingEvaluator.SumAvgEnhancer<DoubleWritable, Object[]>(this, wFrameDef) {
+ 
+         @Override
+         protected DoubleWritable getNextResult(
+@@ -172,14 +168,12 @@ protected DoubleWritable getNextResult(
+           AverageAggregationBuffer<Double> myagg = (AverageAggregationBuffer<Double>) ss.wrappedBuf;
+           Double r = myagg.count == 0 ? null : myagg.sum;
+           long cnt = myagg.count;
+-          if (ss.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-              && (ss.numRows - ss.numFollowing) >= (ss.numPreceding + 1)) {
+-            Object[] o = ss.intermediateVals.remove(0);
+-            if (o != null) {
+-              Double d = (Double) o[0];
+-              r = r == null ? null : r - d;
+-              cnt = cnt - ((Long) o[1]);
+-            }
++
++          Object[] o = ss.retrieveNextIntermediateValue();
++          if (o != null) {
++            Double d = (Double) o[0];
++            r = r == null ? null : r - d;
++            cnt = cnt - ((Long) o[1]);
+           }
+ 
+           return r == null ? null : new DoubleWritable(r / cnt);
+@@ -287,13 +281,10 @@ public AggregationBuffer getNewAggregationBuffer() throws HiveException {
+     }
+ 
+     @Override
+-    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+-
+-      BoundaryDef start = wFrmDef.getStart();
+-      BoundaryDef end = wFrmDef.getEnd();
++    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrameDef) {
+ 
+       return new GenericUDAFStreamingEvaluator.SumAvgEnhancer<HiveDecimalWritable, Object[]>(
+-          this, start.getAmt(), end.getAmt()) {
++          this, wFrameDef) {
+ 
+         @Override
+         protected HiveDecimalWritable getNextResult(
+@@ -302,14 +293,12 @@ protected HiveDecimalWritable getNextResult(
+           AverageAggregationBuffer<HiveDecimal> myagg = (AverageAggregationBuffer<HiveDecimal>) ss.wrappedBuf;
+           HiveDecimal r = myagg.count == 0 ? null : myagg.sum;
+           long cnt = myagg.count;
+-          if (ss.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-              && (ss.numRows - ss.numFollowing) >= (ss.numPreceding + 1)) {
+-            Object[] o = ss.intermediateVals.remove(0);
+-            if (o != null) {
+-              HiveDecimal d = (HiveDecimal) o[0];
+-              r = r == null ? null : r.subtract(d);
+-              cnt = cnt - ((Long) o[1]);
+-            }
++
++          Object[] o = ss.retrieveNextIntermediateValue();
++          if (o != null) {
++            HiveDecimal d = (HiveDecimal) o[0];
++            r = r == null ? null : r.subtract(d);
++            cnt = cnt - ((Long) o[1]);
+           }
+ 
+           return r == null ? null : new HiveDecimalWritable(
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFFirstValue.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFFirstValue.java
+index f679387..dd9eaf3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFFirstValue.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFFirstValue.java
+@@ -178,8 +178,8 @@ public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+ 
+       private final Deque<ValIndexPair> valueChain;
+ 
+-      public State(int numPreceding, int numFollowing, AggregationBuffer buf) {
+-        super(numPreceding, numFollowing, buf);
++      public State(AggregationBuffer buf) {
++        super(buf);
+         valueChain = new ArrayDeque<ValIndexPair>(numPreceding + numFollowing + 1);
+       }
+ 
+@@ -225,7 +225,7 @@ public int getRowsRemainingAfterTerminate() throws HiveException {
+     @Override
+     public AggregationBuffer getNewAggregationBuffer() throws HiveException {
+       AggregationBuffer underlying = wrappedEval.getNewAggregationBuffer();
+-      return new State(numPreceding, numFollowing, underlying);
++      return new State(underlying);
+     }
+ 
+     protected ObjectInspector inputOI() {
+@@ -252,7 +252,7 @@ public void iterate(AggregationBuffer agg, Object[] parameters) throws HiveExcep
+        * add row to chain. except in case of UNB preceding: - only 1 firstVal
+        * needs to be tracked.
+        */
+-      if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT || s.valueChain.isEmpty()) {
++      if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT || s.valueChain.isEmpty()) {
+         /*
+          * add value to chain if it is not null or if skipNulls is false.
+          */
+@@ -261,7 +261,7 @@ public void iterate(AggregationBuffer agg, Object[] parameters) throws HiveExcep
+         }
+       }
+ 
+-      if (s.numRows >= (s.numFollowing)) {
++      if (s.numRows >= numFollowing) {
+         /*
+          * if skipNulls is true and there are no rows in valueChain => all rows
+          * in partition are null so far; so add null in o/p
+@@ -276,8 +276,8 @@ public void iterate(AggregationBuffer agg, Object[] parameters) throws HiveExcep
+ 
+       if (s.valueChain.size() > 0) {
+         int fIdx = (Integer) s.valueChain.getFirst().idx;
+-        if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-            && s.numRows > fIdx + s.numPreceding + s.numFollowing) {
++        if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++            && s.numRows > fIdx + numPreceding + numFollowing) {
+           s.valueChain.removeFirst();
+         }
+       }
+@@ -288,13 +288,13 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+       State s = (State) agg;
+       ValIndexPair r = s.valueChain.size() == 0 ? null : s.valueChain.getFirst();
+ 
+-      for (int i = 0; i < s.numFollowing; i++) {
++      for (int i = 0; i < numFollowing; i++) {
+         s.results.add(r == null ? null : r.val);
+         s.numRows++;
+         if (r != null) {
+           int fIdx = (Integer) r.idx;
+-          if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-              && s.numRows > fIdx + s.numPreceding + s.numFollowing
++          if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++              && s.numRows > fIdx + numPreceding + numFollowing
+               && !s.valueChain.isEmpty()) {
+             s.valueChain.removeFirst();
+             r = !s.valueChain.isEmpty() ? s.valueChain.getFirst() : r;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFLastValue.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFLastValue.java
+index e099154..3ed6de7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFLastValue.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFLastValue.java
+@@ -154,8 +154,8 @@ public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+       private Object lastValue;
+       private int lastIdx;
+ 
+-      public State(int numPreceding, int numFollowing, AggregationBuffer buf) {
+-        super(numPreceding, numFollowing, buf);
++      public State(AggregationBuffer buf) {
++        super(buf);
+         lastValue = null;
+         lastIdx = -1;
+       }
+@@ -192,7 +192,7 @@ public int getRowsRemainingAfterTerminate() throws HiveException {
+     @Override
+     public AggregationBuffer getNewAggregationBuffer() throws HiveException {
+       AggregationBuffer underlying = wrappedEval.getNewAggregationBuffer();
+-      return new State(numPreceding, numFollowing, underlying);
++      return new State(underlying);
+     }
+ 
+     protected ObjectInspector inputOI() {
+@@ -219,14 +219,14 @@ public void iterate(AggregationBuffer agg, Object[] parameters) throws HiveExcep
+         s.lastValue = o;
+         s.lastIdx = s.numRows;
+       } else if (lb.skipNulls && s.lastIdx != -1) {
+-        if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-            && s.numRows > s.lastIdx + s.numPreceding + s.numFollowing) {
++        if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++            && s.numRows > s.lastIdx + numPreceding + numFollowing) {
+           s.lastValue = null;
+           s.lastIdx = -1;
+         }
+       }
+ 
+-      if (s.numRows >= (s.numFollowing)) {
++      if (s.numRows >= (numFollowing)) {
+         s.results.add(s.lastValue);
+       }
+       s.numRows++;
+@@ -238,14 +238,14 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+       LastValueBuffer lb = (LastValueBuffer) s.wrappedBuf;
+ 
+       if (lb.skipNulls && s.lastIdx != -1) {
+-        if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-            && s.numRows > s.lastIdx + s.numPreceding + s.numFollowing) {
++        if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++            && s.numRows > s.lastIdx + numPreceding + numFollowing) {
+           s.lastValue = null;
+           s.lastIdx = -1;
+         }
+       }
+ 
+-      for (int i = 0; i < s.numFollowing; i++) {
++      for (int i = 0; i < numFollowing; i++) {
+         s.results.add(s.lastValue);
+       }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFMax.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFMax.java
+index a153818..6b7808a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFMax.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFMax.java
+@@ -166,8 +166,8 @@ public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+     class State extends GenericUDAFStreamingEvaluator<Object>.StreamingState {
+       private final Deque<Object[]> maxChain;
+ 
+-      public State(int numPreceding, int numFollowing, AggregationBuffer buf) {
+-        super(numPreceding, numFollowing, buf);
++      public State(AggregationBuffer buf) {
++        super(buf);
+         maxChain = new ArrayDeque<Object[]>(numPreceding + numFollowing + 1);
+       }
+ 
+@@ -209,7 +209,7 @@ public MaxStreamingFixedWindow(GenericUDAFEvaluator wrappedEval,
+     @Override
+     public AggregationBuffer getNewAggregationBuffer() throws HiveException {
+       AggregationBuffer underlying = wrappedEval.getNewAggregationBuffer();
+-      return new State(numPreceding, numFollowing, underlying);
++      return new State(underlying);
+     }
+ 
+     protected ObjectInspector inputOI() {
+@@ -240,21 +240,21 @@ public void iterate(AggregationBuffer agg, Object[] parameters)
+        * to be tracked. - current max will never become out of range. It can
+        * only be replaced by a larger max.
+        */
+-      if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++      if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+           || s.maxChain.isEmpty()) {
+         o = o == null ? null : ObjectInspectorUtils.copyToStandardObject(o,
+             inputOI(), ObjectInspectorCopyOption.JAVA);
+         s.maxChain.addLast(new Object[] { o, s.numRows });
+       }
+ 
+-      if (s.numRows >= (s.numFollowing)) {
++      if (s.numRows >= numFollowing) {
+         s.results.add(s.maxChain.getFirst()[0]);
+       }
+       s.numRows++;
+ 
+       int fIdx = (Integer) s.maxChain.getFirst()[1];
+-      if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-          && s.numRows > fIdx + s.numPreceding + s.numFollowing) {
++      if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++          && s.numRows > fIdx + numPreceding + numFollowing) {
+         s.maxChain.removeFirst();
+       }
+     }
+@@ -279,12 +279,12 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+       State s = (State) agg;
+       Object[] r = s.maxChain.getFirst();
+ 
+-      for (int i = 0; i < s.numFollowing; i++) {
++      for (int i = 0; i < numFollowing; i++) {
+         s.results.add(r[0]);
+         s.numRows++;
+         int fIdx = (Integer) r[1];
+-        if (s.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-            && s.numRows - s.numFollowing + i > fIdx + s.numPreceding
++        if (numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
++            && s.numRows - numFollowing + i > fIdx + numPreceding
+             && !s.maxChain.isEmpty()) {
+           s.maxChain.removeFirst();
+           r = !s.maxChain.isEmpty() ? s.maxChain.getFirst() : r;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFStreamingEvaluator.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFStreamingEvaluator.java
+index d68c085..578c356 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFStreamingEvaluator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFStreamingEvaluator.java
+@@ -22,7 +22,7 @@
+ import java.util.List;
+ 
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.ql.parse.WindowingSpec.BoundarySpec;
++import org.apache.hadoop.hive.ql.plan.ptf.WindowFrameDef;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFEvaluator.AggregationBuffer;
+ import org.apache.hadoop.hive.ql.util.JavaDataModel;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+@@ -32,28 +32,44 @@
+     GenericUDAFEvaluator implements ISupportStreamingModeForWindowing {
+ 
+   protected final GenericUDAFEvaluator wrappedEval;
++  protected final WindowFrameDef wFrameDef;
++
+   protected final int numPreceding;
+   protected final int numFollowing;
+ 
++  /**
++   * @param wrappedEval
++   * @param numPreceding
++   * @param numFollowing
++   * @deprecated
++   */
+   public GenericUDAFStreamingEvaluator(GenericUDAFEvaluator wrappedEval,
+       int numPreceding, int numFollowing) {
+     this.wrappedEval = wrappedEval;
++    this.wFrameDef = null;
++    this.mode = wrappedEval.mode;
++
+     this.numPreceding = numPreceding;
+     this.numFollowing = numFollowing;
++  }
++
++  public GenericUDAFStreamingEvaluator(GenericUDAFEvaluator wrappedEval,
++      WindowFrameDef wFrameDef) {
++    this.wrappedEval = wrappedEval;
++    this.wFrameDef = wFrameDef;
+     this.mode = wrappedEval.mode;
++
++    this.numPreceding = -1;
++    this.numFollowing = -1;
+   }
+ 
+   class StreamingState extends AbstractAggregationBuffer {
+     final AggregationBuffer wrappedBuf;
+-    final int numPreceding;
+-    final int numFollowing;
+     final List<T1> results;
+-    int numRows;
++    int numRows;  // Number of rows processed in the partition.
+ 
+-    StreamingState(int numPreceding, int numFollowing, AggregationBuffer buf) {
++    StreamingState(AggregationBuffer buf) {
+       this.wrappedBuf = buf;
+-      this.numPreceding = numPreceding;
+-      this.numFollowing = numFollowing;
+       results = new ArrayList<T1>();
+       numRows = 0;
+     }
+@@ -105,18 +121,16 @@ public Object getNextResult(AggregationBuffer agg) throws HiveException {
+   public static abstract class SumAvgEnhancer<T1, T2> extends
+       GenericUDAFStreamingEvaluator<T1> {
+ 
+-    public SumAvgEnhancer(GenericUDAFEvaluator wrappedEval, int numPreceding,
+-        int numFollowing) {
+-      super(wrappedEval, numPreceding, numFollowing);
++    public SumAvgEnhancer(GenericUDAFEvaluator wrappedEval, WindowFrameDef wFrameDef) {
++      super(wrappedEval, wFrameDef);
+     }
+ 
+     class SumAvgStreamingState extends StreamingState {
+ 
+       final List<T2> intermediateVals;
+ 
+-      SumAvgStreamingState(int numPreceding, int numFollowing,
+-          AggregationBuffer buf) {
+-        super(numPreceding, numFollowing, buf);
++      SumAvgStreamingState(AggregationBuffer buf) {
++        super(buf);
+         intermediateVals = new ArrayList<T2>();
+       }
+ 
+@@ -129,7 +143,7 @@ public int estimate() {
+         if (underlying == -1) {
+           return -1;
+         }
+-        if (numPreceding == BoundarySpec.UNBOUNDED_AMOUNT) {
++        if (wFrameDef.isStartUnbounded()) {
+           return -1;
+         }
+         /*
+@@ -138,7 +152,7 @@ public int estimate() {
+          * of underlying * wdwSz sz of intermediates = sz of underlying * wdwSz
+          */
+ 
+-        int wdwSz = numPreceding + numFollowing + 1;
++        int wdwSz = wFrameDef.getWindowSize();
+         return underlying + (underlying * wdwSz) + (underlying * wdwSz)
+             + (3 * JavaDataModel.PRIMITIVES1);
+       }
+@@ -147,12 +161,33 @@ protected void reset() {
+         intermediateVals.clear();
+         super.reset();
+       }
++
++      /**
++       * After the number of rows processed is more than the size of FOLLOWING window,
++       * we can generate a PTF result for a previous row when a new row gets processed.
++       * @return
++       */
++      public boolean hasResultReady() {
++        return this.numRows >= wFrameDef.getEnd().getAmt();
++      }
++
++      /**
++       * Retrieve the next stored intermediate result to generate the result for next available row
++       */
++      public T2 retrieveNextIntermediateValue() {
++        if (!wFrameDef.getStart().isUnbounded()
++            && (this.numRows - wFrameDef.getEnd().getAmt()) >= (wFrameDef.getStart().getAmt() + 1)) {
++          return this.intermediateVals.remove(0);
++        }
++
++        return null;
++      }
+     }
+ 
+     @Override
+     public AggregationBuffer getNewAggregationBuffer() throws HiveException {
+       AggregationBuffer underlying = wrappedEval.getNewAggregationBuffer();
+-      return new SumAvgStreamingState(numPreceding, numFollowing, underlying);
++      return new SumAvgStreamingState(underlying);
+     }
+ 
+     @Override
+@@ -161,11 +196,11 @@ public void iterate(AggregationBuffer agg, Object[] parameters)
+       SumAvgStreamingState ss = (SumAvgStreamingState) agg;
+ 
+       wrappedEval.iterate(ss.wrappedBuf, parameters);
+-
+-      if (ss.numRows >= ss.numFollowing) {
++      // Generate the result for a previous row, of whose window all the rows have been processed.
++      if (ss.hasResultReady()) {
+         ss.results.add(getNextResult(ss));
+       }
+-      if (ss.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT) {
++      if (!wFrameDef.isStartUnbounded()) {
+         ss.intermediateVals.add(getCurrentIntermediateResult(ss));
+       }
+ 
+@@ -177,10 +212,12 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+       SumAvgStreamingState ss = (SumAvgStreamingState) agg;
+       Object o = wrappedEval.terminate(ss.wrappedBuf);
+ 
+-      for (int i = 0; i < ss.numFollowing; i++) {
++      // After all the rows are processed, continue to generate results for the rows that results haven't generate
++      for (int i = 0; i < wFrameDef.getEnd().getAmt(); i++) {
+         ss.results.add(getNextResult(ss));
+         ss.numRows++;
+       }
++
+       return o;
+     }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFSum.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFSum.java
+index d1118f1..68075d2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFSum.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFSum.java
+@@ -182,13 +182,9 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+     }
+ 
+     @Override
+-    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+-
+-      BoundaryDef start = wFrmDef.getStart();
+-      BoundaryDef end = wFrmDef.getEnd();
+-
++    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrameDef) {
+       return new GenericUDAFStreamingEvaluator.SumAvgEnhancer<HiveDecimalWritable, HiveDecimal>(
+-          this, start.getAmt(), end.getAmt()) {
++          this, wFrameDef) {
+ 
+         @Override
+         protected HiveDecimalWritable getNextResult(
+@@ -196,10 +192,8 @@ protected HiveDecimalWritable getNextResult(
+             throws HiveException {
+           SumHiveDecimalAgg myagg = (SumHiveDecimalAgg) ss.wrappedBuf;
+           HiveDecimal r = myagg.empty ? null : myagg.sum;
+-          if (ss.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-              && (ss.numRows - ss.numFollowing) >= (ss.numPreceding + 1)) {
+-            HiveDecimal d = (HiveDecimal) ss.intermediateVals.remove(0);
+-            d = d == null ? HiveDecimal.ZERO : d;
++          HiveDecimal d = ss.retrieveNextIntermediateValue();
++          if (d != null ) {
+             r = r == null ? null : r.subtract(d);
+           }
+ 
+@@ -302,12 +296,9 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+     }
+ 
+     @Override
+-    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+-      BoundaryDef start = wFrmDef.getStart();
+-      BoundaryDef end = wFrmDef.getEnd();
+-
++    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrameDef) {
+       return new GenericUDAFStreamingEvaluator.SumAvgEnhancer<DoubleWritable, Double>(this,
+-          start.getAmt(), end.getAmt()) {
++          wFrameDef) {
+ 
+         @Override
+         protected DoubleWritable getNextResult(
+@@ -315,10 +306,8 @@ protected DoubleWritable getNextResult(
+             throws HiveException {
+           SumDoubleAgg myagg = (SumDoubleAgg) ss.wrappedBuf;
+           Double r = myagg.empty ? null : myagg.sum;
+-          if (ss.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-              && (ss.numRows - ss.numFollowing) >= (ss.numPreceding + 1)) {
+-            Double d = (Double) ss.intermediateVals.remove(0);
+-            d = d == null ? 0.0 : d;
++          Double d = ss.retrieveNextIntermediateValue();
++          if (d != null) {
+             r = r == null ? null : r - d;
+           }
+ 
+@@ -419,13 +408,9 @@ public Object terminate(AggregationBuffer agg) throws HiveException {
+     }
+ 
+     @Override
+-    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrmDef) {
+-
+-      BoundaryDef start = wFrmDef.getStart();
+-      BoundaryDef end = wFrmDef.getEnd();
+-
++    public GenericUDAFEvaluator getWindowingEvaluator(WindowFrameDef wFrameDef) {
+       return new GenericUDAFStreamingEvaluator.SumAvgEnhancer<LongWritable, Long>(this,
+-          start.getAmt(), end.getAmt()) {
++          wFrameDef) {
+ 
+         @Override
+         protected LongWritable getNextResult(
+@@ -433,10 +418,8 @@ protected LongWritable getNextResult(
+             throws HiveException {
+           SumLongAgg myagg = (SumLongAgg) ss.wrappedBuf;
+           Long r = myagg.empty ? null : myagg.sum;
+-          if (ss.numPreceding != BoundarySpec.UNBOUNDED_AMOUNT
+-              && (ss.numRows - ss.numFollowing) >= (ss.numPreceding + 1)) {
+-            Long d = (Long) ss.intermediateVals.remove(0);
+-            d = d == null ? 0 : d;
++          Long d = ss.retrieveNextIntermediateValue();
++          if (d != null) {
+             r = r == null ? null : r - d;
+           }
+ 
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udaf/TestStreamingSum.java b/ql/src/test/org/apache/hadoop/hive/ql/udaf/TestStreamingSum.java
+index a331e66..88cafc0 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/udaf/TestStreamingSum.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udaf/TestStreamingSum.java
+@@ -50,7 +50,6 @@
+ public class TestStreamingSum {
+ 
+   public static WindowFrameDef wdwFrame(int p, int f) {
+-    WindowFrameDef wFrmDef = new WindowFrameDef();
+     BoundaryDef start, end;
+     if (p == 0) {
+       start = new CurrentRowDef();
+@@ -69,9 +68,8 @@ public static WindowFrameDef wdwFrame(int p, int f) {
+       endR.setAmt(f);
+       end = endR;
+     }
+-    wFrmDef.setStart(start);
+-    wFrmDef.setEnd(end);
+-    return wFrmDef;
++
++    return new WindowFrameDef(start, end);
+   }
+ 
+   public void sumDouble(Iterator<Double> inVals, int inSz, int numPreceding,
+-- 
+1.7.9.5
+

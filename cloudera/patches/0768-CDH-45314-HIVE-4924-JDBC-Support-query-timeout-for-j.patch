@@ -1,0 +1,1639 @@
+From 51e48b57a2d4fee8f7d308f980427a277ed1b3f3 Mon Sep 17 00:00:00 2001
+From: Vaibhav Gumashta <vgumashta@hortonworks.com>
+Date: Tue, 3 May 2016 12:49:22 -0700
+Subject: [PATCH 0768/1164] CDH-45314: HIVE-4924: JDBC: Support query timeout
+ for jdbc (Vaibhav Gumashta reviewed by Thejas
+ Nair)
+
+Conflicts:
+	itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+	jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+	service-rpc/if/TCLIService.thrift
+	service-rpc/src/gen/thrift/gen-cpp/TCLIService_types.cpp
+	service-rpc/src/gen/thrift/gen-cpp/TCLIService_types.h
+	service-rpc/src/gen/thrift/gen-javabean/org/apache/hive/service/rpc/thrift/TExecuteStatementReq.java
+	service-rpc/src/gen/thrift/gen-javabean/org/apache/hive/service/rpc/thrift/TOperationState.java
+	service-rpc/src/gen/thrift/gen-php/Types.php
+	service-rpc/src/gen/thrift/gen-py/TCLIService/ttypes.py
+	service-rpc/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
+	service/src/java/org/apache/hive/service/cli/ICLIService.java
+	service/src/java/org/apache/hive/service/cli/operation/MetadataOperation.java
+	service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+	service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+	service/src/java/org/apache/hive/service/cli/thrift/RetryingThriftCLIServiceClient.java
+	service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+	service/src/test/org/apache/hive/service/cli/thrift/ThriftCliServiceTestWithCookie.java
+
+Change-Id: Ia29bb441ec24445123a640ed4001f4fa2b001373
+---
+ .../java/org/apache/hive/jdbc/TestJdbcDriver2.java |   44 +++++++-
+ .../service/cli/session/TestHiveSessionImpl.java   |    2 +-
+ .../java/org/apache/hive/jdbc/HiveStatement.java   |   17 +--
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   27 +++--
+ .../hadoop/hive/ql/history/HiveHistoryImpl.java    |    8 +-
+ .../hadoop/hive/ql/session/OperationLog.java       |    8 +-
+ service/if/TCLIService.thrift                      |    6 ++
+ .../src/gen/thrift/gen-cpp/TCLIService_types.cpp   |   26 ++++-
+ service/src/gen/thrift/gen-cpp/TCLIService_types.h |   22 +++-
+ .../service/cli/thrift/TExecuteStatementReq.java   |  109 +++++++++++++++++++-
+ .../hive/service/cli/thrift/TOperationState.java   |    5 +-
+ .../src/gen/thrift/gen-py/TCLIService/ttypes.py    |   17 ++-
+ .../src/gen/thrift/gen-rb/t_c_l_i_service_types.rb |    9 +-
+ .../org/apache/hive/service/cli/CLIService.java    |   46 ++++++---
+ .../hive/service/cli/EmbeddedCLIServiceClient.java |   19 ++--
+ .../org/apache/hive/service/cli/ICLIService.java   |   15 +--
+ .../apache/hive/service/cli/OperationState.java    |    7 +-
+ .../cli/operation/ExecuteStatementOperation.java   |    9 +-
+ .../cli/operation/HiveCommandOperation.java        |    5 +
+ .../service/cli/operation/MetadataOperation.java   |    7 +-
+ .../hive/service/cli/operation/Operation.java      |   17 +--
+ .../service/cli/operation/OperationManager.java    |   27 +++--
+ .../hive/service/cli/operation/SQLOperation.java   |  106 ++++++++++++++-----
+ .../hive/service/cli/session/HiveSession.java      |   28 ++++-
+ .../hive/service/cli/session/HiveSessionImpl.java  |   38 ++++---
+ .../hive/service/cli/thrift/ThriftCLIService.java  |   12 ++-
+ .../service/cli/thrift/ThriftCLIServiceClient.java |   32 +++---
+ .../service/cli/thrift/ThriftCLIServiceTest.java   |    6 +-
+ 28 files changed, 512 insertions(+), 162 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+index 3a8a413..bf60eb8 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+@@ -48,6 +48,8 @@
+ import java.sql.ResultSet;
+ import java.sql.ResultSetMetaData;
+ import java.sql.SQLException;
++import java.sql.SQLTimeoutException;
++import java.sql.SQLWarning;
+ import java.sql.Statement;
+ import java.sql.Types;
+ import java.util.ArrayList;
+@@ -2285,7 +2287,7 @@ public void run() {
+         try {
+           System.out.println("Executing query: ");
+           stmt.executeQuery("select sleepUDF(t1.under_col) as u0, t1.under_col as u1, " +
+-              "t2.under_col as u2 from " + tableName +  "t1 join " + tableName +
++              "t2.under_col as u2 from " + tableName +  " t1 join " + tableName +
+               " t2 on t1.under_col = t2.under_col");
+           fail("Expecting SQLException");
+         } catch (SQLException e) {
+@@ -2300,7 +2302,7 @@ public void run() {
+       @Override
+       public void run() {
+         try {
+-          Thread.sleep(1000);
++          Thread.sleep(10000);
+           System.out.println("Cancelling query: ");
+           stmt.cancel();
+         } catch (Exception e) {
+@@ -2315,6 +2317,44 @@ public void run() {
+     stmt.close();
+   }
+ 
++  @Test
++  public void testQueryTimeout() throws Exception {
++    String udfName = SleepUDF.class.getName();
++    Statement stmt1 = con.createStatement();
++    stmt1.execute("create temporary function sleepUDF as '" + udfName + "'");
++    stmt1.close();
++    Statement stmt = con.createStatement();
++    // Test a query where timeout kicks in
++    // Set query timeout to 15 seconds
++    stmt.setQueryTimeout(15);
++    System.err.println("Executing query: ");
++    try {
++      // Sleep UDF sleeps for 100ms for each select call
++      // The test table has 500 rows, so that should be sufficient time
++      stmt.executeQuery("select sleepUDF(t1.under_col) as u0, t1.under_col as u1, "
++          + "t2.under_col as u2 from " + tableName + " t1 join " + tableName
++          + " t2 on t1.under_col = t2.under_col");
++      fail("Expecting SQLTimeoutException");
++    } catch (SQLTimeoutException e) {
++      assertNotNull(e);
++      System.err.println(e.toString());
++    } catch (SQLException e) {
++      fail("Expecting SQLTimeoutException, but got SQLException: " + e);
++      e.printStackTrace();
++    }
++
++    // Test a query where timeout does not kick in. Set it to 25s
++    stmt.setQueryTimeout(25);
++    try {
++      stmt.executeQuery("show tables");
++    } catch (SQLException e) {
++      fail("Unexpected SQLException: " + e);
++      e.printStackTrace();
++    }
++
++    stmt.close();
++  }
++
+   // A udf which sleeps for 100ms to simulate a long running query
+   public static class SleepUDF extends UDF {
+     public Integer evaluate(final Integer value) {
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java
+index 04ed557..cb13796 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java
+@@ -70,7 +70,7 @@ protected synchronized void release(boolean userAccess) {
+     Map<String, String> confOverlay = new HashMap<String, String>();
+     String hql = "drop table if exists table_not_exists";
+     Mockito.when(operationManager.newExecuteStatementOperation(same(session), eq(hql),
+-        (Map<String, String>)Mockito.any(), eq(true))).thenReturn(operation);
++        (Map<String, String>)Mockito.any(), eq(true), eq(0))).thenReturn(operation);
+ 
+     try {
+ 
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java b/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
+index 7ca0cba..be04b4a 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HiveStatement.java
+@@ -22,6 +22,7 @@
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.sql.SQLFeatureNotSupportedException;
++import java.sql.SQLTimeoutException;
+ import java.sql.SQLWarning;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+@@ -105,6 +106,8 @@
+    */
+   private boolean isExecuteStatementFailed = false;
+ 
++  private int queryTimeout = 0;
++
+   public HiveStatement(HiveConnection connection, TCLIService.Iface client,
+       TSessionHandle sessHandle) {
+     this(connection, client, sessHandle, false);
+@@ -238,7 +241,7 @@ public boolean execute(String sql) throws SQLException {
+      */
+     execReq.setRunAsync(true);
+     execReq.setConfOverlay(sessConf);
+-
++    execReq.setQueryTimeout(queryTimeout);
+     try {
+       TExecuteStatementResp execResp = client.ExecuteStatement(execReq);
+       Utils.verifySuccessWithInfo(execResp.getStatus());
+@@ -260,8 +263,8 @@ public boolean execute(String sql) throws SQLException {
+     while (!operationComplete) {
+       try {
+         /**
+-         * For an async SQLOperation, GetOperationStatus will use the long polling approach
+-         * It will essentially return after the HIVE_SERVER2_LONG_POLLING_TIMEOUT (a server config) expires
++         * For an async SQLOperation, GetOperationStatus will use the long polling approach It will
++         * essentially return after the HIVE_SERVER2_LONG_POLLING_TIMEOUT (a server config) expires
+          */
+         statusResp = client.GetOperationStatus(statusReq);
+         Utils.verifySuccessWithInfo(statusResp.getStatus());
+@@ -274,10 +277,12 @@ public boolean execute(String sql) throws SQLException {
+           case CANCELED_STATE:
+             // 01000 -> warning
+             throw new SQLException("Query was cancelled", "01000");
++          case TIMEDOUT_STATE:
++            throw new SQLTimeoutException("Query timed out after " + queryTimeout + " seconds");
+           case ERROR_STATE:
+             // Get the error details from the underlying exception
+-            throw new SQLException(statusResp.getErrorMessage(),
+-                statusResp.getSqlState(), statusResp.getErrorCode());
++            throw new SQLException(statusResp.getErrorMessage(), statusResp.getSqlState(),
++                statusResp.getErrorCode());
+           case UKNOWN_STATE:
+             throw new SQLException("Unknown query", "HY000");
+           case INITIALIZED_STATE:
+@@ -719,7 +724,7 @@ public void setPoolable(boolean poolable) throws SQLException {
+ 
+   @Override
+   public void setQueryTimeout(int seconds) throws SQLException {
+-    throw new SQLException("Method not supported");
++    this.queryTimeout = seconds;
+   }
+ 
+   /*
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index c35d245..a682e0a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -1702,20 +1702,31 @@ public int execute() throws CommandNeedRetryException {
+       }
+       LOG.info("Completed executing command(queryId=" + queryId + "); Time taken: " + duration + " seconds");
+     }
+-    plan.setDone();
+ 
+-    if (SessionState.get() != null) {
+-      try {
+-        SessionState.get().getHiveHistory().logPlanProgress(plan);
+-      } catch (Exception e) {
+-        // ignore
+-      }
++    releasePlan(plan);
++
++    if (console != null) {
++      console.printInfo("OK");
+     }
+-    console.printInfo("OK");
+ 
+     return (0);
+   }
+ 
++  private synchronized void releasePlan(QueryPlan plan) {
++    // Plan maybe null if Driver.close is called in another thread for the same Driver object
++    if (plan != null) {
++      plan.setDone();
++      if (SessionState.get() != null) {
++        try {
++          SessionState.get().getHiveHistory().logPlanProgress(plan);
++        } catch (Exception e) {
++          // Log and ignore
++          LOG.warn("Could not log query plan progress", e);
++        }
++      }
++    }
++  }
++
+   private void setErrorMsgAndDetail(int exitVal, Throwable downstreamError, Task tsk) {
+     this.downstreamError = downstreamError;
+     errorMessage = "FAILED: Execution Error, return code " + exitVal + " from " + tsk.getClass().getName();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistoryImpl.java b/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistoryImpl.java
+index b7b6f90..15c0e2d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistoryImpl.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/history/HiveHistoryImpl.java
+@@ -319,9 +319,11 @@ public void progressTask(String queryId, Task<? extends Serializable> task) {
+ 
+   @Override
+   public void logPlanProgress(QueryPlan plan) throws IOException {
+-    Map<String,String> ctrmap = ctrMapFactory.get();
+-    ctrmap.put("plan", plan.toString());
+-    log(RecordTypes.Counters, ctrmap);
++    if (plan != null) {
++      Map<String,String> ctrmap = ctrMapFactory.get();
++      ctrmap.put("plan", plan.toString());
++      log(RecordTypes.Counters, ctrmap);
++    }
+   }
+ 
+   @Override
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/OperationLog.java b/ql/src/java/org/apache/hadoop/hive/ql/session/OperationLog.java
+index 5b6df2b..8d4fe17 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/OperationLog.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/OperationLog.java
+@@ -152,7 +152,7 @@ synchronized void write(String msg) {
+       return readResults(maxRows);
+     }
+ 
+-    void remove() {
++    synchronized void remove() {
+       try {
+         if (in != null) {
+           in.close();
+@@ -160,8 +160,10 @@ void remove() {
+         if (out != null) {
+           out.close();
+         }
+-        FileUtils.forceDelete(file);
+-        isRemoved = true;
++        if (!isRemoved) {
++          FileUtils.forceDelete(file);
++          isRemoved = true;
++        }
+       } catch (Exception e) {
+         LOG.error("Failed to remove corresponding log file of operation: " + operationName, e);
+       }
+diff --git a/service/if/TCLIService.thrift b/service/if/TCLIService.thrift
+index 485aa30..0f38cd1 100644
+--- a/service/if/TCLIService.thrift
++++ b/service/if/TCLIService.thrift
+@@ -447,6 +447,9 @@ enum TOperationState {
+ 
+   // The operation is in an pending state
+   PENDING_STATE,
++
++  // The operation is in an timedout state
++  TIMEDOUT_STATE,
+ }
+ 
+ // A string identifier. This is interpreted literally.
+@@ -686,6 +689,9 @@ struct TExecuteStatementReq {
+   
+   // Execute asynchronously when runAsync is true
+   4: optional bool runAsync = false
++
++  // The number of seconds after which the query will timeout on the server
++  5: optional i64 queryTimeout = 0
+ }
+ 
+ struct TExecuteStatementResp {
+diff --git a/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp b/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp
+index 9e80eaf..ec9b4e9 100644
+--- a/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp
++++ b/service/src/gen/thrift/gen-cpp/TCLIService_types.cpp
+@@ -100,7 +100,8 @@ int _kTOperationStateValues[] = {
+   TOperationState::CLOSED_STATE,
+   TOperationState::ERROR_STATE,
+   TOperationState::UKNOWN_STATE,
+-  TOperationState::PENDING_STATE
++  TOperationState::PENDING_STATE,
++  TOperationState::TIMEDOUT_STATE
+ };
+ const char* _kTOperationStateNames[] = {
+   "INITIALIZED_STATE",
+@@ -110,9 +111,10 @@ const char* _kTOperationStateNames[] = {
+   "CLOSED_STATE",
+   "ERROR_STATE",
+   "UKNOWN_STATE",
+-  "PENDING_STATE"
++  "PENDING_STATE",
++  "TIMEDOUT_STATE"
+ };
+-const std::map<int, const char*> _TOperationState_VALUES_TO_NAMES(::apache::thrift::TEnumIterator(8, _kTOperationStateValues, _kTOperationStateNames), ::apache::thrift::TEnumIterator(-1, NULL, NULL));
++const std::map<int, const char*> _TOperationState_VALUES_TO_NAMES(::apache::thrift::TEnumIterator(9, _kTOperationStateValues, _kTOperationStateNames), ::apache::thrift::TEnumIterator(-1, NULL, NULL));
+ 
+ int _kTOperationTypeValues[] = {
+   TOperationType::EXECUTE_STATEMENT,
+@@ -4130,8 +4132,8 @@ void swap(TGetInfoResp &a, TGetInfoResp &b) {
+   swap(a.infoValue, b.infoValue);
+ }
+ 
+-const char* TExecuteStatementReq::ascii_fingerprint = "FED75DB77E66D76EC1939A51FB0D96FA";
+-const uint8_t TExecuteStatementReq::binary_fingerprint[16] = {0xFE,0xD7,0x5D,0xB7,0x7E,0x66,0xD7,0x6E,0xC1,0x93,0x9A,0x51,0xFB,0x0D,0x96,0xFA};
++const char* TExecuteStatementReq::ascii_fingerprint = "8DD1140DED7CA1679BA7618F0303C3E1";
++const uint8_t TExecuteStatementReq::binary_fingerprint[16] = {0x8D,0xD1,0x14,0x0D,0xED,0x7C,0xA1,0x67,0x9B,0xA7,0x61,0x8F,0x03,0x03,0xC3,0xE1};
+ 
+ uint32_t TExecuteStatementReq::read(::apache::thrift::protocol::TProtocol* iprot) {
+ 
+@@ -4202,6 +4204,14 @@ uint32_t TExecuteStatementReq::read(::apache::thrift::protocol::TProtocol* iprot
+           xfer += iprot->skip(ftype);
+         }
+         break;
++      case 5:
++        if (ftype == ::apache::thrift::protocol::T_I64) {
++          xfer += iprot->readI64(this->queryTimeout);
++          this->__isset.queryTimeout = true;
++        } else {
++          xfer += iprot->skip(ftype);
++        }
++        break;
+       default:
+         xfer += iprot->skip(ftype);
+         break;
+@@ -4249,6 +4259,11 @@ uint32_t TExecuteStatementReq::write(::apache::thrift::protocol::TProtocol* opro
+     xfer += oprot->writeBool(this->runAsync);
+     xfer += oprot->writeFieldEnd();
+   }
++  if (this->__isset.queryTimeout) {
++    xfer += oprot->writeFieldBegin("queryTimeout", ::apache::thrift::protocol::T_I64, 5);
++    xfer += oprot->writeI64(this->queryTimeout);
++    xfer += oprot->writeFieldEnd();
++  }
+   xfer += oprot->writeFieldStop();
+   xfer += oprot->writeStructEnd();
+   return xfer;
+@@ -4260,6 +4275,7 @@ void swap(TExecuteStatementReq &a, TExecuteStatementReq &b) {
+   swap(a.statement, b.statement);
+   swap(a.confOverlay, b.confOverlay);
+   swap(a.runAsync, b.runAsync);
++  swap(a.queryTimeout, b.queryTimeout);
+   swap(a.__isset, b.__isset);
+ }
+ 
+diff --git a/service/src/gen/thrift/gen-cpp/TCLIService_types.h b/service/src/gen/thrift/gen-cpp/TCLIService_types.h
+index dbbd3e9..da01936 100644
+--- a/service/src/gen/thrift/gen-cpp/TCLIService_types.h
++++ b/service/src/gen/thrift/gen-cpp/TCLIService_types.h
+@@ -78,7 +78,8 @@ struct TOperationState {
+     CLOSED_STATE = 4,
+     ERROR_STATE = 5,
+     UKNOWN_STATE = 6,
+-    PENDING_STATE = 7
++    PENDING_STATE = 7,
++    TIMEDOUT_STATE = 8
+   };
+ };
+ 
+@@ -2329,18 +2330,19 @@ class TGetInfoResp {
+ void swap(TGetInfoResp &a, TGetInfoResp &b);
+ 
+ typedef struct _TExecuteStatementReq__isset {
+-  _TExecuteStatementReq__isset() : confOverlay(false), runAsync(true) {}
++  _TExecuteStatementReq__isset() : confOverlay(false), runAsync(true), queryTimeout(true) {}
+   bool confOverlay;
+   bool runAsync;
++  bool queryTimeout;
+ } _TExecuteStatementReq__isset;
+ 
+ class TExecuteStatementReq {
+  public:
+ 
+-  static const char* ascii_fingerprint; // = "FED75DB77E66D76EC1939A51FB0D96FA";
+-  static const uint8_t binary_fingerprint[16]; // = {0xFE,0xD7,0x5D,0xB7,0x7E,0x66,0xD7,0x6E,0xC1,0x93,0x9A,0x51,0xFB,0x0D,0x96,0xFA};
++  static const char* ascii_fingerprint; // = "8DD1140DED7CA1679BA7618F0303C3E1";
++  static const uint8_t binary_fingerprint[16]; // = {0x8D,0xD1,0x14,0x0D,0xED,0x7C,0xA1,0x67,0x9B,0xA7,0x61,0x8F,0x03,0x03,0xC3,0xE1};
+ 
+-  TExecuteStatementReq() : statement(), runAsync(false) {
++  TExecuteStatementReq() : statement(), runAsync(false), queryTimeout(0LL) {
+   }
+ 
+   virtual ~TExecuteStatementReq() throw() {}
+@@ -2349,6 +2351,7 @@ class TExecuteStatementReq {
+   std::string statement;
+   std::map<std::string, std::string>  confOverlay;
+   bool runAsync;
++  int64_t queryTimeout;
+ 
+   _TExecuteStatementReq__isset __isset;
+ 
+@@ -2370,6 +2373,11 @@ class TExecuteStatementReq {
+     __isset.runAsync = true;
+   }
+ 
++  void __set_queryTimeout(const int64_t val) {
++    queryTimeout = val;
++    __isset.queryTimeout = true;
++  }
++
+   bool operator == (const TExecuteStatementReq & rhs) const
+   {
+     if (!(sessionHandle == rhs.sessionHandle))
+@@ -2384,6 +2392,10 @@ class TExecuteStatementReq {
+       return false;
+     else if (__isset.runAsync && !(runAsync == rhs.runAsync))
+       return false;
++    if (__isset.queryTimeout != rhs.__isset.queryTimeout)
++      return false;
++    else if (__isset.queryTimeout && !(queryTimeout == rhs.queryTimeout))
++      return false;
+     return true;
+   }
+   bool operator != (const TExecuteStatementReq &rhs) const {
+diff --git a/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TExecuteStatementReq.java b/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TExecuteStatementReq.java
+index 4f157ad..c83116b 100644
+--- a/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TExecuteStatementReq.java
++++ b/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TExecuteStatementReq.java
+@@ -38,6 +38,7 @@
+   private static final org.apache.thrift.protocol.TField STATEMENT_FIELD_DESC = new org.apache.thrift.protocol.TField("statement", org.apache.thrift.protocol.TType.STRING, (short)2);
+   private static final org.apache.thrift.protocol.TField CONF_OVERLAY_FIELD_DESC = new org.apache.thrift.protocol.TField("confOverlay", org.apache.thrift.protocol.TType.MAP, (short)3);
+   private static final org.apache.thrift.protocol.TField RUN_ASYNC_FIELD_DESC = new org.apache.thrift.protocol.TField("runAsync", org.apache.thrift.protocol.TType.BOOL, (short)4);
++  private static final org.apache.thrift.protocol.TField QUERY_TIMEOUT_FIELD_DESC = new org.apache.thrift.protocol.TField("queryTimeout", org.apache.thrift.protocol.TType.I64, (short)5);
+ 
+   private static final Map<Class<? extends IScheme>, SchemeFactory> schemes = new HashMap<Class<? extends IScheme>, SchemeFactory>();
+   static {
+@@ -49,13 +50,15 @@
+   private String statement; // required
+   private Map<String,String> confOverlay; // optional
+   private boolean runAsync; // optional
++  private long queryTimeout; // optional
+ 
+   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+     SESSION_HANDLE((short)1, "sessionHandle"),
+     STATEMENT((short)2, "statement"),
+     CONF_OVERLAY((short)3, "confOverlay"),
+-    RUN_ASYNC((short)4, "runAsync");
++    RUN_ASYNC((short)4, "runAsync"),
++    QUERY_TIMEOUT((short)5, "queryTimeout");
+ 
+     private static final Map<String, _Fields> byName = new HashMap<String, _Fields>();
+ 
+@@ -78,6 +81,8 @@ public static _Fields findByThriftId(int fieldId) {
+           return CONF_OVERLAY;
+         case 4: // RUN_ASYNC
+           return RUN_ASYNC;
++        case 5: // QUERY_TIMEOUT
++          return QUERY_TIMEOUT;
+         default:
+           return null;
+       }
+@@ -119,8 +124,9 @@ public String getFieldName() {
+ 
+   // isset id assignments
+   private static final int __RUNASYNC_ISSET_ID = 0;
++  private static final int __QUERYTIMEOUT_ISSET_ID = 1;
+   private byte __isset_bitfield = 0;
+-  private _Fields optionals[] = {_Fields.CONF_OVERLAY,_Fields.RUN_ASYNC};
++  private _Fields optionals[] = {_Fields.CONF_OVERLAY,_Fields.RUN_ASYNC,_Fields.QUERY_TIMEOUT};
+   public static final Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+   static {
+     Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+@@ -134,6 +140,8 @@ public String getFieldName() {
+             new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING))));
+     tmpMap.put(_Fields.RUN_ASYNC, new org.apache.thrift.meta_data.FieldMetaData("runAsync", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
+         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
++    tmpMap.put(_Fields.QUERY_TIMEOUT, new org.apache.thrift.meta_data.FieldMetaData("queryTimeout", org.apache.thrift.TFieldRequirementType.OPTIONAL, 
++        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+     metaDataMap = Collections.unmodifiableMap(tmpMap);
+     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(TExecuteStatementReq.class, metaDataMap);
+   }
+@@ -141,6 +149,8 @@ public String getFieldName() {
+   public TExecuteStatementReq() {
+     this.runAsync = false;
+ 
++    this.queryTimeout = 0L;
++
+   }
+ 
+   public TExecuteStatementReq(
+@@ -179,6 +189,7 @@ public TExecuteStatementReq(TExecuteStatementReq other) {
+       this.confOverlay = __this__confOverlay;
+     }
+     this.runAsync = other.runAsync;
++    this.queryTimeout = other.queryTimeout;
+   }
+ 
+   public TExecuteStatementReq deepCopy() {
+@@ -192,6 +203,8 @@ public void clear() {
+     this.confOverlay = null;
+     this.runAsync = false;
+ 
++    this.queryTimeout = 0L;
++
+   }
+ 
+   public TSessionHandle getSessionHandle() {
+@@ -296,6 +309,28 @@ public void setRunAsyncIsSet(boolean value) {
+     __isset_bitfield = EncodingUtils.setBit(__isset_bitfield, __RUNASYNC_ISSET_ID, value);
+   }
+ 
++  public long getQueryTimeout() {
++    return this.queryTimeout;
++  }
++
++  public void setQueryTimeout(long queryTimeout) {
++    this.queryTimeout = queryTimeout;
++    setQueryTimeoutIsSet(true);
++  }
++
++  public void unsetQueryTimeout() {
++    __isset_bitfield = EncodingUtils.clearBit(__isset_bitfield, __QUERYTIMEOUT_ISSET_ID);
++  }
++
++  /** Returns true if field queryTimeout is set (has been assigned a value) and false otherwise */
++  public boolean isSetQueryTimeout() {
++    return EncodingUtils.testBit(__isset_bitfield, __QUERYTIMEOUT_ISSET_ID);
++  }
++
++  public void setQueryTimeoutIsSet(boolean value) {
++    __isset_bitfield = EncodingUtils.setBit(__isset_bitfield, __QUERYTIMEOUT_ISSET_ID, value);
++  }
++
+   public void setFieldValue(_Fields field, Object value) {
+     switch (field) {
+     case SESSION_HANDLE:
+@@ -330,6 +365,14 @@ public void setFieldValue(_Fields field, Object value) {
+       }
+       break;
+ 
++    case QUERY_TIMEOUT:
++      if (value == null) {
++        unsetQueryTimeout();
++      } else {
++        setQueryTimeout((Long)value);
++      }
++      break;
++
+     }
+   }
+ 
+@@ -347,6 +390,9 @@ public Object getFieldValue(_Fields field) {
+     case RUN_ASYNC:
+       return Boolean.valueOf(isRunAsync());
+ 
++    case QUERY_TIMEOUT:
++      return Long.valueOf(getQueryTimeout());
++
+     }
+     throw new IllegalStateException();
+   }
+@@ -366,6 +412,8 @@ public boolean isSet(_Fields field) {
+       return isSetConfOverlay();
+     case RUN_ASYNC:
+       return isSetRunAsync();
++    case QUERY_TIMEOUT:
++      return isSetQueryTimeout();
+     }
+     throw new IllegalStateException();
+   }
+@@ -419,6 +467,15 @@ public boolean equals(TExecuteStatementReq that) {
+         return false;
+     }
+ 
++    boolean this_present_queryTimeout = true && this.isSetQueryTimeout();
++    boolean that_present_queryTimeout = true && that.isSetQueryTimeout();
++    if (this_present_queryTimeout || that_present_queryTimeout) {
++      if (!(this_present_queryTimeout && that_present_queryTimeout))
++        return false;
++      if (this.queryTimeout != that.queryTimeout)
++        return false;
++    }
++
+     return true;
+   }
+ 
+@@ -446,6 +503,11 @@ public int hashCode() {
+     if (present_runAsync)
+       builder.append(runAsync);
+ 
++    boolean present_queryTimeout = true && (isSetQueryTimeout());
++    builder.append(present_queryTimeout);
++    if (present_queryTimeout)
++      builder.append(queryTimeout);
++
+     return builder.toHashCode();
+   }
+ 
+@@ -497,6 +559,16 @@ public int compareTo(TExecuteStatementReq other) {
+         return lastComparison;
+       }
+     }
++    lastComparison = Boolean.valueOf(isSetQueryTimeout()).compareTo(typedOther.isSetQueryTimeout());
++    if (lastComparison != 0) {
++      return lastComparison;
++    }
++    if (isSetQueryTimeout()) {
++      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.queryTimeout, typedOther.queryTimeout);
++      if (lastComparison != 0) {
++        return lastComparison;
++      }
++    }
+     return 0;
+   }
+ 
+@@ -548,6 +620,12 @@ public String toString() {
+       sb.append(this.runAsync);
+       first = false;
+     }
++    if (isSetQueryTimeout()) {
++      if (!first) sb.append(", ");
++      sb.append("queryTimeout:");
++      sb.append(this.queryTimeout);
++      first = false;
++    }
+     sb.append(")");
+     return sb.toString();
+   }
+@@ -649,6 +727,14 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, TExecuteStatementRe
+               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+             }
+             break;
++          case 5: // QUERY_TIMEOUT
++            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
++              struct.queryTimeout = iprot.readI64();
++              struct.setQueryTimeoutIsSet(true);
++            } else { 
++              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
++            }
++            break;
+           default:
+             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+         }
+@@ -692,6 +778,11 @@ public void write(org.apache.thrift.protocol.TProtocol oprot, TExecuteStatementR
+         oprot.writeBool(struct.runAsync);
+         oprot.writeFieldEnd();
+       }
++      if (struct.isSetQueryTimeout()) {
++        oprot.writeFieldBegin(QUERY_TIMEOUT_FIELD_DESC);
++        oprot.writeI64(struct.queryTimeout);
++        oprot.writeFieldEnd();
++      }
+       oprot.writeFieldStop();
+       oprot.writeStructEnd();
+     }
+@@ -718,7 +809,10 @@ public void write(org.apache.thrift.protocol.TProtocol prot, TExecuteStatementRe
+       if (struct.isSetRunAsync()) {
+         optionals.set(1);
+       }
+-      oprot.writeBitSet(optionals, 2);
++      if (struct.isSetQueryTimeout()) {
++        optionals.set(2);
++      }
++      oprot.writeBitSet(optionals, 3);
+       if (struct.isSetConfOverlay()) {
+         {
+           oprot.writeI32(struct.confOverlay.size());
+@@ -732,6 +826,9 @@ public void write(org.apache.thrift.protocol.TProtocol prot, TExecuteStatementRe
+       if (struct.isSetRunAsync()) {
+         oprot.writeBool(struct.runAsync);
+       }
++      if (struct.isSetQueryTimeout()) {
++        oprot.writeI64(struct.queryTimeout);
++      }
+     }
+ 
+     @Override
+@@ -742,7 +839,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, TExecuteStatementReq
+       struct.setSessionHandleIsSet(true);
+       struct.statement = iprot.readString();
+       struct.setStatementIsSet(true);
+-      BitSet incoming = iprot.readBitSet(2);
++      BitSet incoming = iprot.readBitSet(3);
+       if (incoming.get(0)) {
+         {
+           org.apache.thrift.protocol.TMap _map168 = new org.apache.thrift.protocol.TMap(org.apache.thrift.protocol.TType.STRING, org.apache.thrift.protocol.TType.STRING, iprot.readI32());
+@@ -762,6 +859,10 @@ public void read(org.apache.thrift.protocol.TProtocol prot, TExecuteStatementReq
+         struct.runAsync = iprot.readBool();
+         struct.setRunAsyncIsSet(true);
+       }
++      if (incoming.get(2)) {
++        struct.queryTimeout = iprot.readI64();
++        struct.setQueryTimeoutIsSet(true);
++      }
+     }
+   }
+ 
+diff --git a/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TOperationState.java b/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TOperationState.java
+index 2198662..efbb412 100644
+--- a/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TOperationState.java
++++ b/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TOperationState.java
+@@ -19,7 +19,8 @@
+   CLOSED_STATE(4),
+   ERROR_STATE(5),
+   UKNOWN_STATE(6),
+-  PENDING_STATE(7);
++  PENDING_STATE(7),
++  TIMEDOUT_STATE(8);
+ 
+   private final int value;
+ 
+@@ -56,6 +57,8 @@ public static TOperationState findByValue(int value) {
+         return UKNOWN_STATE;
+       case 7:
+         return PENDING_STATE;
++      case 8:
++        return TIMEDOUT_STATE;
+       default:
+         return null;
+     }
+diff --git a/service/src/gen/thrift/gen-py/TCLIService/ttypes.py b/service/src/gen/thrift/gen-py/TCLIService/ttypes.py
+index c6d0094..29e32ec 100644
+--- a/service/src/gen/thrift/gen-py/TCLIService/ttypes.py
++++ b/service/src/gen/thrift/gen-py/TCLIService/ttypes.py
+@@ -145,6 +145,7 @@ class TOperationState:
+   ERROR_STATE = 5
+   UKNOWN_STATE = 6
+   PENDING_STATE = 7
++  TIMEDOUT_STATE = 8
+ 
+   _VALUES_TO_NAMES = {
+     0: "INITIALIZED_STATE",
+@@ -155,6 +156,7 @@ class TOperationState:
+     5: "ERROR_STATE",
+     6: "UKNOWN_STATE",
+     7: "PENDING_STATE",
++    8: "TIMEDOUT_STATE",
+   }
+ 
+   _NAMES_TO_VALUES = {
+@@ -166,6 +168,7 @@ class TOperationState:
+     "ERROR_STATE": 5,
+     "UKNOWN_STATE": 6,
+     "PENDING_STATE": 7,
++    "TIMEDOUT_STATE": 8,
+   }
+ 
+ class TOperationType:
+@@ -3862,6 +3865,7 @@ class TExecuteStatementReq:
+    - statement
+    - confOverlay
+    - runAsync
++   - queryTimeout
+   """
+ 
+   thrift_spec = (
+@@ -3870,13 +3874,15 @@ class TExecuteStatementReq:
+     (2, TType.STRING, 'statement', None, None, ), # 2
+     (3, TType.MAP, 'confOverlay', (TType.STRING,None,TType.STRING,None), None, ), # 3
+     (4, TType.BOOL, 'runAsync', None, False, ), # 4
++    (5, TType.I64, 'queryTimeout', None, 0, ), # 5
+   )
+ 
+-  def __init__(self, sessionHandle=None, statement=None, confOverlay=None, runAsync=thrift_spec[4][4],):
++  def __init__(self, sessionHandle=None, statement=None, confOverlay=None, runAsync=thrift_spec[4][4], queryTimeout=thrift_spec[5][4],):
+     self.sessionHandle = sessionHandle
+     self.statement = statement
+     self.confOverlay = confOverlay
+     self.runAsync = runAsync
++    self.queryTimeout = queryTimeout
+ 
+   def read(self, iprot):
+     if iprot.__class__ == TBinaryProtocol.TBinaryProtocolAccelerated and isinstance(iprot.trans, TTransport.CReadableTransport) and self.thrift_spec is not None and fastbinary is not None:
+@@ -3914,6 +3920,11 @@ def read(self, iprot):
+           self.runAsync = iprot.readBool();
+         else:
+           iprot.skip(ftype)
++      elif fid == 5:
++        if ftype == TType.I64:
++          self.queryTimeout = iprot.readI64();
++        else:
++          iprot.skip(ftype)
+       else:
+         iprot.skip(ftype)
+       iprot.readFieldEnd()
+@@ -3944,6 +3955,10 @@ def write(self, oprot):
+       oprot.writeFieldBegin('runAsync', TType.BOOL, 4)
+       oprot.writeBool(self.runAsync)
+       oprot.writeFieldEnd()
++    if self.queryTimeout is not None:
++      oprot.writeFieldBegin('queryTimeout', TType.I64, 5)
++      oprot.writeI64(self.queryTimeout)
++      oprot.writeFieldEnd()
+     oprot.writeFieldStop()
+     oprot.writeStructEnd()
+ 
+diff --git a/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb b/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
+index 9dd1266..418997c 100644
+--- a/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
++++ b/service/src/gen/thrift/gen-rb/t_c_l_i_service_types.rb
+@@ -62,8 +62,9 @@ module TOperationState
+   ERROR_STATE = 5
+   UKNOWN_STATE = 6
+   PENDING_STATE = 7
+-  VALUE_MAP = {0 => "INITIALIZED_STATE", 1 => "RUNNING_STATE", 2 => "FINISHED_STATE", 3 => "CANCELED_STATE", 4 => "CLOSED_STATE", 5 => "ERROR_STATE", 6 => "UKNOWN_STATE", 7 => "PENDING_STATE"}
+-  VALID_VALUES = Set.new([INITIALIZED_STATE, RUNNING_STATE, FINISHED_STATE, CANCELED_STATE, CLOSED_STATE, ERROR_STATE, UKNOWN_STATE, PENDING_STATE]).freeze
++  TIMEDOUT_STATE = 8
++  VALUE_MAP = {0 => "INITIALIZED_STATE", 1 => "RUNNING_STATE", 2 => "FINISHED_STATE", 3 => "CANCELED_STATE", 4 => "CLOSED_STATE", 5 => "ERROR_STATE", 6 => "UKNOWN_STATE", 7 => "PENDING_STATE", 8 => "TIMEDOUT_STATE"}
++  VALID_VALUES = Set.new([INITIALIZED_STATE, RUNNING_STATE, FINISHED_STATE, CANCELED_STATE, CLOSED_STATE, ERROR_STATE, UKNOWN_STATE, PENDING_STATE, TIMEDOUT_STATE]).freeze
+ end
+ 
+ module TOperationType
+@@ -1128,12 +1129,14 @@ class TExecuteStatementReq
+   STATEMENT = 2
+   CONFOVERLAY = 3
+   RUNASYNC = 4
++  QUERYTIMEOUT = 5
+ 
+   FIELDS = {
+     SESSIONHANDLE => {:type => ::Thrift::Types::STRUCT, :name => 'sessionHandle', :class => ::TSessionHandle},
+     STATEMENT => {:type => ::Thrift::Types::STRING, :name => 'statement'},
+     CONFOVERLAY => {:type => ::Thrift::Types::MAP, :name => 'confOverlay', :key => {:type => ::Thrift::Types::STRING}, :value => {:type => ::Thrift::Types::STRING}, :optional => true},
+-    RUNASYNC => {:type => ::Thrift::Types::BOOL, :name => 'runAsync', :default => false, :optional => true}
++    RUNASYNC => {:type => ::Thrift::Types::BOOL, :name => 'runAsync', :default => false, :optional => true},
++    QUERYTIMEOUT => {:type => ::Thrift::Types::I64, :name => 'queryTimeout', :default => 0, :optional => true}
+   }
+ 
+   def struct_fields; FIELDS; end
+diff --git a/service/src/java/org/apache/hive/service/cli/CLIService.java b/service/src/java/org/apache/hive/service/cli/CLIService.java
+index 1af887d..f3bc109 100644
+--- a/service/src/java/org/apache/hive/service/cli/CLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/CLIService.java
+@@ -234,33 +234,55 @@ public GetInfoValue getInfo(SessionHandle sessionHandle, GetInfoType getInfoType
+     return infoValue;
+   }
+ 
+-  /* (non-Javadoc)
+-   * @see org.apache.hive.service.cli.ICLIService#executeStatement(org.apache.hive.service.cli.SessionHandle,
+-   *  java.lang.String, java.util.Map)
++  /**
++   * Execute statement on the server. This is a blocking call.
+    */
+   @Override
+   public OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
+-      Map<String, String> confOverlay)
+-          throws HiveSQLException {
+-    OperationHandle opHandle = sessionManager.getSession(sessionHandle)
+-        .executeStatement(statement, confOverlay);
++      Map<String, String> confOverlay) throws HiveSQLException {
++    OperationHandle opHandle =
++        sessionManager.getSession(sessionHandle).executeStatement(statement, confOverlay);
+     LOG.debug(sessionHandle + ": executeStatement()");
+     return opHandle;
+   }
+ 
+-  /* (non-Javadoc)
+-   * @see org.apache.hive.service.cli.ICLIService#executeStatementAsync(org.apache.hive.service.cli.SessionHandle,
+-   *  java.lang.String, java.util.Map)
++  /**
++   * Execute statement on the server with a timeout. This is a blocking call.
++   */
++  @Override
++  public OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException {
++    OperationHandle opHandle =
++        sessionManager.getSession(sessionHandle).executeStatement(statement, confOverlay,
++            queryTimeout);
++    LOG.debug(sessionHandle + ": executeStatement()");
++    return opHandle;
++  }
++
++  /**
++   * Execute statement asynchronously on the server. This is a non-blocking call
+    */
+   @Override
+   public OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
+       Map<String, String> confOverlay) throws HiveSQLException {
+-    OperationHandle opHandle = sessionManager.getSession(sessionHandle)
+-        .executeStatementAsync(statement, confOverlay);
++    OperationHandle opHandle =
++        sessionManager.getSession(sessionHandle).executeStatementAsync(statement, confOverlay);
+     LOG.debug(sessionHandle + ": executeStatementAsync()");
+     return opHandle;
+   }
+ 
++  /**
++   * Execute statement asynchronously on the server with a timeout. This is a non-blocking call
++   */
++  @Override
++  public OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException {
++    OperationHandle opHandle =
++        sessionManager.getSession(sessionHandle).executeStatementAsync(statement, confOverlay,
++            queryTimeout);
++    LOG.debug(sessionHandle + ": executeStatementAsync()");
++    return opHandle;
++  }
+ 
+   /* (non-Javadoc)
+    * @see org.apache.hive.service.cli.ICLIService#getTypeInfo(org.apache.hive.service.cli.SessionHandle)
+diff --git a/service/src/java/org/apache/hive/service/cli/EmbeddedCLIServiceClient.java b/service/src/java/org/apache/hive/service/cli/EmbeddedCLIServiceClient.java
+index 9cad5be..ca2331f 100644
+--- a/service/src/java/org/apache/hive/service/cli/EmbeddedCLIServiceClient.java
++++ b/service/src/java/org/apache/hive/service/cli/EmbeddedCLIServiceClient.java
+@@ -67,26 +67,29 @@ public GetInfoValue getInfo(SessionHandle sessionHandle, GetInfoType getInfoType
+     return cliService.getInfo(sessionHandle, getInfoType);
+   }
+ 
+-  /* (non-Javadoc)
+-   * @see org.apache.hive.service.cli.CLIServiceClient#executeStatement(org.apache.hive.service.cli.SessionHandle,
+-   *  java.lang.String, java.util.Map)
+-   */
+   @Override
+   public OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
+       Map<String, String> confOverlay) throws HiveSQLException {
+     return cliService.executeStatement(sessionHandle, statement, confOverlay);
+   }
+ 
+-  /* (non-Javadoc)
+-   * @see org.apache.hive.service.cli.CLIServiceClient#executeStatementAsync(org.apache.hive.service.cli.SessionHandle,
+-   *  java.lang.String, java.util.Map)
+-   */
++  @Override
++  public OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException {
++    return cliService.executeStatement(sessionHandle, statement, confOverlay, queryTimeout);
++  }
++
+   @Override
+   public OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
+       Map<String, String> confOverlay) throws HiveSQLException {
+     return cliService.executeStatementAsync(sessionHandle, statement, confOverlay);
+   }
+ 
++  @Override
++  public OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException {
++    return cliService.executeStatementAsync(sessionHandle, statement, confOverlay, queryTimeout);
++  }
+ 
+   /* (non-Javadoc)
+    * @see org.apache.hive.service.cli.CLIServiceClient#getTypeInfo(org.apache.hive.service.cli.SessionHandle)
+diff --git a/service/src/java/org/apache/hive/service/cli/ICLIService.java b/service/src/java/org/apache/hive/service/cli/ICLIService.java
+index c9cc1f4..9e189ef 100644
+--- a/service/src/java/org/apache/hive/service/cli/ICLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/ICLIService.java
+@@ -42,12 +42,16 @@ GetInfoValue getInfo(SessionHandle sessionHandle, GetInfoType infoType)
+       throws HiveSQLException;
+ 
+   OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
+-      Map<String, String> confOverlay)
+-          throws HiveSQLException;
++      Map<String, String> confOverlay) throws HiveSQLException;
+ 
+-  OperationHandle executeStatementAsync(SessionHandle sessionHandle,
+-      String statement, Map<String, String> confOverlay)
+-          throws HiveSQLException;
++  OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException;
++
++  OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay) throws HiveSQLException;
++
++  OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException;
+ 
+   OperationHandle getTypeInfo(SessionHandle sessionHandle)
+       throws HiveSQLException;
+@@ -101,5 +105,4 @@ void cancelDelegationToken(SessionHandle sessionHandle, HiveAuthFactory authFact
+   void renewDelegationToken(SessionHandle sessionHandle, HiveAuthFactory authFactory,
+       String tokenStr) throws HiveSQLException;
+ 
+-
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/OperationState.java b/service/src/java/org/apache/hive/service/cli/OperationState.java
+index 51ffb40..342045d 100644
+--- a/service/src/java/org/apache/hive/service/cli/OperationState.java
++++ b/service/src/java/org/apache/hive/service/cli/OperationState.java
+@@ -32,7 +32,8 @@
+   CLOSED(TOperationState.CLOSED_STATE, true),
+   ERROR(TOperationState.ERROR_STATE, true),
+   UNKNOWN(TOperationState.UKNOWN_STATE, false),
+-  PENDING(TOperationState.PENDING_STATE, false);
++  PENDING(TOperationState.PENDING_STATE, false),
++  TIMEDOUT(TOperationState.TIMEDOUT_STATE, true);
+ 
+   private final TOperationState tOperationState;
+   private final boolean terminal;
+@@ -57,6 +58,7 @@ public static void validateTransition(OperationState oldState,
+       case RUNNING:
+       case CANCELED:
+       case CLOSED:
++      case TIMEDOUT:
+         return;
+       }
+       break;
+@@ -67,6 +69,7 @@ public static void validateTransition(OperationState oldState,
+       case CANCELED:
+       case ERROR:
+       case CLOSED:
++      case TIMEDOUT:
+         return;
+       }
+       break;
+@@ -76,11 +79,13 @@ public static void validateTransition(OperationState oldState,
+       case CANCELED:
+       case ERROR:
+       case CLOSED:
++      case TIMEDOUT:
+         return;
+       }
+       break;
+     case FINISHED:
+     case CANCELED:
++    case TIMEDOUT:
+     case ERROR:
+       if (OperationState.CLOSED.equals(newState)) {
+         return;
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java b/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java
+index b3d9b52..ff46ed8 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java
+@@ -39,9 +39,9 @@ public String getStatement() {
+     return statement;
+   }
+ 
+-  public static ExecuteStatementOperation newExecuteStatementOperation(
+-      HiveSession parentSession, String statement, Map<String, String> confOverlay, boolean runAsync)
+-          throws HiveSQLException {
++  public static ExecuteStatementOperation newExecuteStatementOperation(HiveSession parentSession,
++      String statement, Map<String, String> confOverlay, boolean runAsync, long queryTimeout)
++      throws HiveSQLException {
+     String[] tokens = statement.trim().split("\\s+");
+     CommandProcessor processor = null;
+     try {
+@@ -50,7 +50,8 @@ public static ExecuteStatementOperation newExecuteStatementOperation(
+       throw new HiveSQLException(e.getMessage(), e.getSQLState(), e);
+     }
+     if (processor == null) {
+-      return new SQLOperation(parentSession, statement, confOverlay, runAsync);
++      // runAsync, queryTimeout makes sense only for a SQLOperation
++      return new SQLOperation(parentSession, statement, confOverlay, runAsync, queryTimeout);
+     }
+     return new HiveCommandOperation(parentSession, statement, processor, confOverlay);
+   }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java b/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java
+index 807f010..c6d9458 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java
+@@ -218,4 +218,9 @@ private void resetResultReader() {
+       resultReader = null;
+     }
+   }
++
++  @Override
++  public void cancel(OperationState stateAfterCancel) throws HiveSQLException {
++    throw new UnsupportedOperationException("HiveCommandOperation.cancel()");
++  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/MetadataOperation.java b/service/src/java/org/apache/hive/service/cli/operation/MetadataOperation.java
+index fb762a7..274916d 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/MetadataOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/MetadataOperation.java
+@@ -100,7 +100,7 @@ private String convertPattern(String pattern, boolean datanucleusFormat) {
+     pattern = replaceAll(pattern, "^_", ".");
+     return pattern;
+   }
+-  
++
+   private String replaceAll(String input, final String pattern, final String replace) {
+     while (true) {
+       String replaced = input.replaceAll(pattern, replace);
+@@ -111,4 +111,9 @@ private String replaceAll(String input, final String pattern, final String repla
+     }
+   }
+ 
++  @Override
++  public void cancel(OperationState stateAfterCancel) throws HiveSQLException {
++    throw new UnsupportedOperationException("MetadataOperation.cancel()");
++  }
++
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index 1367639..fadeb8c 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -329,22 +329,23 @@ public void run() throws HiveSQLException {
+     }
+   }
+ 
+-  protected void cleanupOperationLog() {
++  protected synchronized void cleanupOperationLog() {
+     if (isOperationLogEnabled) {
++      if (opHandle == null) {
++        LOG.warn("Operation seems to be in invalid state, opHandle is null");
++        return;
++      }
+       if (operationLog == null) {
+-        LOG.error("Operation [ " + opHandle.getHandleIdentifier() + " ] "
+-          + "logging is enabled, but its OperationLog object cannot be found.");
++        LOG.warn("Operation [ " + opHandle.getHandleIdentifier() + " ] " + "logging is enabled, "
++            + "but its OperationLog object cannot be found. "
++            + "Perhaps the operation has already terminated.");
+       } else {
+         operationLog.close();
+       }
+     }
+   }
+ 
+-  // TODO: make this abstract and implement in subclasses.
+-  public void cancel() throws HiveSQLException {
+-    setState(OperationState.CANCELED);
+-    throw new UnsupportedOperationException("SQLOperation.cancel()");
+-  }
++  public abstract void cancel(OperationState stateAfterCancel) throws HiveSQLException;
+ 
+   public abstract void close() throws HiveSQLException;
+ 
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+index 68c62e1..f80f70d 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+@@ -90,12 +90,10 @@ public synchronized void init(HiveConf hiveConf) {
+   @Override
+   public synchronized void start() {
+     super.start();
+-    // TODO
+   }
+ 
+   @Override
+   public synchronized void stop() {
+-    // TODO
+     super.stop();
+   }
+ 
+@@ -106,10 +104,11 @@ private void initOperationLogCapture(String loggingMode) {
+   }
+ 
+   public ExecuteStatementOperation newExecuteStatementOperation(HiveSession parentSession,
+-      String statement, Map<String, String> confOverlay, boolean runAsync)
+-          throws HiveSQLException {
+-    ExecuteStatementOperation executeStatementOperation = ExecuteStatementOperation
+-        .newExecuteStatementOperation(parentSession, statement, confOverlay, runAsync);
++      String statement, Map<String, String> confOverlay, boolean runAsync, long queryTimeout)
++      throws HiveSQLException {
++    ExecuteStatementOperation executeStatementOperation =
++        ExecuteStatementOperation.newExecuteStatementOperation(parentSession, statement,
++            confOverlay, runAsync, queryTimeout);
+     addOperation(executeStatementOperation);
+     return executeStatementOperation;
+   }
+@@ -237,20 +236,20 @@ public OperationStatus getOperationStatus(OperationHandle opHandle)
+     return getOperation(opHandle).getStatus();
+   }
+ 
++  /**
++   * Cancel the running operation unless it is already in a terminal state
++   * @param opHandle
++   * @throws HiveSQLException
++   */
+   public void cancelOperation(OperationHandle opHandle) throws HiveSQLException {
+     Operation operation = getOperation(opHandle);
+     OperationState opState = operation.getStatus().getState();
+-    if (opState == OperationState.CANCELED ||
+-        opState == OperationState.CLOSED ||
+-        opState == OperationState.FINISHED ||
+-        opState == OperationState.ERROR ||
+-        opState == OperationState.UNKNOWN) {
++    if (opState.isTerminal()) {
+       // Cancel should be a no-op in either cases
+       LOG.debug(opHandle + ": Operation is already aborted in state - " + opState);
+-    }
+-    else {
++    } else {
+       LOG.debug(opHandle + ": Attempting to cancel from state - " + opState);
+-      operation.cancel();
++      operation.cancel(OperationState.CANCELED);
+     }
+   }
+ 
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index d882b0f..f01d289 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -18,12 +18,24 @@
+ 
+ package org.apache.hive.service.cli.operation;
+ 
+-import java.io.*;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.PrintStream;
++import java.io.Serializable;
++import java.io.UnsupportedEncodingException;
+ import java.security.PrivilegedExceptionAction;
+ import java.sql.SQLException;
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Properties;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.lang3.CharEncoding;
+@@ -82,9 +94,10 @@
+   private SerDe serde = null;
+   private boolean fetchStarted = false;
+   private volatile MetricsScope currentSQLStateScope;
+-
+-  //Display for WebUI.
++  // Display for WebUI.
+   private SQLOperationDisplay sqlOpDisplay;
++  private long queryTimeout;
++  private ScheduledExecutorService timeoutExecutor;
+ 
+   /**
+    * A map to track query count running by each user
+@@ -92,10 +105,11 @@
+   private static Map<String, AtomicInteger> userQueries = new HashMap<String, AtomicInteger>();
+   private static final String ACTIVE_SQL_USER = MetricsConstant.SQL_OPERATION_PREFIX + "active_user";
+ 
+-  public SQLOperation(HiveSession parentSession, String statement, Map<String,
+-      String> confOverlay, boolean runInBackground) {
++  public SQLOperation(HiveSession parentSession, String statement, Map<String, String> confOverlay,
++      boolean runInBackground, long queryTimeout) {
+     // TODO: call setRemoteUser in ExecuteStatementOperation or higher.
+     super(parentSession, statement, confOverlay, runInBackground);
++    this.queryTimeout = queryTimeout;
+     setupSessionIO(parentSession.getSessionState());
+     try {
+       sqlOpDisplay = new SQLOperationDisplay(this);
+@@ -119,7 +133,7 @@ private void setupSessionIO(SessionState sessionState) {
+       }
+     }
+ 
+-  /***
++  /**
+    * Compile the query and extract metadata
+    * @param sqlOperationConf
+    * @throws HiveSQLException
+@@ -128,6 +142,29 @@ public void prepare(HiveConf sqlOperationConf) throws HiveSQLException {
+     setState(OperationState.RUNNING);
+     try {
+       driver = new Driver(sqlOperationConf, getParentSession().getUserName());
++
++      // Start the timer thread for cancelling the query when query timeout is reached
++      // queryTimeout == 0 means no timeout
++      if (queryTimeout > 0) {
++        timeoutExecutor = new ScheduledThreadPoolExecutor(1);
++        Runnable timeoutTask = new Runnable() {
++          @Override
++          public void run() {
++            try {
++              LOG.info("Query timed out after: " + queryTimeout
++                  + " seconds. Cancelling the execution now.");
++              SQLOperation.this.cancel(OperationState.TIMEDOUT);
++            } catch (HiveSQLException e) {
++              LOG.error("Error cancelling the query after timeout: " + queryTimeout + " seconds", e);
++            } finally {
++              // Stop
++              timeoutExecutor.shutdown();
++            }
++          }
++        };
++        timeoutExecutor.schedule(timeoutTask, queryTimeout, TimeUnit.SECONDS);
++      }
++
+       sqlOpDisplay.setQueryDisplay(driver.getQueryDisplay());
+       // In Hive server mode, we are not able to retry in the FetchTask
+       // case, when calling fetch queries since execute() has returned.
+@@ -180,6 +217,13 @@ public void prepare(HiveConf sqlOperationConf) throws HiveSQLException {
+ 
+   private void runQuery(HiveConf sqlOperationConf) throws HiveSQLException {
+     try {
++      OperationState opState = getStatus().getState();
++      // Operation may have been cancelled by another thread
++      if (opState.isTerminal()) {
++        LOG.info("Not running the query. Operation is already in terminal state: " + opState
++            + ", perhaps cancelled due to query timeout or by another thread.");
++        return;
++      }
+       // In Hive server mode, we are not able to retry in the FetchTask
+       // case, when calling fetch queries since execute() has returned.
+       // For now, we disable the test attempts.
+@@ -189,14 +233,16 @@ private void runQuery(HiveConf sqlOperationConf) throws HiveSQLException {
+         throw toSQLException("Error while processing statement", response);
+       }
+     } catch (HiveSQLException e) {
+-      // If the operation was cancelled by another thread,
+-      // Driver#run will return a non-zero response code.
+-      // We will simply return if the operation state is CANCELED,
+-      // otherwise throw an exception
+-      if (getStatus().getState() == OperationState.CANCELED) {
++      /**
++       * If the operation was cancelled by another thread, or the execution timed out, Driver#run
++       * may return a non-zero response code. We will simply return if the operation state is
++       * CANCELED, TIMEDOUT or CLOSED, otherwise throw an exception
++       */
++      if ((getStatus().getState() == OperationState.CANCELED)
++          || (getStatus().getState() == OperationState.TIMEDOUT)
++          || (getStatus().getState() == OperationState.CLOSED)) {
+         return;
+-      }
+-      else {
++      } else {
+         setState(OperationState.ERROR);
+         throw e;
+       }
+@@ -309,8 +355,22 @@ private void registerCurrentOperationLog() {
+     }
+   }
+ 
+-  private void cleanup(OperationState state) throws HiveSQLException {
++  private synchronized void cleanup(OperationState state) throws HiveSQLException {
+     setState(state);
++    if (driver != null) {
++      driver.close();
++      driver.destroy();
++    }
++    driver = null;
++
++    SessionState ss = SessionState.get();
++    if (ss == null) {
++      LOG.warn("Operation seems to be in invalid state, SessionState is null");
++    } else {
++      ss.deleteTmpOutputFile();
++      ss.deleteTmpErrOutputFile();
++    }
++
+     if (shouldRunAsync()) {
+       Future<?> backgroundHandle = getBackgroundHandle();
+       if (backgroundHandle != null) {
+@@ -318,20 +378,16 @@ private void cleanup(OperationState state) throws HiveSQLException {
+       }
+     }
+ 
+-    if (driver != null) {
+-      driver.close();
+-      driver.destroy();
++    // Shutdown the timeout thread if any, while closing this operation
++    if ((timeoutExecutor != null) && (state != OperationState.TIMEDOUT) && (state.isTerminal())) {
++      timeoutExecutor.shutdownNow();
+     }
+-    driver = null;
+-
+-    SessionState ss = SessionState.get();
+-    ss.deleteTmpOutputFile();
+-    ss.deleteTmpErrOutputFile();
+   }
+ 
+   @Override
+-  public void cancel() throws HiveSQLException {
+-    cleanup(OperationState.CANCELED);
++  public void cancel(OperationState stateAfterCancel) throws HiveSQLException {
++    cleanup(stateAfterCancel);
++    cleanupOperationLog();
+   }
+ 
+   @Override
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSession.java b/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
+index 4f4e92d..0393446 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSession.java
+@@ -56,18 +56,38 @@
+    * @return
+    * @throws HiveSQLException
+    */
+-  OperationHandle executeStatement(String statement,
+-      Map<String, String> confOverlay) throws HiveSQLException;
++  OperationHandle executeStatement(String statement, Map<String, String> confOverlay) throws HiveSQLException;
+ 
+   /**
+    * execute operation handler
+    * @param statement
+    * @param confOverlay
++   * @param queryTimeout
+    * @return
+    * @throws HiveSQLException
+    */
+-  OperationHandle executeStatementAsync(String statement,
+-      Map<String, String> confOverlay) throws HiveSQLException;
++  OperationHandle executeStatement(String statement, Map<String, String> confOverlay,
++      long queryTimeout) throws HiveSQLException;
++
++  /**
++   * execute operation handler
++   * @param statement
++   * @param confOverlay
++   * @return
++   * @throws HiveSQLException
++   */
++  OperationHandle executeStatementAsync(String statement, Map<String, String> confOverlay) throws HiveSQLException;
++
++  /**
++   * execute operation handler
++   * @param statement
++   * @param confOverlay
++   * @param queryTimeout
++   * @return
++   * @throws HiveSQLException
++   */
++  OperationHandle executeStatementAsync(String statement, Map<String, String> confOverlay,
++      long queryTimeout) throws HiveSQLException;
+ 
+   /**
+    * getTypeInfo operation handler
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+index d68ed08..6abd431 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+@@ -192,7 +192,7 @@ protected int processCmd(String cmd) {
+       int rc = 0;
+       String cmd_trimed = cmd.trim();
+       try {
+-        executeStatementInternal(cmd_trimed, null, false);
++        executeStatementInternal(cmd_trimed, null, false, 0);
+       } catch (HiveSQLException e) {
+         rc = -1;
+         LOG.warn("Failed to execute HQL command in global .hiverc file.", e);
+@@ -391,20 +391,29 @@ public GetInfoValue getInfo(GetInfoType getInfoType)
+   }
+ 
+   @Override
+-  public OperationHandle executeStatement(String statement, Map<String, String> confOverlay)
+-      throws HiveSQLException {
+-    return executeStatementInternal(statement, confOverlay, false);
++  public OperationHandle executeStatement(String statement, Map<String, String> confOverlay) throws HiveSQLException {
++    return executeStatementInternal(statement, confOverlay, false, 0);
+   }
+ 
+   @Override
+-  public OperationHandle executeStatementAsync(String statement, Map<String, String> confOverlay)
+-      throws HiveSQLException {
+-    return executeStatementInternal(statement, confOverlay, true);
++  public OperationHandle executeStatement(String statement, Map<String, String> confOverlay,
++      long queryTimeout) throws HiveSQLException {
++    return executeStatementInternal(statement, confOverlay, false, queryTimeout);
+   }
+ 
+-  private OperationHandle executeStatementInternal(String statement, Map<String, String> confOverlay,
+-      boolean runAsync)
+-          throws HiveSQLException {
++  @Override
++  public OperationHandle executeStatementAsync(String statement, Map<String, String> confOverlay) throws HiveSQLException {
++    return executeStatementInternal(statement, confOverlay, true, 0);
++  }
++
++  @Override
++  public OperationHandle executeStatementAsync(String statement, Map<String, String> confOverlay,
++      long queryTimeout) throws HiveSQLException {
++    return executeStatementInternal(statement, confOverlay, true, queryTimeout);
++  }
++
++  private OperationHandle executeStatementInternal(String statement,
++      Map<String, String> confOverlay, boolean runAsync, long queryTimeout) throws HiveSQLException {
+     acquire(true);
+ 
+     // Make a copy of confOverlay
+@@ -418,16 +427,17 @@ private OperationHandle executeStatementInternal(String statement, Map<String, S
+     confOverlay.put(HiveConf.ConfVars.HIVEQUERYID.varname, QueryPlan.makeQueryId());
+ 
+     OperationManager operationManager = getOperationManager();
+-    ExecuteStatementOperation operation = operationManager
+-        .newExecuteStatementOperation(getSession(), statement, confOverlay, runAsync);
++    ExecuteStatementOperation operation =
++        operationManager.newExecuteStatementOperation(getSession(), statement, confOverlay,
++            runAsync, queryTimeout);
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+       addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+-      // Refering to SQLOperation.java,there is no chance that a HiveSQLException throws and the asyn
+-      // background operation submits to thread pool successfully at the same time. So, Cleanup
++      // Refering to SQLOperation.java, there is no chance that a HiveSQLException throws and the
++      // async background operation submits to thread pool successfully at the same time. So, Cleanup
+       // opHandle directly when got HiveSQLException
+       operationManager.closeOperation(opHandle);
+       throw e;
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+index c19c8e2..6bdb4ee 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+@@ -497,11 +497,13 @@ public TExecuteStatementResp ExecuteStatement(TExecuteStatementReq req) throws T
+       String statement = req.getStatement();
+       Map<String, String> confOverlay = req.getConfOverlay();
+       Boolean runAsync = req.isRunAsync();
+-      OperationHandle operationHandle = runAsync ?
+-          cliService.executeStatementAsync(sessionHandle, statement, confOverlay)
+-          : cliService.executeStatement(sessionHandle, statement, confOverlay);
+-          resp.setOperationHandle(operationHandle.toTOperationHandle());
+-          resp.setStatus(OK_STATUS);
++      long queryTimeout = req.getQueryTimeout();
++      OperationHandle operationHandle =
++          runAsync ? cliService.executeStatementAsync(sessionHandle, statement, confOverlay,
++              queryTimeout) : cliService.executeStatement(sessionHandle, statement, confOverlay,
++              queryTimeout);
++      resp.setOperationHandle(operationHandle.toTOperationHandle());
++      resp.setStatus(OK_STATUS);
+     } catch (Exception e) {
+       LOG.warn("Error executing statement: ", e);
+       resp.setStatus(HiveSQLException.toTStatus(e));
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java
+index 7c4ca05..d331a31 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIServiceClient.java
+@@ -108,34 +108,38 @@ public GetInfoValue getInfo(SessionHandle sessionHandle, GetInfoType infoType)
+     }
+   }
+ 
+-  /* (non-Javadoc)
+-   * @see org.apache.hive.service.cli.ICLIService#executeStatement(org.apache.hive.service.cli.SessionHandle, java.lang.String, java.util.Map)
+-   */
+   @Override
+   public OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
+-      Map<String, String> confOverlay)
+-          throws HiveSQLException {
+-    return executeStatementInternal(sessionHandle, statement, confOverlay, false);
++      Map<String, String> confOverlay) throws HiveSQLException {
++    return executeStatementInternal(sessionHandle, statement, confOverlay, false, 0);
++  }
++
++  @Override
++  public OperationHandle executeStatement(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException {
++    return executeStatementInternal(sessionHandle, statement, confOverlay, false, queryTimeout);
+   }
+ 
+-  /* (non-Javadoc)
+-   * @see org.apache.hive.service.cli.ICLIService#executeStatementAsync(org.apache.hive.service.cli.SessionHandle, java.lang.String, java.util.Map)
+-   */
+   @Override
+   public OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
+-      Map<String, String> confOverlay)
+-          throws HiveSQLException {
+-    return executeStatementInternal(sessionHandle, statement, confOverlay, true);
++      Map<String, String> confOverlay) throws HiveSQLException {
++    return executeStatementInternal(sessionHandle, statement, confOverlay, true, 0);
++  }
++
++  @Override
++  public OperationHandle executeStatementAsync(SessionHandle sessionHandle, String statement,
++      Map<String, String> confOverlay, long queryTimeout) throws HiveSQLException {
++    return executeStatementInternal(sessionHandle, statement, confOverlay, true, queryTimeout);
+   }
+ 
+   private OperationHandle executeStatementInternal(SessionHandle sessionHandle, String statement,
+-      Map<String, String> confOverlay, boolean isAsync)
+-          throws HiveSQLException {
++      Map<String, String> confOverlay, boolean isAsync, long queryTimeout) throws HiveSQLException {
+     try {
+       TExecuteStatementReq req =
+           new TExecuteStatementReq(sessionHandle.toTSessionHandle(), statement);
+       req.setConfOverlay(confOverlay);
+       req.setRunAsync(isAsync);
++      req.setQueryTimeout(queryTimeout);
+       TExecuteStatementResp resp = cliService.ExecuteStatement(req);
+       checkStatus(resp.getStatus());
+       TProtocolVersion protocol = sessionHandle.getProtocolVersion();
+diff --git a/service/src/test/org/apache/hive/service/cli/thrift/ThriftCLIServiceTest.java b/service/src/test/org/apache/hive/service/cli/thrift/ThriftCLIServiceTest.java
+index 630cfc9..c744173 100644
+--- a/service/src/test/org/apache/hive/service/cli/thrift/ThriftCLIServiceTest.java
++++ b/service/src/test/org/apache/hive/service/cli/thrift/ThriftCLIServiceTest.java
+@@ -178,8 +178,7 @@ public void testExecuteStatement() throws Exception {
+ 
+     // Execute another query
+     queryString = "SELECT ID+1 FROM TEST_EXEC_THRIFT";
+-    OperationHandle opHandle = client.executeStatement(sessHandle,
+-        queryString, opConf);
++    OperationHandle opHandle = client.executeStatement(sessHandle, queryString, opConf);
+     assertNotNull(opHandle);
+ 
+     OperationStatus opStatus = client.getOperationStatus(opHandle);
+@@ -229,8 +228,7 @@ public void testExecuteStatementAsync() throws Exception {
+     // Execute another query
+     queryString = "SELECT ID+1 FROM TEST_EXEC_ASYNC_THRIFT";
+     System.out.println("Will attempt to execute: " + queryString);
+-    opHandle = client.executeStatementAsync(sessHandle,
+-        queryString, opConf);
++    opHandle = client.executeStatementAsync(sessHandle, queryString, opConf);
+     assertNotNull(opHandle);
+ 
+     // Poll on the operation status till the query is completed
+-- 
+1.7.9.5
+

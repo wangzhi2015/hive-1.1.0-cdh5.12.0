@@ -1,0 +1,1570 @@
+From ba31a4d4bc818f0b43de3fb5d9cb718770afc72c Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Wed, 7 Dec 2016 11:09:11 -0600
+Subject: [PATCH 0859/1164] HIVE-15361: INSERT dynamic partition on S3 fails
+ with a MoveTask failure (Sergio Pena, reviewed by
+ Mohit Sabharwal and Illya Yalovyy)
+
+Change-Id: I696f061b1df115196f88f1885207b1bda62087a3
+---
+ .../insert_into_dynamic_partitions.q               |   24 ++
+ .../queries/clientpositive/insert_into_table.q     |    8 -
+ .../insert_overwrite_dynamic_partitions.q          |   30 ++
+ .../insert_into_dynamic_partitions.q.out           |  364 ++++++++++++++++
+ .../results/clientpositive/insert_into_table.q.out |    4 +-
+ .../insert_overwrite_directory.q.out               |   12 +-
+ .../insert_overwrite_dynamic_partitions.q.out      |  444 ++++++++++++++++++++
+ .../clientpositive/insert_overwrite_table.q.out    |    4 +-
+ .../hadoop/hive/ql/optimizer/GenMapRedUtils.java   |  234 +++++------
+ .../org/apache/hadoop/hive/ql/plan/LoadDesc.java   |    5 +-
+ .../apache/hadoop/hive/ql/plan/LoadFileDesc.java   |   11 +
+ .../apache/hadoop/hive/ql/plan/LoadTableDesc.java  |   12 +
+ .../org/apache/hadoop/hive/ql/plan/MoveWork.java   |   10 +
+ .../TestGenMapRedUtilsCreateConditionalTask.java   |  108 ++++-
+ 14 files changed, 1114 insertions(+), 156 deletions(-)
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/insert_into_dynamic_partitions.q
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/insert_overwrite_dynamic_partitions.q
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/insert_into_dynamic_partitions.q.out
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_dynamic_partitions.q.out
+
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_dynamic_partitions.q b/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_dynamic_partitions.q
+new file mode 100644
+index 0000000..7269e29
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_dynamic_partitions.q
+@@ -0,0 +1,24 @@
++SET hive.blobstore.optimizations.enabled=true;
++SET hive.exec.dynamic.partition.mode=nonstrict;
++
++-- Single partition with buckets
++DROP TABLE table1;
++CREATE TABLE table1 (id int) partitioned by (key string) clustered by (id) into 2 buckets LOCATION '${hiveconf:test.blobstore.path.unique}/table1/';
++INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
++INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
++SELECT * FROM table1;
++EXPLAIN EXTENDED INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
++DROP TABLE table1;
++
++-- Multiple partitions
++CREATE TABLE table1 (name string, age int) PARTITIONED BY (country string, state string);
++INSERT INTO table1 PARTITION (country='USA', state='CA') values ('John Doe', 23), ('Jane Doe', 22);
++INSERT INTO table1 PARTITION (country='USA', state='CA') values ('Mark Cage', 38), ('Mirna Cage', 37);
++INSERT INTO table1 PARTITION (country='USA', state='TX') values ('Bill Rose', 52), ('Maria Full', 50);
++CREATE TABLE table2 (name string, age int) PARTITIONED BY (country string, state string) LOCATION '${hiveconf:test.blobstore.path.unique}/table2/';
++INSERT INTO TABLE table2 PARTITION (country, state) SELECT * FROM table1;
++INSERT INTO TABLE table2 PARTITION (country='MEX', state) VALUES ('Peter Mo', 87, 'SON');
++SHOW PARTITIONS table2;
++SELECT * FROM table2;
++DROP TABLE table2;
++DROP TABLE table1;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_table.q b/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_table.q
+index 25e2e70..fd38aef 100644
+--- a/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_table.q
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/insert_into_table.q
+@@ -9,12 +9,4 @@ INSERT INTO TABLE table1 VALUES (1);
+ INSERT INTO TABLE table1 VALUES (2);
+ SELECT * FROM table1;
+ EXPLAIN EXTENDED INSERT INTO TABLE table1 VALUES (1);
+-DROP TABLE table1;
+-
+--- Insert dynamic partitions;
+-CREATE TABLE table1 (id int) partitioned by (key string) clustered by (id) into 2 buckets LOCATION '${hiveconf:test.blobstore.path.unique}/table1/';
+-INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
+-INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
+-SELECT * FROM table1;
+-EXPLAIN EXTENDED INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
+ DROP TABLE table1;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/insert_overwrite_dynamic_partitions.q b/itests/hive-blobstore/src/test/queries/clientpositive/insert_overwrite_dynamic_partitions.q
+new file mode 100644
+index 0000000..0be4f16
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/insert_overwrite_dynamic_partitions.q
+@@ -0,0 +1,30 @@
++SET hive.blobstore.optimizations.enabled=true;
++SET hive.exec.dynamic.partition.mode=nonstrict;
++
++-- Single partition with buckets
++DROP TABLE table1;
++CREATE TABLE table1 (id int) partitioned by (key string) clustered by (id) into 2 buckets LOCATION '${hiveconf:test.blobstore.path.unique}/table1/';
++INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
++SELECT * FROM table1;
++INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
++SELECT * FROM table1;
++EXPLAIN EXTENDED INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505');
++DROP TABLE table1;
++
++-- Multiple partitions
++CREATE TABLE table1 (name string, age int) PARTITIONED BY (country string, state string);
++INSERT INTO table1 PARTITION (country='USA', state='CA') values ('John Doe', 23), ('Jane Doe', 22);
++INSERT INTO table1 PARTITION (country='USA', state='CA') values ('Mark Cage', 38), ('Mirna Cage', 37);
++INSERT INTO table1 PARTITION (country='USA', state='TX') values ('Bill Rose', 52), ('Maria Full', 50);
++CREATE TABLE table2 (name string, age int) PARTITIONED BY (country string, state string) LOCATION '${hiveconf:test.blobstore.path.unique}/table2/';
++INSERT OVERWRITE TABLE table2 PARTITION (country, state) SELECT * FROM table1;
++SHOW PARTITIONS table2;
++SELECT * FROM table2;
++INSERT OVERWRITE TABLE table2 PARTITION (country, state) SELECT * FROM table1 WHERE age < 30;
++SHOW PARTITIONS table2;
++SELECT * FROM table2;
++INSERT OVERWRITE TABLE table2 PARTITION (country='MEX', state) VALUES ('Peter Mo', 87, 'SON');
++SHOW PARTITIONS table2;
++SELECT * FROM table2;
++DROP TABLE table2;
++DROP TABLE table1;
+\ No newline at end of file
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_into_dynamic_partitions.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_into_dynamic_partitions.q.out
+new file mode 100644
+index 0000000..b80334f
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_into_dynamic_partitions.q.out
+@@ -0,0 +1,364 @@
++PREHOOK: query: -- Single partition with buckets
++DROP TABLE table1
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: -- Single partition with buckets
++DROP TABLE table1
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/table1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@table1
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/table1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@table1
++PREHOOK: query: INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@table1
++POSTHOOK: query: INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@table1@key=101
++POSTHOOK: Output: default@table1@key=202
++POSTHOOK: Output: default@table1@key=303
++POSTHOOK: Output: default@table1@key=404
++POSTHOOK: Output: default@table1@key=505
++POSTHOOK: Lineage: table1 PARTITION(key=101).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=202).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=303).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=404).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=505).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__2
++PREHOOK: Output: default@table1
++POSTHOOK: query: INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__2
++POSTHOOK: Output: default@table1@key=101
++POSTHOOK: Output: default@table1@key=202
++POSTHOOK: Output: default@table1@key=303
++POSTHOOK: Output: default@table1@key=404
++POSTHOOK: Output: default@table1@key=505
++POSTHOOK: Lineage: table1 PARTITION(key=101).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=202).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=303).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=404).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=505).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SELECT * FROM table1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table1
++PREHOOK: Input: default@table1@key=101
++PREHOOK: Input: default@table1@key=202
++PREHOOK: Input: default@table1@key=303
++PREHOOK: Input: default@table1@key=404
++PREHOOK: Input: default@table1@key=505
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table1
++POSTHOOK: Input: default@table1@key=101
++POSTHOOK: Input: default@table1@key=202
++POSTHOOK: Input: default@table1@key=303
++POSTHOOK: Input: default@table1@key=404
++POSTHOOK: Input: default@table1@key=505
++#### A masked pattern was here ####
++1	101
++1	101
++2	202
++2	202
++3	303
++3	303
++4	404
++4	404
++5	505
++5	505
++PREHOOK: query: EXPLAIN EXTENDED INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++PREHOOK: type: QUERY
++POSTHOOK: query: EXPLAIN EXTENDED INSERT INTO TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_QUERY
++   TOK_FROM
++      null
++         null
++            Values__Tmp__Table__3
++   TOK_INSERT
++      TOK_INSERT_INTO
++         TOK_TAB
++            TOK_TABNAME
++               table1
++            TOK_PARTSPEC
++               TOK_PARTVAL
++                  key
++      TOK_SELECT
++         TOK_SELEXPR
++            TOK_ALLCOLREF
++
++
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++  Stage-2 depends on stages: Stage-0
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: values__tmp__table__3
++            Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++            GatherStats: false
++            Select Operator
++              expressions: UDFToInteger(tmp_values_col1) (type: int), tmp_values_col2 (type: string)
++              outputColumnNames: _col0, _col1
++              Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++              Reduce Output Operator
++                key expressions: _col1 (type: string), '_bucket_number' (type: string)
++                sort order: ++
++                Map-reduce partition columns: _col1 (type: string)
++                Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++                tag: -1
++                value expressions: _col0 (type: int)
++                auto parallelism: false
++      Path -> Alias:
++#### A masked pattern was here ####
++      Path -> Partition:
++#### A masked pattern was here ####
++          Partition
++            base file name: Values__Tmp__Table__3
++            input format: org.apache.hadoop.mapred.TextInputFormat
++            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++            properties:
++              bucket_count -1
++              columns tmp_values_col1,tmp_values_col2
++              columns.comments 
++              columns.types string:string
++#### A masked pattern was here ####
++              name default.values__tmp__table__3
++              serialization.ddl struct values__tmp__table__3 { string tmp_values_col1, string tmp_values_col2}
++              serialization.format 1
++              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++          
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                bucket_count -1
++                columns tmp_values_col1,tmp_values_col2
++                columns.comments 
++                columns.types string:string
++#### A masked pattern was here ####
++                name default.values__tmp__table__3
++                serialization.ddl struct values__tmp__table__3 { string tmp_values_col1, string tmp_values_col2}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.values__tmp__table__3
++            name: default.values__tmp__table__3
++      Truncated Path -> Alias:
++#### A masked pattern was here ####
++      Needs Tagging: false
++      Reduce Operator Tree:
++        Select Operator
++          expressions: VALUE._col0 (type: int), KEY._col1 (type: string), KEY.'_bucket_number' (type: string)
++          outputColumnNames: _col0, _col1, '_bucket_number'
++          Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++          File Output Operator
++            compressed: false
++            GlobalTableId: 1
++            directory: ### BLOBSTORE_STAGING_PATH ###
++            NumFilesPerFileSink: 1
++            Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++            Stats Publishing Key Prefix: ### BLOBSTORE_STAGING_PATH ###
++            table:
++                input format: org.apache.hadoop.mapred.TextInputFormat
++                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                properties:
++                  bucket_count 2
++                  bucket_field_name id
++                  columns id
++                  columns.comments 
++                  columns.types int
++#### A masked pattern was here ####
++                  location ### test.blobstore.path ###/table1
++                  name default.table1
++                  partition_columns key
++                  partition_columns.types string
++                  serialization.ddl struct table1 { i32 id}
++                  serialization.format 1
++                  serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++#### A masked pattern was here ####
++                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                name: default.table1
++            TotalFiles: 1
++            GatherStats: true
++            MultiFileSpray: false
++
++  Stage: Stage-0
++    Move Operator
++      tables:
++          partition:
++            key 
++          replace: false
++          source: ### BLOBSTORE_STAGING_PATH ###
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                bucket_count 2
++                bucket_field_name id
++                columns id
++                columns.comments 
++                columns.types int
++#### A masked pattern was here ####
++                location ### test.blobstore.path ###/table1
++                name default.table1
++                partition_columns key
++                partition_columns.types string
++                serialization.ddl struct table1 { i32 id}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++#### A masked pattern was here ####
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.table1
++
++  Stage: Stage-2
++    Stats-Aggr Operator
++      Stats Aggregation Key Prefix: ### BLOBSTORE_STAGING_PATH ###
++
++PREHOOK: query: DROP TABLE table1
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@table1
++PREHOOK: Output: default@table1
++POSTHOOK: query: DROP TABLE table1
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@table1
++POSTHOOK: Output: default@table1
++PREHOOK: query: -- Multiple partitions
++CREATE TABLE table1 (name string, age int) PARTITIONED BY (country string, state string)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@table1
++POSTHOOK: query: -- Multiple partitions
++CREATE TABLE table1 (name string, age int) PARTITIONED BY (country string, state string)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@table1
++PREHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('John Doe', 23), ('Jane Doe', 22)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__4
++PREHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('John Doe', 23), ('Jane Doe', 22)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__4
++POSTHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).age EXPRESSION [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).name SIMPLE [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('Mark Cage', 38), ('Mirna Cage', 37)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__5
++PREHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('Mark Cage', 38), ('Mirna Cage', 37)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__5
++POSTHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).age EXPRESSION [(values__tmp__table__5)values__tmp__table__5.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).name SIMPLE [(values__tmp__table__5)values__tmp__table__5.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='TX') values ('Bill Rose', 52), ('Maria Full', 50)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__6
++PREHOOK: Output: default@table1@country=USA/state=TX
++POSTHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='TX') values ('Bill Rose', 52), ('Maria Full', 50)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__6
++POSTHOOK: Output: default@table1@country=USA/state=TX
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=TX).age EXPRESSION [(values__tmp__table__6)values__tmp__table__6.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=TX).name SIMPLE [(values__tmp__table__6)values__tmp__table__6.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/table2
++PREHOOK: Output: database:default
++PREHOOK: Output: default@table2
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/table2
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@table2
++PREHOOK: query: INSERT INTO TABLE table2 PARTITION (country, state) SELECT * FROM table1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table1
++PREHOOK: Input: default@table1@country=USA/state=CA
++PREHOOK: Input: default@table1@country=USA/state=TX
++PREHOOK: Output: default@table2
++POSTHOOK: query: INSERT INTO TABLE table2 PARTITION (country, state) SELECT * FROM table1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table1
++POSTHOOK: Input: default@table1@country=USA/state=CA
++POSTHOOK: Input: default@table1@country=USA/state=TX
++POSTHOOK: Output: default@table2@country=USA/state=CA
++POSTHOOK: Output: default@table2@country=USA/state=TX
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=CA).age SIMPLE [(table1)table1.FieldSchema(name:age, type:int, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=CA).name SIMPLE [(table1)table1.FieldSchema(name:name, type:string, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=TX).age SIMPLE [(table1)table1.FieldSchema(name:age, type:int, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=TX).name SIMPLE [(table1)table1.FieldSchema(name:name, type:string, comment:null), ]
++PREHOOK: query: INSERT INTO TABLE table2 PARTITION (country='MEX', state) VALUES ('Peter Mo', 87, 'SON')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__7
++PREHOOK: Output: default@table2@country=MEX
++POSTHOOK: query: INSERT INTO TABLE table2 PARTITION (country='MEX', state) VALUES ('Peter Mo', 87, 'SON')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__7
++POSTHOOK: Output: default@table2@country=MEX/state=SON
++POSTHOOK: Lineage: table2 PARTITION(country=MEX,state=SON).age EXPRESSION [(values__tmp__table__7)values__tmp__table__7.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table2 PARTITION(country=MEX,state=SON).name SIMPLE [(values__tmp__table__7)values__tmp__table__7.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SHOW PARTITIONS table2
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@table2
++POSTHOOK: query: SHOW PARTITIONS table2
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@table2
++country=MEX/state=SON
++country=USA/state=CA
++country=USA/state=TX
++PREHOOK: query: SELECT * FROM table2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table2
++PREHOOK: Input: default@table2@country=MEX/state=SON
++PREHOOK: Input: default@table2@country=USA/state=CA
++PREHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table2
++POSTHOOK: Input: default@table2@country=MEX/state=SON
++POSTHOOK: Input: default@table2@country=USA/state=CA
++POSTHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++Peter Mo	87	MEX	SON
++Mirna Cage	37	USA	CA
++Mark Cage	38	USA	CA
++Jane Doe	22	USA	CA
++John Doe	23	USA	CA
++Maria Full	50	USA	TX
++Bill Rose	52	USA	TX
++PREHOOK: query: DROP TABLE table2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@table2
++PREHOOK: Output: default@table2
++POSTHOOK: query: DROP TABLE table2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@table2
++POSTHOOK: Output: default@table2
++PREHOOK: query: DROP TABLE table1
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@table1
++PREHOOK: Output: default@table1
++POSTHOOK: query: DROP TABLE table1
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@table1
++POSTHOOK: Output: default@table1
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_into_table.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_into_table.q.out
+index a2cd141..b237e59 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/insert_into_table.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_into_table.q.out
+@@ -65,9 +65,9 @@ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+   Stage-4
+-  Stage-2 depends on stages: Stage-0, Stage-4, Stage-6
++  Stage-2 depends on stages: Stage-0, Stage-4
+   Stage-3
+-  Stage-0 depends on stages: Stage-3
++  Stage-0 depends on stages: Stage-3, Stage-6
+   Stage-5
+   Stage-6 depends on stages: Stage-5
+ 
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_directory.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_directory.q.out
+index be68336..dcb751a 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_directory.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_directory.q.out
+@@ -91,7 +91,7 @@ STAGE DEPENDENCIES:
+   Stage-6 depends on stages: Stage-1 , consists of Stage-3, Stage-2, Stage-4
+   Stage-3
+   Stage-2
+-  Stage-0 depends on stages: Stage-2
++  Stage-0 depends on stages: Stage-2, Stage-5
+   Stage-4
+   Stage-5 depends on stages: Stage-4
+ 
+@@ -296,7 +296,7 @@ STAGE PLANS:
+       files:
+           hdfs directory: true
+           source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/table1.dir
++          destination: ### BLOBSTORE_STAGING_PATH ###
+ 
+ PREHOOK: query: EXPLAIN EXTENDED FROM table1
+                  INSERT OVERWRITE DIRECTORY '### test.blobstore.path ###/table1.dir/' SELECT id
+@@ -336,13 +336,13 @@ STAGE DEPENDENCIES:
+   Stage-7 depends on stages: Stage-2 , consists of Stage-4, Stage-3, Stage-5
+   Stage-4
+   Stage-3
+-  Stage-0 depends on stages: Stage-3
++  Stage-0 depends on stages: Stage-3, Stage-6
+   Stage-5
+   Stage-6 depends on stages: Stage-5
+   Stage-12 depends on stages: Stage-2 , consists of Stage-9, Stage-8, Stage-10
+   Stage-9
+   Stage-8
+-  Stage-1 depends on stages: Stage-8
++  Stage-1 depends on stages: Stage-8, Stage-11
+   Stage-10
+   Stage-11 depends on stages: Stage-10
+ 
+@@ -570,7 +570,7 @@ STAGE PLANS:
+       files:
+           hdfs directory: true
+           source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/table1.dir
++          destination: ### BLOBSTORE_STAGING_PATH ###
+ 
+   Stage: Stage-12
+     Conditional Operator
+@@ -690,5 +690,5 @@ STAGE PLANS:
+       files:
+           hdfs directory: true
+           source: ### BLOBSTORE_STAGING_PATH ###
+-          destination: ### test.blobstore.path ###/table2.dir
++          destination: ### BLOBSTORE_STAGING_PATH ###
+ 
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_dynamic_partitions.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_dynamic_partitions.q.out
+new file mode 100644
+index 0000000..451f28a
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_dynamic_partitions.q.out
+@@ -0,0 +1,444 @@
++PREHOOK: query: -- Single partition with buckets
++DROP TABLE table1
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: -- Single partition with buckets
++DROP TABLE table1
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/table1
++PREHOOK: Output: database:default
++PREHOOK: Output: default@table1
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/table1
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@table1
++PREHOOK: query: INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@table1
++POSTHOOK: query: INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@table1@key=101
++POSTHOOK: Output: default@table1@key=202
++POSTHOOK: Output: default@table1@key=303
++POSTHOOK: Output: default@table1@key=404
++POSTHOOK: Output: default@table1@key=505
++POSTHOOK: Lineage: table1 PARTITION(key=101).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=202).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=303).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=404).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=505).id EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SELECT * FROM table1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table1
++PREHOOK: Input: default@table1@key=101
++PREHOOK: Input: default@table1@key=202
++PREHOOK: Input: default@table1@key=303
++PREHOOK: Input: default@table1@key=404
++PREHOOK: Input: default@table1@key=505
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table1
++POSTHOOK: Input: default@table1@key=101
++POSTHOOK: Input: default@table1@key=202
++POSTHOOK: Input: default@table1@key=303
++POSTHOOK: Input: default@table1@key=404
++POSTHOOK: Input: default@table1@key=505
++#### A masked pattern was here ####
++1	101
++2	202
++3	303
++4	404
++5	505
++PREHOOK: query: INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__2
++PREHOOK: Output: default@table1
++POSTHOOK: query: INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__2
++POSTHOOK: Output: default@table1@key=101
++POSTHOOK: Output: default@table1@key=202
++POSTHOOK: Output: default@table1@key=303
++POSTHOOK: Output: default@table1@key=404
++POSTHOOK: Output: default@table1@key=505
++POSTHOOK: Lineage: table1 PARTITION(key=101).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=202).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=303).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=404).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(key=505).id EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SELECT * FROM table1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table1
++PREHOOK: Input: default@table1@key=101
++PREHOOK: Input: default@table1@key=202
++PREHOOK: Input: default@table1@key=303
++PREHOOK: Input: default@table1@key=404
++PREHOOK: Input: default@table1@key=505
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table1
++POSTHOOK: Input: default@table1@key=101
++POSTHOOK: Input: default@table1@key=202
++POSTHOOK: Input: default@table1@key=303
++POSTHOOK: Input: default@table1@key=404
++POSTHOOK: Input: default@table1@key=505
++#### A masked pattern was here ####
++1	101
++2	202
++3	303
++4	404
++5	505
++PREHOOK: query: EXPLAIN EXTENDED INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++PREHOOK: type: QUERY
++POSTHOOK: query: EXPLAIN EXTENDED INSERT OVERWRITE TABLE table1 PARTITION (key) VALUES (1, '101'), (2, '202'), (3, '303'), (4, '404'), (5, '505')
++POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_QUERY
++   TOK_FROM
++      null
++         null
++            Values__Tmp__Table__3
++   TOK_INSERT
++      TOK_DESTINATION
++         TOK_TAB
++            TOK_TABNAME
++               table1
++            TOK_PARTSPEC
++               TOK_PARTVAL
++                  key
++      TOK_SELECT
++         TOK_SELEXPR
++            TOK_ALLCOLREF
++
++
++STAGE DEPENDENCIES:
++  Stage-1 is a root stage
++  Stage-0 depends on stages: Stage-1
++  Stage-2 depends on stages: Stage-0
++
++STAGE PLANS:
++  Stage: Stage-1
++    Map Reduce
++      Map Operator Tree:
++          TableScan
++            alias: values__tmp__table__3
++            Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++            GatherStats: false
++            Select Operator
++              expressions: UDFToInteger(tmp_values_col1) (type: int), tmp_values_col2 (type: string)
++              outputColumnNames: _col0, _col1
++              Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++              Reduce Output Operator
++                key expressions: _col1 (type: string), '_bucket_number' (type: string)
++                sort order: ++
++                Map-reduce partition columns: _col1 (type: string)
++                Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++                tag: -1
++                value expressions: _col0 (type: int)
++                auto parallelism: false
++      Path -> Alias:
++#### A masked pattern was here ####
++      Path -> Partition:
++#### A masked pattern was here ####
++          Partition
++            base file name: Values__Tmp__Table__3
++            input format: org.apache.hadoop.mapred.TextInputFormat
++            output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++            properties:
++              bucket_count -1
++              columns tmp_values_col1,tmp_values_col2
++              columns.comments 
++              columns.types string:string
++#### A masked pattern was here ####
++              name default.values__tmp__table__3
++              serialization.ddl struct values__tmp__table__3 { string tmp_values_col1, string tmp_values_col2}
++              serialization.format 1
++              serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++            serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++          
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                bucket_count -1
++                columns tmp_values_col1,tmp_values_col2
++                columns.comments 
++                columns.types string:string
++#### A masked pattern was here ####
++                name default.values__tmp__table__3
++                serialization.ddl struct values__tmp__table__3 { string tmp_values_col1, string tmp_values_col2}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.values__tmp__table__3
++            name: default.values__tmp__table__3
++      Truncated Path -> Alias:
++#### A masked pattern was here ####
++      Needs Tagging: false
++      Reduce Operator Tree:
++        Select Operator
++          expressions: VALUE._col0 (type: int), KEY._col1 (type: string), KEY.'_bucket_number' (type: string)
++          outputColumnNames: _col0, _col1, '_bucket_number'
++          Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++          File Output Operator
++            compressed: false
++            GlobalTableId: 1
++            directory: ### BLOBSTORE_STAGING_PATH ###
++            NumFilesPerFileSink: 1
++            Statistics: Num rows: 1 Data size: 30 Basic stats: COMPLETE Column stats: NONE
++            Stats Publishing Key Prefix: ### BLOBSTORE_STAGING_PATH ###
++            table:
++                input format: org.apache.hadoop.mapred.TextInputFormat
++                output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++                properties:
++                  bucket_count 2
++                  bucket_field_name id
++                  columns id
++                  columns.comments 
++                  columns.types int
++#### A masked pattern was here ####
++                  location ### test.blobstore.path ###/table1
++                  name default.table1
++                  partition_columns key
++                  partition_columns.types string
++                  serialization.ddl struct table1 { i32 id}
++                  serialization.format 1
++                  serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++#### A masked pattern was here ####
++                serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++                name: default.table1
++            TotalFiles: 1
++            GatherStats: true
++            MultiFileSpray: false
++
++  Stage: Stage-0
++    Move Operator
++      tables:
++          partition:
++            key 
++          replace: true
++          source: ### BLOBSTORE_STAGING_PATH ###
++          table:
++              input format: org.apache.hadoop.mapred.TextInputFormat
++              output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++              properties:
++                bucket_count 2
++                bucket_field_name id
++                columns id
++                columns.comments 
++                columns.types int
++#### A masked pattern was here ####
++                location ### test.blobstore.path ###/table1
++                name default.table1
++                partition_columns key
++                partition_columns.types string
++                serialization.ddl struct table1 { i32 id}
++                serialization.format 1
++                serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++#### A masked pattern was here ####
++              serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
++              name: default.table1
++
++  Stage: Stage-2
++    Stats-Aggr Operator
++      Stats Aggregation Key Prefix: ### BLOBSTORE_STAGING_PATH ###
++
++PREHOOK: query: DROP TABLE table1
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@table1
++PREHOOK: Output: default@table1
++POSTHOOK: query: DROP TABLE table1
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@table1
++POSTHOOK: Output: default@table1
++PREHOOK: query: -- Multiple partitions
++CREATE TABLE table1 (name string, age int) PARTITIONED BY (country string, state string)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@table1
++POSTHOOK: query: -- Multiple partitions
++CREATE TABLE table1 (name string, age int) PARTITIONED BY (country string, state string)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@table1
++PREHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('John Doe', 23), ('Jane Doe', 22)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__4
++PREHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('John Doe', 23), ('Jane Doe', 22)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__4
++POSTHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).age EXPRESSION [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).name SIMPLE [(values__tmp__table__4)values__tmp__table__4.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('Mark Cage', 38), ('Mirna Cage', 37)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__5
++PREHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='CA') values ('Mark Cage', 38), ('Mirna Cage', 37)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__5
++POSTHOOK: Output: default@table1@country=USA/state=CA
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).age EXPRESSION [(values__tmp__table__5)values__tmp__table__5.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=CA).name SIMPLE [(values__tmp__table__5)values__tmp__table__5.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='TX') values ('Bill Rose', 52), ('Maria Full', 50)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__6
++PREHOOK: Output: default@table1@country=USA/state=TX
++POSTHOOK: query: INSERT INTO table1 PARTITION (country='USA', state='TX') values ('Bill Rose', 52), ('Maria Full', 50)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__6
++POSTHOOK: Output: default@table1@country=USA/state=TX
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=TX).age EXPRESSION [(values__tmp__table__6)values__tmp__table__6.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table1 PARTITION(country=USA,state=TX).name SIMPLE [(values__tmp__table__6)values__tmp__table__6.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/table2
++PREHOOK: Output: database:default
++PREHOOK: Output: default@table2
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/table2
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@table2
++PREHOOK: query: INSERT OVERWRITE TABLE table2 PARTITION (country, state) SELECT * FROM table1
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table1
++PREHOOK: Input: default@table1@country=USA/state=CA
++PREHOOK: Input: default@table1@country=USA/state=TX
++PREHOOK: Output: default@table2
++POSTHOOK: query: INSERT OVERWRITE TABLE table2 PARTITION (country, state) SELECT * FROM table1
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table1
++POSTHOOK: Input: default@table1@country=USA/state=CA
++POSTHOOK: Input: default@table1@country=USA/state=TX
++POSTHOOK: Output: default@table2@country=USA/state=CA
++POSTHOOK: Output: default@table2@country=USA/state=TX
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=CA).age SIMPLE [(table1)table1.FieldSchema(name:age, type:int, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=CA).name SIMPLE [(table1)table1.FieldSchema(name:name, type:string, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=TX).age SIMPLE [(table1)table1.FieldSchema(name:age, type:int, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=TX).name SIMPLE [(table1)table1.FieldSchema(name:name, type:string, comment:null), ]
++PREHOOK: query: SHOW PARTITIONS table2
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@table2
++POSTHOOK: query: SHOW PARTITIONS table2
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@table2
++country=USA/state=CA
++country=USA/state=TX
++PREHOOK: query: SELECT * FROM table2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table2
++PREHOOK: Input: default@table2@country=USA/state=CA
++PREHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table2
++POSTHOOK: Input: default@table2@country=USA/state=CA
++POSTHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++Mirna Cage	37	USA	CA
++Mark Cage	38	USA	CA
++Jane Doe	22	USA	CA
++John Doe	23	USA	CA
++Maria Full	50	USA	TX
++Bill Rose	52	USA	TX
++PREHOOK: query: INSERT OVERWRITE TABLE table2 PARTITION (country, state) SELECT * FROM table1 WHERE age < 30
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table1
++PREHOOK: Input: default@table1@country=USA/state=CA
++PREHOOK: Input: default@table1@country=USA/state=TX
++PREHOOK: Output: default@table2
++POSTHOOK: query: INSERT OVERWRITE TABLE table2 PARTITION (country, state) SELECT * FROM table1 WHERE age < 30
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table1
++POSTHOOK: Input: default@table1@country=USA/state=CA
++POSTHOOK: Input: default@table1@country=USA/state=TX
++POSTHOOK: Output: default@table2@country=USA/state=CA
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=CA).age SIMPLE [(table1)table1.FieldSchema(name:age, type:int, comment:null), ]
++POSTHOOK: Lineage: table2 PARTITION(country=USA,state=CA).name SIMPLE [(table1)table1.FieldSchema(name:name, type:string, comment:null), ]
++PREHOOK: query: SHOW PARTITIONS table2
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@table2
++POSTHOOK: query: SHOW PARTITIONS table2
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@table2
++country=USA/state=CA
++country=USA/state=TX
++PREHOOK: query: SELECT * FROM table2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table2
++PREHOOK: Input: default@table2@country=USA/state=CA
++PREHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table2
++POSTHOOK: Input: default@table2@country=USA/state=CA
++POSTHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++Jane Doe	22	USA	CA
++John Doe	23	USA	CA
++Maria Full	50	USA	TX
++Bill Rose	52	USA	TX
++PREHOOK: query: INSERT OVERWRITE TABLE table2 PARTITION (country='MEX', state) VALUES ('Peter Mo', 87, 'SON')
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__7
++PREHOOK: Output: default@table2@country=MEX
++POSTHOOK: query: INSERT OVERWRITE TABLE table2 PARTITION (country='MEX', state) VALUES ('Peter Mo', 87, 'SON')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__7
++POSTHOOK: Output: default@table2@country=MEX/state=SON
++POSTHOOK: Lineage: table2 PARTITION(country=MEX,state=SON).age EXPRESSION [(values__tmp__table__7)values__tmp__table__7.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: table2 PARTITION(country=MEX,state=SON).name SIMPLE [(values__tmp__table__7)values__tmp__table__7.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SHOW PARTITIONS table2
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@table2
++POSTHOOK: query: SHOW PARTITIONS table2
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@table2
++country=MEX/state=SON
++country=USA/state=CA
++country=USA/state=TX
++PREHOOK: query: SELECT * FROM table2
++PREHOOK: type: QUERY
++PREHOOK: Input: default@table2
++PREHOOK: Input: default@table2@country=MEX/state=SON
++PREHOOK: Input: default@table2@country=USA/state=CA
++PREHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM table2
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@table2
++POSTHOOK: Input: default@table2@country=MEX/state=SON
++POSTHOOK: Input: default@table2@country=USA/state=CA
++POSTHOOK: Input: default@table2@country=USA/state=TX
++#### A masked pattern was here ####
++Peter Mo	87	MEX	SON
++Jane Doe	22	USA	CA
++John Doe	23	USA	CA
++Maria Full	50	USA	TX
++Bill Rose	52	USA	TX
++PREHOOK: query: DROP TABLE table2
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@table2
++PREHOOK: Output: default@table2
++POSTHOOK: query: DROP TABLE table2
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@table2
++POSTHOOK: Output: default@table2
++PREHOOK: query: DROP TABLE table1
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@table1
++PREHOOK: Output: default@table1
++POSTHOOK: query: DROP TABLE table1
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@table1
++POSTHOOK: Output: default@table1
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_table.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_table.q.out
+index cd6d8ef..f930637 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_table.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_overwrite_table.q.out
+@@ -73,9 +73,9 @@ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+   Stage-4
+-  Stage-2 depends on stages: Stage-0, Stage-4, Stage-6
++  Stage-2 depends on stages: Stage-0, Stage-4
+   Stage-3
+-  Stage-0 depends on stages: Stage-3
++  Stage-0 depends on stages: Stage-3, Stage-6
+   Stage-5
+   Stage-6 depends on stages: Stage-5
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+index 8c74b92..957c7f7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+@@ -33,6 +33,7 @@
+ import java.util.Properties;
+ import java.util.Set;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.Path;
+@@ -1303,19 +1304,15 @@ public static void createMRWorkForMergingFiles (FileSinkOperator fsInput,
+     cplan.setInputformat("org.apache.hadoop.hive.ql.io.CombineHiveInputFormat");
+     // NOTE: we should gather stats in MR1 rather than MR2 at merge job since we don't
+     // know if merge MR2 will be triggered at execution time
++    Task<MoveWork> mvTask = GenMapRedUtils.findMoveTask(mvTasks, fsOutput);
+     ConditionalTask cndTsk = GenMapRedUtils.createCondTask(conf, currTask, dummyMv, work,
+-        fsInputDesc.getFinalDirName().toString());
++        fsInputDesc.getFinalDirName(), finalName, mvTask, dependencyTask);
+ 
+     // keep the dynamic partition context in conditional task resolver context
+     ConditionalResolverMergeFilesCtx mrCtx =
+         (ConditionalResolverMergeFilesCtx) cndTsk.getResolverCtx();
+     mrCtx.setDPCtx(fsInputDesc.getDynPartCtx());
+     mrCtx.setLbCtx(fsInputDesc.getLbCtx());
+-
+-    //
+-    // 3. add the moveTask as the children of the conditional task
+-    //
+-    linkMoveTask(fsOutput, cndTsk, mvTasks, conf, dependencyTask);
+   }
+ 
+   /**
+@@ -1388,60 +1385,12 @@ public static void addDependentMoveTasks(Task<MoveWork> mvTask, HiveConf hconf,
+           parentTask.addDependentTask(mvTask);
+         }
+       } else {
+-        if (BlobStorageUtils.areOptimizationsEnabled(hconf) && parentTask instanceof MoveTask && areMoveTasksOnSameBlobStorage(hconf, (Task<MoveWork>)parentTask, mvTask)) {
+-          mergeMoveTasks((Task<MoveWork>)parentTask, mvTask);
+-        } else {
+-          parentTask.addDependentTask(mvTask);
+-        }
++        parentTask.addDependentTask(mvTask);
+       }
+     }
+   }
+ 
+   /**
+-   * Compare if moveTask1 source path is on the same filesystem as moveTask2 destination path.
+-   *
+-   * @param hconf Configuration object
+-   * @param moveTask1 First MoveTask where the source will be compared.
+-   * @param moveTask2 Second MoveTask where the destination will be compared.
+-   * @return True if source/destination are on the same filesystem; False otherwise.
+-   */
+-  private static boolean areMoveTasksOnSameBlobStorage(HiveConf hconf, Task<MoveWork> moveTask1, Task<MoveWork> moveTask2) {
+-    Path sourcePath1, targetPath2;
+-
+-    MoveWork moveWork1 = moveTask1.getWork();
+-    MoveWork moveWork2 = moveTask2.getWork();
+-
+-    // Let's not merge the tasks in case both file and table work are present. This should not
+-    // be configured this way, but the API allows you to do that.
+-    if (moveWork1.getLoadFileWork() != null && moveWork1.getLoadTableWork() != null) { return false; }
+-    if (moveWork2.getLoadFileWork() != null && moveWork2.getLoadTableWork() != null) { return false; }
+-
+-    if (moveWork1.getLoadFileWork() != null) {
+-      sourcePath1 = moveWork1.getLoadFileWork().getSourcePath();
+-    } else if (moveWork1.getLoadTableWork() != null) {
+-      sourcePath1 = moveWork1.getLoadTableWork().getSourcePath();
+-    } else {
+-      // Multi-files is not supported on this optimization
+-      return false;
+-    }
+-
+-    if (moveWork2.getLoadFileWork() != null) {
+-      targetPath2 = moveWork2.getLoadFileWork().getTargetDir();
+-    } else if (moveWork2.getLoadTableWork() != null) {
+-      targetPath2 = getTableLocationPath(hconf, moveWork2.getLoadTableWork().getTable());
+-    } else {
+-      // Multi-files is not supported on this optimization
+-      return false;
+-    }
+-
+-    if (sourcePath1 != null && targetPath2 != null && BlobStorageUtils.isBlobStoragePath(hconf, sourcePath1)) {
+-      return sourcePath1.toUri().getScheme().equals(targetPath2.toUri().getScheme());
+-    } else {
+-      return false;
+-    }
+-  }
+-
+-  /**
+    * Returns the table location path from a TableDesc object.
+    *
+    * @param hconf Configuration object.
+@@ -1461,69 +1410,6 @@ private static Path getTableLocationPath(final HiveConf hconf, final TableDesc t
+   }
+ 
+   /**
+-   * Creates a new MoveTask that uses the moveTask1 source and moveTask2 destination as new
+-   * source/destination paths. This function is useful when two MoveTask are found on the
+-   * execution plan, and they are join each other.
+-   *
+-   * @param moveTask1 First MoveTask where the source path will be used.
+-   * @param moveTask2 Second MoveTask where the destination path will be used.
+-   */
+-  private static void mergeMoveTasks(Task<MoveWork> moveTask1, Task<MoveWork> moveTask2) {
+-    Path sourcePath1;
+-    LoadTableDesc loadTableDesc = null;
+-    LoadFileDesc loadFileDesc = null;
+-
+-    MoveWork moveWork1 = moveTask1.getWork();
+-    MoveWork moveWork2 = moveTask2.getWork();
+-
+-    // Let's not merge the tasks in case both file and table work are present. This should not
+-    // be configured this way, but the API allows you to do that.
+-    if (moveWork1.getLoadFileWork() != null && moveWork1.getLoadTableWork() != null) { return; }
+-    if (moveWork2.getLoadFileWork() != null && moveWork2.getLoadTableWork() != null) { return; }
+-
+-    if (moveWork1.getLoadFileWork() != null) {
+-      sourcePath1 = moveTask1.getWork().getLoadFileWork().getSourcePath();
+-    } else if (moveWork1.getLoadTableWork() != null) {
+-      sourcePath1 = moveTask1.getWork().getLoadTableWork().getSourcePath();
+-    } else {
+-      // Multi-files is not supported on this optimization
+-      return;
+-    }
+-
+-    if (moveTask2.getWork().getLoadFileWork() != null) {
+-      loadFileDesc = new LoadFileDesc(
+-          sourcePath1,
+-          moveWork2.getLoadFileWork().getTargetDir(),
+-          moveWork2.getLoadFileWork().getIsDfsDir(),
+-          moveWork2.getLoadFileWork().getColumns(),
+-          moveWork2.getLoadFileWork().getColumnTypes()
+-      );
+-    } else if (moveTask2.getWork().getLoadTableWork() != null) {
+-      loadTableDesc = new LoadTableDesc(
+-          sourcePath1,
+-          moveWork2.getLoadTableWork().getTable(),
+-          moveWork2.getLoadTableWork().getPartitionSpec(),
+-          moveWork2.getLoadTableWork().getReplace(),
+-          moveWork2.getLoadTableWork().getWriteType()
+-      );
+-    } else {
+-      // Multi-files is not supported on this optimization
+-      return;
+-    }
+-
+-    moveWork1.setLoadTableWork(loadTableDesc);
+-    moveWork1.setLoadFileWork(loadFileDesc);
+-    moveWork1.setCheckFileFormat(moveWork2.getCheckFileFormat());
+-
+-    // Link task2 dependent tasks to MoveTask1
+-    if (moveTask2.getDependentTasks() != null) {
+-      for (Task dependentTask : moveTask2.getDependentTasks()) {
+-        moveTask1.addDependentTask(dependentTask);
+-      }
+-    }
+-  }
+-
+-  /**
+    * Add the StatsTask as a dependent task of the MoveTask
+    * because StatsTask will change the Table/Partition metadata. For atomicity, we
+    * should not change it before the data is actually there done by MoveTask.
+@@ -1708,24 +1594,103 @@ public static MapWork createMergeTask(FileSinkDesc fsInputDesc,
+   }
+ 
+   /**
++   * Checks whether the given input/output paths and a linked MoveWork should be merged into one only MoveWork.
++   * This is an optimization for BlobStore systems to avoid doing two renames/copies that are not necessary.
++
++   *
++   * @param conf A HiveConf object to check if BlobStorage optimizations are enabled.
++   * @param condInputPath A path that the ConditionalTask uses as input for its sub-tasks.
++   * @param condOutputPath A path that the ConditionalTask uses as output for its sub-tasks.
++   * @param linkedMoveWork A MoveWork that the ConditionalTask uses to link to its sub-tasks.
++   * @return True if both Conditional input/output paths and the linked MoveWork should be merged.
++   */
++  @VisibleForTesting
++  protected static boolean shouldMergeMovePaths(HiveConf conf, Path condInputPath, Path condOutputPath, MoveWork linkedMoveWork) {
++    Path linkedSourcePath, linkedTargetPath;
++
++    if (linkedMoveWork == null || !BlobStorageUtils.areOptimizationsEnabled(conf)) {
++      return false;
++    }
++
++    if (linkedMoveWork.getLoadFileWork() != null && linkedMoveWork.getLoadTableWork() == null) {
++      linkedSourcePath = linkedMoveWork.getLoadFileWork().getSourcePath();
++      linkedTargetPath = linkedMoveWork.getLoadFileWork().getTargetDir();
++    } else if (linkedMoveWork.getLoadTableWork() != null && linkedMoveWork.getLoadFileWork() == null) {
++      linkedSourcePath = linkedMoveWork.getLoadTableWork().getSourcePath();
++      linkedTargetPath = getTableLocationPath(conf, linkedMoveWork.getLoadTableWork().getTable());
++    } else {
++      return false;
++    }
++
++    return condOutputPath.equals(linkedSourcePath)
++        && BlobStorageUtils.isBlobStoragePath(conf, condInputPath)
++        && BlobStorageUtils.isBlobStoragePath(conf, linkedTargetPath);
++  }
++
++  /**
++   * Merges the given Conditional input path and the linked MoveWork into one only MoveWork.
++   * This is an optimization for BlobStore systems to avoid doing two renames/copies that are not necessary.
++   *
++   * @param condInputPath A path that the ConditionalTask uses as input for its sub-tasks.
++   * @param linkedMoveWork A MoveWork that the ConditionalTask uses to link to its sub-tasks.
++   * @return A new MoveWork that has the Conditional input path as source and the linkedMoveWork as target.
++   */
++  @VisibleForTesting
++  protected static MoveWork mergeMovePaths(Path condInputPath, MoveWork linkedMoveWork) {
++    MoveWork newWork = new MoveWork(linkedMoveWork);
++    LoadFileDesc fileDesc = null;
++    LoadTableDesc tableDesc = null;
++
++    if (linkedMoveWork.getLoadFileWork() != null) {
++      fileDesc = new LoadFileDesc(linkedMoveWork.getLoadFileWork());
++      fileDesc.setSourcePath(condInputPath);
++    } else if (linkedMoveWork.getLoadTableWork() != null) {
++      tableDesc = new LoadTableDesc(linkedMoveWork.getLoadTableWork());
++      tableDesc.setSourcePath(condInputPath);
++    } else {
++      throw new IllegalArgumentException("Merging a path with a MoveWork with multi-files work is not allowed.");
++    }
++
++    newWork.setLoadFileWork(fileDesc);
++    newWork.setLoadTableWork(tableDesc);
++
++    return newWork;
++  }
++
++  /**
+    * Construct a conditional task given the current leaf task, the MoveWork and the MapredWork.
+    *
+    * @param conf
+    *          HiveConf
+    * @param currTask
+    *          current leaf task
+-   * @param mvWork
++   * @param dummyMoveWork
+    *          MoveWork for the move task
+    * @param mergeWork
+    *          MapredWork for the merge task.
+-   * @param inputPath
++   * @param condInputPath
+    *          the input directory of the merge/move task
++   * @param condOutputPath
++   *          the output directory of the merge/move task
++   * @param moveTaskToLink
++   *          a MoveTask that may be linked to the conditional sub-tasks
++   * @param dependencyTask
++   *          a dependency task that may be linked to the conditional sub-tasks
+    * @return The conditional task
+    */
+-  @SuppressWarnings("unchecked")
+-  public static ConditionalTask createCondTask(HiveConf conf,
+-      Task<? extends Serializable> currTask, MoveWork mvWork,
+-      Serializable mergeWork, String inputPath) {
++  private static ConditionalTask createCondTask(HiveConf conf,
++      Task<? extends Serializable> currTask, MoveWork dummyMoveWork, Serializable mergeWork,
++      Path condInputPath, Path condOutputPath, Task<MoveWork> moveTaskToLink, DependencyCollectionTask dependencyTask) {
++
++    boolean shouldMergeMovePaths = (moveTaskToLink != null && dependencyTask == null
++        && shouldMergeMovePaths(conf, condInputPath, condOutputPath, moveTaskToLink.getWork()));
++
++    MoveWork workForMoveOnlyTask;
++    if (shouldMergeMovePaths) {
++      workForMoveOnlyTask = mergeMovePaths(condInputPath, moveTaskToLink.getWork());
++    } else {
++      workForMoveOnlyTask = dummyMoveWork;
++    }
+ 
+     // There are 3 options for this ConditionalTask:
+     // 1) Merge the partitions
+@@ -1734,9 +1699,9 @@ public static ConditionalTask createCondTask(HiveConf conf,
+     // merge others) in this case the merge is done first followed by the move to prevent
+     // conflicts.
+     Task<? extends Serializable> mergeOnlyMergeTask = TaskFactory.get(mergeWork, conf);
+-    Task<? extends Serializable> moveOnlyMoveTask = TaskFactory.get(mvWork, conf);
++    Task<? extends Serializable> moveOnlyMoveTask = TaskFactory.get(workForMoveOnlyTask, conf);
+     Task<? extends Serializable> mergeAndMoveMergeTask = TaskFactory.get(mergeWork, conf);
+-    Task<? extends Serializable> mergeAndMoveMoveTask = TaskFactory.get(mvWork, conf);
++    Task<? extends Serializable> mergeAndMoveMoveTask = TaskFactory.get(dummyMoveWork, conf);
+ 
+     // NOTE! It is necessary merge task is the parent of the move task, and not
+     // the other way around, for the proper execution of the execute method of
+@@ -1744,7 +1709,7 @@ public static ConditionalTask createCondTask(HiveConf conf,
+     mergeAndMoveMergeTask.addDependentTask(mergeAndMoveMoveTask);
+ 
+     List<Serializable> listWorks = new ArrayList<Serializable>();
+-    listWorks.add(mvWork);
++    listWorks.add(workForMoveOnlyTask);
+     listWorks.add(mergeWork);
+ 
+     ConditionalWork cndWork = new ConditionalWork(listWorks);
+@@ -1760,12 +1725,25 @@ public static ConditionalTask createCondTask(HiveConf conf,
+     // create resolver
+     cndTsk.setResolver(new ConditionalResolverMergeFiles());
+     ConditionalResolverMergeFilesCtx mrCtx =
+-        new ConditionalResolverMergeFilesCtx(listTasks, inputPath);
++        new ConditionalResolverMergeFilesCtx(listTasks, condInputPath.toString());
+     cndTsk.setResolverCtx(mrCtx);
+ 
+     // make the conditional task as the child of the current leaf task
+     currTask.addDependentTask(cndTsk);
+ 
++    if (shouldMergeMovePaths) {
++      if (moveTaskToLink.getDependentTasks() != null) {
++        for (Task dependentTask : moveTaskToLink.getDependentTasks()) {
++          moveOnlyMoveTask.addDependentTask(dependentTask);
++        }
++      }
++    } else {
++      addDependentMoveTasks(moveTaskToLink, conf, moveOnlyMoveTask, dependencyTask);
++    }
++
++    addDependentMoveTasks(moveTaskToLink, conf, mergeOnlyMergeTask, dependencyTask);
++    addDependentMoveTasks(moveTaskToLink, conf, mergeAndMoveMoveTask, dependencyTask);
++
+     return cndTsk;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadDesc.java
+index 68e2afc..e329b3e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadDesc.java
+@@ -41,5 +41,8 @@ public LoadDesc(final Path sourcePath) {
+   public Path getSourcePath() {
+     return sourcePath;
+   }
+-  
++
++  public void setSourcePath(Path sourcePath) {
++    this.sourcePath = sourcePath;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadFileDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadFileDesc.java
+index 0226278..8918653 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadFileDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadFileDesc.java
+@@ -42,6 +42,17 @@
+   public LoadFileDesc() {
+   }
+ 
++  public LoadFileDesc(final LoadFileDesc o) {
++    super(o.getSourcePath());
++
++    this.targetDir = o.targetDir;
++    this.isDfsDir = o.isDfsDir;
++    this.columns = o.columns;
++    this.columnTypes = o.columnTypes;
++    this.destinationCreateTable = o.destinationCreateTable;
++  }
++
++
+   public LoadFileDesc(final CreateTableDesc createTableDesc, final Path sourcePath,
+       final Path targetDir,
+       final boolean isDfsDir, final String columns, final String columnTypes) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadTableDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadTableDesc.java
+index f514857..1360e15 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadTableDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/LoadTableDesc.java
+@@ -50,6 +50,18 @@ public LoadTableDesc() {
+     this.holdDDLTime = false;
+   }
+ 
++  public LoadTableDesc(final LoadTableDesc o) {
++    super(o.getSourcePath());
++
++    this.replace = o.getReplace();
++    this.dpCtx = o.getDPCtx();
++    this.lbCtx = o.getLbCtx();
++    this.inheritTableSpecs = o.getInheritTableSpecs();
++    this.writeType = o.getWriteType();
++    this.table = o.getTable();
++    this.partitionSpec = o.getPartitionSpec();
++  }
++
+   public LoadTableDesc(final Path sourcePath,
+       final org.apache.hadoop.hive.ql.plan.TableDesc table,
+       final Map<String, String> partitionSpec,
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/MoveWork.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/MoveWork.java
+index e43156f..542c2c4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/MoveWork.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/MoveWork.java
+@@ -57,6 +57,16 @@
+   public MoveWork() {
+   }
+ 
++  public MoveWork(final MoveWork o) {
++    loadTableWork = o.getLoadTableWork();
++    loadFileWork = o.getLoadFileWork();
++    loadMultiFilesWork = o.getLoadMultiFilesWork();
++    checkFileFormat = o.getCheckFileFormat();
++    srcLocal = o.isSrcLocal();
++    inputs = o.getInputs();
++    outputs = o.getOutputs();
++  }
++
+   public MoveWork(HashSet<ReadEntity> inputs, HashSet<WriteEntity> outputs) {
+     this.inputs = inputs;
+     this.outputs = outputs;
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java b/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java
+index e9d61a9..7c74ba6 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/optimizer/TestGenMapRedUtilsCreateConditionalTask.java
+@@ -24,10 +24,7 @@
+ import org.apache.hadoop.hive.ql.io.HiveInputFormat;
+ import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
+ import org.apache.hadoop.hive.ql.parse.SemanticException;
+-import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
+-import org.apache.hadoop.hive.ql.plan.LoadFileDesc;
+-import org.apache.hadoop.hive.ql.plan.MoveWork;
+-import org.apache.hadoop.hive.ql.plan.TableDesc;
++import org.apache.hadoop.hive.ql.plan.*;
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+@@ -37,9 +34,9 @@
+ import java.util.List;
+ import java.util.Properties;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertNull;
++import static org.junit.Assert.*;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.reset;
+ import static org.mockito.Mockito.when;
+ 
+ public class TestGenMapRedUtilsCreateConditionalTask {
+@@ -58,6 +55,98 @@ public void setUp() {
+   }
+ 
+   @Test
++  public void testMovePathsThatCannotBeMerged() {
++    final Path condInputPath = new Path("s3a://bucket/scratch/-ext-10000");
++    final Path condOutputPath = new Path("s3a://bucket/scratch/-ext-10002");
++    final MoveWork mockWork = mock(MoveWork.class);
++
++    assertFalse("A MoveWork null object cannot be merged.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, null));
++
++    hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname, "false");
++    assertFalse("Merging paths is not allowed when BlobStorage optimizations are disabled.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, mockWork));
++
++    // Enable BlobStore optimizations for the rest of tests
++    hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname, "true");
++
++    reset(mockWork);
++    when(mockWork.getLoadMultiFilesWork()).thenReturn(new LoadMultiFilesDesc());
++    assertFalse("Merging paths is not allowed when MultiFileWork is found in the MoveWork object.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, mockWork));
++
++    reset(mockWork);
++    when(mockWork.getLoadFileWork()).thenReturn(mock(LoadFileDesc.class));
++    when(mockWork.getLoadTableWork()).thenReturn(mock(LoadTableDesc.class));
++    assertFalse("Merging paths is not allowed when both LoadFileWork & LoadTableWork are found in the MoveWork object.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, mockWork));
++
++    reset(mockWork);
++    when(mockWork.getLoadFileWork()).thenReturn(new LoadFileDesc(condInputPath, condOutputPath, false, "", ""));
++    assertFalse("Merging paths is not allowed when both conditional output path is not equals to MoveWork input path.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, mockWork));
++
++    reset(mockWork);
++    when(mockWork.getLoadFileWork()).thenReturn(new LoadFileDesc(condOutputPath, new Path("unused"), false, "", ""));
++    assertFalse("Merging paths is not allowed when conditional input path is not a BlobStore path.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, new Path("hdfs://hdfs-path"), condOutputPath, mockWork));
++
++    reset(mockWork);
++    when(mockWork.getLoadFileWork()).thenReturn(new LoadFileDesc(condOutputPath, new Path("hdfs://hdfs-path"), false, "", ""));
++    assertFalse("Merging paths is not allowed when MoveWork output path is not a BlobStore path.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, mockWork));
++  }
++
++  @Test
++  public void testMovePathsThatCanBeMerged() {
++    final Path condInputPath = new Path("s3a://bucket/scratch/-ext-10000");
++    final Path condOutputPath = new Path("s3a://bucket/scratch/-ext-10002");
++    final Path targetMoveWorkPath = new Path("s3a://bucket/scratch/-ext-10003");
++    final MoveWork mockWork = mock(MoveWork.class);
++
++    when(mockWork.getLoadFileWork()).thenReturn(new LoadFileDesc(condOutputPath, targetMoveWorkPath, false, "", ""));
++
++    assertTrue("Merging BlobStore paths should be allowed.",
++        GenMapRedUtils.shouldMergeMovePaths(hiveConf, condInputPath, condOutputPath, mockWork));
++  }
++
++  @Test(expected = IllegalArgumentException.class)
++  public void testMergePathWithInvalidMoveWorkThrowsException() {
++    final Path condInputPath = new Path("s3a://bucket/scratch/-ext-10000");
++    final MoveWork mockWork = mock(MoveWork.class);
++
++    when(mockWork.getLoadMultiFilesWork()).thenReturn(new LoadMultiFilesDesc());
++    GenMapRedUtils.mergeMovePaths(condInputPath, mockWork);
++  }
++
++  @Test
++  public void testMergePathValidMoveWorkReturnsNewMoveWork() {
++    final Path condInputPath = new Path("s3a://bucket/scratch/-ext-10000");
++    final Path condOutputPath = new Path("s3a://bucket/scratch/-ext-10002");
++    final Path targetMoveWorkPath = new Path("s3a://bucket/scratch/-ext-10003");
++    final MoveWork mockWork = mock(MoveWork.class);
++    MoveWork newWork;
++
++    // test using loadFileWork
++    when(mockWork.getLoadFileWork()).thenReturn(new LoadFileDesc(condOutputPath, targetMoveWorkPath, false, "", ""));
++    newWork = GenMapRedUtils.mergeMovePaths(condInputPath, mockWork);
++    assertNotNull(newWork);
++    assertNotEquals(newWork, mockWork);
++    assertEquals(condInputPath, newWork.getLoadFileWork().getSourcePath());
++    assertEquals(targetMoveWorkPath, newWork.getLoadFileWork().getTargetDir());
++
++    // test using loadTableWork
++    TableDesc tableDesc = new TableDesc();
++    reset(mockWork);
++    when(mockWork.getLoadTableWork()).thenReturn(new LoadTableDesc(condOutputPath, tableDesc, null));
++    newWork = GenMapRedUtils.mergeMovePaths(condInputPath, mockWork);
++    assertNotNull(newWork);
++    assertNotEquals(newWork, mockWork);
++    assertEquals(condInputPath, newWork.getLoadTableWork().getSourcePath());
++    assertTrue(newWork.getLoadTableWork().getTable().equals(tableDesc));
++  }
++
++  @Test
+   public void testConditionalMoveTaskIsOptimized() throws SemanticException {
+     hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname, "true");
+ 
+@@ -90,10 +179,11 @@ public void testConditionalMoveTaskIsOptimized() throws SemanticException {
+     assertEquals(1, mergeOnlyTask.getChildTasks().size());
+     verifyMoveTask(mergeOnlyTask.getChildTasks().get(0), finalDirName, tableLocation);
+ 
+-    // Verify mergeAndMoveTask is optimized
++    // Verify mergeAndMoveTask is NOT optimized
+     assertEquals(1, mergeAndMoveTask.getChildTasks().size());
+-    assertNull(mergeAndMoveTask.getChildTasks().get(0).getChildTasks());
+-    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0), sinkDirName, tableLocation);
++    assertEquals(1, mergeAndMoveTask.getChildTasks().get(0).getChildTasks().size());
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0), sinkDirName, finalDirName);
++    verifyMoveTask(mergeAndMoveTask.getChildTasks().get(0).getChildTasks().get(0), finalDirName, tableLocation);
+   }
+ 
+   @Test
+-- 
+1.7.9.5
+

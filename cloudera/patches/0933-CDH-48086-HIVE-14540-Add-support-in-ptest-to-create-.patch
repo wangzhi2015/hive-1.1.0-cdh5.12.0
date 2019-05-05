@@ -1,0 +1,3107 @@
+From 1ec23f7b2bc4a1b5fba10af7b560e9cb711826e0 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Fri, 16 Sep 2016 08:52:40 -0700
+Subject: [PATCH 0933/1164] CDH-48086 : HIVE-14540 : Add support in ptest to
+ create batches for non qfile tests. (Siddharth
+ Seth, reviewed by Prasanth Jayachandran)
+
+Change-Id: I5c578eff84e2d143fa7258325f7921a819d7e3b7
+---
+ .../hive/ptest/execution/ExecutionPhase.java       |    8 +
+ .../apache/hive/ptest/execution/HostExecutor.java  |    7 +-
+ .../org/apache/hive/ptest/execution/PTest.java     |    3 +-
+ .../ptest/execution/conf/FileListProvider.java     |   31 +
+ .../hive/ptest/execution/conf/QFileTestBatch.java  |   20 +-
+ .../hive/ptest/execution/conf/TestBatch.java       |   30 +-
+ .../ptest/execution/conf/TestConfiguration.java    |    4 +
+ .../hive/ptest/execution/conf/TestParser.java      |   68 +-
+ .../hive/ptest/execution/conf/UnitTestBatch.java   |   91 ++-
+ .../execution/conf/UnitTestPropertiesParser.java   |  666 +++++++++++++++++++
+ testutils/ptest2/src/main/resources/batch-exec.vm  |    8 +-
+ testutils/ptest2/src/main/resources/source-prep.vm |   22 +-
+ .../ptest/execution/MockRSyncCommandExecutor.java  |    7 +
+ .../ptest/execution/MockSSHCommandExecutor.java    |    7 +
+ .../hive/ptest/execution/TestExecutionPhase.java   |   10 +-
+ ...ExecutionPhase.testFailingUnitTest.approved.txt |    6 +-
+ ...ExecutionPhase.testPassingUnitTest.approved.txt |    6 +-
+ .../hive/ptest/execution/TestHostExecutor.java     |   52 +-
+ .../TestHostExecutor.testBasic.approved.txt        |   24 +-
+ ...stExecutor.testIsolatedFailsOnExec.approved.txt |   10 +-
+ ...ecutor.testIsolatedFailsOnRsyncOne.approved.txt |    8 +-
+ ...or.testIsolatedFailsOnRsyncUnknown.approved.txt |    8 +-
+ ...stExecutor.testParallelFailsOnExec.approved.txt |   10 +-
+ ...tExecutor.testParallelFailsOnRsync.approved.txt |    8 +-
+ ...TestScripts.testAlternativeTestJVM.approved.txt |   10 +-
+ .../execution/TestScripts.testBatch.approved.txt   |   10 +-
+ .../execution/TestScripts.testPrepGit.approved.txt |   13 +-
+ .../TestScripts.testPrepHadoop1.approved.txt       |   22 +-
+ .../TestScripts.testPrepNone.approved.txt          |   13 +-
+ .../execution/TestScripts.testPrepSvn.approved.txt |   13 +-
+ .../ptest/execution/conf/TestQFileTestBatch.java   |    9 +-
+ .../hive/ptest/execution/conf/TestTestParser.java  |   10 +-
+ .../conf/TestUnitTestPropertiesParser.java         |  672 ++++++++++++++++++++
+ .../ptest2/src/test/resources/log4j2.properties    |   62 ++
+ .../test/resources/test-configuration2.properties  |  154 +++++
+ 35 files changed, 1918 insertions(+), 184 deletions(-)
+ create mode 100644 testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/FileListProvider.java
+ create mode 100644 testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestPropertiesParser.java
+ create mode 100644 testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestUnitTestPropertiesParser.java
+ create mode 100644 testutils/ptest2/src/test/resources/log4j2.properties
+ create mode 100644 testutils/ptest2/src/test/resources/test-configuration2.properties
+
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
+index 6063afc..65af6fa 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/ExecutionPhase.java
+@@ -88,6 +88,14 @@ public void execute() throws Throwable {
+     }
+     logger.info("ParallelWorkQueueSize={}, IsolatedWorkQueueSize={}", parallelWorkQueue.size(),
+         isolatedWorkQueue.size());
++    if (logger.isDebugEnabled()) {
++      for (TestBatch testBatch : parallelWorkQueue) {
++        logger.debug("PBatch: {}", testBatch);
++      }
++      for (TestBatch testBatch : isolatedWorkQueue) {
++        logger.debug("IBatch: {}", testBatch);
++      }
++    }
+     try {
+       int expectedNumHosts = hostExecutors.size();
+       initalizeHosts();
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+index 5f84f00..123e310 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+@@ -30,6 +30,7 @@
+ import java.util.concurrent.TimeUnit;
+ 
+ import com.google.common.base.Stopwatch;
++import org.apache.commons.lang.StringUtils;
+ import org.apache.hive.ptest.execution.conf.Host;
+ import org.apache.hive.ptest.execution.conf.TestBatch;
+ import org.apache.hive.ptest.execution.ssh.RSyncCommand;
+@@ -40,7 +41,6 @@
+ import org.apache.hive.ptest.execution.ssh.SSHCommandExecutor;
+ import org.apache.hive.ptest.execution.ssh.SSHExecutionException;
+ import org.apache.hive.ptest.execution.ssh.SSHResult;
+-import org.apache.logging.log4j.util.Strings;
+ import org.slf4j.Logger;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+@@ -244,9 +244,8 @@ private boolean executeTestBatch(Drone drone, TestBatch batch, Set<TestBatch> fa
+     templateVariables.put("testArguments", batch.getTestArguments());
+     templateVariables.put("localDir", drone.getLocalDirectory());
+     templateVariables.put("logDir", drone.getLocalLogDirectory());
+-    if (!Strings.isEmpty(batch.getTestModule())) {
+-      templateVariables.put("testModule", batch.getTestModule());
+-    }
++    Preconditions.checkArgument(StringUtils.isNotBlank(batch.getTestModuleRelativeDir()));
++    templateVariables.put("testModule", batch.getTestModuleRelativeDir());
+     String command = Templates.getTemplateResult("bash $localDir/$instanceName/scratch/" + script.getName(),
+         templateVariables);
+     Templates.writeTemplateResult("batch-exec.vm", script, templateVariables);
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+index 6b2ef8f..952c09b 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+@@ -32,6 +32,7 @@
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import com.google.common.annotations.VisibleForTesting;
+@@ -132,7 +133,7 @@ public PTest(final TestConfiguration configuration, final ExecutionContext execu
+       templateDefaultsBuilder.put("additionalProfiles", configuration.getAdditionalProfiles());
+     }
+     templateDefaults = templateDefaultsBuilder.build();
+-    TestParser testParser = new TestParser(configuration.getContext(), configuration.getTestCasePropertyName(),
++    TestParser testParser = new TestParser(configuration.getContext(), new AtomicInteger(1), configuration.getTestCasePropertyName(),
+         new File(mExecutionContext.getLocalWorkingDirectory(), configuration.getRepositoryName() + "-source"),
+         logger);
+ 
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/FileListProvider.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/FileListProvider.java
+new file mode 100644
+index 0000000..b1eb66f
+--- /dev/null
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/FileListProvider.java
+@@ -0,0 +1,31 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.hive.ptest.execution.conf;
++
++import java.io.File;
++import java.util.Collection;
++
++// Exists primarily to allow for easier unit tests.
++public interface FileListProvider {
++
++  Collection<File> listFiles(
++      File directory, String[] extensions, boolean recursive);
++
++}
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
+index fa213db..fe4952c 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
+@@ -19,11 +19,12 @@
+ package org.apache.hive.ptest.execution.conf;
+ 
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.common.base.Joiner;
+ import com.google.common.collect.Iterators;
+ 
+-public class QFileTestBatch implements TestBatch {
++public class QFileTestBatch extends TestBatch {
+ 
+   private final String testCasePropertyName;
+   private final String driver;
+@@ -32,8 +33,11 @@
+   private final String moduleName;
+   private final Set<String> tests;
+   private final boolean isParallel;
+-  public QFileTestBatch(String testCasePropertyName, String driver, 
+-      String queryFilesProperty, Set<String> tests, boolean isParallel, String moduleName) {
++
++  public QFileTestBatch(AtomicInteger batchIdCounter, String testCasePropertyName, String driver,
++                        String queryFilesProperty, Set<String> tests, boolean isParallel,
++                        String moduleName) {
++    super(batchIdCounter);
+     this.testCasePropertyName = testCasePropertyName;
+     this.driver = driver;
+     this.queryFilesProperty = queryFilesProperty;
+@@ -66,7 +70,8 @@ public String getTestArguments() {
+ 
+   @Override
+   public String toString() {
+-    return "QFileTestBatch [driver=" + driver + ", queryFilesProperty="
++    return "QFileTestBatch [batchId=" + getBatchId() + ", size=" + tests.size() + ", driver=" +
++        driver + ", queryFilesProperty="
+         + queryFilesProperty + ", name=" + name + ", tests=" + tests
+         + ", isParallel=" + isParallel + ", moduleName=" + moduleName + "]";
+   }
+@@ -76,11 +81,16 @@ public boolean isParallel() {
+   }
+ 
+   @Override
+-  public String getTestModule() {
++  public String getTestModuleRelativeDir() {
+     return moduleName;
+   }
+ 
+   @Override
++  public int getNumTestsInBatch() {
++    return tests.size();
++  }
++
++  @Override
+   public int hashCode() {
+     final int prime = 31;
+     int result = 1;
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
+index 4ebb670..c537169 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
+@@ -18,15 +18,31 @@
+  */
+ package org.apache.hive.ptest.execution.conf;
+ 
+-public interface TestBatch {
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+-  public String getTestArguments();
+-  
+-  public String getTestClass();
++public abstract class TestBatch {
+ 
+-  public String getName();
++  public TestBatch(AtomicInteger BATCH_ID_GEN) {
++    this.batchId = BATCH_ID_GEN.getAndIncrement();
++  }
+ 
+-  public boolean isParallel();
++  private final int batchId;
++
++  public abstract String getTestArguments();
++
++  // TODO Get rid of this.
++  public abstract String getTestClass();
++
++  public abstract String getName();
++
++  public abstract boolean isParallel();
++
++  public abstract String getTestModuleRelativeDir();
++
++  public abstract int getNumTestsInBatch();
++
++  public final int getBatchId() {
++    return batchId;
++  }
+ 
+-  public String getTestModule();
+ }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java
+index 2c5bd3a..f14026c 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestConfiguration.java
+@@ -58,6 +58,7 @@
+   private static final String JENKINS_URL = "jenkinsURL";
+   private static final String SSH_OPTS = "sshOpts";
+   private static final String LOGS_URL = "logsURL";
++  // This ends up being set to "test" | mvn ${testCasePropertyName} for instance
+   private static final String TEST_CASE_PROPERTY_NAME = "testCasePropertyName";
+   private static final String BUILD_TOOL = "buildTool";
+   // The following parameters are not supported yet. TODO Add support
+@@ -226,14 +227,17 @@ public String getTestCasePropertyName() {
+     return testCasePropertyName;
+   }
+ 
++  // TODO Make sure this method is eventually used to find the prep / batch scripts.
+   public String getApplyPathScriptPath() {
+     return applyPathScriptPath;
+   }
+ 
++  // TODO Make sure this method is eventually used to find the prep / batch scripts.
+   public String getPrepTemplatePath() {
+     return prepTemplatePath;
+   }
+ 
++  // TODO Make sure this method is eventually used to find the prep / batch scripts.
+   public String getBatchExecTemplatePath() {
+     return batchExecTemplatePath;
+   }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
+index 5da804f..a243774 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
+@@ -24,16 +24,17 @@
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.util.Arrays;
++import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Properties;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+-import org.apache.commons.io.FileUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -44,69 +45,44 @@
+ import com.google.common.collect.Sets;
+ 
+ public class TestParser {
++
+   private static final Splitter TEST_SPLITTER = Splitter.onPattern("[, ]")
+-    .trimResults().omitEmptyStrings();
++      .trimResults().omitEmptyStrings();
+ 
+   private static final String QTEST_MODULE_NAME = "itests/qtest";
+   private static final String QTEST_SPARK_MODULE_NAME = "itests/qtest-spark";
+ 
++  private final AtomicInteger batchIdCounter;
++
+   private final Context context;
+   private final String testCasePropertyName;
+   private final File sourceDirectory;
+   private final Logger logger;
+ 
+-  public TestParser(Context context, String testCasePropertyName, 
++  public TestParser(Context context, AtomicInteger batchIdCounter, String testCasePropertyName,
+       File sourceDirectory, Logger logger) {
+     this.context = context;
++    this.batchIdCounter = batchIdCounter;
+     this.testCasePropertyName = testCasePropertyName;
+     this.sourceDirectory = sourceDirectory;
+     this.logger = logger;
+   }
+   private List<TestBatch> parseTests() {
+-    Context unitContext = new Context(context.getSubProperties(
+-        Joiner.on(".").join("unitTests", "")));
+-    Set<String> excluded = Sets.newHashSet(TEST_SPLITTER.split(unitContext.getString("exclude", "")));
+-    Set<String> isolated = Sets.newHashSet(TEST_SPLITTER.split(unitContext.getString("isolate", "")));
+-    Set<String> included = Sets.newHashSet(TEST_SPLITTER.split(unitContext.getString("include", "")));
+-    if(!included.isEmpty() && !excluded.isEmpty()) {
+-      throw new IllegalArgumentException(String.format("Included and excluded mutally exclusive." +
+-          " Included = %s, excluded = %s", included.toString(), excluded.toString()));
+-    }
+-    List<File> unitTestsDirs = Lists.newArrayList();
+-    for(String unitTestDir : TEST_SPLITTER
+-        .split(checkNotNull(unitContext.getString("directories"), "directories"))) {
+-      File unitTestParent = new File(sourceDirectory, unitTestDir);
+-      if(unitTestParent.isDirectory()) {
+-        unitTestsDirs.add(unitTestParent);
+-      } else {
+-        logger.warn("Unit test directory " + unitTestParent + " does not exist.");
+-      }
+-    }
++
++    Set<String> excluded = new HashSet<String>();
++
++
+     List<TestBatch> result = Lists.newArrayList();
+     for(QFileTestBatch test : parseQFileTests()) {
+       result.add(test);
+       excluded.add(test.getDriver());
+     }
+-    for(File unitTestDir : unitTestsDirs) {
+-      for(File classFile : FileUtils.listFiles(unitTestDir, new String[]{"class"}, true)) {
+-        String className = classFile.getName();
+-        logger.debug("In  " + unitTestDir  + ", found " + className);
+-        if(className.startsWith("Test") && !className.contains("$")) {
+-          String testName = className.replaceAll("\\.class$", "");
+-          if(excluded.contains(testName)) {
+-            logger.info("Exlcuding unit test " + testName);
+-          } else if(included.isEmpty() || included.contains(testName)) {
+-            if(isolated.contains(testName)) {
+-              logger.info("Executing isolated unit test " + testName);
+-              result.add(new UnitTestBatch(testCasePropertyName, testName, false));
+-            } else {
+-              logger.info("Executing parallel unit test " + testName);
+-              result.add(new UnitTestBatch(testCasePropertyName, testName, true));
+-            }
+-          }
+-        }
+-      }
+-    }
++
++    Collection<TestBatch> unitTestBatches =
++        new UnitTestPropertiesParser(context, batchIdCounter, testCasePropertyName, sourceDirectory, logger,
++            excluded).generateTestBatches();
++    result.addAll(unitTestBatches);
++
+     return result;
+   }
+   private List<QFileTestBatch> parseQFileTests() {
+@@ -185,11 +161,11 @@ public TestParser(Context context, String testCasePropertyName,
+         logger.info("Exlcuding test " + driver + " " + test);
+       } else if(isolated.contains(test)) {
+         logger.info("Executing isolated test " + driver + " " + test);
+-        testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty,
++        testBatches.add(new QFileTestBatch(batchIdCounter, testCasePropertyName, driver, queryFilesProperty,
+             Sets.newHashSet(test), isParallel, getModuleName(driver)));
+       } else {
+         if(testBatch.size() >= batchSize) {
+-          testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty,
++          testBatches.add(new QFileTestBatch(batchIdCounter, testCasePropertyName, driver, queryFilesProperty,
+               Sets.newHashSet(testBatch), isParallel, getModuleName(driver)));
+           testBatch = Lists.newArrayList();
+         }
+@@ -197,7 +173,7 @@ public TestParser(Context context, String testCasePropertyName,
+       }
+     }
+     if(!testBatch.isEmpty()) {
+-      testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty,
++      testBatches.add(new QFileTestBatch(batchIdCounter, testCasePropertyName, driver, queryFilesProperty,
+           Sets.newHashSet(testBatch), isParallel, getModuleName(driver)));
+     }
+     return testBatches;
+@@ -301,7 +277,7 @@ public static void main(String[] args) throws Exception {
+     File workingDir = new File("../..");
+     File testConfigurationFile = new File(args[0]);
+     TestConfiguration conf = TestConfiguration.fromFile(testConfigurationFile, log);
+-    TestParser testParser = new TestParser(conf.getContext(), "test", workingDir, log);
++    TestParser testParser = new TestParser(conf.getContext(), new AtomicInteger(1), "test", workingDir, log);
+     List<TestBatch> testBatches = testParser.parse().get();
+     for (TestBatch testBatch : testBatches) {
+       System.out.println(testBatch.getTestArguments());
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
+index 51f7f90..cedc5a3 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
+@@ -18,34 +18,58 @@
+  */
+ package org.apache.hive.ptest.execution.conf;
+ 
+-public class UnitTestBatch implements TestBatch {
++import java.util.List;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import com.google.common.base.Joiner;
++import com.google.common.base.Preconditions;
++
++public class UnitTestBatch extends TestBatch {
+ 
+   private final String testCasePropertyName;
+-  private final String testName;
++  private final List<String> testList;
+   private final boolean isParallel;
++  private final String moduleName;
++  private final String batchName;
+ 
+-  public UnitTestBatch(String testCasePropertyName, String testName, boolean isParallel) {
++  public UnitTestBatch(AtomicInteger batchIdCounter, String testCasePropertyName,
++                       List<String> tests, String moduleName, boolean isParallel) {
++    super(batchIdCounter);
++    Preconditions.checkNotNull(testCasePropertyName);
++    Preconditions.checkArgument(tests!= null && !tests.isEmpty());
+     this.testCasePropertyName = testCasePropertyName;
+-    this.testName = testName;
++    this.testList = tests;
+     this.isParallel = isParallel;
++    this.moduleName = moduleName;
++    if (tests.size() == 1) {
++      batchName = String.format("%d_%s", getBatchId(), tests.get(0));
++    } else {
++      batchName = String.format("%d_UTBatch_%s_%d_tests", getBatchId(),
++          (moduleName.replace("/", "__").replace(".", "__")), tests.size());
++    }
+   }
+   @Override
+   public String getTestArguments() {
+-    return String.format("-D%s=%s", testCasePropertyName, testName);
++    String testArg = Joiner.on(",").join(testList);
++    return String.format("-D%s=%s", testCasePropertyName, testArg);
+   }
+ 
+   @Override
+   public String getName() {
+-    return testName;
++    // Used for logDir, failure messages etc.
++    return batchName;
+   }
+   @Override
+   public String getTestClass() {
+-    return testName;
++    // Used to identify the module name. Return any.
++    return testList.get(0);
+   }
++
+   @Override
+   public String toString() {
+-    return "UnitTestBatch [testName=" + testName + ", isParallel=" + isParallel
+-        + "]";
++    return "UnitTestBatch [name=" + batchName + ", id=" + getBatchId() + ", moduleName=" +
++        moduleName +", batchSize=" + testList.size() +
++        ", isParallel=" + isParallel + ", testList=" + testList + "]";
+   }
+   @Override
+   public boolean isParallel() {
+@@ -53,34 +77,45 @@ public boolean isParallel() {
+   }
+ 
+   @Override
+-  public String getTestModule() {
+-    return null;
++  public String getTestModuleRelativeDir() {
++    return moduleName;
+   }
+ 
+   @Override
+-  public int hashCode() {
+-    final int prime = 31;
+-    int result = 1;
+-    result = prime * result + (isParallel ? 1231 : 1237);
+-    result = prime * result + ((testName == null) ? 0 : testName.hashCode());
+-    return result;
++  public int getNumTestsInBatch() {
++    return testList.size();
+   }
++
+   @Override
+-  public boolean equals(Object obj) {
+-    if (this == obj)
++  public boolean equals(Object o) {
++    if (this == o) {
+       return true;
+-    if (obj == null)
++    }
++    if (o == null || getClass() != o.getClass()) {
+       return false;
+-    if (getClass() != obj.getClass())
++    }
++
++    UnitTestBatch that = (UnitTestBatch) o;
++
++    if (isParallel != that.isParallel) {
+       return false;
+-    UnitTestBatch other = (UnitTestBatch) obj;
+-    if (isParallel != other.isParallel)
++    }
++    if (testList != null ? !testList.equals(that.testList) : that.testList != null) {
+       return false;
+-    if (testName == null) {
+-      if (other.testName != null)
+-        return false;
+-    } else if (!testName.equals(other.testName))
++    }
++    if (moduleName != null ? !moduleName.equals(that.moduleName) : that.moduleName != null) {
+       return false;
+-    return true;
++    }
++    return batchName != null ? batchName.equals(that.batchName) : that.batchName == null;
++
++  }
++
++  @Override
++  public int hashCode() {
++    int result = testList != null ? testList.hashCode() : 0;
++    result = 31 * result + (isParallel ? 1 : 0);
++    result = 31 * result + (moduleName != null ? moduleName.hashCode() : 0);
++    result = 31 * result + (batchName != null ? batchName.hashCode() : 0);
++    return result;
+   }
+ }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestPropertiesParser.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestPropertiesParser.java
+new file mode 100644
+index 0000000..a482fce
+--- /dev/null
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestPropertiesParser.java
+@@ -0,0 +1,666 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.hive.ptest.execution.conf;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Joiner;
++import com.google.common.base.Preconditions;
++import com.google.common.base.Splitter;
++import com.google.common.collect.Lists;
++import com.google.common.collect.Sets;
++import org.apache.commons.io.FileUtils;
++import org.apache.commons.lang.StringUtils;
++import org.slf4j.Logger;
++
++class UnitTestPropertiesParser {
++
++  private static final Splitter VALUE_SPLITTER = Splitter.onPattern("[, ]")
++      .trimResults().omitEmptyStrings();
++
++  // Prefix for top level properties.
++  static final String PROP_PREFIX_ROOT = "unitTests";
++  // Prefix used to specify module specific properties. Mainly to avoid conflicts with older unitTests properties
++  static final String PROP_PREFIX_MODULE = "ut";
++
++  static final String PROP_DIRECTORIES = "directories";
++  static final String PROP_INCLUDE = "include";
++  static final String PROP_EXCLUDE = "exclude";
++  static final String PROP_ISOLATE = "isolate";
++  static final String PROP_SKIP_BATCHING = "skipBatching";
++  static final String PROP_BATCH_SIZE = "batchSize";
++  static final String PROP_SUBDIR_FOR_PREFIX = "subdirForPrefix";
++
++  static final String PROP_ONE_MODULE = "module";
++  static final String PROP_MODULE_LIST = "modules";
++
++  private final AtomicInteger batchIdCounter;
++
++  static final int DEFAULT_PROP_BATCH_SIZE = 1;
++  static final int DEFAULT_PROP_BATCH_SIZE_NOT_SPECIFIED = -1;
++  static final int DEFAULT_PROP_BATCH_SIZE_INCLUDE_ALL = 0;
++  static final String DEFAULT_PROP_DIRECTORIES = ".";
++  static final String DEFAULT_PROP_SUBDIR_FOR_PREFIX = "target";
++
++  static final String MODULE_NAME_TOP_LEVEL = "_root_"; // Special module for tests in the rootDir.
++  static final String PREFIX_TOP_LEVEL = ".";
++
++  private final Context unitRootContext; // Everything prefixed by ^unitTests.
++  private final Context unitModuleContext; // Everything prefixed by ^ut.
++  private final String testCasePropertyName;
++  private final Logger logger;
++  private final File sourceDirectory;
++  private final FileListProvider fileListProvider;
++  private final Set<String> excludedProvided; // excludedProvidedBy Framework vs excludedConfigured
++  private final boolean inTest;
++
++
++  @VisibleForTesting
++  UnitTestPropertiesParser(Context testContext, AtomicInteger batchIdCounter, String testCasePropertyName,
++                           File sourceDirectory, Logger logger,
++                           FileListProvider fileListProvider,
++                           Set<String> excludedProvided, boolean inTest) {
++    logger.info("{} created with sourceDirectory={}, testCasePropertyName={}, excludedProvide={}",
++        "fileListProvider={}, inTest={}",
++        UnitTestPropertiesParser.class.getSimpleName(), sourceDirectory, testCasePropertyName,
++        excludedProvided,
++        (fileListProvider == null ? "null" : fileListProvider.getClass().getSimpleName()), inTest);
++    Preconditions.checkNotNull(batchIdCounter, "batchIdCounter cannot be null");
++    Preconditions.checkNotNull(testContext, "testContext cannot be null");
++    Preconditions.checkNotNull(testCasePropertyName, "testCasePropertyName cannot be null");
++    Preconditions.checkNotNull(sourceDirectory, "sourceDirectory cannot be null");
++    Preconditions.checkNotNull(logger, "logger must be specified");
++    this.batchIdCounter = batchIdCounter;
++    this.unitRootContext =
++        new Context(testContext.getSubProperties(Joiner.on(".").join(PROP_PREFIX_ROOT, "")));
++    this.unitModuleContext =
++        new Context(testContext.getSubProperties(Joiner.on(".").join(PROP_PREFIX_MODULE, "")));
++    this.sourceDirectory = sourceDirectory;
++    this.testCasePropertyName = testCasePropertyName;
++    this.logger = logger;
++    if (excludedProvided != null) {
++      this.excludedProvided = excludedProvided;
++    } else {
++      this.excludedProvided = new HashSet<>();
++    }
++    if (fileListProvider != null) {
++      this.fileListProvider = fileListProvider;
++    } else {
++      this.fileListProvider = new DefaultFileListProvider();
++    }
++    this.inTest = inTest;
++
++  }
++
++  UnitTestPropertiesParser(Context testContext, AtomicInteger batchIdCounter, String testCasePropertyName,
++                           File sourceDirectory, Logger logger,
++                           Set<String> excludedProvided) {
++    this(testContext, batchIdCounter, testCasePropertyName, sourceDirectory, logger, null, excludedProvided, false);
++  }
++
++
++  Collection<TestBatch> generateTestBatches() {
++    try {
++      return parse();
++    } catch (IOException e) {
++      throw new RuntimeException(e);
++    }
++  }
++
++
++  private Collection<TestBatch> parse() throws IOException {
++
++    RootConfig rootConfig = getRootConfig(unitRootContext);
++    logger.info("RootConfig: " + rootConfig);
++
++    // TODO: Set this up as a tree, instead of a flat list.
++    Map<String, ModuleConfig> moduleConfigs = extractModuleConfigs();
++    logger.info("ModuleConfigs: {} ", moduleConfigs);
++
++    List<TestDir> unitTestsDirs = processPropertyDirectories();
++
++    validateConfigs(rootConfig, moduleConfigs, unitTestsDirs);
++
++    LinkedHashMap<String, LinkedHashSet<TestInfo>> allTests =
++        generateFullTestSet(rootConfig, moduleConfigs, unitTestsDirs);
++
++
++    return createTestBatches(allTests, rootConfig, moduleConfigs);
++  }
++
++  private Collection<TestBatch> createTestBatches(
++      LinkedHashMap<String, LinkedHashSet<TestInfo>> allTests, RootConfig rootConfig,
++      Map<String, ModuleConfig> moduleConfigs) {
++    List<TestBatch> testBatches = new LinkedList<>();
++    for (Map.Entry<String, LinkedHashSet<TestInfo>> entry : allTests.entrySet()) {
++      logger.info("Creating test batches for module={}, numTests={}", entry.getKey(),
++          entry.getValue().size());
++      String currentModule = entry.getKey();
++      String currentPathPrefix = getPathPrefixFromModuleName(currentModule);
++      int batchSize = rootConfig.batchSize;
++      if (moduleConfigs.containsKey(currentModule)) {
++        ModuleConfig moduleConfig = moduleConfigs.get(currentModule);
++        int batchSizeModule = moduleConfig.batchSize;
++        if (batchSizeModule != DEFAULT_PROP_BATCH_SIZE_NOT_SPECIFIED) {
++          batchSize = batchSizeModule;
++        }
++      }
++
++      if (batchSize == DEFAULT_PROP_BATCH_SIZE_INCLUDE_ALL) {
++        batchSize = Integer.MAX_VALUE;
++      }
++      logger.info("batchSize determined to be {} for module={}", batchSize, currentModule);
++
++      // TODO Even out the batch sizes (i.e. 20/20/1 should be replaced by 14/14/13)
++      List<String> currentList = new LinkedList<>();
++      for (TestInfo testInfo : entry.getValue()) {
++        if (testInfo.isIsolated || testInfo.skipBatching) {
++          UnitTestBatch unitTestBatch =
++              new UnitTestBatch(batchIdCounter, testCasePropertyName, Collections.singletonList(testInfo.testName),
++                  currentPathPrefix, !testInfo.isIsolated);
++          testBatches.add(unitTestBatch);
++        } else {
++          currentList.add(testInfo.testName);
++          if (currentList.size() == batchSize) {
++            UnitTestBatch unitTestBatch =
++                new UnitTestBatch(batchIdCounter, testCasePropertyName, Collections.unmodifiableList(currentList),
++                    currentPathPrefix, true);
++            testBatches.add(unitTestBatch);
++            currentList = new LinkedList<>();
++          }
++        }
++      }
++      if (!currentList.isEmpty()) {
++        UnitTestBatch unitTestBatch =
++            new UnitTestBatch(batchIdCounter, testCasePropertyName, Collections.unmodifiableList(currentList),
++                currentPathPrefix, true);
++        testBatches.add(unitTestBatch);
++      }
++    }
++    return testBatches;
++  }
++
++
++  private RootConfig getRootConfig(Context context) {
++    ModuleConfig moduleConfig =
++        getModuleConfig(context, "irrelevant", DEFAULT_PROP_BATCH_SIZE);
++
++    String subDirForPrefix =
++        context.getString(PROP_SUBDIR_FOR_PREFIX, DEFAULT_PROP_SUBDIR_FOR_PREFIX);
++    Preconditions
++        .checkArgument(StringUtils.isNotBlank(subDirForPrefix) && !subDirForPrefix.contains("/"));
++
++    Context modulesContext =
++        new Context(context.getSubProperties(Joiner.on(".").join(PROP_MODULE_LIST, "")));
++    Set<String> includedModules = getProperty(modulesContext, PROP_INCLUDE);
++    Set<String> excludedModules = getProperty(modulesContext, PROP_EXCLUDE);
++    if (!includedModules.isEmpty() && !excludedModules.isEmpty()) {
++      throw new IllegalArgumentException(String.format(
++          "%s and %s are mutually exclusive for property %s. Provided values: included=%s, excluded=%s",
++          PROP_INCLUDE, PROP_EXCLUDE, PROP_MODULE_LIST, includedModules, excludedModules));
++    }
++
++    return new RootConfig(includedModules, excludedModules, moduleConfig.include,
++        moduleConfig.exclude, moduleConfig.skipBatching, moduleConfig.isolate,
++        moduleConfig.batchSize, subDirForPrefix);
++  }
++
++  private ModuleConfig getModuleConfig(Context context, String moduleName, int defaultBatchSize) {
++    Set<String> excluded = getProperty(context, PROP_EXCLUDE);
++    Set<String> isolated = getProperty(context, PROP_ISOLATE);
++    Set<String> included = getProperty(context, PROP_INCLUDE);
++    Set<String> skipBatching = getProperty(context, PROP_SKIP_BATCHING);
++    if (!included.isEmpty() && !excluded.isEmpty()) {
++      throw new IllegalArgumentException(String.format("Included and excluded mutually exclusive." +
++          " Included = %s, excluded = %s", included.toString(), excluded.toString()) +
++          " for module: " + moduleName);
++    }
++    int batchSize = context.getInteger(PROP_BATCH_SIZE, defaultBatchSize);
++
++    String pathPrefix = getPathPrefixFromModuleName(moduleName);
++
++    return new ModuleConfig(moduleName, included, excluded, skipBatching, isolated, batchSize,
++        pathPrefix);
++  }
++
++  private Set<String> getProperty(Context context, String propertyName) {
++    return Sets.newHashSet(VALUE_SPLITTER.split(context.getString(propertyName, "")));
++  }
++
++  private String getPathPrefixFromModuleName(String moduleName) {
++    String pathPrefix;
++    if (moduleName.equals(MODULE_NAME_TOP_LEVEL)) {
++      pathPrefix = PREFIX_TOP_LEVEL;
++    } else {
++      pathPrefix = moduleName.replace(".", "/");
++    }
++    return pathPrefix;
++  }
++
++  private String getModuleNameFromPathPrefix(String pathPrefix) {
++    if (pathPrefix.equals(PREFIX_TOP_LEVEL)) {
++      return MODULE_NAME_TOP_LEVEL;
++    } else {
++      pathPrefix = stripEndAndStart(pathPrefix, "/");
++      pathPrefix = pathPrefix.replace("/", ".");
++      // Example handling of dirs with a .
++      // shims/hadoop-2.6
++      //   -> moduleName=shims.hadoop-.2.6
++      return pathPrefix;
++    }
++  }
++
++  private String stripEndAndStart(String srcString, String stripChars) {
++    srcString = StringUtils.stripEnd(srcString, stripChars);
++    srcString = StringUtils.stripStart(srcString, stripChars);
++    return srcString;
++  }
++
++  private Map<String, ModuleConfig> extractModuleConfigs() {
++    Collection<String> modules = extractConfiguredModules();
++    Map<String, ModuleConfig> result = new HashMap<>();
++
++    for (String moduleName : modules) {
++      Context moduleContext =
++          new Context(unitModuleContext.getSubProperties(Joiner.on(".").join(moduleName, "")));
++      ModuleConfig moduleConfig =
++          getModuleConfig(moduleContext, moduleName, DEFAULT_PROP_BATCH_SIZE_NOT_SPECIFIED);
++      logger.info("Adding moduleConfig={}", moduleConfig);
++      result.put(moduleName, moduleConfig);
++    }
++    return result;
++  }
++
++  private Collection<String> extractConfiguredModules() {
++    List<String> configuredModules = new LinkedList<>();
++
++    Map<String, String> modulesMap = unitRootContext.getSubProperties(Joiner.on(".").join(
++        PROP_ONE_MODULE, ""));
++    for (Map.Entry<String, String> module : modulesMap.entrySet()) {
++      // This is an unnecessary check, and forced configuration in the property file. Maybe
++      // replace with an enforced empty value string.
++      Preconditions.checkArgument(module.getKey().equals(module.getValue()));
++      String moduleName = module.getKey();
++      configuredModules.add(moduleName);
++    }
++    return configuredModules;
++  }
++
++  private List<TestDir> processPropertyDirectories() throws IOException {
++    String srcDirString = sourceDirectory.getCanonicalPath();
++    List<TestDir> unitTestsDirs = Lists.newArrayList();
++    String propDirectoriies = unitRootContext.getString(PROP_DIRECTORIES, DEFAULT_PROP_DIRECTORIES);
++    Iterable<String> propDirectoriesIterable = VALUE_SPLITTER.split(propDirectoriies);
++
++    for (String unitTestDir : propDirectoriesIterable) {
++      File unitTestParent = new File(sourceDirectory, unitTestDir);
++      if (unitTestParent.isDirectory() || inTest) {
++        String absUnitTestDir = unitTestParent.getCanonicalPath();
++
++        Preconditions.checkState(absUnitTestDir.startsWith(srcDirString),
++            "Unit test dir: " + absUnitTestDir + " is not under provided src dir: " + srcDirString);
++        String modulePath = absUnitTestDir.substring(srcDirString.length());
++
++        modulePath = stripEndAndStart(modulePath, "/");
++
++        Preconditions.checkState(!modulePath.startsWith("/"),
++            String.format("Illegal module path: [%s]", modulePath));
++        if (StringUtils.isEmpty(modulePath)) {
++          modulePath = PREFIX_TOP_LEVEL;
++        }
++        String moduleName = getModuleNameFromPathPrefix(modulePath);
++        logger.info("modulePath determined as {} for testdir={}, DerivedModuleName={}", modulePath,
++            absUnitTestDir, moduleName);
++
++
++        logger.info("Adding unitTests dir [{}],[{}]", unitTestParent, moduleName);
++        unitTestsDirs.add(new TestDir(unitTestParent, moduleName));
++      } else {
++        logger.warn("Unit test directory " + unitTestParent + " does not exist, or is a file.");
++      }
++    }
++
++    return unitTestsDirs;
++  }
++
++  private void validateConfigs(RootConfig rootConfig,
++                               Map<String, ModuleConfig> moduleConfigs,
++                               List<TestDir> unitTestDir) {
++
++    if (rootConfig.include.isEmpty() & rootConfig.exclude.isEmpty()) {
++      // No conflicts. Module configuration is what will be used.
++      // We've already verified that includes and excludes are not present at the same time for
++      // individual modules.
++      return;
++    }
++
++    // Validate mainly for includes / excludes working as they should.
++    for (Map.Entry<String, ModuleConfig> entry : moduleConfigs.entrySet()) {
++      if (rootConfig.excludedModules.contains(entry.getKey())) {
++        // Don't bother validating.
++        continue;
++      }
++
++      if (!rootConfig.includedModules.isEmpty() &&
++          !rootConfig.includedModules.contains(entry.getKey())) {
++        // Include specified, but this module is not in the set.
++        continue;
++      }
++
++      // If global contains includes, individual modules can only contain additional includes.
++      if (!rootConfig.include.isEmpty() && !entry.getValue().exclude.isEmpty()) {
++        throw new IllegalStateException(String.format(
++            "Global config specified includes, while module config for %s specified excludes",
++            entry.getKey()));
++      }
++      // If global contains excludes, individual modules can only contain additional excludes.
++      if (!rootConfig.exclude.isEmpty() && !entry.getValue().include.isEmpty()) {
++        throw new IllegalStateException(String.format(
++            "Global config specified excludes, while module config for %s specified includes",
++            entry.getKey()));
++      }
++    }
++  }
++
++  private LinkedHashMap<String, LinkedHashSet<TestInfo>> generateFullTestSet(RootConfig rootConfig,
++                                                                             Map<String, ModuleConfig> moduleConfigs,
++                                                                             List<TestDir> unitTestDirs) throws
++      IOException {
++    LinkedHashMap<String, LinkedHashSet<TestInfo>> result = new LinkedHashMap<>();
++
++    for (TestDir unitTestDir : unitTestDirs) {
++      for (File classFile : fileListProvider
++          .listFiles(unitTestDir.path, new String[]{"class"}, true)) {
++        String className = classFile.getName();
++
++        if (className.startsWith("Test") && !className.contains("$")) {
++          String testName = className.replaceAll("\\.class$", "");
++          String pathPrefix = getPathPrefix(classFile, rootConfig.subDirForPrefix);
++          String moduleName = getModuleNameFromPathPrefix(pathPrefix);
++          logger.debug("In {}, found class {} with pathPrefix={}, moduleName={}", unitTestDir.path,
++              className,
++              pathPrefix, moduleName);
++
++
++          ModuleConfig moduleConfig = moduleConfigs.get(moduleName);
++          if (moduleConfig == null) {
++            moduleConfig = FAKE_MODULE_CONFIG;
++          }
++          TestInfo testInfo = checkAndGetTestInfo(moduleName, pathPrefix, testName, rootConfig, moduleConfig);
++          if (testInfo != null) {
++            logger.info("Adding test: " + testInfo);
++            addTestToResult(result, testInfo);
++          }
++        } else {
++          logger.trace("In {}, found class {} with pathPrefix={}. Not a test", unitTestDir.path,
++              className);
++        }
++      }
++    }
++    return result;
++  }
++
++  private void addTestToResult(Map<String, LinkedHashSet<TestInfo>> result, TestInfo testInfo) {
++    LinkedHashSet<TestInfo> moduleSet = result.get(testInfo.moduleName);
++    if (moduleSet == null) {
++      moduleSet = new LinkedHashSet<>();
++      result.put(testInfo.moduleName, moduleSet);
++    }
++    moduleSet.add(testInfo);
++  }
++
++  private String getPathPrefix(File file, String subDirPrefix) throws IOException {
++    String fname = file.getCanonicalPath();
++    Preconditions.checkState(fname.startsWith(sourceDirectory.getCanonicalPath()));
++    fname = fname.substring(sourceDirectory.getCanonicalPath().length(), fname.length());
++    if (fname.contains(subDirPrefix)) {
++      fname = fname.substring(0, fname.indexOf(subDirPrefix));
++      fname = StringUtils.stripStart(fname, "/");
++      if (StringUtils.isEmpty(fname)) {
++        fname = PREFIX_TOP_LEVEL;
++      }
++      return fname;
++    } else {
++      logger.error("Could not find subDirPrefix {} in path: {}", subDirPrefix, fname);
++      return PREFIX_TOP_LEVEL;
++    }
++  }
++
++  private TestInfo checkAndGetTestInfo(String moduleName, String moduleRelDir, String testName,
++                                       RootConfig rootConfig, ModuleConfig moduleConfig) {
++    Preconditions.checkNotNull(moduleConfig);
++    TestInfo testInfo;
++    String rejectReason = null;
++    try {
++      if (rootConfig.excludedModules.contains(moduleName)) {
++        rejectReason = "root level module exclude";
++        return null;
++      }
++      if (!rootConfig.includedModules.isEmpty() &&
++          !rootConfig.includedModules.contains(moduleName)) {
++        rejectReason = "root level include, but not for module";
++        return null;
++      }
++      if (rootConfig.exclude.contains(testName)) {
++        rejectReason = "root excludes test";
++        return null;
++      }
++      if (moduleConfig.exclude.contains(testName)) {
++        rejectReason = "module excludes test";
++        return null;
++      }
++      boolean containsInclude = !rootConfig.include.isEmpty() || !moduleConfig.include.isEmpty();
++      if (containsInclude) {
++        if (!(rootConfig.include.contains(testName) || moduleConfig.include.contains(testName))) {
++          rejectReason = "test missing from include list";
++          return null;
++        }
++      }
++      if (excludedProvided.contains(testName)) {
++        // All qfiles handled via this...
++        rejectReason = "test present in provided exclude list";
++        return null;
++      }
++
++      // Add the test.
++      testInfo = new TestInfo(moduleName, moduleRelDir, testName, rootConfig.skipBatching.contains(testName) ||
++          moduleConfig.skipBatching.contains(testName),
++          rootConfig.isolate.contains(testName) || moduleConfig.isolate.contains(testName));
++      return testInfo;
++
++    } finally {
++      if (rejectReason != null) {
++        logger.debug("excluding {} due to {}", testName, rejectReason);
++      }
++    }
++  }
++
++  private static final class RootConfig {
++    private final Set<String> includedModules;
++    private final Set<String> excludedModules;
++    private final Set<String> include;
++    private final Set<String> exclude;
++    private final Set<String> skipBatching;
++    private final Set<String> isolate;
++    private final int batchSize;
++    private final String subDirForPrefix;
++
++    RootConfig(Set<String> includedModules, Set<String> excludedModules, Set<String> include,
++               Set<String> exclude, Set<String> skipBatching, Set<String> isolate,
++               int batchSize, String subDirForPrefix) {
++      this.includedModules = includedModules;
++      this.excludedModules = excludedModules;
++      this.include = include;
++      this.exclude = exclude;
++      this.skipBatching = skipBatching;
++      this.isolate = isolate;
++      this.batchSize = batchSize;
++      this.subDirForPrefix = subDirForPrefix;
++    }
++
++    @Override
++    public String toString() {
++      return "RootConfig{" +
++          "includedModules=" + includedModules +
++          ", excludedModules=" + excludedModules +
++          ", include=" + include +
++          ", exclude=" + exclude +
++          ", skipBatching=" + skipBatching +
++          ", isolate=" + isolate +
++          ", batchSize=" + batchSize +
++          ", subDirForPrefix='" + subDirForPrefix + '\'' +
++          '}';
++    }
++  }
++
++  private static final ModuleConfig FAKE_MODULE_CONFIG =
++      new ModuleConfig("_FAKE_", new HashSet<String>(), new HashSet<String>(),
++          new HashSet<String>(), new HashSet<String>(), DEFAULT_PROP_BATCH_SIZE_NOT_SPECIFIED,
++          "_fake_");
++
++  private static final class ModuleConfig {
++    private final String name;
++    private final Set<String> include;
++    private final Set<String> exclude;
++    private final Set<String> skipBatching;
++    private final Set<String> isolate;
++    private final String pathPrefix;
++    private final int batchSize;
++
++    ModuleConfig(String name, Set<String> include, Set<String> exclude,
++                 Set<String> skipBatching, Set<String> isolate, int batchSize,
++                 String pathPrefix) {
++      this.name = name;
++      this.include = include;
++      this.exclude = exclude;
++      this.skipBatching = skipBatching;
++      this.isolate = isolate;
++      this.batchSize = batchSize;
++      this.pathPrefix = pathPrefix;
++    }
++
++    @Override
++    public String toString() {
++      return "ModuleConfig{" +
++          "name='" + name + '\'' +
++          ", include=" + include +
++          ", exclude=" + exclude +
++          ", skipBatching=" + skipBatching +
++          ", isolate=" + isolate +
++          ", pathPrefix='" + pathPrefix + '\'' +
++          ", batchSize=" + batchSize +
++          '}';
++    }
++  }
++
++  private static class TestDir {
++    final File path;
++    final String module;
++
++    TestDir(File path, String module) {
++      this.path = path;
++      this.module = module;
++    }
++
++    @Override
++    public String toString() {
++      return "TestDir{" +
++          "path=" + path +
++          ", module='" + module + '\'' +
++          '}';
++    }
++  }
++
++  private static class TestInfo {
++    final String moduleName;
++    final String moduleRelativeDir;
++    final String testName;
++    final boolean skipBatching;
++    final boolean isIsolated;
++
++    TestInfo(String moduleName, String moduleRelativeDir, String testName, boolean skipBatching, boolean isIsolated) {
++      this.moduleName = moduleName;
++      this.moduleRelativeDir = moduleRelativeDir;
++      this.testName = testName;
++      this.skipBatching = skipBatching;
++      this.isIsolated = isIsolated;
++    }
++
++    @Override
++    public String toString() {
++      return "TestInfo{" +
++          "moduleName='" + moduleName + '\'' +
++          ", moduleRelativeDir='" + moduleRelativeDir + '\'' +
++          ", testName='" + testName + '\'' +
++          ", skipBatching=" + skipBatching +
++          ", isIsolated=" + isIsolated +
++          '}';
++    }
++
++    @Override
++    public boolean equals(Object o) {
++      if (this == o) {
++        return true;
++      }
++      if (o == null || getClass() != o.getClass()) {
++        return false;
++      }
++
++      TestInfo testInfo = (TestInfo) o;
++
++      return skipBatching == testInfo.skipBatching && isIsolated == testInfo.isIsolated &&
++          moduleName.equals(testInfo.moduleName) &&
++          moduleRelativeDir.equals(testInfo.moduleRelativeDir) &&
++          testName.equals(testInfo.testName);
++
++    }
++
++    @Override
++    public int hashCode() {
++      int result = moduleName.hashCode();
++      result = 31 * result + moduleRelativeDir.hashCode();
++      result = 31 * result + testName.hashCode();
++      result = 31 * result + (skipBatching ? 1 : 0);
++      result = 31 * result + (isIsolated ? 1 : 0);
++      return result;
++    }
++  }
++
++  private static final class DefaultFileListProvider implements FileListProvider {
++
++    @Override
++    public Collection<File> listFiles(File directory, String[] extensions, boolean recursive) {
++      return FileUtils.listFiles(directory, extensions, recursive);
++    }
++  }
++}
+diff --git a/testutils/ptest2/src/main/resources/batch-exec.vm b/testutils/ptest2/src/main/resources/batch-exec.vm
+index 98f2dd4..dfb39dd 100644
+--- a/testutils/ptest2/src/main/resources/batch-exec.vm
++++ b/testutils/ptest2/src/main/resources/batch-exec.vm
+@@ -16,6 +16,7 @@
+ 
+ ##### Remember, this is a velocity template 
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ umask 0022
+ echo $$
+ ps -e -o pid,pgrp,user,args
+@@ -38,6 +39,8 @@ export M2_OPTS="-Xmx1g -XX:MaxPermSize=256m -Djava.io.tmpdir=$logDir/tmp ${maven
+ export HADOOP_ROOT_LOGGER=INFO,console
+ export HADOOP_OPTS="-Dhive.log.dir=$logDir -Dhive.query.id=hadoop -Djava.io.tmpdir=$logDir/tmp"
+ cd $localDir/$instanceName/${repositoryName}-source || exit 1
++date +"%Y-%m-%d %T.%3N"
++echo "Pre test cleanup"
+ if [[ -s batch.pid ]]
+ then
+   while read pid
+@@ -56,7 +59,6 @@ echo "Pre test cleanup done"
+ ret=0
+ if [[ "${buildTool}" == "maven" ]]
+ then
+-  testModule=$(find ./ -name '${testClass}.java' | awk -F'/' '{print $2}')
+   if [[ -z "$testModule" ]]
+   then
+     testModule=./
+@@ -64,6 +66,7 @@ then
+   pushd $testModule
+   timeout 2h mvn -B test -Dmaven.repo.local=$localDir/$instanceName/maven \
+     $mavenArgs $mavenTestArgs $testArguments 1>$logDir/maven-test.txt 2>&1 </dev/null &
++  date +"%Y-%m-%d %T.%3N"
+ #[[
+   pid=$!
+ ]]#
+@@ -86,6 +89,7 @@ fi
+ echo $pid >> batch.pid
+ wait $pid
+ ret=$?
++date +"%Y-%m-%d %T.%3N"
+ find ./ -type f -name hive.log -o -name spark.log -o -name derby.log | \
+   xargs -I {} sh -c 'f=$(basename {}); test -f ${logDir}/$f && f=$f-$(uuidgen); mv {} ${logDir}/$f'
+ find ./ -type f -name 'TEST-*.xml' | \
+@@ -94,7 +98,7 @@ find ./ -path "*/spark/work" | \
+   xargs -I {} sh -c 'mv {} ${logDir}/spark-log'
+ find ./ -type f -name 'syslog*' | \
+   xargs -I {} sh -c 'mkdir -p ${logDir}/syslogs; mv {} ${logDir}/syslogs'
+-
++date +"%Y-%m-%d %T.%3N"
+ 
+ if [[ -f $logDir/.log ]]
+ then
+diff --git a/testutils/ptest2/src/main/resources/source-prep.vm b/testutils/ptest2/src/main/resources/source-prep.vm
+index be5b542..67e6a95 100644
+--- a/testutils/ptest2/src/main/resources/source-prep.vm
++++ b/testutils/ptest2/src/main/resources/source-prep.vm
+@@ -16,6 +16,7 @@
+ ##### Remember this is a velocity template
+ set -e
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ if [[ -n "${javaHome}" ]]
+ then
+   export JAVA_HOME=$javaHome
+@@ -64,13 +65,15 @@ cd $workingDir/
+     then
+       git clone $repository ${repositoryName}-source
+     fi
++    date +"%Y-%m-%d %T.%3N"
+     cd ${repositoryName}-source
+     git fetch origin
+     git reset --hard HEAD && git clean -f -d
+     git checkout $branch || git checkout -b $branch origin/$branch
+     git reset --hard origin/$branch
+     git merge --ff-only origin/$branch
+-    git gc
++    #git gc
++    date +"%Y-%m-%d %T.%3N"
+   else
+     echo "Unknown repository type '${repositoryType}'"
+     exit 1
+@@ -91,14 +94,20 @@ cd $workingDir/
+     for i in $(echo $ADDITIONAL_PROFILES | tr "," "\n")
+       do
+         mvn clean install -DskipTests -P$i;
+-        cd itests
+-        mvn clean install -DskipTests -P$i;
++        if [[ "-d itests" ]]
++        then
++          cd itests
++          mvn clean install -DskipTests -P$i;
+         cd ..
++        fi
+       done
+     #end
+-    mvn -B clean install -DskipTests -T 4 -q -Dmaven.repo.local=$workingDir/maven $mavenArgs $mavenBuildArgs
+-    cd itests
+-    mvn -B clean install -DskipTests -T 4 -q -Dmaven.repo.local=$workingDir/maven $mavenArgs $mavenBuildArgs
++    mvn -B clean install -DskipTests -Dmaven.repo.local=$workingDir/maven $mavenArgs $mavenBuildArgs
++    if [[ -d "itests" ]]
++    then
++      cd itests
++      mvn -B clean install -DskipTests -Dmaven.repo.local=$workingDir/maven $mavenArgs $mavenBuildArgs
++    fi
+   elif [[ "${buildTool}" == "ant" ]]
+   then
+     ant $antArgs -Divy.default.ivy.user.dir=$workingDir/ivy \
+@@ -108,5 +117,6 @@ cd $workingDir/
+      echo "Unknown build tool ${buildTool}"
+      exit 127
+    fi
++   date +"%Y-%m-%d %T.%3N"
+ ) 2>&1 | tee $logDir/source-prep.txt
+ exit ${PIPESTATUS[0]}
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockRSyncCommandExecutor.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockRSyncCommandExecutor.java
+index 6347ce5..3906435 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockRSyncCommandExecutor.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockRSyncCommandExecutor.java
+@@ -22,6 +22,8 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Queue;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.hive.ptest.execution.ssh.RSyncCommand;
+ import org.apache.hive.ptest.execution.ssh.RSyncCommandExecutor;
+@@ -33,6 +35,7 @@
+ public class MockRSyncCommandExecutor extends RSyncCommandExecutor {
+   private final List<String> mCommands;
+   private final Map<String, Queue<Integer>> mFailures;
++  private final AtomicInteger matchCount = new AtomicInteger(0);
+   public MockRSyncCommandExecutor(Logger logger) {
+     super(logger, 0, null);
+     mCommands = Lists.newArrayList();
+@@ -62,9 +65,13 @@ public synchronized void execute(RSyncCommand command) {
+     if(queue == null || queue.isEmpty()) {
+       command.setExitCode(0);
+     } else {
++      matchCount.incrementAndGet();
+       command.setExitCode(queue.remove());
+     }
+   }
+ 
++  public int getMatchCount() {
++    return matchCount.get();
++  }
+ 
+ }
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockSSHCommandExecutor.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockSSHCommandExecutor.java
+index e4cd807..1f3db12 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockSSHCommandExecutor.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/MockSSHCommandExecutor.java
+@@ -22,6 +22,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Queue;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.hive.ptest.execution.ssh.SSHCommand;
+ import org.apache.hive.ptest.execution.ssh.SSHCommandExecutor;
+@@ -33,6 +34,7 @@
+ public class MockSSHCommandExecutor extends SSHCommandExecutor {
+   private final List<String> mCommands;
+   private final Map<String, Queue<Integer>> mFailures;
++  private final AtomicInteger matchCount = new AtomicInteger(0);
+   public MockSSHCommandExecutor(Logger logger) {
+     super(logger);
+     mCommands = Lists.newArrayList();
+@@ -61,7 +63,12 @@ public synchronized void execute(SSHCommand command) {
+     if(queue == null || queue.isEmpty()) {
+       command.setExitCode(0);
+     } else {
++      matchCount.incrementAndGet();
+       command.setExitCode(queue.remove());
+     }
+   }
++
++  public int getMatchCount() {
++    return matchCount.get();
++  }
+ }
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
+index 29d148b..bb1bb3e 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
+@@ -20,9 +20,11 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.io.FileUtils;
+ import org.apache.hive.ptest.execution.conf.QFileTestBatch;
+@@ -70,12 +72,12 @@ private void setupQFile(boolean isParallel) throws Exception {
+     testDir = Dirs.create( new File(baseDir, "test"));
+     Assert.assertTrue(new File(testDir, QFILENAME).createNewFile());
+     testBatch =
+-        new QFileTestBatch("testcase", DRIVER, "qfile", Sets.newHashSet(QFILENAME), isParallel,
++        new QFileTestBatch(new AtomicInteger(1), "testcase", DRIVER, "qfile", Sets.newHashSet(QFILENAME), isParallel,
+             "testModule");
+     testBatches = Collections.singletonList(testBatch);
+   }
+   private void setupUnitTest() throws Exception {
+-    testBatch = new UnitTestBatch("testcase", DRIVER, false);
++    testBatch = new UnitTestBatch(new AtomicInteger(1), "testcase", Arrays.asList(DRIVER), "fakemodule", false);
+     testBatches = Collections.singletonList(testBatch);
+   }
+   private void copyTestOutput(String resource, File directory, String name) throws Exception {
+@@ -104,6 +106,7 @@ public void testFailingQFile() throws Throwable {
+         "-0/scratch/hiveptest-" + DRIVER + "-" + QFILENAME + ".sh", 1);
+     copyTestOutput("SomeTest-failure.xml", failedLogDir, testBatch.getName());
+     getPhase().execute();
++    Assert.assertEquals(1, sshCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+     Assert.assertEquals(Sets.newHashSet("SomeTest." + QFILENAME), executedTests);
+     Assert.assertEquals(Sets.newHashSet("SomeTest." + QFILENAME), failedTests);
+@@ -121,9 +124,10 @@ public void testPassingUnitTest() throws Throwable {
+   public void testFailingUnitTest() throws Throwable {
+     setupUnitTest();
+     sshCommandExecutor.putFailure("bash " + LOCAL_DIR + "/" + HOST + "-" + USER +
+-        "-0/scratch/hiveptest-" + DRIVER + ".sh", 1);
++        "-0/scratch/hiveptest-" + testBatch.getBatchId() + "_" + DRIVER + ".sh", 1);
+     copyTestOutput("SomeTest-failure.xml", failedLogDir, testBatch.getName());
+     getPhase().execute();
++    Assert.assertEquals(1, sshCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+     Assert.assertEquals(Sets.newHashSet("SomeTest." + QFILENAME), executedTests);
+     Assert.assertEquals(Sets.newHashSet("SomeTest." + QFILENAME), failedTests);
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingUnitTest.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingUnitTest.approved.txt
+index f32d5fa..02d1426 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingUnitTest.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testFailingUnitTest.approved.txt
+@@ -1,9 +1,9 @@
+ /some/working/dir/ivy /some/local/dir/somehost-someuser-0
+ /some/working/dir/maven /some/local/dir/somehost-someuser-0
+ /some/working/dir/repositoryName-source /some/local/dir/somehost-someuser-0
+-/tmp/hive-ptest-units/TestExecutionPhase/logs/failed/driver /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-driver.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver.sh
++/tmp/hive-ptest-units/TestExecutionPhase/logs/failed/1_driver /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-1_driver.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver.sh
+ killall -q -9 java || true
+ mkdir -p /some/local/dir/somehost-someuser-0/logs /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-0/repositoryName-source
+ mkdir -p /some/local/dir/somehost-someuser-1/logs /some/local/dir/somehost-someuser-1/maven /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/ivy /some/local/dir/somehost-someuser-1/repositoryName-source
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingUnitTest.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingUnitTest.approved.txt
+index 7aacd2d..e7cb292 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingUnitTest.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.testPassingUnitTest.approved.txt
+@@ -1,9 +1,9 @@
+ /some/working/dir/ivy /some/local/dir/somehost-someuser-0
+ /some/working/dir/maven /some/local/dir/somehost-someuser-0
+ /some/working/dir/repositoryName-source /some/local/dir/somehost-someuser-0
+-/tmp/hive-ptest-units/TestExecutionPhase/logs/succeeded/driver /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-driver.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver.sh
++/tmp/hive-ptest-units/TestExecutionPhase/logs/succeeded/1_driver /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestExecutionPhase/scratch/hiveptest-1_driver.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver.sh
+ killall -q -9 java || true
+ mkdir -p /some/local/dir/somehost-someuser-0/logs /some/local/dir/somehost-someuser-0/maven /some/local/dir/somehost-someuser-0/scratch /some/local/dir/somehost-someuser-0/ivy /some/local/dir/somehost-someuser-0/repositoryName-source
+ mkdir -p /some/local/dir/somehost-someuser-1/logs /some/local/dir/somehost-someuser-1/maven /some/local/dir/somehost-someuser-1/scratch /some/local/dir/somehost-someuser-1/ivy /some/local/dir/somehost-someuser-1/repositoryName-source
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.java
+index 0acebb9..65cf6a0 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.java
+@@ -22,12 +22,14 @@
+ import static org.mockito.Mockito.spy;
+ 
+ import java.io.File;
++import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import junit.framework.Assert;
+ 
+@@ -104,10 +106,11 @@ public void setup() throws Exception {
+     parallelWorkQueue = new LinkedBlockingQueue<TestBatch>();
+     isolatedWorkQueue = new LinkedBlockingQueue<TestBatch>();
+     failedTestResults = Sets.newHashSet();
+-    testBatchParallel1 = new UnitTestBatch("testcase", DRIVER_PARALLEL_1, true);
+-    testBatchParallel2 = new UnitTestBatch("testcase", DRIVER_PARALLEL_2, true);
+-    testBatchIsolated1 = new UnitTestBatch("testcase", DRIVER_ISOLATED_1, false);
+-    testBatchIsolated2 = new UnitTestBatch("testcase", DRIVER_ISOLATED_2, false);
++    AtomicInteger unitTestBatchCounter = new AtomicInteger(1);
++    testBatchParallel1 = new UnitTestBatch(unitTestBatchCounter, "testcase", Arrays.asList(DRIVER_PARALLEL_1), "fakeModule1", true);
++    testBatchParallel2 = new UnitTestBatch(unitTestBatchCounter, "testcase", Arrays.asList(DRIVER_PARALLEL_2), "fakeModule2", true);
++    testBatchIsolated1 = new UnitTestBatch(unitTestBatchCounter, "testcase", Arrays.asList(DRIVER_ISOLATED_1), "fakeModule3", false);
++    testBatchIsolated2 = new UnitTestBatch(unitTestBatchCounter, "testcase", Arrays.asList(DRIVER_ISOLATED_2), "fakeModule4", false);
+     executor = MoreExecutors.listeningDecorator(Executors.newFixedThreadPool(2));
+     localCommandFactory = new MockLocalCommandFactory(LOG);
+     localCommand = mock(LocalCommand.class);
+@@ -159,44 +162,55 @@ public void testBasic()
+   @Test
+   public void testParallelFailsOnExec()
+       throws Exception {
+-    sshCommandExecutor.putFailure("bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh",
++    sshCommandExecutor.putFailure("bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-" +
++            testBatchParallel1.getBatchId() + "_driver-parallel-1.sh",
+         Constants.EXIT_CODE_UNKNOWN);
+     HostExecutor executor = createHostExecutor();
+     parallelWorkQueue.addAll(Lists.newArrayList(testBatchParallel1));
+     executor.submitTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults).get();
+     Assert.assertEquals(Collections.emptySet(),  failedTestResults);
+     Assert.assertTrue(parallelWorkQueue.toString(), parallelWorkQueue.isEmpty());
++    Assert.assertEquals(1, sshCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+   }
+   @Test
+   public void testIsolatedFailsOnExec()
+       throws Exception {
+-    sshCommandExecutor.putFailure("bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh",
++    sshCommandExecutor.putFailure("bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-" +
++            testBatchIsolated1.getBatchId() + "_driver-isolated-1.sh",
+         Constants.EXIT_CODE_UNKNOWN);
+     HostExecutor executor = createHostExecutor();
+     isolatedWorkQueue.addAll(Lists.newArrayList(testBatchIsolated1));
+     executor.submitTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults).get();
+     Assert.assertEquals(Collections.emptySet(),  failedTestResults);
+     Assert.assertTrue(isolatedWorkQueue.toString(), parallelWorkQueue.isEmpty());
++    Assert.assertEquals(1, sshCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+   }
+   @Test
+   public void testParallelFailsOnRsync()
+       throws Exception {
+-    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh "
+-        + "/some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh", Constants.EXIT_CODE_UNKNOWN);
++    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-" +
++            testBatchParallel1.getBatchId() + "_driver-parallel-1.sh "
++            + "/some/local/dir/somehost-someuser-0/scratch/hiveptest-" +
++            testBatchParallel1.getBatchId() + "_driver-parallel-1.sh",
++        Constants.EXIT_CODE_UNKNOWN);
+     HostExecutor executor = createHostExecutor();
+     parallelWorkQueue.addAll(Lists.newArrayList(testBatchParallel1));
+     executor.submitTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults).get();
+     Assert.assertEquals(Collections.emptySet(),  failedTestResults);
+     Assert.assertTrue(parallelWorkQueue.toString(), parallelWorkQueue.isEmpty());
++    Assert.assertEquals(1, rsyncCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+   }
+   @Test
+   public void testShutdownBeforeExec()
+       throws Exception {
+-    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh "
+-        + "/some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh", Constants.EXIT_CODE_UNKNOWN);
++    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-" +
++            testBatchParallel1.getBatchId() + "_driver-parallel-1.sh "
++            + "/some/local/dir/somehost-someuser-0/scratch/hiveptest-" +
++            testBatchParallel1.getBatchId() + "_driver-parallel-1.sh",
++        Constants.EXIT_CODE_UNKNOWN);
+     HostExecutor executor = createHostExecutor();
+     parallelWorkQueue.addAll(Lists.newArrayList(testBatchParallel1));
+     executor.shutdownNow();
+@@ -204,30 +218,38 @@ public void testShutdownBeforeExec()
+     Assert.assertEquals(Collections.emptySet(),  failedTestResults);
+     Assert.assertEquals(parallelWorkQueue.toString(), 1, parallelWorkQueue.size());
+     Approvals.verify("EMPTY\n" + getExecutedCommands());
++    Assert.assertEquals(0, rsyncCommandExecutor.getMatchCount());
+     Assert.assertTrue(executor.isShutdown());
+   }
+   @Test
+   public void testIsolatedFailsOnRsyncUnknown()
+       throws Exception {
+-    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh "+
+-        "/some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh", Constants.EXIT_CODE_UNKNOWN);
++    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-" +
++            testBatchIsolated1.getBatchId() + "_driver-isolated-1.sh " +
++            "/some/local/dir/somehost-someuser-0/scratch/hiveptest-" +
++            testBatchIsolated1.getBatchId() + "_driver-isolated-1.sh",
++        Constants.EXIT_CODE_UNKNOWN);
+     HostExecutor executor = createHostExecutor();
+     isolatedWorkQueue.addAll(Lists.newArrayList(testBatchIsolated1));
+     executor.submitTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults).get();
+     Assert.assertEquals(Collections.emptySet(),  failedTestResults);
+     Assert.assertTrue(isolatedWorkQueue.toString(), isolatedWorkQueue.isEmpty());
++    Assert.assertEquals(1, rsyncCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+   }
+   @Test
+   public void testIsolatedFailsOnRsyncOne()
+       throws Exception {
+-    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh "+
+-        "/some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh", 1);
++    rsyncCommandExecutor.putFailure("/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-" +
++        testBatchIsolated1.getBatchId() + "_driver-isolated-1.sh " +
++        "/some/local/dir/somehost-someuser-0/scratch/hiveptest-" + testBatchIsolated1.getBatchId() +
++        "_driver-isolated-1.sh", 1);
+     HostExecutor executor = createHostExecutor();
+     isolatedWorkQueue.addAll(Lists.newArrayList(testBatchIsolated1));
+     executor.submitTests(parallelWorkQueue, isolatedWorkQueue, failedTestResults).get();
+     Assert.assertEquals(Collections.emptySet(),  failedTestResults);
+     Assert.assertTrue(isolatedWorkQueue.toString(), parallelWorkQueue.isEmpty());
++    Assert.assertEquals(1, rsyncCommandExecutor.getMatchCount());
+     Approvals.verify(getExecutedCommands());
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testBasic.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testBasic.approved.txt
+index c2a702c..c4cc9f6 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testBasic.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testBasic.approved.txt
+@@ -1,12 +1,12 @@
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-isolated-1 /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-isolated-2 /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-parallel-1 /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-parallel-2 /some/local/dir/somehost-someuser-0/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-2.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-2.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-2.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-2.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-2.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-2.sh
+\ No newline at end of file
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/1_driver-parallel-1 /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/2_driver-parallel-2 /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/3_driver-isolated-1 /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/4_driver-isolated-2 /some/local/dir/somehost-someuser-0/logs/
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-1_driver-parallel-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver-parallel-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-2_driver-parallel-2.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-2_driver-parallel-2.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-3_driver-isolated-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-4_driver-isolated-2.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-4_driver-isolated-2.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver-parallel-1.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-2_driver-parallel-2.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-3_driver-isolated-1.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-4_driver-isolated-2.sh
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnExec.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnExec.approved.txt
+index 2a3a4a6..506b2e0 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnExec.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnExec.approved.txt
+@@ -1,5 +1,5 @@
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-isolated-1 /some/local/dir/somehost-someuser-1/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-isolated-1.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh
+-bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-isolated-1.sh
+\ No newline at end of file
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/3_driver-isolated-1 /some/local/dir/somehost-someuser-1/logs/
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-3_driver-isolated-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-3_driver-isolated-1.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-3_driver-isolated-1.sh
++bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-3_driver-isolated-1.sh
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncOne.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncOne.approved.txt
+index 13945bf..a460175 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncOne.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncOne.approved.txt
+@@ -1,4 +1,4 @@
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-isolated-1 /some/local/dir/somehost-someuser-1/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-isolated-1.sh
+-bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-isolated-1.sh
+\ No newline at end of file
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/3_driver-isolated-1 /some/local/dir/somehost-someuser-1/logs/
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-3_driver-isolated-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-3_driver-isolated-1.sh
++bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-3_driver-isolated-1.sh
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncUnknown.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncUnknown.approved.txt
+index 13945bf..a460175 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncUnknown.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testIsolatedFailsOnRsyncUnknown.approved.txt
+@@ -1,4 +1,4 @@
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-isolated-1 /some/local/dir/somehost-someuser-1/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-isolated-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-isolated-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-isolated-1.sh
+-bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-isolated-1.sh
+\ No newline at end of file
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/3_driver-isolated-1 /some/local/dir/somehost-someuser-1/logs/
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-3_driver-isolated-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-3_driver-isolated-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-3_driver-isolated-1.sh
++bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-3_driver-isolated-1.sh
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnExec.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnExec.approved.txt
+index df86b02..2ae7fa1 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnExec.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnExec.approved.txt
+@@ -1,5 +1,5 @@
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-parallel-1 /some/local/dir/somehost-someuser-1/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-parallel-1.sh
+-bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh
+-bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-parallel-1.sh
+\ No newline at end of file
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/1_driver-parallel-1 /some/local/dir/somehost-someuser-1/logs/
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-1_driver-parallel-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver-parallel-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-1_driver-parallel-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-1_driver-parallel-1.sh
++bash /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver-parallel-1.sh
++bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-1_driver-parallel-1.sh
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnRsync.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnRsync.approved.txt
+index 4f32a9f..76ab9e3 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnRsync.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestHostExecutor.testParallelFailsOnRsync.approved.txt
+@@ -1,4 +1,4 @@
+-/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/driver-parallel-1 /some/local/dir/somehost-someuser-1/logs/
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-driver-parallel-1.sh
+-/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-driver-parallel-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-parallel-1.sh
+-bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-driver-parallel-1.sh
+\ No newline at end of file
++/tmp/hive-ptest-units/TestHostExecutor/logs/succeeded/1_driver-parallel-1 /some/local/dir/somehost-someuser-1/logs/
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-1_driver-parallel-1.sh /some/local/dir/somehost-someuser-0/scratch/hiveptest-1_driver-parallel-1.sh
++/tmp/hive-ptest-units/TestHostExecutor/scratch/hiveptest-1_driver-parallel-1.sh /some/local/dir/somehost-someuser-1/scratch/hiveptest-1_driver-parallel-1.sh
++bash /some/local/dir/somehost-someuser-1/scratch/hiveptest-1_driver-parallel-1.sh
+\ No newline at end of file
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testAlternativeTestJVM.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testAlternativeTestJVM.approved.txt
+index 5ab1a4c..3d572aa 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testAlternativeTestJVM.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testAlternativeTestJVM.approved.txt
+@@ -15,6 +15,7 @@
+ # limitations under the License.
+ 
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ umask 0022
+ echo $$
+ ps -e -o pid,pgrp,user,args
+@@ -37,6 +38,8 @@ export M2_OPTS="-Xmx1g -XX:MaxPermSize=256m -Djava.io.tmpdir=/some/log/dir/tmp $
+ export HADOOP_ROOT_LOGGER=INFO,console
+ export HADOOP_OPTS="-Dhive.log.dir=/some/log/dir -Dhive.query.id=hadoop -Djava.io.tmpdir=/some/log/dir/tmp"
+ cd /some/local/dir/instance-1/apache-source || exit 1
++date +"%Y-%m-%d %T.%3N"
++echo "Pre test cleanup"
+ if [[ -s batch.pid ]]
+ then
+   while read pid
+@@ -52,10 +55,11 @@ echo "$$" > batch.pid
+ find ./ -name 'TEST-*.xml' -delete
+ find ./ -name 'hive.log' -delete
+ find ./ -name junit_metastore_db | xargs -r rm -rf
++date +"%Y-%m-%d %T.%3N"
++echo "Pre test cleanup done"
+ ret=0
+ if [[ "ant" == "maven" ]]
+ then
+-  testModule=$(find ./ -name 'TestCliDriver.java' | awk -F'/' '{print $2}')
+   if [[ -z "$testModule" ]]
+   then
+     testModule=./
+@@ -63,6 +67,7 @@ then
+   pushd $testModule
+   timeout 2h mvn -B test -Dmaven.repo.local=/some/local/dir/instance-1/maven \
+     $mavenArgs $mavenTestArgs -Dtest=arg1 1>/some/log/dir/maven-test.txt 2>&1 </dev/null &
++  date +"%Y-%m-%d %T.%3N"
+ 
+   pid=$!
+ 
+@@ -85,6 +90,7 @@ fi
+ echo $pid >> batch.pid
+ wait $pid
+ ret=$?
++date +"%Y-%m-%d %T.%3N"
+ find ./ -type f -name hive.log -o -name spark.log -o -name derby.log | \
+   xargs -I {} sh -c 'f=$(basename {}); test -f /some/log/dir/$f && f=$f-$(uuidgen); mv {} /some/log/dir/$f'
+ find ./ -type f -name 'TEST-*.xml' | \
+@@ -93,7 +99,7 @@ find ./ -path "*/spark/work" | \
+   xargs -I {} sh -c 'mv {} /some/log/dir/spark-log'
+ find ./ -type f -name 'syslog*' | \
+   xargs -I {} sh -c 'mkdir -p /some/log/dir/syslogs; mv {} /some/log/dir/syslogs'
+-
++date +"%Y-%m-%d %T.%3N"
+ 
+ if [[ -f /some/log/dir/.log ]]
+ then
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testBatch.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testBatch.approved.txt
+index 0c33e48..49ac836 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testBatch.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testBatch.approved.txt
+@@ -15,6 +15,7 @@
+ # limitations under the License.
+ 
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ umask 0022
+ echo $$
+ ps -e -o pid,pgrp,user,args
+@@ -37,6 +38,8 @@ export M2_OPTS="-Xmx1g -XX:MaxPermSize=256m -Djava.io.tmpdir=/some/log/dir/tmp $
+ export HADOOP_ROOT_LOGGER=INFO,console
+ export HADOOP_OPTS="-Dhive.log.dir=/some/log/dir -Dhive.query.id=hadoop -Djava.io.tmpdir=/some/log/dir/tmp"
+ cd /some/local/dir/instance-1/apache-source || exit 1
++date +"%Y-%m-%d %T.%3N"
++echo "Pre test cleanup"
+ if [[ -s batch.pid ]]
+ then
+   while read pid
+@@ -52,10 +55,11 @@ echo "$$" > batch.pid
+ find ./ -name 'TEST-*.xml' -delete
+ find ./ -name 'hive.log' -delete
+ find ./ -name junit_metastore_db | xargs -r rm -rf
++date +"%Y-%m-%d %T.%3N"
++echo "Pre test cleanup done"
+ ret=0
+ if [[ "maven" == "maven" ]]
+ then
+-  testModule=$(find ./ -name 'TestCliDriver.java' | awk -F'/' '{print $2}')
+   if [[ -z "$testModule" ]]
+   then
+     testModule=./
+@@ -63,6 +67,7 @@ then
+   pushd $testModule
+   timeout 2h mvn -B test -Dmaven.repo.local=/some/local/dir/instance-1/maven \
+     -Dant=arg1 $mavenTestArgs -Dtest=arg1 1>/some/log/dir/maven-test.txt 2>&1 </dev/null &
++  date +"%Y-%m-%d %T.%3N"
+ 
+   pid=$!
+ 
+@@ -85,6 +90,7 @@ fi
+ echo $pid >> batch.pid
+ wait $pid
+ ret=$?
++date +"%Y-%m-%d %T.%3N"
+ find ./ -type f -name hive.log -o -name spark.log -o -name derby.log | \
+   xargs -I {} sh -c 'f=$(basename {}); test -f /some/log/dir/$f && f=$f-$(uuidgen); mv {} /some/log/dir/$f'
+ find ./ -type f -name 'TEST-*.xml' | \
+@@ -93,7 +99,7 @@ find ./ -path "*/spark/work" | \
+   xargs -I {} sh -c 'mv {} /some/log/dir/spark-log'
+ find ./ -type f -name 'syslog*' | \
+   xargs -I {} sh -c 'mkdir -p /some/log/dir/syslogs; mv {} /some/log/dir/syslogs'
+-
++date +"%Y-%m-%d %T.%3N"
+ 
+ if [[ -f /some/log/dir/.log ]]
+ then
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepGit.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepGit.approved.txt
+index d58d910..29d2413 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepGit.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepGit.approved.txt
+@@ -15,6 +15,7 @@
+ 
+ set -e
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ if [[ -n "/usr/java/jdk1.7" ]]
+ then
+   export JAVA_HOME=/usr/java/jdk1.7
+@@ -63,13 +64,15 @@ cd /some/working/dir/
+     then
+       git clone git:///repo1 apache-source
+     fi
++    date +"%Y-%m-%d %T.%3N"
+     cd apache-source
+     git fetch origin
+     git reset --hard HEAD && git clean -f -d
+     git checkout branch-1 || git checkout -b branch-1 origin/branch-1
+     git reset --hard origin/branch-1
+     git merge --ff-only origin/branch-1
+-    git gc
++    #git gc
++    date +"%Y-%m-%d %T.%3N"
+   else
+     echo "Unknown repository type 'git'"
+     exit 1
+@@ -85,8 +88,11 @@ cd /some/working/dir/
+   then
+     rm -rf /some/working/dir/maven/org/apache/hive
+         mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven -X -Phadoop-2
+-    cd itests
+-    mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven -X -Phadoop-2
++    if [[ -d "itests" ]]
++    then
++      cd itests
++      mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven -X -Phadoop-2
++    fi
+   elif [[ "${buildTool}" == "ant" ]]
+   then
+     ant -Dant=arg1 -Divy.default.ivy.user.dir=/some/working/dir/ivy \
+@@ -96,5 +102,6 @@ cd /some/working/dir/
+      echo "Unknown build tool ${buildTool}"
+      exit 127
+    fi
++   date +"%Y-%m-%d %T.%3N"
+ ) 2>&1 | tee /some/log/dir/source-prep.txt
+ exit ${PIPESTATUS[0]}
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepHadoop1.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepHadoop1.approved.txt
+index dbb6a6d..361b9bb 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepHadoop1.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepHadoop1.approved.txt
+@@ -15,6 +15,7 @@
+ 
+ set -e
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ if [[ -n "/usr/java/jdk1.7" ]]
+ then
+   export JAVA_HOME=/usr/java/jdk1.7
+@@ -63,13 +64,15 @@ cd /some/working/dir/
+     then
+       git clone https://svn.apache.org/repos/asf/hive/trunk apache-source
+     fi
++    date +"%Y-%m-%d %T.%3N"
+     cd apache-source
+     git fetch origin
+     git reset --hard HEAD && git clean -f -d
+     git checkout  || git checkout -b  origin/
+     git reset --hard origin/
+     git merge --ff-only origin/
+-    git gc
++    #git gc
++    date +"%Y-%m-%d %T.%3N"
+   else
+     echo "Unknown repository type 'svn'"
+     exit 1
+@@ -89,15 +92,19 @@ cd /some/working/dir/
+     for i in $(echo $ADDITIONAL_PROFILES | tr "," "\n")
+       do
+         mvn clean install -DskipTests -P$i;
+-        cd itests
+-        mvn clean install -DskipTests -P$i;
++        if [[ "-d itests" ]]
++        then
++          cd itests
++          mvn clean install -DskipTests -P$i;
+         cd ..
++        fi
+       done
+         mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
+-    mvn -B test -Dmaven.repo.local=/some/working/dir/maven -Dtest=TestDummy $mavenArgs $mavenTestArgs
+-    cd itests
+-    mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
+-    mvn -B test -Dmaven.repo.local=/some/working/dir/maven -Dtest=TestDummy $mavenArgs $mavenTestArgs
++    if [[ -d "itests" ]]
++    then
++      cd itests
++      mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
++    fi
+   elif [[ "maven" == "ant" ]]
+   then
+     ant -Dant=arg1 -Divy.default.ivy.user.dir=/some/working/dir/ivy \
+@@ -107,5 +114,6 @@ cd /some/working/dir/
+      echo "Unknown build tool maven"
+      exit 127
+    fi
++   date +"%Y-%m-%d %T.%3N"
+ ) 2>&1 | tee /some/log/dir/source-prep.txt
+ exit ${PIPESTATUS[0]}
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepNone.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepNone.approved.txt
+index dde8822..5f494ee 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepNone.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepNone.approved.txt
+@@ -15,6 +15,7 @@
+ 
+ set -e
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ if [[ -n "/usr/java/jdk1.7" ]]
+ then
+   export JAVA_HOME=/usr/java/jdk1.7
+@@ -63,13 +64,15 @@ cd /some/working/dir/
+     then
+       git clone git:///repo1 apache-source
+     fi
++    date +"%Y-%m-%d %T.%3N"
+     cd apache-source
+     git fetch origin
+     git reset --hard HEAD && git clean -f -d
+     git checkout branch-1 || git checkout -b branch-1 origin/branch-1
+     git reset --hard origin/branch-1
+     git merge --ff-only origin/branch-1
+-    git gc
++    #git gc
++    date +"%Y-%m-%d %T.%3N"
+   else
+     echo "Unknown repository type '${repositoryType}'"
+     exit 1
+@@ -85,8 +88,11 @@ cd /some/working/dir/
+   then
+     rm -rf /some/working/dir/maven/org/apache/hive
+         mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
+-    cd itests
+-    mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
++    if [[ -d "itests" ]]
++    then
++      cd itests
++      mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
++    fi
+   elif [[ "ant" == "ant" ]]
+   then
+     ant -Dant=arg1 -Divy.default.ivy.user.dir=/some/working/dir/ivy \
+@@ -96,5 +102,6 @@ cd /some/working/dir/
+      echo "Unknown build tool ant"
+      exit 127
+    fi
++   date +"%Y-%m-%d %T.%3N"
+ ) 2>&1 | tee /some/log/dir/source-prep.txt
+ exit ${PIPESTATUS[0]}
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepSvn.approved.txt b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepSvn.approved.txt
+index f3eec2d..9de17af 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepSvn.approved.txt
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestScripts.testPrepSvn.approved.txt
+@@ -15,6 +15,7 @@
+ 
+ set -e
+ set -x
++date +"%Y-%m-%d %T.%3N"
+ if [[ -n "/usr/java/jdk1.7" ]]
+ then
+   export JAVA_HOME=/usr/java/jdk1.7
+@@ -63,13 +64,15 @@ cd /some/working/dir/
+     then
+       git clone https://svn.apache.org/repos/asf/hive/trunk apache-source
+     fi
++    date +"%Y-%m-%d %T.%3N"
+     cd apache-source
+     git fetch origin
+     git reset --hard HEAD && git clean -f -d
+     git checkout  || git checkout -b  origin/
+     git reset --hard origin/
+     git merge --ff-only origin/
+-    git gc
++    #git gc
++    date +"%Y-%m-%d %T.%3N"
+   else
+     echo "Unknown repository type 'svn'"
+     exit 1
+@@ -85,8 +88,11 @@ cd /some/working/dir/
+   then
+     rm -rf /some/working/dir/maven/org/apache/hive
+         mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
+-    cd itests
+-    mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
++    if [[ -d "itests" ]]
++    then
++      cd itests
++      mvn -B clean install -DskipTests -Dmaven.repo.local=/some/working/dir/maven $mavenArgs $mavenBuildArgs
++    fi
+   elif [[ "maven" == "ant" ]]
+   then
+     ant -Dant=arg1 -Divy.default.ivy.user.dir=/some/working/dir/ivy \
+@@ -96,5 +102,6 @@ cd /some/working/dir/
+      echo "Unknown build tool maven"
+      exit 127
+    fi
++   date +"%Y-%m-%d %T.%3N"
+ ) 2>&1 | tee /some/log/dir/source-prep.txt
+ exit ${PIPESTATUS[0]}
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
+index 0257591..fb7bee8 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
+@@ -19,6 +19,7 @@
+ package org.apache.hive.ptest.execution.conf;
+ 
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import junit.framework.Assert;
+ 
+@@ -44,26 +45,26 @@ public void setup() {
+   @Test
+   public void testParallel() throws Exception {
+     QFileTestBatch batch =
+-        new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
++        new QFileTestBatch(new AtomicInteger(1), "testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
+     Assert.assertTrue(batch.isParallel());
+     Assert.assertEquals(DRIVER, batch.getDriver());
+     Assert.assertEquals(Joiner.on("-").join(DRIVER, "a", "b", "c"), batch.getName());
+     Assert.assertEquals(String.format("-Dtestcase=%s -D%s=a,b,c", DRIVER,
+         QUERY_FILES_PROPERTY), batch.getTestArguments());
+-    Assert.assertEquals(TEST_MODULE_NAME, batch.getTestModule());
++    Assert.assertEquals(TEST_MODULE_NAME, batch.getTestModuleRelativeDir());
+   }
+   @Test
+   public void testMoreThanThreeTests() throws Exception {
+     Assert.assertTrue(tests.add("d"));
+     QFileTestBatch batch =
+-        new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
++        new QFileTestBatch(new AtomicInteger(1), "testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
+     Assert.assertEquals(Joiner.on("-").join(DRIVER, "a", "b", "c", "and", "1", "more"),
+         batch.getName());
+   }
+   @Test
+   public void testNotParallel() throws Exception {
+     QFileTestBatch batch =
+-        new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, false,
++        new QFileTestBatch(new AtomicInteger(1), "testcase", DRIVER, QUERY_FILES_PROPERTY, tests, false,
+             TEST_MODULE_NAME);
+     Assert.assertFalse(batch.isParallel());
+   }
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestTestParser.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestTestParser.java
+index 1ec27f5..bbf3226 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestTestParser.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestTestParser.java
+@@ -23,6 +23,7 @@
+ import java.io.OutputStream;
+ import java.util.List;
+ import java.util.Properties;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import junit.framework.Assert;
+ 
+@@ -91,6 +92,7 @@ public void teardown() {
+   @Test
+   public void testParseWithExcludes() throws Exception {
+     context.put("unitTests.directories", "build/1 build/2");
++    context.put("unitTests.subdirForPrefix", "units");
+     context.put("unitTests.exclude", "TestA");
+     context.put("unitTests.isolate", "TestB");
+     context.put("qFileTests", "f");
+@@ -101,13 +103,14 @@ public void testParseWithExcludes() throws Exception {
+     context.put("qFileTest.f.isolate", "isolated");
+     context.put("qFileTest.f.groups.excluded", "excluded.q");
+     context.put("qFileTest.f.groups.isolated", "isolated.q");
+-    testParser = new TestParser(context, "testcase", workingDirectory, LOG);
++    testParser = new TestParser(context, new AtomicInteger(1),  "testcase", workingDirectory, LOG);
+     List<TestBatch> testBatches = testParser.parse().get();
+     Assert.assertEquals(4, testBatches.size());
+   }
+   @Test
+   public void testParseWithIncludes() throws Exception {
+     context.put("unitTests.directories", "build/1 build/2");
++    context.put("unitTests.subdirForPrefix", "units");
+     context.put("unitTests.include", "TestA TestB");
+     context.put("unitTests.isolate", "TestB");
+     context.put("qFileTests", "f");
+@@ -118,13 +121,14 @@ public void testParseWithIncludes() throws Exception {
+     context.put("qFileTest.f.queryFilesProperty", "qfile");
+     context.put("qFileTest.f.groups.included", "included.q isolated.q");
+     context.put("qFileTest.f.groups.isolated", "isolated.q");
+-    testParser = new TestParser(context, "testcase", workingDirectory, LOG);
++    testParser = new TestParser(context, new AtomicInteger(1), "testcase", workingDirectory, LOG);
+     List<TestBatch> testBatches = testParser.parse().get();
+     Assert.assertEquals(4, testBatches.size());
+   }
+   @Test
+   public void testParsePropertyFile() throws Exception {
+     context.put("unitTests.directories", "build/1 build/2");
++    context.put("unitTests.subdirForPrefix", "units");
+     context.put("unitTests.include", "TestA TestB");
+     context.put("unitTests.isolate", "TestB");
+     context.put("qFileTests", "f");
+@@ -139,7 +143,7 @@ public void testParsePropertyFile() throws Exception {
+     context.put("qFileTest.f.groups.included", "prop.${normal.one.group} prop.${normal.two.group} prop.${isolated.group}");
+     context.put("qFileTest.f.groups.isolated", "prop.${isolated.group}");
+     context.put("qFileTest.f.groups.excluded", "prop.${excluded.group}");
+-    testParser = new TestParser(context, "testcase", workingDirectory, LOG);
++    testParser = new TestParser(context, new AtomicInteger(1), "testcase", workingDirectory, LOG);
+     List<TestBatch> testBatches = testParser.parse().get();
+     Assert.assertEquals(4, testBatches.size());
+   }
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestUnitTestPropertiesParser.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestUnitTestPropertiesParser.java
+new file mode 100644
+index 0000000..5bc521a
+--- /dev/null
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestUnitTestPropertiesParser.java
+@@ -0,0 +1,672 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hive.ptest.execution.conf;
++
++import static org.junit.Assert.assertEquals;
++
++import java.io.File;
++import java.util.Collection;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Set;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import com.google.common.base.Joiner;
++import com.google.common.collect.Sets;
++import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++
++public class TestUnitTestPropertiesParser {
++
++  private static final Logger LOG = LoggerFactory
++      .getLogger(TestUnitTestPropertiesParser.class);
++
++  private static final String MODULE1_NAME = "module1";
++  private static final String MODULE1_TEST_NAME = "Module1";
++  private static final String MODULE2_NAME = "module2";
++  private static final String MODULE2_TEST_NAME = "Module2";
++
++  private static final String TOP_LEVEL_TEST_NAME = "tl";
++  private static final String TWO_LEVEL_MODULE1_NAME = "module2l.submodule1";
++  private static final String TWO_LEVEL_TEST_NAME = "TwoLevel";
++  private static final String THREE_LEVEL_MODULE1_NAME = "module3l.sub.submodule1";
++  private static final String THREE_LEVEL_TEST_NAME = "ThreeLevel";
++
++  private static final String MODULE3_REL_DIR = "TwoLevel/module-2.6";
++  private static final String MODULE3_MODULE_NAME = "TwoLevel.module-2.6";
++  private static final String MODULE3_TEST_NAME = "Module3";
++
++
++  private static final int BATCH_SIZE_DEFAULT = 10;
++
++  private static final String TEST_CASE_PROPERT_NAME = "test";
++
++  @Test(timeout = 5000)
++  public void testSimpleSetup() {
++
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE2_NAME},
++        new int[]{5, 4},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelExclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_EXCLUDE),
++        "Test" + MODULE1_TEST_NAME + "1");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE2_NAME},
++        new int[]{4, 4},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelInclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_INCLUDE),
++        "Test" + MODULE1_TEST_NAME + "1" + " " + "Test" + MODULE1_TEST_NAME + "2");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        1,
++        new String[]{MODULE1_NAME},
++        new int[]{2},
++        new boolean[]{true});
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelSkipBatching() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_SKIP_BATCHING),
++        "Test" + MODULE1_TEST_NAME + "1" + " " + "Test" + MODULE1_TEST_NAME + "2");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        4,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE1_NAME, MODULE2_NAME},
++        new int[]{1, 1, 3, 4},
++        new boolean[]{true, true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelIsolate() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ISOLATE),
++        "Test" + MODULE1_TEST_NAME + "1" + " " + "Test" + MODULE1_TEST_NAME + "2");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        4,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE1_NAME, MODULE2_NAME},
++        new int[]{1, 1, 3, 4},
++        new boolean[]{false, false, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelBatchSize() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context
++        .put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_BATCH_SIZE), Integer.toString(2));
++
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        5,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE1_NAME, MODULE2_NAME, MODULE2_NAME},
++        new int[]{2, 2, 1, 2, 2},
++        new boolean[]{true, true, true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleLevelExclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_EXCLUDE),
++        "Test" + MODULE1_TEST_NAME + "1");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE2_NAME},
++        new int[]{4, 4},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleLevelInclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_INCLUDE),
++        "Test" + MODULE1_TEST_NAME + "1" + " " + "Test" + MODULE1_TEST_NAME + "2");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE2_NAME},
++        new int[]{2, 4},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleLevelSkipBatching() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context
++        .put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_SKIP_BATCHING),
++            "Test" + MODULE1_TEST_NAME + "1" + " " + "Test" + MODULE1_TEST_NAME + "2");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        4,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE1_NAME, MODULE2_NAME},
++        new int[]{1, 1, 3, 4},
++        new boolean[]{true, true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleLevelIsolate() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_ISOLATE),
++        "Test" + MODULE1_TEST_NAME + "1" + " " + "Test" + MODULE1_TEST_NAME + "2");
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        4,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE1_NAME, MODULE2_NAME},
++        new int[]{1, 1, 3, 4},
++        new boolean[]{false, false, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleLevelBatchSize() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(2));
++
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        4,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE1_NAME, MODULE2_NAME},
++        new int[]{2, 2, 1, 4},
++        new boolean[]{true, true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testProvidedExclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 5, 4);
++
++    Set<String> excludedProvided = Sets.newHashSet("Test" + MODULE1_TEST_NAME + "1");
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            excludedProvided, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE2_NAME},
++        new int[]{4, 4},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelBatchSizeIncludeAll() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 120, 60);
++    context
++        .put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_BATCH_SIZE), Integer.toString(0));
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE2_NAME},
++        new int[]{120, 60},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleLevelBatchSizeIncludeAll() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 50, 4);
++    context
++        .put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_BATCH_SIZE), Integer.toString(2));
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(0));
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        3,
++        new String[]{MODULE1_NAME, MODULE2_NAME, MODULE2_NAME},
++        new int[]{50, 2, 2},
++        new boolean[]{true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testMultiLevelModules() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProviderMultiLevel(baseDir, 4, 30, 6, 9);
++    context
++        .put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_BATCH_SIZE), Integer.toString(4));
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE1_NAME),
++        MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(MODULE1_NAME, UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(0));
++
++    context.put(
++        getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, THREE_LEVEL_MODULE1_NAME),
++        THREE_LEVEL_MODULE1_NAME);
++    context.put(getUtSpecificPropertyName(THREE_LEVEL_MODULE1_NAME,
++        UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(0));
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        5,
++        new String[]{UnitTestPropertiesParser.PREFIX_TOP_LEVEL, MODULE1_NAME,
++            TWO_LEVEL_MODULE1_NAME, TWO_LEVEL_MODULE1_NAME, THREE_LEVEL_MODULE1_NAME},
++        new int[]{4, 30, 4, 2, 9},
++        new boolean[]{true, true, true, true, true});
++
++  }
++
++  @Test(timeout = 5000)
++  public void testTopLevelModuleConfig() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProviderMultiLevel(baseDir, 9, 0, 0, 0);
++    context
++        .put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_BATCH_SIZE), Integer.toString(4));
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE,
++        UnitTestPropertiesParser.MODULE_NAME_TOP_LEVEL),
++        UnitTestPropertiesParser.MODULE_NAME_TOP_LEVEL);
++    context.put(getUtSpecificPropertyName(UnitTestPropertiesParser.MODULE_NAME_TOP_LEVEL,
++        UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(0));
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        1,
++        new String[]{UnitTestPropertiesParser.PREFIX_TOP_LEVEL},
++        new int[]{9},
++        new boolean[]{true});
++  }
++
++  @Test(timeout = 5000)
++  public void testScanMultipleDirectoriesNested() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProviderMultiLevel(baseDir, 13, 5, 0, 0);
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_DIRECTORIES),
++        "./ ./" + MODULE1_NAME);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        3,
++        new String[]{UnitTestPropertiesParser.PREFIX_TOP_LEVEL,
++            UnitTestPropertiesParser.PREFIX_TOP_LEVEL, MODULE1_NAME},
++        new int[]{10, 3, 5},
++        new boolean[]{true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testScanMultipleDirectoriesNonNested() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 13, 8);
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_DIRECTORIES),
++        "./" + MODULE1_NAME + " " + "./" + MODULE2_NAME);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        3,
++        new String[]{MODULE1_NAME, MODULE1_NAME, MODULE2_NAME},
++        new int[]{10, 3, 8},
++        new boolean[]{true, true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleInclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 13, 8);
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_MODULE_LIST,
++        UnitTestPropertiesParser.PROP_INCLUDE), MODULE1_NAME);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        2,
++        new String[]{MODULE1_NAME, MODULE1_NAME},
++        new int[]{10, 3},
++        new boolean[]{true, true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleExclude() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider = getTestFileListProvider(baseDir, 13, 8);
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_MODULE_LIST,
++        UnitTestPropertiesParser.PROP_EXCLUDE), MODULE1_NAME);
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        1,
++        new String[]{MODULE2_NAME},
++        new int[]{8},
++        new boolean[]{true});
++  }
++
++  @Test(timeout = 5000)
++  public void testModuleWithPeriodInDirName() {
++    File baseDir = getFakeTestBaseDir();
++    Context context = getDefaultContext();
++
++    FileListProvider flProvider =
++        getTestFileListProviderSingleModule(baseDir, MODULE3_REL_DIR, MODULE3_TEST_NAME, 13);
++    context
++        .put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_ONE_MODULE, MODULE3_MODULE_NAME),
++            MODULE3_MODULE_NAME);
++    context.put(
++        getUtSpecificPropertyName(MODULE3_MODULE_NAME, UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(5));
++
++    UnitTestPropertiesParser parser =
++        new UnitTestPropertiesParser(context, new AtomicInteger(1), TEST_CASE_PROPERT_NAME, baseDir, LOG, flProvider,
++            null, true);
++    Collection<TestBatch> testBatchCollection = parser.generateTestBatches();
++    verifyBatches(testBatchCollection,
++        3,
++        new String[]{MODULE3_MODULE_NAME, MODULE3_MODULE_NAME, MODULE3_MODULE_NAME},
++        new int[]{5, 5, 3},
++        new boolean[]{true, true, true});
++
++  }
++
++  private void verifyBatches(Collection<TestBatch> testBatchCollection, int numBatches,
++                             String[] moduleNames, int[] testsPerBatch, boolean[] isParallel) {
++    List<TestBatch> testBatches = new LinkedList<>(testBatchCollection);
++    assertEquals(String.format("Expected batches=[%d], found=[%d]", numBatches, testBatches.size()),
++        numBatches, testBatches.size());
++    assert moduleNames.length == numBatches;
++    assert testsPerBatch.length == numBatches;
++    assert isParallel.length == numBatches;
++
++    for (int i = 0; i < numBatches; i++) {
++      TestBatch testBatch = testBatches.get(i);
++      if (!moduleNames[i].equals(UnitTestPropertiesParser.PREFIX_TOP_LEVEL)) {
++        moduleNames[i] = moduleNames[i].replace(".", "/");
++      }
++
++      assertEquals(String.format("Expected batchName=[%s], found=[%s] on index=%d", moduleNames[i],
++          testBatch.getTestModuleRelativeDir(), i), moduleNames[i],
++          testBatch.getTestModuleRelativeDir());
++      assertEquals(String.format("Expected size=[%d], found=[%d] on index=%d", testsPerBatch[i],
++          testBatch.getNumTestsInBatch(), i), testsPerBatch[i], testBatch.getNumTestsInBatch());
++      assertEquals(String.format("Expected isParallel=[%s], found=[%s] on index=%d", isParallel[i],
++          testBatch.isParallel(), i), isParallel[i], testBatch.isParallel());
++    }
++  }
++
++
++  private static File getFakeTestBaseDir() {
++    File javaTmpDir = new File(System.getProperty("java.io.tmpdir"));
++    File baseDir = new File(javaTmpDir, UUID.randomUUID().toString());
++    return baseDir;
++  }
++
++  /**
++   * Returns 2 modules. Counts can be specified.
++   *
++   * @param module1Count
++   * @param module2Count
++   * @return
++   */
++  private static FileListProvider getTestFileListProvider(final File baseDir,
++                                                          final int module1Count,
++                                                          final int module2Count) {
++
++    return new FileListProvider() {
++      @Override
++      public Collection<File> listFiles(File directory, String[] extensions, boolean recursive) {
++        List<File> list = new LinkedList<>();
++
++        File m1F = new File(baseDir, Joiner.on("/").join(MODULE1_NAME, "target", "test", "p1"));
++        for (int i = 0; i < module1Count; i++) {
++          list.add(new File(m1F, "Test" + MODULE1_TEST_NAME + (i + 1) + ".class"));
++        }
++
++        File m2F = new File(baseDir, Joiner.on("/").join(MODULE2_NAME, "target", "test"));
++        for (int i = 0; i < module2Count; i++) {
++          list.add(new File(m2F, "Test" + MODULE2_TEST_NAME + (i + 1) + ".class"));
++        }
++
++        return list;
++      }
++    };
++  }
++
++  private static FileListProvider getTestFileListProviderMultiLevel(final File baseDir,
++                                                                    final int l0Count,
++                                                                    final int l1Count,
++                                                                    final int l2Count,
++                                                                    final int l3Count) {
++    return new FileListProvider() {
++      @Override
++      public Collection<File> listFiles(File directory, String[] extensions, boolean recursive) {
++        List<File> list = new LinkedList<>();
++
++        File l0F = new File(baseDir, Joiner.on("/").join("target", "test", "p1", "p2"));
++        for (int i = 0; i < l0Count; i++) {
++          list.add(new File(l0F, "Test" + TOP_LEVEL_TEST_NAME + (i + 1) + ".class"));
++        }
++
++
++        File l1F = new File(baseDir, Joiner.on("/").join(MODULE1_NAME, "target", "test"));
++        for (int i = 0; i < l1Count; i++) {
++          list.add(new File(l1F, "Test" + MODULE1_TEST_NAME + (i + 1) + ".class"));
++        }
++
++        File l2F = new File(baseDir, Joiner.on("/").join(TWO_LEVEL_MODULE1_NAME, "target", "test"));
++        for (int i = 0; i < l2Count; i++) {
++          list.add(new File(l2F, "Test" + TWO_LEVEL_TEST_NAME + (i + 1) + ".class"));
++        }
++
++        File l3F =
++            new File(baseDir, Joiner.on("/").join(THREE_LEVEL_MODULE1_NAME, "target", "test"));
++        for (int i = 0; i < l3Count; i++) {
++          list.add(new File(l3F, "Test" + THREE_LEVEL_TEST_NAME + (i + 1) + ".class"));
++        }
++        return list;
++      }
++    };
++  }
++
++  private static FileListProvider getTestFileListProviderSingleModule(final File baseDir,
++                                                                      final String moduleRelDir,
++                                                                      final String testName,
++                                                                      final int numTests) {
++    return new FileListProvider() {
++
++      @Override
++      public Collection<File> listFiles(File directory, String[] extensions, boolean recursive) {
++        List<File> list = new LinkedList<>();
++        File f = new File(baseDir, Joiner.on("/").join(moduleRelDir, "target", "package", "test"));
++        for (int i = 0; i < numTests; i++) {
++          list.add(new File(f, "Test" + testName + (i + 1) + ".class"));
++        }
++        return list;
++      }
++    };
++  }
++
++  private static Context getDefaultContext() {
++    Context context = new Context();
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_DIRECTORIES), "./");
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_SUBDIR_FOR_PREFIX), "target");
++    context.put(getUtRootPropertyName(UnitTestPropertiesParser.PROP_BATCH_SIZE),
++        Integer.toString(BATCH_SIZE_DEFAULT));
++    return context;
++  }
++
++  private static String getUtRootPropertyName(String p1, String... rest) {
++    return Joiner.on(".").join(UnitTestPropertiesParser.PROP_PREFIX_ROOT, p1, rest);
++  }
++
++  private static String getUtSpecificPropertyName(String p1, String... rest) {
++    return Joiner.on(".").join(UnitTestPropertiesParser.PROP_PREFIX_MODULE, p1, rest);
++  }
++}
+diff --git a/testutils/ptest2/src/test/resources/log4j2.properties b/testutils/ptest2/src/test/resources/log4j2.properties
+new file mode 100644
+index 0000000..944556a
+--- /dev/null
++++ b/testutils/ptest2/src/test/resources/log4j2.properties
+@@ -0,0 +1,62 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++status = INFO
++name = PTest2Log4j2
++packages = org.apache.hadoop.hive.ql.log
++
++# list of properties
++property.hive.ptest.log.level = DEBUG
++property.hive.ptest.root.logger = console
++
++# list of all appenders
++appenders = console
++
++# console appender
++appender.console.type = Console
++appender.console.name = console
++appender.console.target = SYSTEM_ERR
++appender.console.layout.type = PatternLayout
++appender.console.layout.pattern = %d{yy/MM/dd HH:mm:ss} %p %c{2}: %m%n
++
++# list of all loggers
++loggers = Http, SpringFramework, OrgJclouds, Jclouds, Hive, NIOServerCnxn, ClientCnxnSocketNIO
++
++logger.Http.name = org.apache.http
++logger.Http.level = TRACE
++
++logger.SpringFramework.name = org.springframework
++logger.SpringFramework.level = INFO
++
++logger.OrgJclouds.name = org.jclouds
++logger.OrgJclouds.level = INFO
++
++logger.Jclouds.name = jclouds
++logger.Jclouds.level = INFO
++
++logger.Hive.name = org.apache.hive
++logger.Hive.level = DEBUG
++
++logger.NIOServerCnxn.name = org.apache.zookeeper.server.NIOServerCnxn
++logger.NIOServerCnxn.level = WARN
++
++logger.ClientCnxnSocketNIO.name = org.apache.zookeeper.ClientCnxnSocketNIO
++logger.ClientCnxnSocketNIO.level = WARN
++
++# root logger
++rootLogger.level = ${sys:hive.ptest.log.level}
++rootLogger.appenderRefs = root
++rootLogger.appenderRef.root.ref = ${sys:hive.ptest.root.logger}
+diff --git a/testutils/ptest2/src/test/resources/test-configuration2.properties b/testutils/ptest2/src/test/resources/test-configuration2.properties
+new file mode 100644
+index 0000000..19e1ac2
+--- /dev/null
++++ b/testutils/ptest2/src/test/resources/test-configuration2.properties
+@@ -0,0 +1,154 @@
++repositoryType = git
++repository = http://git-wip-us.apache.org/repos/asf/hive.git
++repositoryName = apache-github-source
++branch = master
++
++
++#jiraUrl = https://issues.apache.org/jira
++#jiraUser =
++#jiraPassword =
++#jenkinsURL = https://builds.apache.org/job
++#logsURL = http://webserver/logs/
++
++mavenArgs =
++#mavenEnvOpts = -Dhttp.proxyHost=localhost -Dhttp.proxyPort=3128
++mavenTestArgs =
++testCasePropertyName = test
++buildTool = maven
++javaHome = /opt/jdk1.8.0_102
++javaHomeForTests = /opt/jdk1.8.0_102
++# Relative path to the src directory. If specified, will be treated as the module name.
++unitTests.directories = ./
++additionalProfiles =
++# TODO prepScriptPath
++# TODO execScriptPath
++# TODO applyPatchScriptPath
++# TODO testParser.classname - plugin to parse the test section
++# TODO testPropertiesPath - Used in confjunction with the parser
++
++# List of tests to include/exclude
++unitTests.isolate = TestAuthorizationPreEventListener TestDefaultHCatRecord TestDefaultHiveMetastoreAuthorizationProvider TestEmbeddedHiveMetaStore TestExecDriver TestHadoop20SAuthBridge TestHBaseBulkOutputFormat TestHBaseDirectOutputFormat TestHBaseInputFormat TestHBaseMinimrCliDriver TestHCatClient TestHCatDynamicPartitioned TestHCatExternalDynamicPartitioned TestHCatExternalPartitioned TestHCatHiveCompatibility TestHCatHiveThriftCompatibility TestHCatInputFormat TestHCatLoader TestHCatLoaderComplexSchema TestHCatLoaderStorer TestHCatMultiOutputFormat TestHCatNonPartitioned TestHCatOutputFormat TestHCatPartitioned TestHCatPartitionPublish TestHCatRecordSerDe TestHCatSchema TestHCatSchemaUtils TestHCatStorer TestHCatStorerMulti TestHCatStorerWrapper TestHCatUtil TestHdfsAuthorizationProvider TestHive TestHiveClientCache TestHiveMetaStoreWithEnvironmentContext TestHiveRemote TestIDGenerator TestInputJobInfo TestJsonSerDe TestLazyHCatRecord TestMetaStoreAuthorization TestMetaStoreEventListener TestMsgBusConnection TestMultiOutputFormat TestNotificationListener TestOrcDynamicPartitioned TestOrcHCatLoader TestOrcHCatLoaderComplexSchema TestOrcHCatStorer TestPassProperties TestPermsGrp TestPigHCatUtil TestRCFileMapReduceInputFormat TestReaderWriter TestRemoteHiveMetaStore TestRemoteHiveMetaStoreIpAddress TestRemoteUGIHiveMetaStoreIpAddress TestRevisionManager TestSemanticAnalysis TestSequenceFileReadWrite TestSetUGIOnBothClientServer TestSetUGIOnOnlyClient TestSetUGIOnOnlyServer TestSnapshots TestUseDatabase TestZNodeSetUp
++
++# comes from build-command.xml excludes
++unitTests.exclude = TestSerDe TestHiveMetaStore TestHiveServer2Concurrency TestAccumuloCliDriver
++
++# module include / exclude list
++# unitTests.modules.include
++# unitTests.modules.exclude
++
++# Default batch-size when running a test-module
++unitTests.batchSize=20
++
++#The path one level above this property (e.g. for ql/src - moduleName=ql) is considered the module name. Can be multiple levels.
++# This should match up with the properties specified further down to override module settings. e.g. unitTests.ql., unitTests.itests.hiveUnit.
++# unitTests.subdirForPrefix=target
++
++# Overrides for specific tests modules.
++unitTests.module.ql=ql
++ut.ql.batchSize=15
++ut.ql.isolate=
++ut.ql.include=
++ut.ql.exclude=
++ut.ql.skipBatching=TestDbTxnManager2 TestTxnCommands2WithSplitUpdateAndVectorization TestTxnCommands2WithSplitUpdate TestOrcFile TestVectorRowObject
++# TODO unitTests.ql.prepScript
++# TODO unitTests.ql.execScript
++
++unitTests.module.itests.hive-unit=itests.hive-unit
++ut.itests.hive-unit.batchSize=9
++ut.itests.hive-unit.skipBatching=TestAcidOnTezWithSplitUpdate TestAcidOnTez TestMTQueries TestCompactor TestSchedulerQueue TestOperationLoggingAPIWithTez TestSSL TestJdbcDriver2 TestJdbcWithMiniHA TestJdbcWithMiniMr
++
++unitTests.module.accumulo-handler=accumulo-handler
++ut.accumulo-handler.batchSize=0
++
++unitTests.module.common=common
++ut.common.batchSize=0
++
++unitTests.module.hbase-handler=hbase-handler
++ut.hbase-handler.batchSize=0
++
++unitTests.module.metastore=metastore
++ut.metastore.batchSize=12
++
++unitTests.module.orc=orc
++ut.orc.batchSize=0
++
++unitTests.module.service=service
++ut.service.batchSize=8
++
++unitTests.module.hcatalog.core=hcatalog.core
++ut.hcatalog.core.batchSize=9
++ut.hcatalog.core.skipBatching=TestHCatMutableDynamicPartitioned TestHCatMutablePartitioned
++
++
++qFileTests = clientPositive miniMr clientNegative miniMrNegative hbasePositive miniTez spark miniLlap
++qFileTests.propertyFiles.mainProperties = itests/src/test/resources/testconfiguration.properties
++
++qFileTest.clientPositive.driver = TestCliDriver
++qFileTest.clientPositive.directory = ql/src/test/queries/clientpositive
++qFileTest.clientPositive.batchSize = 15
++qFileTest.clientPositive.queryFilesProperty = qfile
++qFileTest.clientPositive.exclude = minimr
++qFileTest.clientPositive.groups.minimr = mainProperties.${minimr.query.files}
++
++qFileTest.miniMr.driver = TestMinimrCliDriver
++qFileTest.miniMr.directory = ql/src/test/queries/clientpositive
++qFileTest.miniMr.batchSize = 10
++qFileTest.miniMr.queryFilesProperty = minimr.query.files
++qFileTest.miniMr.include = normal
++qFileTest.miniMr.isolate = flaky
++# normal are tests that run in minimr mode via build-common.xml
++qFileTest.miniMr.groups.normal = mainProperties.${minimr.query.files}
++
++qFileTest.miniMrNegative.driver = TestNegativeMinimrCliDriver
++qFileTest.miniMrNegative.directory = ql/src/test/queries/clientnegative
++qFileTest.miniMrNegative.batchSize = 1000
++qFileTest.miniMrNegative.queryFilesProperty = minimr.query.negative.files
++qFileTest.miniMrNegative.include = normal
++qFileTest.miniMrNegative.isolate = flaky
++# normal are tests that run in minimr mode via build-common.xml
++qFileTest.miniMrNegative.groups.normal = mainProperties.${minimr.query.negative.files}
++qFileTest.miniMrNegative.groups.flaky = mapreduce_stack_trace_hadoop20.q
++
++qFileTest.clientNegative.driver = TestNegativeCliDriver
++qFileTest.clientNegative.directory = ql/src/test/queries/clientnegative
++qFileTest.clientNegative.batchSize = 1000
++qFileTest.clientNegative.queryFilesProperty = qfile
++qFileTest.clientNegative.exclude = miniMrNormal failing
++# stats_aggregator_error_1.q fails in both negative client and minimr mode
++# Disable for HIVE-4941 as this tests runs via ant test
++#qFileTest.clientNegative.groups.failing = stats_aggregator_error_1.q
++# normal are run via minimr
++qFileTest.clientNegative.groups.miniMrNormal = cluster_tasklog_retrieval.q minimr_broken_pipe.q mapreduce_stack_trace.q mapreduce_stack_trace_turnoff.q mapreduce_stack_trace_hadoop20.q mapreduce_stack_trace_turnoff_hadoop20.q
++
++qFileTest.hbasePositive.driver = TestHBaseCliDriver
++qFileTest.hbasePositive.directory = hbase-handler/src/test/queries/positive
++qFileTest.hbasePositive.batchSize = 3
++qFileTest.hbasePositive.queryFilesProperty = qfile
++qFileTest.hbasePositive.isolate = long
++qFileTest.hbasePositive.exclude = minimr
++qFileTest.hbasePositive.groups.long = hbase_queries.q hbase_binary_storage_queries.q hbase_binary_map_queries.q hbase_joins.q
++# when listing directories we actually look for .q so we'd have to do work to actually make .m execute here
++qFileTest.hbasePositive.groups.minimr = hbase_bulk.m
++
++qFileTest.miniTez.driver = TestMiniTezCliDriver
++qFileTest.miniTez.directory = ql/src/test/queries/clientpositive
++qFileTest.miniTez.batchSize = 15
++qFileTest.miniTez.queryFilesProperty = qfile
++qFileTest.miniTez.include = normal
++#qFileTest.miniTez.exclude = HIVE-8964
++qFileTest.miniTez.groups.normal = mainProperties.${minitez.query.files} mainProperties.${minitez.query.files.shared}
++#qFileTest.miniTez.groups.HIVE-8964 = lvj_mapjoin.q
++
++qFileTest.spark.driver = TestSparkCliDriver
++qFileTest.spark.directory = ql/src/test/queries/clientpositive
++qFileTest.spark.batchSize = 15
++qFileTest.spark.queryFilesProperty = qfile
++qFileTest.spark.include = normal
++qFileTest.spark.groups.normal = mainProperties.${spark.query.files}
++
++qFileTest.miniLlap.driver = TestMiniLlapCliDriver
++qFileTest.miniLlap.directory = ql/src/test/queries/clientpositive
++qFileTest.miniLlap.batchSize = 15
++qFileTest.miniLlap.queryFilesProperty = qfile
++qFileTest.miniLlap.include = normal
++qFileTest.miniLlap.groups.normal = mainProperties.${minillap.query.files} mainProperties.${minillap.shared.query.files}
+-- 
+1.7.9.5
+

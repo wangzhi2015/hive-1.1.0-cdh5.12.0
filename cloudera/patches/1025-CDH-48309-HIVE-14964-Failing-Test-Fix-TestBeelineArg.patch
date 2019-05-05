@@ -1,0 +1,195 @@
+From 54c65a48e95cc126e33380e23360ee6950f21c49 Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Thu, 27 Oct 2016 04:05:56 +0800
+Subject: [PATCH 1025/1164] CDH-48309 HIVE-14964: Failing Test: Fix
+ TestBeelineArgParsing tests (Zoltan Haindrich,
+ reviewed by Siddharth Seth and Ferdinand Xu)
+
+(cherry picked from commit ddbaa33a668ee8ea772c30935d36a203643d01b6)
+
+Change-Id: I5d6696239be65016b8534c57502eecb7460b0f21
+---
+ .../apache/hive/beeline/ClassNameCompleter.java    |   54 ++++++++------
+ .../apache/hive/beeline/TestBeelineArgParsing.java |    1 +
+ .../hive/beeline/TestClassNameCompleter.java       |   76 ++++++++++++++++++++
+ 3 files changed, 108 insertions(+), 23 deletions(-)
+ create mode 100644 beeline/src/test/org/apache/hive/beeline/TestClassNameCompleter.java
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java b/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java
+index d630e46..caa425c 100644
+--- a/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java
++++ b/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java
+@@ -123,38 +123,42 @@ public ClassNameCompleter(String... candidates) {
+ 
+     for (Iterator i = urls.iterator(); i.hasNext(); ) {
+       URL url = (URL) i.next();
+-      File file = new File(url.getFile());
++      try {
++        File file = new File(url.getFile());
+ 
+-      if (file.isDirectory()) {
+-        Set files = getClassFiles(file.getAbsolutePath(), new HashSet(), file, new int[]{200});
+-        classes.addAll(files);
++        if (file.isDirectory()) {
++          Set files = getClassFiles(file.getAbsolutePath(), new HashSet(), file, new int[] { 200 });
++          classes.addAll(files);
+ 
+-        continue;
+-      }
++          continue;
++        }
+ 
+-      if ((file == null) || !file.isFile()) {
+-        continue;
+-      }
++        if (!isJarFile(file)) {
++          continue;
++        }
+ 
+-      JarFile jf = new JarFile(file);
++        JarFile jf = new JarFile(file);
+ 
+-      for (Enumeration e = jf.entries(); e.hasMoreElements(); ) {
+-        JarEntry entry = (JarEntry) e.nextElement();
++        for (Enumeration e = jf.entries(); e.hasMoreElements();) {
++          JarEntry entry = (JarEntry) e.nextElement();
+ 
+-        if (entry == null) {
+-          continue;
+-        }
++          if (entry == null) {
++            continue;
++          }
+ 
+-        String name = entry.getName();
++          String name = entry.getName();
+ 
+-        if (isClazzFile(name)) {
+-          /* only use class file*/
+-          classes.add(name);
+-        } else if (isJarFile(name)) {
+-          classes.addAll(getClassNamesFromJar(name));
+-        } else {
+-          continue;
++          if (isClazzFile(name)) {
++            /* only use class file */
++            classes.add(name);
++          } else if (isJarFile(name)) {
++            classes.addAll(getClassNamesFromJar(name));
++          } else {
++            continue;
++          }
+         }
++      } catch (IOException e) {
++        throw new IOException(String.format("Error reading classpath entry: %s", url), e);
+       }
+     }
+ 
+@@ -236,6 +240,10 @@ private static Set getClassFiles(String root, Set holder, File directory, int[]
+     return classNames;
+   }
+ 
++  private static boolean isJarFile(File file) {
++    return (file != null && file.isFile() && isJarFile(file.getName()));
++  }
++
+   private static boolean isJarFile(String fileName) {
+     return fileName.endsWith(jarFileNameExtension);
+   }
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java b/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
+index 5700ab3..e2492c6 100644
+--- a/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
++++ b/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
+@@ -266,6 +266,7 @@ public void testAddLocalJarWithoutAddDriverClazz() throws Exception {
+       Assert.assertNull(bl.findLocalDriver(connectionString));
+     } else {
+       // no need to add for the default supported local jar driver
++      Assert.assertNotNull(bl.findLocalDriver(connectionString));
+       Assert.assertEquals(bl.findLocalDriver(connectionString).getClass().getName(), driverClazzName);
+     }
+   }
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestClassNameCompleter.java b/beeline/src/test/org/apache/hive/beeline/TestClassNameCompleter.java
+new file mode 100644
+index 0000000..1999937
+--- /dev/null
++++ b/beeline/src/test/org/apache/hive/beeline/TestClassNameCompleter.java
+@@ -0,0 +1,76 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.beeline;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.URL;
++import java.net.URLClassLoader;
++
++import org.junit.ClassRule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import static org.junit.Assert.*;
++
++public class TestClassNameCompleter {
++
++  @ClassRule
++  public static TemporaryFolder tmpFolder = new TemporaryFolder();
++
++  @Test
++  public void addingAndEmptyJarFile() throws IOException {
++
++    String fileName = "empty.file.jar";
++    File p = tmpFolder.newFile(fileName);
++
++    URLClassLoader classLoader = (URLClassLoader) Thread.currentThread().getContextClassLoader();
++    try {
++      URLClassLoader newClassLoader = new URLClassLoader(new URL[] { p.toURL() }, classLoader);
++
++      Thread.currentThread().setContextClassLoader(newClassLoader);
++      ClassNameCompleter.getClassNames();
++      fail("an exception was expected!");
++    } catch (IOException e) {
++      assertTrue("Exception message should contain the filename!",
++          e.getMessage().indexOf(fileName) >= 0);
++    } finally {
++      Thread.currentThread().setContextClassLoader(classLoader);
++    }
++
++  }
++
++  @Test
++  public void addingEmptyFile() throws IOException {
++
++    String fileName = "empty.file";
++    File p = tmpFolder.newFile(fileName);
++
++    URLClassLoader classLoader = (URLClassLoader) Thread.currentThread().getContextClassLoader();
++    try {
++      URLClassLoader newClassLoader = new URLClassLoader(new URL[] { p.toURL() }, classLoader);
++
++      Thread.currentThread().setContextClassLoader(newClassLoader);
++      ClassNameCompleter.getClassNames();
++    } finally {
++      Thread.currentThread().setContextClassLoader(classLoader);
++    }
++
++  }
++}
+-- 
+1.7.9.5
+

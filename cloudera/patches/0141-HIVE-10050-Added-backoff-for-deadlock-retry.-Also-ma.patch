@@ -1,0 +1,85 @@
+From e4a2ddfd72cf6cecafa9465694e76ae545acd2fa Mon Sep 17 00:00:00 2001
+From: Alan Gates <gates@hortonworks.com>
+Date: Mon, 27 Apr 2015 11:46:38 -0700
+Subject: [PATCH 0141/1164] HIVE-10050 Added backoff for deadlock retry.  Also
+ make sure to reset the deadlock counter at
+ appropriate points.
+
+---
+ .../hadoop/hive/metastore/txn/TxnHandler.java      |   12 +++++++++++-
+ .../hadoop/hive/metastore/txn/TestTxnHandler.java  |    1 +
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/txn/TxnHandler.java b/metastore/src/java/org/apache/hadoop/hive/metastore/txn/TxnHandler.java
+index f4bbd6a..6ebfe6e 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/txn/TxnHandler.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/txn/TxnHandler.java
+@@ -73,7 +73,7 @@
+   static final protected char LOCK_SHARED = 'r';
+   static final protected char LOCK_SEMI_SHARED = 'w';
+ 
+-  static final private int ALLOWED_REPEATED_DEADLOCKS = 5;
++  static final private int ALLOWED_REPEATED_DEADLOCKS = 10;
+   static final private Log LOG = LogFactory.getLog(TxnHandler.class.getName());
+ 
+   static private DataSource connPool;
+@@ -84,6 +84,7 @@
+    * Number of consecutive deadlocks we have seen
+    */
+   protected int deadlockCnt;
++  private long deadlockRetryInterval;
+   protected HiveConf conf;
+   protected DatabaseProduct dbProduct;
+ 
+@@ -130,6 +131,7 @@ public TxnHandler(HiveConf conf) {
+     buildJumpTable();
+     retryInterval = HiveConf.getTimeVar(conf, HiveConf.ConfVars.HMSHANDLERINTERVAL, TimeUnit.MILLISECONDS);
+     retryLimit = HiveConf.getIntVar(conf, HiveConf.ConfVars.HMSHANDLERATTEMPTS);
++    deadlockRetryInterval = retryInterval / 10;
+ 
+   }
+ 
+@@ -270,6 +272,7 @@ public static ValidTxnList createValidReadTxnList(GetOpenTxnsResponse txns, long
+   }
+ 
+   public OpenTxnsResponse openTxns(OpenTxnRequest rqst) throws MetaException {
++    deadlockCnt = 0;  // Reset deadlock count since this is a new transaction
+     int numTxns = rqst.getNum_txns();
+     try {
+       Connection dbConn = null;
+@@ -410,6 +413,7 @@ public void commitTxn(CommitTxnRequest rqst)
+ 
+   public LockResponse lock(LockRequest rqst)
+     throws NoSuchTxnException, TxnAbortedException, MetaException {
++    deadlockCnt = 0;
+     try {
+       Connection dbConn = null;
+       try {
+@@ -931,6 +935,12 @@ protected void checkRetryable(Connection conn,
+         || e.getMessage().contains("can't serialize access for this transaction")))) {
+       if (deadlockCnt++ < ALLOWED_REPEATED_DEADLOCKS) {
+         LOG.warn("Deadlock detected in " + caller + ", trying again.");
++        // Pause for a just a bit for retrying to avoid immediately jumping back into the deadlock.
++        try {
++          Thread.sleep(deadlockRetryInterval * deadlockCnt);
++        } catch (InterruptedException ie) {
++          // NOP
++        }
+         throw new RetryException();
+       } else {
+         LOG.error("Too many repeated deadlocks in " + caller + ", giving up.");
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/txn/TestTxnHandler.java b/metastore/src/test/org/apache/hadoop/hive/metastore/txn/TestTxnHandler.java
+index e85ea34..367000e 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/txn/TestTxnHandler.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/txn/TestTxnHandler.java
+@@ -1091,6 +1091,7 @@ public void showLocks() throws Exception {
+   @Test
+   @Ignore
+   public void deadlockDetected() throws Exception {
++    LOG.debug("Starting deadlock test");
+     Connection conn = txnHandler.getDbConn(Connection.TRANSACTION_SERIALIZABLE);
+     Statement stmt = conn.createStatement();
+     long now = txnHandler.getDbTime(conn);
+-- 
+1.7.9.5
+

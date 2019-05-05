@@ -1,0 +1,140 @@
+From a5a2fcb83fa5b56dbf95d0bef8828dbe5d528d2d Mon Sep 17 00:00:00 2001
+From: Swarnim Kulkarni <kulkarni.swarnim@gmail.com>
+Date: Fri, 21 Aug 2015 11:17:46 -0700
+Subject: [PATCH 0414/1164] CDH-34948 HIVE-11513: AvroLazyObjectInspector
+ could handle empty data better (Swarnim Kulkarni,
+ reviewed by Xuefu Zhang)
+
+Change-Id: Ib28a188df86525bce642b3320fb1f64097a0409c
+---
+ .../hive/serde2/avro/AvroLazyObjectInspector.java  |   19 +++----
+ .../serde2/avro/TestAvroLazyObjectInspector.java   |   59 ++++++++++++++++++++
+ 2 files changed, 68 insertions(+), 10 deletions(-)
+ create mode 100644 serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroLazyObjectInspector.java
+
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java
+index 9fc9873..756f566 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java
+@@ -138,7 +138,7 @@ public Object getStructFieldData(Object data, StructField f) {
+ 
+       if (rowField instanceof LazyStruct) {
+ 
+-        if (LOG.isDebugEnabled()) {
++        if (LOG.isDebugEnabled() && rowField != null) {
+           LOG.debug("Deserializing struct [" + rowField.getClass() + "]");
+         }
+ 
+@@ -166,7 +166,7 @@ public Object getStructFieldData(Object data, StructField f) {
+ 
+       } else {
+         if (LOG.isDebugEnabled()) {
+-          LOG.debug("Returning [" + rowField.toString() + "] for field [" + f.getFieldName() + "]");
++          LOG.debug("Returning [" + rowField + "] for field [" + f.getFieldName() + "]");
+         }
+ 
+         // Just return the object. We need no further operation on it
+@@ -223,7 +223,7 @@ private Object deserializeStruct(Object struct, String fieldName) {
+     byte[] data = ((LazyStruct) struct).getBytes();
+     AvroDeserializer deserializer = new AvroDeserializer();
+ 
+-    if (data == null) {
++    if (data == null || data.length == 0) {
+       return null;
+     }
+ 
+@@ -239,6 +239,12 @@ private Object deserializeStruct(Object struct, String fieldName) {
+     AvroGenericRecordWritable avroWritable = new AvroGenericRecordWritable();
+ 
+     if (readerSchema == null) {
++      offset = schemaRetriever.getOffset();
++
++      if (data.length < offset) {
++          throw new IllegalArgumentException("Data size cannot be less than [" + offset
++              + "]. Found [" + data.length + "]");
++      }
+ 
+       rs = schemaRetriever.retrieveReaderSchema(data);
+ 
+@@ -257,13 +263,6 @@ private Object deserializeStruct(Object struct, String fieldName) {
+       }
+ 
+       // adjust the data bytes according to any possible offset that was provided
+-      offset = schemaRetriever.getOffset();
+-
+-      if (data.length < offset) {
+-        throw new IllegalArgumentException("Data size cannot be less than [" + offset
+-            + "]. Found [" + data.length + "]");
+-      }
+-
+       if (LOG.isDebugEnabled()) {
+         LOG.debug("Retrieved writer Schema: " + ws.toString());
+         LOG.debug("Retrieved reader Schema: " + rs.toString());
+diff --git a/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroLazyObjectInspector.java b/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroLazyObjectInspector.java
+new file mode 100644
+index 0000000..2b7d513
+--- /dev/null
++++ b/serde/src/test/org/apache/hadoop/hive/serde2/avro/TestAvroLazyObjectInspector.java
+@@ -0,0 +1,59 @@
++package org.apache.hadoop.hive.serde2.avro;
++
++import static org.junit.Assert.assertNull;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.hadoop.hive.serde2.lazy.ByteArrayRef;
++import org.apache.hadoop.hive.serde2.lazy.LazyStruct;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.LazyObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyPrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.StructField;
++import org.apache.hadoop.io.Text;
++import org.junit.Test;
++
++public class TestAvroLazyObjectInspector {
++
++	@Test
++	public void testEmptyData(){
++		List<String> fieldNames = new ArrayList<String>();
++		fieldNames.add("myField");
++
++		List<ObjectInspector> ois = new ArrayList<ObjectInspector>();
++		ois.add(LazyPrimitiveObjectInspectorFactory.getLazyStringObjectInspector(false, new Byte((byte) 0)));
++
++		AvroLazyObjectInspector aloi = new AvroLazyObjectInspector(fieldNames, ois, null, (byte)0, new Text(), false, false, (byte)0);
++		LazyStruct lazyStruct = new LazyStruct(LazyObjectInspectorFactory.getLazySimpleStructObjectInspector(fieldNames, ois, (byte)0, new Text(), false, false, (byte)0));
++
++		ByteArrayRef byteArrayRef = new ByteArrayRef();
++		byteArrayRef.setData(new byte[0]); // set data to empty explicitly
++		lazyStruct.init(byteArrayRef, 0, 0);
++
++		assertNull(aloi.getStructFieldData(lazyStruct, new TestStructField()));
++	}
++
++	class TestStructField implements StructField {
++
++		@Override
++		public String getFieldName() {
++			return "testfield";
++		}
++
++		@Override
++		public ObjectInspector getFieldObjectInspector() {
++			return LazyPrimitiveObjectInspectorFactory.getLazyStringObjectInspector(false, new Byte((byte) 0));
++		}
++
++		@Override
++		public int getFieldID() {
++			return 0;
++		}
++
++		@Override
++		public String getFieldComment() {
++			return null;
++    }
++	}
++}
+-- 
+1.7.9.5
+

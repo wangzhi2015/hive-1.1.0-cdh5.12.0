@@ -1,0 +1,88 @@
+From fbe52fb0f5ff3065931a25f9bcb4a87f80180f27 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@cloudera.com>
+Date: Mon, 26 Oct 2015 10:20:25 -0700
+Subject: [PATCH 0365/1164] HIVE-12265: Generate lineage info only if
+ requested (Jimmy, reviewed by Chao)
+
+Change-Id: Iefe312e5feaddad509ff6916a26d371d4cf9956d
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    9 +++++----
+ .../apache/hadoop/hive/ql/optimizer/Optimizer.java |   14 +++++++++++++-
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 95cb827..46684fa 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -292,9 +292,7 @@ public Driver(HiveConf conf, String userName) {
+   }
+ 
+   public Driver() {
+-    if (SessionState.get() != null) {
+-      conf = SessionState.get().getConf();
+-    }
++    this((SessionState.get() != null) ? SessionState.get().getConf() : null);
+   }
+ 
+   /**
+@@ -1042,6 +1040,10 @@ private void releaseLocksAndCommitOrRollback(boolean commit)
+    * while keeping the result around.
+    */
+   private void releaseResources() {
++    if (SessionState.get() != null) {
++      SessionState.get().getLineageState().clear();
++    }
++
+     if (plan != null) {
+       fetchTask = plan.getFetchTask();
+       if (fetchTask != null) {
+@@ -1592,7 +1594,6 @@ public int execute() throws CommandNeedRetryException {
+ 
+     if (SessionState.get() != null) {
+       try {
+-        SessionState.get().getLineageState().clear();
+         SessionState.get().getHiveHistory().logPlanProgress(plan);
+       } catch (Exception e) {
+         // ignore
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java
+index ea5efe5..dcd8898 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/Optimizer.java
+@@ -20,6 +20,7 @@
+ 
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -40,6 +41,10 @@
+ import org.apache.hadoop.hive.ql.ppd.PredicateTransitivePropagate;
+ import org.apache.hadoop.hive.ql.ppd.SyntheticJoinPredicate;
+ 
++import com.google.common.base.Splitter;
++import com.google.common.base.Strings;
++import com.google.common.collect.Sets;
++
+ /**
+  * Implementation of the optimizer.
+  */
+@@ -62,7 +67,14 @@ public void initialize(HiveConf hiveConf) {
+     transformations = new ArrayList<Transform>();
+ 
+     // Add the transformation that computes the lineage information.
+-    transformations.add(new Generator());
++    Set<String> postExecHooks = Sets.newHashSet(
++      Splitter.on(",").trimResults().omitEmptyStrings().split(
++        Strings.nullToEmpty(HiveConf.getVar(hiveConf, HiveConf.ConfVars.POSTEXECHOOKS))));
++    if (postExecHooks.contains("org.apache.hadoop.hive.ql.hooks.PostExecutePrinter")
++        || postExecHooks.contains("org.apache.hadoop.hive.ql.hooks.LineageLogger")) {
++      transformations.add(new Generator());
++    }
++
+     if (HiveConf.getBoolVar(hiveConf, HiveConf.ConfVars.HIVEOPTPPD)) {
+     transformations.add(new PredicateTransitivePropagate());
+     if (HiveConf.getBoolVar(hiveConf, HiveConf.ConfVars.HIVEOPTCONSTANTPROPAGATION)) {
+-- 
+1.7.9.5
+

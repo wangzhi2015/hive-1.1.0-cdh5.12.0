@@ -1,0 +1,172 @@
+From f2d78dd719e5681ecbe4924f2533426154e7ba46 Mon Sep 17 00:00:00 2001
+From: xzhang <xzhang@xzdt>
+Date: Tue, 26 Jan 2016 14:33:54 -0800
+Subject: [PATCH 0477/1164] CDH-34626: HIVE-9774: Print yarn application id to
+ console [Spark Branch] (Rui reviewed by Xuefu)
+
+Change-Id: Ib5cee1e2b542e9242e72e6ec8f578e3f5d4d243a
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   22 +++++++++++++++-----
+ .../exec/spark/status/RemoteSparkJobMonitor.java   |   15 +++++++++++++
+ .../hive/ql/exec/spark/status/SparkJobStatus.java  |    2 ++
+ .../spark/status/impl/LocalSparkJobStatus.java     |    5 +++++
+ .../spark/status/impl/RemoteSparkJobStatus.java    |   22 ++++++++++++++++++++
+ 5 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index d4fbb65..4e77bd0 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -352,6 +352,7 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     // a symbolic name to reference in the Hive source code. Properties with non-null
+     // values will override any values set in the underlying Hadoop configuration.
+     HADOOPBIN("hadoop.bin.path", findHadoopBinary(), "", true),
++    YARNBIN("yarn.bin.path", findYarnBinary(), "", true),
+     HIVE_FS_HAR_IMPL("fs.har.impl", "org.apache.hadoop.hive.shims.HiveHarFileSystem",
+         "The implementation for accessing Hadoop Archives. Note that this won't be applicable to Hadoop versions less than 0.20"),
+     HADOOPFS(ShimLoader.getHadoopShims().getHadoopConfNames().get("HADOOPFS"), null, "", true),
+@@ -2251,16 +2252,27 @@ public String toString() {
+     }
+ 
+     private static String findHadoopBinary() {
++      String val = findHadoopHome();
++      // if can't find hadoop home we can at least try /usr/bin/hadoop
++      val = (val == null ? File.separator + "usr" : val)
++          + File.separator + "bin" + File.separator + "hadoop";
++      // Launch hadoop command file on windows.
++      return val + (Shell.WINDOWS ? ".cmd" : "");
++    }
++
++    private static String findYarnBinary() {
++      String val = findHadoopHome();
++      val = (val == null ? "yarn" : val + File.separator + "bin" + File.separator + "yarn");
++      return val + (Shell.WINDOWS ? ".cmd" : "");
++    }
++
++    private static String findHadoopHome() {
+       String val = System.getenv("HADOOP_HOME");
+       // In Hadoop 1.X and Hadoop 2.X HADOOP_HOME is gone and replaced with HADOOP_PREFIX
+       if (val == null) {
+         val = System.getenv("HADOOP_PREFIX");
+       }
+-      // and if all else fails we can at least try /usr/bin/hadoop
+-      val = (val == null ? File.separator + "usr" : val)
+-        + File.separator + "bin" + File.separator + "hadoop";
+-      // Launch hadoop command file on windows.
+-      return val + (Shell.WINDOWS ? ".cmd" : "");
++      return val;
+     }
+ 
+     public String getDefaultValue() {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/RemoteSparkJobMonitor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/RemoteSparkJobMonitor.java
+index fb0498a..6990e80 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/RemoteSparkJobMonitor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/RemoteSparkJobMonitor.java
+@@ -34,10 +34,12 @@
+ public class RemoteSparkJobMonitor extends SparkJobMonitor {
+ 
+   private RemoteSparkJobStatus sparkJobStatus;
++  private final HiveConf hiveConf;
+ 
+   public RemoteSparkJobMonitor(HiveConf hiveConf, RemoteSparkJobStatus sparkJobStatus) {
+     super(hiveConf);
+     this.sparkJobStatus = sparkJobStatus;
++    this.hiveConf = hiveConf;
+   }
+ 
+   @Override
+@@ -77,6 +79,7 @@ public int startMonitor() {
+             Map<String, SparkStageProgress> progressMap = sparkJobStatus.getSparkStageProgress();
+             if (!running) {
+               perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.SPARK_SUBMIT_TO_RUNNING);
++              printAppInfo();
+               // print job stages.
+               console.printInfo("\nQuery Hive on Spark job["
+                 + sparkJobStatus.getJobId() + "] stages:");
+@@ -137,4 +140,16 @@ public int startMonitor() {
+     perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.SPARK_RUN_JOB);
+     return rc;
+   }
++
++  private void printAppInfo() {
++    String sparkMaster = hiveConf.get("spark.master");
++    if (sparkMaster != null && sparkMaster.startsWith("yarn")) {
++      String appID = sparkJobStatus.getAppID();
++      if (appID != null) {
++        console.printInfo("Running with YARN Application = " + appID);
++        console.printInfo("Kill Command = " +
++            HiveConf.getVar(hiveConf, HiveConf.ConfVars.YARNBIN) + " application -kill " + appID);
++      }
++    }
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobStatus.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobStatus.java
+index fa45ec8..7959089 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobStatus.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobStatus.java
+@@ -29,6 +29,8 @@
+  */
+ public interface SparkJobStatus {
+ 
++  String getAppID();
++
+   int getJobId();
+ 
+   JobExecutionStatus getState() throws HiveException;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java
+index c6f1b8d..3f62df7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/LocalSparkJobStatus.java
+@@ -66,6 +66,11 @@ public LocalSparkJobStatus(JavaSparkContext sparkContext, int jobId,
+   }
+ 
+   @Override
++  public String getAppID() {
++    return sparkContext.sc().applicationId();
++  }
++
++  @Override
+   public int getJobId() {
+     return jobId;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java
+index 072bac9..1d1227a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/impl/RemoteSparkJobStatus.java
+@@ -62,6 +62,17 @@ public RemoteSparkJobStatus(SparkClient sparkClient, JobHandle<Serializable> job
+   }
+ 
+   @Override
++  public String getAppID() {
++    Future<String> getAppID = sparkClient.run(new GetAppIDJob());
++    try {
++      return getAppID.get(sparkClientTimeoutInSeconds, TimeUnit.SECONDS);
++    } catch (Exception e) {
++      LOG.warn("Failed to get APP ID.", e);
++      return null;
++    }
++  }
++
++  @Override
+   public int getJobId() {
+     return jobHandle.getSparkJobIds().size() == 1 ? jobHandle.getSparkJobIds().get(0) : -1;
+   }
+@@ -268,4 +279,15 @@ public JobExecutionStatus status() {
+       }
+     };
+   }
++
++  private static class GetAppIDJob implements Job<String> {
++
++    public GetAppIDJob() {
++    }
++
++    @Override
++    public String call(JobContext jc) throws Exception {
++      return jc.sc().sc().applicationId();
++    }
++  }
+ }
+-- 
+1.7.9.5
+

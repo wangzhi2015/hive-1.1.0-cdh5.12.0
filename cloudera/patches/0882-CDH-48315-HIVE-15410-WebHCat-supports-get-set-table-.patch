@@ -1,0 +1,109 @@
+From 2bbd2f13099fea78ded2807e90b0a2ebd13fdb0b Mon Sep 17 00:00:00 2001
+From: Chaoyu Tang <ctang@cloudera.com>
+Date: Wed, 14 Dec 2016 16:05:15 -0500
+Subject: [PATCH 0882/1164] CDH-48315: HIVE-15410: WebHCat supports get/set
+ table property with its name containing period
+ and hyphen (Chaoyu Tang, reviewed by Thejas M
+ Nair)
+
+Change-Id: If5efe1b5d6a0484e4dbfb3452a7182d81576cb26
+---
+ .../org/apache/hive/hcatalog/templeton/Server.java |   21 ++++++++++++--
+ .../apache/hive/hcatalog/templeton/TestServer.java |   30 ++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/Server.java b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/Server.java
+index a28e04d..fc71cb8 100644
+--- a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/Server.java
++++ b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/Server.java
+@@ -363,7 +363,7 @@ public Response descOneTableProperty(@PathParam("db") String db,
+     verifyUser();
+     verifyDdlParam(db, ":db");
+     verifyDdlParam(table, ":table");
+-    verifyDdlParam(property, ":property");
++    verifyPropertyParam(property, ":property");
+ 
+     HcatDelegator d = new HcatDelegator(appConf, execService);
+     return d.descTableProperty(getDoAsUser(), db, table, property);
+@@ -402,7 +402,7 @@ public Response addOneTableProperty(@PathParam("db") String db,
+     verifyUser();
+     verifyDdlParam(db, ":db");
+     verifyDdlParam(table, ":table");
+-    verifyDdlParam(property, ":property");
++    verifyPropertyParam(property, ":property");
+     desc.name = property;
+ 
+     HcatDelegator d = new HcatDelegator(appConf, execService);
+@@ -1090,6 +1090,8 @@ public void verifyParam(List<String> param, String name)
+   }
+ 
+   public static final Pattern DDL_ID = Pattern.compile("[a-zA-Z]\\w*");
++  public static final Pattern PROPERTY_ID =
++      Pattern.compile("[a-zA-Z0-9][\\w\\.\\-]*(?<!\\-)(?<!\\.)(?<!\\_)$");
+ 
+   /**
+    * Verify that the parameter exists and is a simple DDL identifier
+@@ -1105,6 +1107,21 @@ public void verifyDdlParam(String param, String name)
+       throw new BadParam("Invalid DDL identifier " + name);
+     }
+   }
++
++  /**
++   * Verify that the parameter exists and is a valid property
++   * name.  Throw an exception if invalid.
++   *
++   */
++  public void verifyPropertyParam(String param, String name)
++    throws BadParam {
++    verifyParam(param, name);
++    Matcher m = PROPERTY_ID.matcher(param);
++    if (!m.matches()) {
++      throw new BadParam("Invalid property name " + name);
++    }
++  }
++
+   /**
+    * Get the user name from the security context, i.e. the user making the HTTP request.
+    * With simple/pseudo security mode this should return the
+diff --git a/hcatalog/webhcat/svr/src/test/java/org/apache/hive/hcatalog/templeton/TestServer.java b/hcatalog/webhcat/svr/src/test/java/org/apache/hive/hcatalog/templeton/TestServer.java
+index cf02c76..e9148a8 100644
+--- a/hcatalog/webhcat/svr/src/test/java/org/apache/hive/hcatalog/templeton/TestServer.java
++++ b/hcatalog/webhcat/svr/src/test/java/org/apache/hive/hcatalog/templeton/TestServer.java
+@@ -51,4 +51,34 @@ public void testFormats() {
+     assertEquals(1, server.requestFormats().size());
+     assertEquals( ((List)server.requestFormats().get("responseTypes")).get(0), "application/json");
+   }
++
++  public void testVerifyPropertyParam() {
++    // HIVE-15410: Though there are not restrictions to Hive table property key and it could be any
++    // combination of the letters, digits and even punctuations, we support conventional property
++    // name in WebHCat (e.g. prepery name starting with a letter or digit probably with period (.),
++    // underscore (_) and hyphen (-) only in the middle like auto.purge, last_modified_by etc)
++    String [] validTblProperties = {"abcd", "Abcd", "1Abcd", "abc1d", "Abcd.efgh", "Abcd-efgh",
++        "Abcd_efgh", "A", "b", "1"};
++    for (String propertyKey : validTblProperties) {
++      try {
++        server.verifyPropertyParam(propertyKey, ":property");
++      } catch (Exception e) {
++        fail(propertyKey + " should be a valid table property name in WebHCat.");
++      }
++    }
++
++    String [] invalidTblProperties = {".abcd", "-Abcd", "_1Abcd", "abc1d.", "Abcd_", "Abcd-",
++    "Abcd ", " Abcd", ".", "-", "_", " ", "$"};
++    for (String propertyKey : invalidTblProperties) {
++      boolean throwException = false;
++      try {
++        server.verifyPropertyParam(propertyKey, ":property");
++      } catch (Exception e) {
++        throwException = true;
++      }
++      if (!throwException) {
++        fail(propertyKey + " should not be a valid table property name in WebHCat.");
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

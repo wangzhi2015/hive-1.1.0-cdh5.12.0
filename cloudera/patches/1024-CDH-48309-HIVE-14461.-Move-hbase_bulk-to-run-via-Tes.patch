@@ -1,0 +1,544 @@
+From 178d2c05e2557887a84bbd87c9c364ce25aeea97 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Wed, 21 Sep 2016 14:35:53 -0700
+Subject: [PATCH 1024/1164] CDH-48309: HIVE-14461. Move hbase_bulk to run via
+ TestCliDriver. (Siddharth Seth, reviewed by
+ Prasanth Jayachandran)
+
+(cherry picked from commit 91082e5fffbce87029e0a0280d50693a0ffdb1f8)
+
+Change-Id: I6ec66fa9299ce98c616ec004e82d40e66421f338
+---
+ .../src/test/queries/positive/hbase_bulk.m         |   63 ----------
+ .../src/test/queries/positive/hbase_bulk.q         |   63 ++++++++++
+ .../src/test/results/positive/hbase_bulk.m.out     |  133 --------------------
+ .../src/test/results/positive/hbase_bulk.q.out     |  133 ++++++++++++++++++++
+ .../hadoop/hive/cli/TestHBaseMinimrCliDriver.java  |   62 ---------
+ .../apache/hadoop/hive/cli/control/CliConfigs.java |   22 ----
+ 6 files changed, 196 insertions(+), 280 deletions(-)
+ delete mode 100644 hbase-handler/src/test/queries/positive/hbase_bulk.m
+ create mode 100644 hbase-handler/src/test/queries/positive/hbase_bulk.q
+ delete mode 100644 hbase-handler/src/test/results/positive/hbase_bulk.m.out
+ create mode 100644 hbase-handler/src/test/results/positive/hbase_bulk.q.out
+ delete mode 100644 itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestHBaseMinimrCliDriver.java
+
+diff --git a/hbase-handler/src/test/queries/positive/hbase_bulk.m b/hbase-handler/src/test/queries/positive/hbase_bulk.m
+deleted file mode 100644
+index 8375c48..0000000
+--- a/hbase-handler/src/test/queries/positive/hbase_bulk.m
++++ /dev/null
+@@ -1,63 +0,0 @@
+-drop table hbsort;
+-drop table hbpartition;
+-
+-set hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat;
+-
+--- this is a dummy table used for controlling how the HFiles are
+--- created
+-create table hbsort(key string, val string, val2 string)
+-stored as
+-INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+-OUTPUTFORMAT 'org.apache.hadoop.hive.hbase.HiveHFileOutputFormat'
+-TBLPROPERTIES ('hfile.family.path' = '/tmp/hbsort/cf');
+-
+--- this is a dummy table used for controlling how the input file
+--- for TotalOrderPartitioner is created
+-create table hbpartition(part_break string)
+-row format serde
+-'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe'
+-stored as
+-inputformat
+-'org.apache.hadoop.mapred.TextInputFormat'
+-outputformat
+-'org.apache.hadoop.hive.ql.io.HiveNullValueSequenceFileOutputFormat'
+-location '/tmp/data/hbpartition';
+-
+--- this should produce one file, but we do not
+--- know what it will be called, so we will copy it to a well known
+--- filename /tmp/hbpartition.lst
+-insert overwrite table hbpartition
+-select distinct value
+-from src
+-where value='val_100' or value='val_200';
+-
+-dfs -count /tmp/data/hbpartition;
+-dfs -cp -f /tmp/data/hbpartition/* /tmp/hbpartition.lst;
+-
+-set mapred.reduce.tasks=3;
+-set hive.mapred.supports.subdirectories=true;
+-set hive.mapred.partitioner=org.apache.hadoop.mapred.lib.TotalOrderPartitioner;
+-set total.order.partitioner.natural.order=false;
+-set total.order.partitioner.path=/tmp/hbpartition.lst;
+-set mapreduce.totalorderpartitioner.naturalorder=false;
+-set mapreduce.totalorderpartitioner.path=/tmp/hbpartition.lst;
+-
+--- this should produce three files in /tmp/hbsort/cf
+--- include some trailing blanks and nulls to make sure we handle them correctly
+-insert overwrite table hbsort
+-select distinct value,
+-  case when key=103 then cast(null as string) else key end,
+-  case when key=103 then ''
+-       else cast(key+1 as string) end
+-from src
+-cluster by value;
+-
+-dfs -count /tmp/hbsort/cf;
+-
+--- To get the files out to your local filesystem for loading into
+--- HBase, run mkdir -p /tmp/blah/cf, then uncomment and
+--- semicolon-terminate the line below before running this test:
+--- dfs -copyToLocal /tmp/hbsort/cf/* /tmp/blah/cf
+-
+-drop table hbsort;
+-drop table hbpartition;
+diff --git a/hbase-handler/src/test/queries/positive/hbase_bulk.q b/hbase-handler/src/test/queries/positive/hbase_bulk.q
+new file mode 100644
+index 0000000..8375c48
+--- /dev/null
++++ b/hbase-handler/src/test/queries/positive/hbase_bulk.q
+@@ -0,0 +1,63 @@
++drop table hbsort;
++drop table hbpartition;
++
++set hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat;
++
++-- this is a dummy table used for controlling how the HFiles are
++-- created
++create table hbsort(key string, val string, val2 string)
++stored as
++INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
++OUTPUTFORMAT 'org.apache.hadoop.hive.hbase.HiveHFileOutputFormat'
++TBLPROPERTIES ('hfile.family.path' = '/tmp/hbsort/cf');
++
++-- this is a dummy table used for controlling how the input file
++-- for TotalOrderPartitioner is created
++create table hbpartition(part_break string)
++row format serde
++'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe'
++stored as
++inputformat
++'org.apache.hadoop.mapred.TextInputFormat'
++outputformat
++'org.apache.hadoop.hive.ql.io.HiveNullValueSequenceFileOutputFormat'
++location '/tmp/data/hbpartition';
++
++-- this should produce one file, but we do not
++-- know what it will be called, so we will copy it to a well known
++-- filename /tmp/hbpartition.lst
++insert overwrite table hbpartition
++select distinct value
++from src
++where value='val_100' or value='val_200';
++
++dfs -count /tmp/data/hbpartition;
++dfs -cp -f /tmp/data/hbpartition/* /tmp/hbpartition.lst;
++
++set mapred.reduce.tasks=3;
++set hive.mapred.supports.subdirectories=true;
++set hive.mapred.partitioner=org.apache.hadoop.mapred.lib.TotalOrderPartitioner;
++set total.order.partitioner.natural.order=false;
++set total.order.partitioner.path=/tmp/hbpartition.lst;
++set mapreduce.totalorderpartitioner.naturalorder=false;
++set mapreduce.totalorderpartitioner.path=/tmp/hbpartition.lst;
++
++-- this should produce three files in /tmp/hbsort/cf
++-- include some trailing blanks and nulls to make sure we handle them correctly
++insert overwrite table hbsort
++select distinct value,
++  case when key=103 then cast(null as string) else key end,
++  case when key=103 then ''
++       else cast(key+1 as string) end
++from src
++cluster by value;
++
++dfs -count /tmp/hbsort/cf;
++
++-- To get the files out to your local filesystem for loading into
++-- HBase, run mkdir -p /tmp/blah/cf, then uncomment and
++-- semicolon-terminate the line below before running this test:
++-- dfs -copyToLocal /tmp/hbsort/cf/* /tmp/blah/cf
++
++drop table hbsort;
++drop table hbpartition;
+diff --git a/hbase-handler/src/test/results/positive/hbase_bulk.m.out b/hbase-handler/src/test/results/positive/hbase_bulk.m.out
+deleted file mode 100644
+index 0dc5802..0000000
+--- a/hbase-handler/src/test/results/positive/hbase_bulk.m.out
++++ /dev/null
+@@ -1,133 +0,0 @@
+-PREHOOK: query: drop table hbsort
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: drop table hbsort
+-POSTHOOK: type: DROPTABLE
+-PREHOOK: query: drop table hbpartition
+-PREHOOK: type: DROPTABLE
+-POSTHOOK: query: drop table hbpartition
+-POSTHOOK: type: DROPTABLE
+-PREHOOK: query: -- this is a dummy table used for controlling how the HFiles are
+--- created
+-create table hbsort(key string, val string, val2 string)
+-stored as
+-INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+-OUTPUTFORMAT 'org.apache.hadoop.hive.hbase.HiveHFileOutputFormat'
+-#### A masked pattern was here ####
+-PREHOOK: type: CREATETABLE
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@hbsort
+-POSTHOOK: query: -- this is a dummy table used for controlling how the HFiles are
+--- created
+-create table hbsort(key string, val string, val2 string)
+-stored as
+-INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+-OUTPUTFORMAT 'org.apache.hadoop.hive.hbase.HiveHFileOutputFormat'
+-#### A masked pattern was here ####
+-POSTHOOK: type: CREATETABLE
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@hbsort
+-PREHOOK: query: -- this is a dummy table used for controlling how the input file
+--- for TotalOrderPartitioner is created
+-create table hbpartition(part_break string)
+-row format serde
+-'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe'
+-stored as
+-inputformat
+-'org.apache.hadoop.mapred.TextInputFormat'
+-outputformat
+-'org.apache.hadoop.hive.ql.io.HiveNullValueSequenceFileOutputFormat'
+-#### A masked pattern was here ####
+-PREHOOK: type: CREATETABLE
+-#### A masked pattern was here ####
+-PREHOOK: Output: database:default
+-PREHOOK: Output: default@hbpartition
+-POSTHOOK: query: -- this is a dummy table used for controlling how the input file
+--- for TotalOrderPartitioner is created
+-create table hbpartition(part_break string)
+-row format serde
+-'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe'
+-stored as
+-inputformat
+-'org.apache.hadoop.mapred.TextInputFormat'
+-outputformat
+-'org.apache.hadoop.hive.ql.io.HiveNullValueSequenceFileOutputFormat'
+-#### A masked pattern was here ####
+-POSTHOOK: type: CREATETABLE
+-#### A masked pattern was here ####
+-POSTHOOK: Output: database:default
+-POSTHOOK: Output: default@hbpartition
+-PREHOOK: query: -- this should produce one file, but we do not
+--- know what it will be called, so we will copy it to a well known
+-#### A masked pattern was here ####
+-insert overwrite table hbpartition
+-select distinct value
+-from src
+-where value='val_100' or value='val_200'
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@src
+-PREHOOK: Output: default@hbpartition
+-POSTHOOK: query: -- this should produce one file, but we do not
+--- know what it will be called, so we will copy it to a well known
+-#### A masked pattern was here ####
+-insert overwrite table hbpartition
+-select distinct value
+-from src
+-where value='val_100' or value='val_200'
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@src
+-POSTHOOK: Output: default@hbpartition
+-POSTHOOK: Lineage: hbpartition.part_break SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
+-#### A masked pattern was here ####
+--- include some trailing blanks and nulls to make sure we handle them correctly
+-insert overwrite table hbsort
+-select distinct value,
+-  case when key=103 then cast(null as string) else key end,
+-  case when key=103 then ''
+-       else cast(key+1 as string) end
+-from src
+-cluster by value
+-PREHOOK: type: QUERY
+-PREHOOK: Input: default@src
+-PREHOOK: Output: default@hbsort
+-#### A masked pattern was here ####
+--- include some trailing blanks and nulls to make sure we handle them correctly
+-insert overwrite table hbsort
+-select distinct value,
+-  case when key=103 then cast(null as string) else key end,
+-  case when key=103 then ''
+-       else cast(key+1 as string) end
+-from src
+-cluster by value
+-POSTHOOK: type: QUERY
+-POSTHOOK: Input: default@src
+-POSTHOOK: Output: default@hbsort
+-POSTHOOK: Lineage: hbsort.key SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
+-POSTHOOK: Lineage: hbsort.val EXPRESSION [(src)src.FieldSchema(name:key, type:string, comment:default), ]
+-POSTHOOK: Lineage: hbsort.val2 EXPRESSION [(src)src.FieldSchema(name:key, type:string, comment:default), ]
+-#### A masked pattern was here ####
+-PREHOOK: query: -- To get the files out to your local filesystem for loading into
+-#### A masked pattern was here ####
+--- semicolon-terminate the line below before running this test:
+-#### A masked pattern was here ####
+-
+-drop table hbsort
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@hbsort
+-PREHOOK: Output: default@hbsort
+-POSTHOOK: query: -- To get the files out to your local filesystem for loading into
+-#### A masked pattern was here ####
+--- semicolon-terminate the line below before running this test:
+-#### A masked pattern was here ####
+-
+-drop table hbsort
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@hbsort
+-POSTHOOK: Output: default@hbsort
+-PREHOOK: query: drop table hbpartition
+-PREHOOK: type: DROPTABLE
+-PREHOOK: Input: default@hbpartition
+-PREHOOK: Output: default@hbpartition
+-POSTHOOK: query: drop table hbpartition
+-POSTHOOK: type: DROPTABLE
+-POSTHOOK: Input: default@hbpartition
+-POSTHOOK: Output: default@hbpartition
+diff --git a/hbase-handler/src/test/results/positive/hbase_bulk.q.out b/hbase-handler/src/test/results/positive/hbase_bulk.q.out
+new file mode 100644
+index 0000000..0dc5802
+--- /dev/null
++++ b/hbase-handler/src/test/results/positive/hbase_bulk.q.out
+@@ -0,0 +1,133 @@
++PREHOOK: query: drop table hbsort
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table hbsort
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table hbpartition
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table hbpartition
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: -- this is a dummy table used for controlling how the HFiles are
++-- created
++create table hbsort(key string, val string, val2 string)
++stored as
++INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
++OUTPUTFORMAT 'org.apache.hadoop.hive.hbase.HiveHFileOutputFormat'
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@hbsort
++POSTHOOK: query: -- this is a dummy table used for controlling how the HFiles are
++-- created
++create table hbsort(key string, val string, val2 string)
++stored as
++INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
++OUTPUTFORMAT 'org.apache.hadoop.hive.hbase.HiveHFileOutputFormat'
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@hbsort
++PREHOOK: query: -- this is a dummy table used for controlling how the input file
++-- for TotalOrderPartitioner is created
++create table hbpartition(part_break string)
++row format serde
++'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe'
++stored as
++inputformat
++'org.apache.hadoop.mapred.TextInputFormat'
++outputformat
++'org.apache.hadoop.hive.ql.io.HiveNullValueSequenceFileOutputFormat'
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@hbpartition
++POSTHOOK: query: -- this is a dummy table used for controlling how the input file
++-- for TotalOrderPartitioner is created
++create table hbpartition(part_break string)
++row format serde
++'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe'
++stored as
++inputformat
++'org.apache.hadoop.mapred.TextInputFormat'
++outputformat
++'org.apache.hadoop.hive.ql.io.HiveNullValueSequenceFileOutputFormat'
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@hbpartition
++PREHOOK: query: -- this should produce one file, but we do not
++-- know what it will be called, so we will copy it to a well known
++#### A masked pattern was here ####
++insert overwrite table hbpartition
++select distinct value
++from src
++where value='val_100' or value='val_200'
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@hbpartition
++POSTHOOK: query: -- this should produce one file, but we do not
++-- know what it will be called, so we will copy it to a well known
++#### A masked pattern was here ####
++insert overwrite table hbpartition
++select distinct value
++from src
++where value='val_100' or value='val_200'
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@hbpartition
++POSTHOOK: Lineage: hbpartition.part_break SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
++#### A masked pattern was here ####
++-- include some trailing blanks and nulls to make sure we handle them correctly
++insert overwrite table hbsort
++select distinct value,
++  case when key=103 then cast(null as string) else key end,
++  case when key=103 then ''
++       else cast(key+1 as string) end
++from src
++cluster by value
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@hbsort
++#### A masked pattern was here ####
++-- include some trailing blanks and nulls to make sure we handle them correctly
++insert overwrite table hbsort
++select distinct value,
++  case when key=103 then cast(null as string) else key end,
++  case when key=103 then ''
++       else cast(key+1 as string) end
++from src
++cluster by value
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@hbsort
++POSTHOOK: Lineage: hbsort.key SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
++POSTHOOK: Lineage: hbsort.val EXPRESSION [(src)src.FieldSchema(name:key, type:string, comment:default), ]
++POSTHOOK: Lineage: hbsort.val2 EXPRESSION [(src)src.FieldSchema(name:key, type:string, comment:default), ]
++#### A masked pattern was here ####
++PREHOOK: query: -- To get the files out to your local filesystem for loading into
++#### A masked pattern was here ####
++-- semicolon-terminate the line below before running this test:
++#### A masked pattern was here ####
++
++drop table hbsort
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@hbsort
++PREHOOK: Output: default@hbsort
++POSTHOOK: query: -- To get the files out to your local filesystem for loading into
++#### A masked pattern was here ####
++-- semicolon-terminate the line below before running this test:
++#### A masked pattern was here ####
++
++drop table hbsort
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@hbsort
++POSTHOOK: Output: default@hbsort
++PREHOOK: query: drop table hbpartition
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@hbpartition
++PREHOOK: Output: default@hbpartition
++POSTHOOK: query: drop table hbpartition
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@hbpartition
++POSTHOOK: Output: default@hbpartition
+diff --git a/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestHBaseMinimrCliDriver.java b/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestHBaseMinimrCliDriver.java
+deleted file mode 100644
+index 934af16..0000000
+--- a/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestHBaseMinimrCliDriver.java
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hive.cli;
+-
+-import java.io.File;
+-import java.util.List;
+-
+-import org.apache.hadoop.hive.cli.control.CliAdapter;
+-import org.apache.hadoop.hive.cli.control.CliConfigs;
+-import org.junit.ClassRule;
+-import org.junit.Rule;
+-import org.junit.Test;
+-import org.junit.rules.TestRule;
+-import org.junit.runner.RunWith;
+-import org.junit.runners.Parameterized;
+-import org.junit.runners.Parameterized.Parameters;
+-
+-@RunWith(Parameterized.class)
+-public class TestHBaseMinimrCliDriver {
+-
+-  static CliAdapter adapter = new CliConfigs.HBaseMinimrCliConfig().getCliAdapter();
+-
+-  @Parameters(name = "{0}")
+-  public static List<Object[]> getParameters() throws Exception {
+-    return adapter.getParameters();
+-  }
+-
+-  @ClassRule
+-  public static TestRule cliClassRule = adapter.buildClassRule();
+-
+-  @Rule
+-  public TestRule cliTestRule = adapter.buildTestRule();
+-
+-  private String name;
+-  private File qfile;
+-
+-  public TestHBaseMinimrCliDriver(String name, File qfile) {
+-    this.name = name;
+-    this.qfile = qfile;
+-  }
+-
+-  @Test
+-  public void testCliDriver() throws Exception {
+-    adapter.runTest(name, qfile);
+-  }
+-
+-}
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java
+index cd35cba..4e520bc 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java
+@@ -290,28 +290,6 @@ public HBaseCliConfig() {
+     }
+   }
+ 
+-  public static class HBaseMinimrCliConfig extends AbstractCliConfig {
+-    public HBaseMinimrCliConfig() {
+-      super(CoreHBaseCliDriver.class);
+-      try {
+-        setQueryDir("hbase-handler/src/test/queries/positive");
+-        // XXX: i think this was non intentionally set to run only hbase_bulk.m???
+-        // includeQuery("hbase_bulk.m"); => will be filter out because not ends with .q
+-        // to keep existing behaviour i added this method
+-        overrideUserQueryFile("hbase_bulk.m");
+-
+-        setResultsDir("hbase-handler/src/test/results/positive");
+-        setLogDir("itests/qtest/target/qfile-results/hbase-handler/minimrpositive");
+-        setInitScript("q_test_init.sql");
+-        setCleanupScript("q_test_cleanup.sql");
+-        setHiveConfDir("");
+-        setClusterType(MiniClusterType.mr);
+-      } catch (Exception e) {
+-        throw new RuntimeException("can't construct cliconfig", e);
+-      }
+-    }
+-  }
+-
+   public static class DummyConfig extends AbstractCliConfig {
+     public DummyConfig() {
+       super(CoreDummy.class);
+-- 
+1.7.9.5
+

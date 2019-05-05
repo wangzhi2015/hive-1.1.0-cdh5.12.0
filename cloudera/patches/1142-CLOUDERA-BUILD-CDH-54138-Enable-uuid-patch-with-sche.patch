@@ -1,0 +1,236 @@
+From 5d400b40c6af850a0e707c0bc9d28c1684438570 Mon Sep 17 00:00:00 2001
+From: Vihang Karajgaonkar <vihang@cloudera.com>
+Date: Tue, 23 May 2017 13:39:16 -0700
+Subject: [PATCH 1142/1164] CLOUDERA-BUILD : CDH-54138 : Enable uuid patch
+ with schematool
+
+Change-Id: I0ee033ac564b1adfee0449dcf791c6d42bafff0b
+---
+ .../org/apache/hive/beeline/TestSchemaTool.java    |   28 ++++++++++++++++++++
+ .../upgrade/derby/hive-schema-1.1.0.derby.sql      |   13 ++++++---
+ .../upgrade-1.1.0-to-1.1.0-cdh5.12.0.derby.sql     |    5 ++++
+ .../upgrade/mssql/hive-schema-1.1.0.mssql.sql      |   15 ++++++-----
+ .../upgrade-1.1.0-to-1.1.0-cdh5.12.0.mssql.sql     |    6 +++++
+ .../upgrade/mysql/hive-schema-1.1.0.mysql.sql      |   13 ++++++---
+ .../upgrade-1.1.0-to-1.1.0-cdh5.12.0.mysql.sql     |    6 +++++
+ .../upgrade/oracle/hive-schema-1.1.0.oracle.sql    |    9 +++++--
+ .../upgrade-1.1.0-to-1.1.0-cdh5.12.0.oracle.sql    |    6 +++++
+ .../postgres/hive-schema-1.1.0.postgres.sql        |   13 ++++++---
+ .../upgrade-1.1.0-to-1.1.0-cdh5.12.0.postgres.sql  |    6 +++++
+ 11 files changed, 100 insertions(+), 20 deletions(-)
+ create mode 100644 metastore/scripts/upgrade/derby/upgrade-1.1.0-to-1.1.0-cdh5.12.0.derby.sql
+ create mode 100644 metastore/scripts/upgrade/mssql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mssql.sql
+ create mode 100644 metastore/scripts/upgrade/mysql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mysql.sql
+ create mode 100644 metastore/scripts/upgrade/oracle/upgrade-1.1.0-to-1.1.0-cdh5.12.0.oracle.sql
+ create mode 100644 metastore/scripts/upgrade/postgres/upgrade-1.1.0-to-1.1.0-cdh5.12.0.postgres.sql
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
+index c0f64e8..1bec42d 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
+@@ -667,6 +667,34 @@ public void testValidateLocations() throws Exception {
+     assertFalse(isValid);
+   }
+ 
++  public void testHiveMetastoreDbPropertiesTable() throws HiveMetaException, IOException {
++    schemaTool.doInit("1.1.0");
++    validateMetastoreDbPropertiesTable();
++  }
++
++  public void testMetastoreDbPropertiesAfterUpgrade() throws HiveMetaException, IOException {
++    schemaTool.doInit("0.14.0");
++    schemaTool.doUpgrade();
++    validateMetastoreDbPropertiesTable();
++  }
++
++  private void validateMetastoreDbPropertiesTable() throws HiveMetaException, IOException {
++    boolean isValid = (boolean) schemaTool.validateSchemaTables(conn);
++    assertTrue(isValid);
++    // adding same property key twice should throw unique key constraint violation exception
++    String[] scripts = new String[] {
++      "insert into METASTORE_DB_PROPERTIES values ('guid', 'test-uuid-1', 'dummy uuid 1')",
++      "insert into METASTORE_DB_PROPERTIES values ('guid', 'test-uuid-2', 'dummy uuid 2')", };
++    File scriptFile = generateTestScript(scripts);
++    Exception ex = null;
++    try {
++      schemaTool.runBeeLine(scriptFile.getPath());
++    } catch (Exception iox) {
++      ex = iox;
++    }
++    assertTrue(ex != null && ex instanceof IOException);
++  }
++
+   private File generateTestScript(String [] stmts) throws IOException {
+     File testScriptFile = File.createTempFile("schematest", ".sql");
+     testScriptFile.deleteOnExit();
+diff --git a/metastore/scripts/upgrade/derby/hive-schema-1.1.0.derby.sql b/metastore/scripts/upgrade/derby/hive-schema-1.1.0.derby.sql
+index fc92a4f..749ce3c 100644
+--- a/metastore/scripts/upgrade/derby/hive-schema-1.1.0.derby.sql
++++ b/metastore/scripts/upgrade/derby/hive-schema-1.1.0.derby.sql
+@@ -329,8 +329,13 @@ ALTER TABLE "APP"."SDS" ADD CONSTRAINT "SQL110318025505550" CHECK (IS_COMPRESSED
+ -- ----------------------------
+ RUN 'hive-txn-schema-0.13.0.derby.sql';
+ 
+--- -----------------------------------------------------------------
+--- Record schema version. Should be the last step in the init script
+--- -----------------------------------------------------------------
+-INSERT INTO "APP"."VERSION" (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0', 'Hive release version 1.1.0');
++--- ------------------------------------------
++--- Cloudera specific metastore schema patches
++--- ------------------------------------------
++RUN '041-HIVE-16556.derby.sql';
++
++-- -------------------------------------------------------------------------------------------------------------------------------------------------
++-- Record schema version. Should be the last step in the init script. Starting CDH-5.12.0 CDH version also needs to be recorded in the version table
++-- -------------------------------------------------------------------------------------------------------------------------------------------------
++INSERT INTO "APP"."VERSION" (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0-cdh5.12.0', 'Hive release version 1.1.0-cdh5.12.0');
+ 
+diff --git a/metastore/scripts/upgrade/derby/upgrade-1.1.0-to-1.1.0-cdh5.12.0.derby.sql b/metastore/scripts/upgrade/derby/upgrade-1.1.0-to-1.1.0-cdh5.12.0.derby.sql
+new file mode 100644
+index 0000000..70a5de3
+--- /dev/null
++++ b/metastore/scripts/upgrade/derby/upgrade-1.1.0-to-1.1.0-cdh5.12.0.derby.sql
+@@ -0,0 +1,5 @@
++-- Upgrade MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0
++
++RUN '041-HIVE-16556.derby.sql';
++
++UPDATE "APP".VERSION SET SCHEMA_VERSION='1.1.0-cdh5.12.0', VERSION_COMMENT='Hive release version 1.1.0-cdh5.12.0' where VER_ID=1;
+diff --git a/metastore/scripts/upgrade/mssql/hive-schema-1.1.0.mssql.sql b/metastore/scripts/upgrade/mssql/hive-schema-1.1.0.mssql.sql
+index 319cf52..da019b2 100644
+--- a/metastore/scripts/upgrade/mssql/hive-schema-1.1.0.mssql.sql
++++ b/metastore/scripts/upgrade/mssql/hive-schema-1.1.0.mssql.sql
+@@ -939,9 +939,12 @@ CREATE TABLE TXN_COMPONENTS(
+ 
+ ALTER TABLE TXN_COMPONENTS  WITH CHECK ADD FOREIGN KEY(TC_TXNID) REFERENCES TXNS (TXN_ID);
+ 
+-
+-
+--- -----------------------------------------------------------------
+--- Record schema version. Should be the last step in the init script
+--- -----------------------------------------------------------------
+-INSERT INTO VERSION (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0', 'Hive release version 1.1.0');
++-- ------------------------------------------
++-- Cloudera specific metastore schema patches
++-- ------------------------------------------
++:r 026-HIVE-16556.mssql.sql;
++
++-- -----------------------------------------------------------------------------------------------------------------------------------------
++-- Record schema version. Should be the last step in the init script. Starting CDH-5.12.0 CDH version must be included in the schema version
++-- -----------------------------------------------------------------------------------------------------------------------------------------
++INSERT INTO VERSION (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0-cdh5.12.0', 'Hive release version 1.1.0-cdh5.12.0');
+diff --git a/metastore/scripts/upgrade/mssql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mssql.sql b/metastore/scripts/upgrade/mssql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mssql.sql
+new file mode 100644
+index 0000000..f040807
+--- /dev/null
++++ b/metastore/scripts/upgrade/mssql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mssql.sql
+@@ -0,0 +1,6 @@
++SELECT 'Upgrading MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0' AS MESSAGE;
++
++:r 026-HIVE-16556.mssql.sql;
++
++UPDATE VERSION SET SCHEMA_VERSION='1.1.0-cdh5.12.0', VERSION_COMMENT='Hive release version 1.1.0-cdh5.12.0' where VER_ID=1;
++SELECT 'Finished upgrading MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0' AS MESSAGE;
+diff --git a/metastore/scripts/upgrade/mysql/hive-schema-1.1.0.mysql.sql b/metastore/scripts/upgrade/mysql/hive-schema-1.1.0.mysql.sql
+index 1f93f85..7c98df9 100644
+--- a/metastore/scripts/upgrade/mysql/hive-schema-1.1.0.mysql.sql
++++ b/metastore/scripts/upgrade/mysql/hive-schema-1.1.0.mysql.sql
+@@ -821,10 +821,15 @@ CREATE TABLE IF NOT EXISTS `NOTIFICATION_SEQUENCE`
+ -- ----------------------------
+ SOURCE hive-txn-schema-0.13.0.mysql.sql;
+ 
+--- -----------------------------------------------------------------
+--- Record schema version. Should be the last step in the init script
+--- -----------------------------------------------------------------
+-INSERT INTO VERSION (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0', 'Hive release version 1.1.0');
++-- -------------------------------------------
++--  Cloudera specific metastore schema patches
++-- -------------------------------------------
++SOURCE 041-HIVE-16556.mysql.sql;
++
++-- ----------------------------------------------------------------------------------------------------------------------------------------
++-- Record schema version. Should be the last step in the init script. Starting CDH-5.12.0 the schema version should also include CDH version
++-- -----------------------------------------------------------------------------------------------------------------------------------------
++INSERT INTO VERSION (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0-cdh5.12.0', 'Hive release version 1.1.0-cdh5.12.0');
+ 
+ /*!40101 SET character_set_client = @saved_cs_client */;
+ /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
+diff --git a/metastore/scripts/upgrade/mysql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mysql.sql b/metastore/scripts/upgrade/mysql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mysql.sql
+new file mode 100644
+index 0000000..5a5b07d
+--- /dev/null
++++ b/metastore/scripts/upgrade/mysql/upgrade-1.1.0-to-1.1.0-cdh5.12.0.mysql.sql
+@@ -0,0 +1,6 @@
++-- Upgrade MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0
++
++SOURCE 041-HIVE-16556.mysql.sql;
++
++UPDATE VERSION SET SCHEMA_VERSION='1.1.0-cdh5.12.0', VERSION_COMMENT='Hive release version 1.1.0-cdh5.12.0' where VER_ID=1;
++SELECT 'Finished upgrading MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0' AS ' ';
+diff --git a/metastore/scripts/upgrade/oracle/hive-schema-1.1.0.oracle.sql b/metastore/scripts/upgrade/oracle/hive-schema-1.1.0.oracle.sql
+index 323ea4a..cc3a2ab 100644
+--- a/metastore/scripts/upgrade/oracle/hive-schema-1.1.0.oracle.sql
++++ b/metastore/scripts/upgrade/oracle/hive-schema-1.1.0.oracle.sql
+@@ -782,7 +782,12 @@ CREATE INDEX FUNC_RU_N49 ON FUNC_RU (FUNC_ID);
+ ------------------------------
+ @hive-txn-schema-0.13.0.oracle.sql;
+ 
++-- ------------------------------------------
++-- Cloudera specific metastore schema patches
++-- ------------------------------------------
++@041-HIVE-16556.oracle.sql;
++
+ -- -----------------------------------------------------------------
+--- Record schema version. Should be the last step in the init script
++-- Record schema version. Should be the last step in the init script. Starting CDH5.12.0 schema version must include the CDH version as well
+ -- -----------------------------------------------------------------
+-INSERT INTO VERSION (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0', 'Hive release version 1.1.0');
++INSERT INTO VERSION (VER_ID, SCHEMA_VERSION, VERSION_COMMENT) VALUES (1, '1.1.0-cdh5.12.0', 'Hive release version 1.1.0-cdh5.12.0');
+diff --git a/metastore/scripts/upgrade/oracle/upgrade-1.1.0-to-1.1.0-cdh5.12.0.oracle.sql b/metastore/scripts/upgrade/oracle/upgrade-1.1.0-to-1.1.0-cdh5.12.0.oracle.sql
+new file mode 100644
+index 0000000..aef8945
+--- /dev/null
++++ b/metastore/scripts/upgrade/oracle/upgrade-1.1.0-to-1.1.0-cdh5.12.0.oracle.sql
+@@ -0,0 +1,6 @@
++-- Upgrade MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0
++
++@041-HIVE-16556.oracle.sql;
++
++UPDATE VERSION SET SCHEMA_VERSION='1.1.0-cdh5.12.0', VERSION_COMMENT='Hive release version 1.1.0-cdh5.12.0' where VER_ID=1;
++SELECT 'Finished upgrading MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0' AS Status from dual;
+diff --git a/metastore/scripts/upgrade/postgres/hive-schema-1.1.0.postgres.sql b/metastore/scripts/upgrade/postgres/hive-schema-1.1.0.postgres.sql
+index 38cfc53..6bf8f79 100644
+--- a/metastore/scripts/upgrade/postgres/hive-schema-1.1.0.postgres.sql
++++ b/metastore/scripts/upgrade/postgres/hive-schema-1.1.0.postgres.sql
+@@ -1487,7 +1487,12 @@ GRANT ALL ON SCHEMA public TO PUBLIC;
+ ------------------------------
+ \i hive-txn-schema-0.13.0.postgres.sql;
+ 
+--- -----------------------------------------------------------------
+--- Record schema version. Should be the last step in the init script
+--- -----------------------------------------------------------------
+-INSERT INTO "VERSION" ("VER_ID", "SCHEMA_VERSION", "VERSION_COMMENT") VALUES (1, '1.1.0', 'Hive release version 1.1.0');
++-- ------------------------------------------
++-- Cloudera specific metastore schema patches
++-- ------------------------------------------
++\i 040-HIVE-16556.postgres.sql;
++
++-- ------------------------------------------------------------------------------------------------------------------------------
++-- Record schema version. Should be the last step in the init script. Starting CDH-5.12.0 schema version must include CDH version
++-- ------------------------------------------------------------------------------------------------------------------------------
++INSERT INTO "VERSION" ("VER_ID", "SCHEMA_VERSION", "VERSION_COMMENT") VALUES (1, '1.1.0-cdh5.12.0', 'Hive release version 1.1.0-cdh5.12.0');
+diff --git a/metastore/scripts/upgrade/postgres/upgrade-1.1.0-to-1.1.0-cdh5.12.0.postgres.sql b/metastore/scripts/upgrade/postgres/upgrade-1.1.0-to-1.1.0-cdh5.12.0.postgres.sql
+new file mode 100644
+index 0000000..180fe03
+--- /dev/null
++++ b/metastore/scripts/upgrade/postgres/upgrade-1.1.0-to-1.1.0-cdh5.12.0.postgres.sql
+@@ -0,0 +1,6 @@
++SELECT 'Upgrading MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0';
++
++\i 040-HIVE-16556.postgres.sql;
++
++UPDATE "VERSION" SET "SCHEMA_VERSION"='1.1.0-cdh5.12.0', "VERSION_COMMENT"='Hive release version 1.1.0-cdh5.12.0' where "VER_ID"=1;
++SELECT 'Finished upgrading MetaStore schema from 1.1.0 to 1.1.0-cdh5.12.0';
+-- 
+1.7.9.5
+

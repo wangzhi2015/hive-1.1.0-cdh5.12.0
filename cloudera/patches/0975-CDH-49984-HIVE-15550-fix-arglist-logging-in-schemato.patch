@@ -1,0 +1,242 @@
+From 8c214fd159c39c509f7dc4979810a1eb5dcb5c75 Mon Sep 17 00:00:00 2001
+From: Anishek Agarwal <anishek@gmail.com>
+Date: Thu, 26 Jan 2017 21:57:41 -0800
+Subject: [PATCH 0975/1164] CDH-49984: HIVE-15550 : fix arglist logging in
+ schematool (Anishek Agarwal via Thejas Nair)
+
+(cherry picked from commit 16ed90aefd0157af750af0ddbf7741ab715b1034)
+(cherry picked from commit 8ff096548d0f94f9abb5361cce9539e71613e5d8)
+
+Change-Id: I8bb0bd7c9501555abc590883c4ea4d8dd1ec3346
+---
+ beeline/pom.xml                                    |   12 ++-
+ .../org/apache/hive/beeline/HiveSchemaTool.java    |   82 +++++++++++---------
+ .../apache/hive/beeline/TestHiveSchemaTool.java    |   73 +++++++++++++++++
+ 3 files changed, 130 insertions(+), 37 deletions(-)
+ create mode 100644 beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java
+
+diff --git a/beeline/pom.xml b/beeline/pom.xml
+index 83b3815..87b07c6 100644
+--- a/beeline/pom.xml
++++ b/beeline/pom.xml
+@@ -29,6 +29,7 @@
+ 
+   <properties>
+     <hive.path.to.root>..</hive.path.to.root>
++    <powermock.version>1.6.6</powermock.version>
+   </properties>
+ 
+   <dependencies>
+@@ -112,8 +113,15 @@
+       <scope>test</scope>
+     </dependency>
+     <dependency>
+-      <groupId>org.mockito</groupId>
+-      <artifactId>mockito-all</artifactId>
++      <groupId>org.powermock</groupId>
++      <artifactId>powermock-module-junit4</artifactId>
++      <version>${powermock.version}</version>
++      <scope>test</scope>
++    </dependency>
++    <dependency>
++      <groupId>org.powermock</groupId>
++      <artifactId>powermock-api-mockito</artifactId>
++      <version>${powermock.version}</version>
+       <scope>test</scope>
+     </dependency>
+     <dependency>
+diff --git a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+index 19e383f..829836c 100644
+--- a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
++++ b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+@@ -75,7 +75,7 @@
+   private final HiveConf hiveConf;
+   private final String dbType;
+   private final MetaStoreSchemaInfo metaStoreSchemaInfo;
+-  Log LOG = LogFactory.getLog("HiveSchemaTool");
++  static Log LOG = LogFactory.getLog("HiveSchemaTool");
+ 
+   public HiveSchemaTool(String dbType) throws HiveMetaException {
+     this(System.getenv("HIVE_HOME"), new HiveConf(HiveSchemaTool.class), dbType);
+@@ -807,38 +807,10 @@ private void runBeeLine(String scriptDir, String scriptFile)
+ 
+   // Generate the beeline args per hive conf and execute the given script
+   public void runBeeLine(String sqlScriptFile) throws IOException {
+-    List<String> argList = new ArrayList<String>();
+-    argList.add("-u");
+-    argList.add(HiveSchemaHelper.getValidConfVar(
+-        ConfVars.METASTORECONNECTURLKEY, hiveConf));
+-    argList.add("-d");
+-    argList.add(HiveSchemaHelper.getValidConfVar(
+-        ConfVars.METASTORE_CONNECTION_DRIVER, hiveConf));
+-    argList.add("-n");
+-    argList.add(userName);
+-    argList.add("-p");
+-    argList.add(passWord);
+-    argList.add("-f");
+-    argList.add(sqlScriptFile);
+-
+-    if (LOG.isDebugEnabled()) {
+-      LOG.debug("Going to invoke file that contains:");
+-      BufferedReader reader = new BufferedReader(new FileReader(sqlScriptFile));
+-      try {
+-        String line;
+-        while ((line = reader.readLine()) != null) {
+-          LOG.debug("script: " + line);
+-        }
+-      } finally {
+-        if (reader != null) {
+-          reader.close();
+-        }
+-      }
+-    }
++    CommandBuilder builder = new CommandBuilder(hiveConf, userName, passWord, sqlScriptFile);
+ 
+     // run the script using Beeline
+-    BeeLine beeLine = new BeeLine();
+-    try {
++    try (BeeLine beeLine = new BeeLine()) {
+       if (!verbose) {
+         beeLine.setOutputStream(new PrintStream(new NullOutputStream()));
+         beeLine.getOpts().setSilent(true);
+@@ -848,13 +820,53 @@ public void runBeeLine(String sqlScriptFile) throws IOException {
+       // We can be pretty sure that an entire line can be processed as a single command since
+       // we always add a line separator at the end while calling dbCommandParser.buildCommand.
+       beeLine.getOpts().setEntireLineAsCommand(true);
+-      LOG.debug("Going to run command <" + StringUtils.join(argList, " ") + ">");
+-      int status = beeLine.begin(argList.toArray(new String[0]), null);
++      LOG.debug("Going to run command <" + builder.buildToLog() + ">");
++      int status = beeLine.begin(builder.buildToRun(), null);
+       if (status != 0) {
+         throw new IOException("Schema script failed, errorcode " + status);
+       }
+-    } finally {
+-      beeLine.close();
++    }
++  }
++
++  static class CommandBuilder {
++    private final HiveConf hiveConf;
++    private final String userName;
++    private final String password;
++    private final String sqlScriptFile;
++
++    CommandBuilder(HiveConf hiveConf, String userName, String password, String sqlScriptFile) {
++      this.hiveConf = hiveConf;
++      this.userName = userName;
++      this.password = password;
++      this.sqlScriptFile = sqlScriptFile;
++    }
++
++    String[] buildToRun() throws IOException {
++      return argsWith(password);
++    }
++
++    String buildToLog() throws IOException {
++      logScript();
++      return StringUtils.join(argsWith(BeeLine.PASSWD_MASK), " ");
++    }
++
++    private String[] argsWith(String password) throws IOException {
++      return new String[] { "-u",
++          HiveSchemaHelper.getValidConfVar(ConfVars.METASTORECONNECTURLKEY, hiveConf), "-d",
++          HiveSchemaHelper.getValidConfVar(ConfVars.METASTORE_CONNECTION_DRIVER, hiveConf), "-n",
++          userName, "-p", password, "-f", sqlScriptFile };
++    }
++
++    private void logScript() throws IOException {
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Going to invoke file that contains:");
++        try (BufferedReader reader = new BufferedReader(new FileReader(sqlScriptFile))) {
++          String line;
++          while ((line = reader.readLine()) != null) {
++            LOG.debug("script: " + line);
++          }
++        }
++      }
+     }
+   }
+ 
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java b/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java
+new file mode 100644
+index 0000000..8d386da
+--- /dev/null
++++ b/beeline/src/test/org/apache/hive/beeline/TestHiveSchemaTool.java
+@@ -0,0 +1,73 @@
++package org.apache.hive.beeline;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.Mock;
++import org.powermock.core.classloader.annotations.PowerMockIgnore;
++import org.powermock.core.classloader.annotations.PrepareForTest;
++import org.powermock.modules.junit4.PowerMockRunner;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.Arrays;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Matchers.eq;
++import static org.mockito.Matchers.same;
++import static org.mockito.Mockito.when;
++import static org.powermock.api.mockito.PowerMockito.mockStatic;
++import static org.powermock.api.mockito.PowerMockito.verifyStatic;
++
++@RunWith(PowerMockRunner.class)
++@PowerMockIgnore("javax.management.*")
++@PrepareForTest({ HiveSchemaHelper.class, HiveSchemaTool.CommandBuilder.class })
++public class TestHiveSchemaTool {
++
++  String scriptFile = System.getProperty("java.io.tmpdir") + File.separator + "someScript.sql";
++  @Mock
++  private HiveConf hiveConf;
++  private HiveSchemaTool.CommandBuilder builder;
++  private String pasword = "reallySimplePassword";
++
++  @Before
++  public void setup() throws IOException {
++    mockStatic(HiveSchemaHelper.class);
++    when(HiveSchemaHelper
++        .getValidConfVar(eq(HiveConf.ConfVars.METASTORECONNECTURLKEY), same(hiveConf)))
++        .thenReturn("someURL");
++    when(HiveSchemaHelper
++        .getValidConfVar(eq(HiveConf.ConfVars.METASTORE_CONNECTION_DRIVER), same(hiveConf)))
++        .thenReturn("someDriver");
++
++    File file = new File(scriptFile);
++    if (!file.exists()) {
++      file.createNewFile();
++    }
++    builder = new HiveSchemaTool.CommandBuilder(hiveConf, "testUser", pasword, scriptFile);
++  }
++
++  @After
++  public void globalAssert() throws IOException {
++    verifyStatic();
++    HiveSchemaHelper.getValidConfVar(eq(HiveConf.ConfVars.METASTORECONNECTURLKEY), same(hiveConf));
++    HiveSchemaHelper
++        .getValidConfVar(eq(HiveConf.ConfVars.METASTORE_CONNECTION_DRIVER), same(hiveConf));
++
++    new File(scriptFile).delete();
++  }
++
++  @Test
++  public void shouldReturnStrippedPassword() throws IOException {
++    assertFalse(builder.buildToLog().contains(pasword));
++  }
++
++  @Test
++  public void shouldReturnActualPassword() throws IOException {
++    String[] strings = builder.buildToRun();
++    assertTrue(Arrays.asList(strings).contains(pasword));
++  }
++}
+\ No newline at end of file
+-- 
+1.7.9.5
+

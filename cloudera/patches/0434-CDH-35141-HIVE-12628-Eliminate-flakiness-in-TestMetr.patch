@@ -1,0 +1,572 @@
+From 72cc7f6ac94f97b97e8ceb301dc3bdf73c5fe375 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Mon, 14 Dec 2015 11:15:10 -0800
+Subject: [PATCH 0434/1164] CDH-35141 : HIVE-12628 : Eliminate flakiness in
+ TestMetrics (Szehon, reviewed by Jimmy Xiang)
+
+Conflicts:
+	itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
+	itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/hbase/TestHBaseMetastoreMetrics.java
+
+Change-Id: If1e053e1fcff262f469f4136f951e61fdf598811
+---
+ .../common/metrics/metrics2/CodahaleMetrics.java   |    7 ++
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    2 +
+ .../hive/common/metrics/MetricsTestUtils.java      |    9 +-
+ .../hive/metastore/TestMetaStoreMetrics.java       |  119 +++++---------------
+ .../apache/hive/jdbc/miniHS2/TestHs2Metrics.java   |   42 ++++---
+ .../hadoop/hive/metastore/HiveMetaStore.java       |    2 +-
+ .../metastore/TestHiveMetaStorePartitionSpecs.java |    2 +-
+ ql/pom.xml                                         |    7 ++
+ .../zookeeper/TestZookeeperLockManager.java        |   29 ++---
+ service/pom.xml                                    |   14 +--
+ .../cli/session/TestSessionManagerMetrics.java     |   23 ++--
+ 11 files changed, 97 insertions(+), 159 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+index 1b5c645..179d096 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+@@ -332,6 +332,13 @@ public MetricRegistry getMetricRegistry() {
+     return metricRegistry;
+   }
+ 
++  @VisibleForTesting
++  public String dumpJson() throws Exception {
++    ObjectMapper jsonMapper = new ObjectMapper().registerModule(
++      new MetricsModule(TimeUnit.MILLISECONDS, TimeUnit.MILLISECONDS, false));
++    return jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(metricRegistry);
++  }
++
+   /**
+    * Should be only called once to initialize the reporters
+    */
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index a2339ad..2a89015 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -600,6 +600,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     METASTORE_FILTER_HOOK("hive.metastore.filter.hook", "org.apache.hadoop.hive.metastore.DefaultMetaStoreFilterHookImpl",
+         "Metastore hook class for filtering the metadata read results"),
+     METASTORE_METRICS("hive.metastore.metrics.enabled", false, "Enable metrics on the metastore."),
++    METASTORE_INIT_METADATA_COUNT_ENABLED("hive.metastore.initial.metadata.count.enabled", true,
++      "Enable a metadata count at metastore startup for metrics."),
+ 
+     // Parameters for exporting metadata on table drop (requires the use of the)
+     // org.apache.hadoop.hive.ql.parse.MetaDataExportListener preevent listener
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+index f21b431..c90a614 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+@@ -44,16 +44,15 @@
+     }
+   }
+ 
+-  public static void verifyMetricFile(File jsonReportFile, MetricsCategory category, String metricsName,
++  public static void verifyMetricsJson(String json, MetricsCategory category, String metricsName,
+     Object expectedValue) throws Exception {
+-    JsonNode jsonNode = getJsonNode(jsonReportFile, category, metricsName);
++    JsonNode jsonNode = getJsonNode(json, category, metricsName);
+     Assert.assertEquals(expectedValue.toString(), jsonNode.asText());
+   }
+ 
+-  private static JsonNode getJsonNode(File jsonReportFile, MetricsCategory category, String metricsName) throws Exception {
+-    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
++  private static JsonNode getJsonNode(String json, MetricsCategory category, String metricsName) throws Exception {
+     ObjectMapper objectMapper = new ObjectMapper();
+-    JsonNode rootNode = objectMapper.readTree(jsonData);
++    JsonNode rootNode = objectMapper.readTree(json);
+     JsonNode categoryNode = rootNode.path(category.category);
+     JsonNode metricsNode = categoryNode.path(metricsName);
+     return metricsNode.path(category.metricsHandle);
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
+index 8b33abe..3274281 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreMetrics.java
+@@ -17,92 +17,53 @@
+  */
+ package org.apache.hadoop.hive.metastore;
+ 
+-import com.fasterxml.jackson.databind.JsonNode;
+-import com.fasterxml.jackson.databind.ObjectMapper;
+ import org.apache.hadoop.hive.cli.CliSessionState;
+ import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+-import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.metrics2.CodahaleMetrics;
+ import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.metastore.api.FieldSchema;
+-import org.apache.hadoop.hive.metastore.api.Partition;
+-import org.apache.hadoop.hive.metastore.api.SerDeInfo;
+-import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+-import org.apache.hadoop.hive.metastore.api.Table;
+ import org.apache.hadoop.hive.ql.Driver;
+-import org.apache.hadoop.hive.ql.metadata.Hive;
+-import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+-import org.junit.Assert;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+-import java.io.File;
+-import java.nio.file.Files;
+-import java.nio.file.Paths;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+ /**
+  * Tests Hive Metastore Metrics.
+  *
+  */
+ public class TestMetaStoreMetrics {
+ 
+-  private static File workDir = new File(System.getProperty("test.tmp.dir"));
+-  private static File jsonReportFile;
+ 
+   private static HiveConf hiveConf;
+   private static Driver driver;
++  private static CodahaleMetrics metrics;
+ 
+   @BeforeClass
+   public static void before() throws Exception {
+ 
+     int port = MetaStoreUtils.findFreePort();
+ 
+-    jsonReportFile = new File(workDir, "json_reporting");
+-    jsonReportFile.delete();
+-
+     hiveConf = new HiveConf(TestMetaStoreMetrics.class);
+     hiveConf.setVar(HiveConf.ConfVars.METASTOREURIS, "thrift://localhost:" + port);
+     hiveConf.setIntVar(HiveConf.ConfVars.METASTORETHRIFTCONNECTIONRETRIES, 3);
+     hiveConf.setBoolVar(HiveConf.ConfVars.METASTORE_METRICS, true);
+     hiveConf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+-    hiveConf.setVar(HiveConf.ConfVars.HIVE_METRICS_REPORTER, MetricsReporting.JSON_FILE.name() + "," + MetricsReporting.JMX.name());
+-    hiveConf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_LOCATION, jsonReportFile.toString());
+-    hiveConf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "100ms");
+ 
+     MetaStoreUtils.startMetaStore(port, ShimLoader.getHadoopThriftAuthBridge(), hiveConf);
+     SessionState.start(new CliSessionState(hiveConf));
+     driver = new Driver(hiveConf);
++
++    metrics = (CodahaleMetrics) MetricsFactory.getInstance();
+   }
+ 
+ 
+   @Test
+   public void testMethodCounts() throws Exception {
+     driver.run("show databases");
+-
+-    //give timer thread a chance to print the metrics
+-    Thread.sleep(2000);
+-
+-    //This can be replaced by CodahaleMetrics's JsonServlet reporter once it is exposed.
+-    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    ObjectMapper objectMapper = new ObjectMapper();
+-
+-    JsonNode rootNode = objectMapper.readTree(jsonData);
+-    JsonNode timersNode = rootNode.path("timers");
+-    JsonNode methodCounterNode = timersNode.path("api_get_all_databases");
+-    JsonNode methodCountNode = methodCounterNode.path("count");
+-    Assert.assertTrue(methodCountNode.asInt() > 0);
+-
+-    JsonNode countersNode = rootNode.path("counters");
+-    JsonNode committedJdoTxNode = countersNode.path("committed_jdo_transactions");
+-    JsonNode committedCountNode = committedJdoTxNode.path("count");
+-    Assert.assertTrue(committedCountNode.asInt() > 0);
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_get_all_databases", 1);
+   }
+ 
+   @Test
+@@ -144,12 +105,11 @@ public void testMetaDataCounts() throws Exception {
+     driver.run("drop database tempdb cascade");
+ 
+     //give timer thread a chance to print the metrics
+-    Thread.sleep(2000);
+-
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, MetricsConstant.DELTA_TOTAL_DATABASES, 1);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, MetricsConstant.DELTA_TOTAL_TABLES, 4);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, MetricsConstant.DELTA_TOTAL_PARTITIONS, 6);
+-
++    CodahaleMetrics metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.DELTA_TOTAL_DATABASES, 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.DELTA_TOTAL_TABLES, 4);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.DELTA_TOTAL_PARTITIONS, 6);
+ 
+     //to test initial metadata count metrics.
+     hiveConf.setVar(HiveConf.ConfVars.METASTORE_RAW_STORE_IMPL, ObjectStore.class.getName());
+@@ -157,55 +117,36 @@ public void testMetaDataCounts() throws Exception {
+     baseHandler.init();
+     baseHandler.updateMetrics();
+ 
+-    Thread.sleep(2000);
+-
+     //1 new db + default
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.INIT_TOTAL_DATABASES, 2);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.INIT_TOTAL_TABLES, 4);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.INIT_TOTAL_PARTITIONS, 6);
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.INIT_TOTAL_DATABASES, 2);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.INIT_TOTAL_TABLES, 4);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.INIT_TOTAL_PARTITIONS, 6);
+   }
+ 
+ 
+   @Test
+   public void testConnections() throws Exception {
+-    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    ObjectMapper objectMapper = new ObjectMapper();
+-    JsonNode rootNode = objectMapper.readTree(jsonData);
+-    JsonNode countersNode = rootNode.path("counters");
+-    JsonNode openCnxNode = countersNode.path("open_connections");
+-    JsonNode openCnxCountNode = openCnxNode.path("count");
+-    Assert.assertTrue(openCnxCountNode.asInt() == 1);
+-
+-    //create a second connection
++
++    //initial state is one connection
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.OPEN_CONNECTIONS, 1);
++
++    //create two connections
+     HiveMetaStoreClient msc = new HiveMetaStoreClient(hiveConf);
+     HiveMetaStoreClient msc2 = new HiveMetaStoreClient(hiveConf);
+-    Thread.sleep(2000);
+ 
+-    jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    rootNode = objectMapper.readTree(jsonData);
+-    countersNode = rootNode.path("counters");
+-    openCnxNode = countersNode.path("open_connections");
+-    openCnxCountNode = openCnxNode.path("count");
+-    Assert.assertTrue(openCnxCountNode.asInt() == 3);
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.OPEN_CONNECTIONS, 3);
+ 
++    //close one connection, verify still two left
+     msc.close();
+-    Thread.sleep(2000);
+-
+-    jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    rootNode = objectMapper.readTree(jsonData);
+-    countersNode = rootNode.path("counters");
+-    openCnxNode = countersNode.path("open_connections");
+-    openCnxCountNode = openCnxNode.path("count");
+-    Assert.assertTrue(openCnxCountNode.asInt() == 2);
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.OPEN_CONNECTIONS, 2);
+ 
++    //close one connection, verify still one left
+     msc2.close();
+-    Thread.sleep(2000);
+-
+-    jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    rootNode = objectMapper.readTree(jsonData);
+-    countersNode = rootNode.path("counters");
+-    openCnxNode = countersNode.path("open_connections");
+-    openCnxCountNode = openCnxNode.path("count");
+-    Assert.assertTrue(openCnxCountNode.asInt() == 1);
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.OPEN_CONNECTIONS, 1);
+   }
+ }
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+index 873e126..c55c05e 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+@@ -19,7 +19,7 @@
+ 
+ import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+-import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
++import org.apache.hadoop.hive.common.metrics.metrics2.CodahaleMetrics;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.parse.ASTNode;
+@@ -31,7 +31,6 @@
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ 
+-import java.io.File;
+ import java.io.Serializable;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -44,7 +43,7 @@
+ 
+   private static MiniHS2 miniHS2;
+   private static Map<String, String> confOverlay;
+-  private static File jsonReportFile;
++  private static CodahaleMetrics metrics;
+ 
+   //Check metrics during semantic analysis.
+   public static class MetricCheckingHook implements HiveSemanticAnalyzerHook {
+@@ -52,10 +51,12 @@
+     public ASTNode preAnalyze(HiveSemanticAnalyzerHookContext context,
+       ASTNode ast) throws SemanticException {
+       try {
++        CodahaleMetrics metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++        String json = metrics.dumpJson();
+         //Pre-analyze hook is fired in the middle of these calls
+-        MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 1);
+-        MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_compile", 1);
+-        MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 1);
++        MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 1);
++        MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_compile", 1);
++        MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 1);
+       } catch (Exception e) {
+         throw new SemanticException("metrics verification failed", e);
+       }
+@@ -76,17 +77,12 @@ public static void setup() throws Exception {
+     confOverlay.put(HiveConf.ConfVars.SEMANTIC_ANALYZER_HOOK.varname, MetricCheckingHook.class.getName());
+     miniHS2.start(confOverlay);
+ 
+-    //for Metrics.  MiniHS2 init code-path doesn't go through HiveServer2.startHiveServer2().
+-    File workDir = new File(System.getProperty("test.tmp.dir"));
+-    jsonReportFile = new File(workDir, "json_reporting");
+-    jsonReportFile.delete();
+     HiveConf conf = new HiveConf();
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED, true);
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_REPORTER, MetricsReporting.JSON_FILE.name() + "," + MetricsReporting.JMX.name());
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_LOCATION, jsonReportFile.toString());
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "100ms");
+     MetricsFactory.init(conf);
++
++    metrics = (CodahaleMetrics) MetricsFactory.getInstance();
+   }
+ 
+   @Test
+@@ -97,20 +93,20 @@ public void testMetrics() throws Exception {
+ 
+     //Block on semantic analysis to check 'active_calls'
+     serviceClient.executeStatement(sessHandle, "CREATE TABLE " + tableName + " (id INT)", confOverlay);
+-    Thread.sleep(2000);
+ 
+     //check that all calls were recorded.
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_hs2_operation_INITIALIZED", 1);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_hs2_operation_PENDING", 1);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_hs2_operation_RUNNING", 1);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "hs2_completed_operation_FINISHED", 1);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_Driver.run", 1);
++    CodahaleMetrics metrics = (CodahaleMetrics) MetricsFactory.getInstance();
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_operation_INITIALIZED", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_operation_PENDING", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_operation_RUNNING", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "hs2_completed_operation_FINISHED", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_Driver.run", 1);
+ 
+     //but there should be no more active calls.
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 0);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_compile", 0);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 0);
+-
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 0);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_compile", 0);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 0);
+   }
+ 
+ }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index e7baa9f..2672b8a 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -494,7 +494,7 @@ public void init() throws MetaException {
+       }
+ 
+       Metrics metrics = MetricsFactory.getInstance();
+-      if (metrics != null) {
++      if (metrics != null && hiveConf.getBoolVar(ConfVars.METASTORE_INIT_METADATA_COUNT_ENABLED)) {
+         LOG.info("Begin calculating metadata count metrics.");
+         updateMetrics();
+         LOG.info("Finished metadata count metrics: " + initDatabaseCount + " databases, " + initTableCount +
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStorePartitionSpecs.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStorePartitionSpecs.java
+index ed1a453..922a4bf 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStorePartitionSpecs.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestHiveMetaStorePartitionSpecs.java
+@@ -97,7 +97,7 @@ public static void startMetaStoreServer() throws Exception {
+ 
+     Thread t = new Thread(new RunMS());
+     t.start();
+-    Thread.sleep(5000);
++    Thread.sleep(10000);
+ 
+     securityManager = System.getSecurityManager();
+     System.setSecurityManager(new NoExitSecurityManager());
+diff --git a/ql/pom.xml b/ql/pom.xml
+index 4c1ed9e..08917d3 100644
+--- a/ql/pom.xml
++++ b/ql/pom.xml
+@@ -52,6 +52,13 @@
+     </dependency>
+     <dependency>
+       <groupId>org.apache.hive</groupId>
++      <artifactId>hive-common</artifactId>
++      <version>${project.version}</version>
++      <scope>test</scope>
++      <type>test-jar</type>
++    </dependency>
++    <dependency>
++      <groupId>org.apache.hive</groupId>
+       <artifactId>hive-metastore</artifactId>
+       <version>${project.version}</version>
+     </dependency>
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java
+index 7fcaa22..3f9926e 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/zookeeper/TestZookeeperLockManager.java
+@@ -22,7 +22,10 @@
+ import java.nio.file.Files;
+ import java.nio.file.Paths;
+ 
++import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.metrics2.CodahaleMetrics;
+ import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.lockmgr.HiveLockManagerCtx;
+@@ -125,38 +128,22 @@ public void testGetQuorumServers() {
+   public void testMetrics() throws Exception{
+     conf.setVar(HiveConf.ConfVars.HIVE_ZOOKEEPER_QUORUM, "localhost");
+     conf.setVar(HiveConf.ConfVars.HIVE_ZOOKEEPER_CLIENT_PORT, String.valueOf(server.getPort()));
+-    File workDir = new File(System.getProperty("test.tmp.dir"));
+-    File jsonReportFile = new File(workDir, "json_reportingzk1");
+-    jsonReportFile.delete();
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED, true);
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+     conf.setVar(HiveConf.ConfVars.HIVE_METRICS_REPORTER, MetricsReporting.JSON_FILE.name() + "," + MetricsReporting.JMX.name());
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_LOCATION, jsonReportFile.toString());
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "100ms");
+     MetricsFactory.init(conf);
++    CodahaleMetrics metrics = (CodahaleMetrics) MetricsFactory.getInstance();
+ 
+     HiveLockManagerCtx ctx = new HiveLockManagerCtx(conf);
+     ZooKeeperHiveLockManager zMgr= new ZooKeeperHiveLockManager();
+     zMgr.setContext(ctx);
+     ZooKeeperHiveLock curLock = zMgr.lock(hiveLock, HiveLockMode.SHARED, false);
+-    Thread.sleep(2000);
+-    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    ObjectMapper objectMapper = new ObjectMapper();
+-    JsonNode rootNode = objectMapper.readTree(jsonData);
+-    JsonNode countersNode = rootNode.path("counters");
+-    JsonNode zkLockNode = countersNode.path("zookeeper_hive_sharedlocks");
+-    JsonNode zkLockCountNode = zkLockNode.path("count");
+-    Assert.assertTrue(zkLockCountNode.asInt() == 1);
++    String json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.ZOOKEEPER_HIVE_SHAREDLOCKS, 1);
+ 
+     zMgr.unlock(curLock);
+-    Thread.sleep(2000);
+-    jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
+-    objectMapper = new ObjectMapper();
+-    rootNode = objectMapper.readTree(jsonData);
+-    countersNode = rootNode.path("counters");
+-    zkLockNode = countersNode.path("zookeeper_hive_sharedlocks");
+-    zkLockCountNode = zkLockNode.path("count");
+-    Assert.assertTrue(zkLockCountNode.asInt() == 0);
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, MetricsConstant.ZOOKEEPER_HIVE_SHAREDLOCKS, 0);
+     zMgr.close();
+   }
+ 
+diff --git a/service/pom.xml b/service/pom.xml
+index dcace2a..98bc17a 100644
+--- a/service/pom.xml
++++ b/service/pom.xml
+@@ -104,13 +104,13 @@
+       <scope>test</scope>
+       <classifier>tests</classifier>
+     </dependency>
+-      <dependency>
+-        <groupId>org.apache.hive</groupId>
+-        <artifactId>hive-common</artifactId>
+-        <version>${project.version}</version>
+-        <scope>test</scope>
+-        <type>test-jar</type>
+-      </dependency>
++    <dependency>
++      <groupId>org.apache.hive</groupId>
++      <artifactId>hive-common</artifactId>
++      <version>${project.version}</version>
++      <scope>test</scope>
++      <type>test-jar</type>
++    </dependency>
+     <!-- test inter-project -->
+     <dependency>
+       <groupId>junit</groupId>
+diff --git a/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java b/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+index aaeecbe..44d57c4 100644
+--- a/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
++++ b/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+@@ -21,6 +21,7 @@
+ import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.metrics2.CodahaleMetrics;
+ import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hive.service.server.HiveServer2;
+@@ -35,7 +36,7 @@
+ public class TestSessionManagerMetrics {
+ 
+   private static SessionManager sm;
+-  private static File jsonReportFile;
++  private static CodahaleMetrics metrics;
+ 
+   @BeforeClass
+   public static void setup() throws Exception {
+@@ -44,19 +45,17 @@ public static void setup() throws Exception {
+     conf.setIntVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_WAIT_QUEUE_SIZE, 10);
+     conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_KEEPALIVE_TIME, "1000000s");
+ 
+-    File workDir = new File(System.getProperty("test.tmp.dir"));
+-    jsonReportFile = new File(workDir, "json_reporting");
+-    jsonReportFile.delete();
++
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED, true);
+     conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
+     conf.setVar(HiveConf.ConfVars.HIVE_METRICS_REPORTER, MetricsReporting.JSON_FILE.name() + "," + MetricsReporting.JMX.name());
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_LOCATION, jsonReportFile.toString());
+-    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "100ms");
+     MetricsFactory.init(conf);
+ 
+     HiveServer2 hs2 = new HiveServer2();
+     sm = new SessionManager(hs2);
+     sm.init(conf);
++
++    metrics = (CodahaleMetrics) MetricsFactory.getInstance();
+   }
+ 
+   final Object barrier = new Object();
+@@ -85,16 +84,16 @@ public void testThreadPoolMetrics() throws Exception {
+     sm.submitBackgroundOperation(new BarrierRunnable());
+     sm.submitBackgroundOperation(new BarrierRunnable());
+ 
+-    Thread.sleep(2000);
++    String json = metrics.dumpJson();
+ 
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_POOL_SIZE, 2);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, 2);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_POOL_SIZE, 2);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, 2);
+ 
+     synchronized (barrier) {
+       barrier.notifyAll();
+     }
+-    Thread.sleep(2000);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_POOL_SIZE, 2);
+-    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, 0);
++    json = metrics.dumpJson();
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_POOL_SIZE, 2);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, 0);
+   }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,70 @@
+From 8610254ee0ceface0bd1bbd5c51982da43bbca7c Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Wed, 8 Jun 2016 11:50:47 -0400
+Subject: [PATCH 0649/1164] CDH-41789: HIVE-7443: Fix HiveConnection to
+ communicate with Kerberized Hive JDBC server and
+ alternative JDKs (Yu Gao & Aihua Xu, reviewed by
+ Chaoyu Tang)
+
+Change-Id: Ifcff3238f3101f18b08eddcb7d5f73ac37e80203
+---
+ .../hadoop/hive/thrift/HadoopThriftAuthBridge.java |   30 ++++++++++++--------
+ 1 file changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java b/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java
+index 67aee05..6c00818 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java
+@@ -184,9 +184,9 @@ private boolean loginUserHasCurrentAuthMethod(UserGroupInformation ugi, String s
+ 
+     public TTransport createClientTransport(
+         String principalConfig, String host,
+-        String methodStr, String tokenStrForm, TTransport underlyingTransport,
+-        Map<String, String> saslProps) throws IOException {
+-      AuthMethod method = AuthMethod.valueOf(AuthMethod.class, methodStr);
++        String methodStr, String tokenStrForm, final TTransport underlyingTransport,
++        final Map<String, String> saslProps) throws IOException {
++      final AuthMethod method = AuthMethod.valueOf(AuthMethod.class, methodStr);
+ 
+       TTransport saslTransport = null;
+       switch (method) {
+@@ -203,21 +203,27 @@ public TTransport createClientTransport(
+ 
+       case KERBEROS:
+         String serverPrincipal = SecurityUtil.getServerPrincipal(principalConfig, host);
+-        String names[] = SaslRpcServer.splitKerberosName(serverPrincipal);
++        final String names[] = SaslRpcServer.splitKerberosName(serverPrincipal);
+         if (names.length != 3) {
+           throw new IOException(
+               "Kerberos principal name does NOT have the expected hostname part: "
+                   + serverPrincipal);
+         }
+         try {
+-          saslTransport = new TSaslClientTransport(
+-              method.getMechanismName(),
+-              null,
+-              names[0], names[1],
+-              saslProps, null,
+-              underlyingTransport);
+-          return new TUGIAssumingTransport(saslTransport, UserGroupInformation.getCurrentUser());
+-        } catch (SaslException se) {
++          return UserGroupInformation.getCurrentUser().doAs(
++              new PrivilegedExceptionAction<TUGIAssumingTransport>() {
++                @Override
++                public TUGIAssumingTransport run() throws IOException {
++                  TTransport saslTransport = new TSaslClientTransport(
++                    method.getMechanismName(),
++                    null,
++                    names[0], names[1],
++                    saslProps, null,
++                    underlyingTransport);
++                  return new TUGIAssumingTransport(saslTransport, UserGroupInformation.getCurrentUser());
++                }
++              });
++        } catch (InterruptedException | SaslException se) {
+           throw new IOException("Could not instantiate SASL transport", se);
+         }
+ 
+-- 
+1.7.9.5
+

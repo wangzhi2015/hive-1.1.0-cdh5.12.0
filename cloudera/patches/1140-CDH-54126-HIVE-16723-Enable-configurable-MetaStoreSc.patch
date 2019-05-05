@@ -1,0 +1,1014 @@
+From 47af46fbb00a2f1753f1d1229eaa8037e7b4758a Mon Sep 17 00:00:00 2001
+From: Vihang Karajgaonkar <vihang@cloudera.com>
+Date: Fri, 19 May 2017 16:06:33 -0700
+Subject: [PATCH 1140/1164] CDH-54126 : HIVE-16723 : Enable configurable
+ MetaStoreSchemaInfo
+
+Change-Id: I1edc6bcdee8c3dcf0896d44c228d0ab5eaab287b
+---
+ .../org/apache/hive/beeline/HiveSchemaTool.java    |   23 +-
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    5 +
+ .../hive/metastore/TestMetastoreVersion.java       |    9 +-
+ .../org/apache/hive/beeline/TestSchemaTool.java    |    6 +-
+ .../hive/metastore/IMetaStoreSchemaInfo.java       |   92 +++++
+ .../hadoop/hive/metastore/MetaStoreSchemaInfo.java |   51 ++-
+ .../hive/metastore/MetaStoreSchemaInfoFactory.java |   65 ++++
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |   17 +-
+ .../hive/metastore/TestMetaStoreSchemaFactory.java |   67 ++++
+ .../clientpositive/show_functions.q.out.orig       |  367 --------------------
+ 10 files changed, 284 insertions(+), 418 deletions(-)
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfoFactory.java
+ create mode 100644 metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaFactory.java
+ delete mode 100644 ql/src/test/results/clientpositive/show_functions.q.out.orig
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+index bb6e7e3..c30fa03 100644
+--- a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
++++ b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+@@ -50,7 +50,8 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.HiveMetaException;
+-import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfo;
++import org.apache.hadoop.hive.metastore.IMetaStoreSchemaInfo;
++import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfoFactory;
+ import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+@@ -75,7 +76,7 @@
+   private URI[] validationServers = null; // The list of servers the database/partition/table can locate on
+   private final HiveConf hiveConf;
+   private final String dbType;
+-  private final MetaStoreSchemaInfo metaStoreSchemaInfo;
++  private final IMetaStoreSchemaInfo metaStoreSchemaInfo;
+   static Log LOG = LogFactory.getLog("HiveSchemaTool");
+ 
+   public HiveSchemaTool(String dbType) throws HiveMetaException {
+@@ -89,7 +90,7 @@ public HiveSchemaTool(String hiveHome, HiveConf hiveConf, String dbType)
+     }
+     this.hiveConf = hiveConf;
+     this.dbType = dbType;
+-    this.metaStoreSchemaInfo = new MetaStoreSchemaInfo(hiveHome, hiveConf, dbType);
++    this.metaStoreSchemaInfo = MetaStoreSchemaInfoFactory.get(hiveConf, hiveHome, dbType);
+   }
+ 
+   public HiveConf getHiveConf() {
+@@ -149,7 +150,7 @@ private NestedScriptParser getDbCommandParser(String dbType) {
+    */
+   public void showInfo() throws HiveMetaException {
+     Connection metastoreConn = getConnectionToMetastore(true);
+-    String hiveVersion = MetaStoreSchemaInfo.getHiveSchemaVersion();
++    String hiveVersion = metaStoreSchemaInfo.getHiveSchemaVersion();
+     String dbVersion = getMetaStoreSchemaVersion(metastoreConn);
+     System.out.println("Hive distribution version:\t " + hiveVersion);
+     System.out.println("Metastore schema version:\t " + dbVersion);
+@@ -482,13 +483,13 @@ public void verifySchemaVersion() throws HiveMetaException {
+     String newSchemaVersion = getMetaStoreSchemaVersion(
+         getConnectionToMetastore(false));
+     // verify that the new version is added to schema
+-    assertCompatibleVersion(MetaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
++    assertCompatibleVersion(metaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
+ 
+   }
+ 
+   private void assertCompatibleVersion(String hiveSchemaVersion, String dbSchemaVersion)
+       throws HiveMetaException {
+-    if (!MetaStoreSchemaInfo.isVersionCompatible(hiveSchemaVersion, dbSchemaVersion)) {
++    if (!metaStoreSchemaInfo.isVersionCompatible(hiveSchemaVersion, dbSchemaVersion)) {
+       throw new HiveMetaException("Metastore schema version is not compatible. Hive Version: "
+           + hiveSchemaVersion + ", Database Schema Version: " + dbSchemaVersion);
+     }
+@@ -516,7 +517,7 @@ public void doUpgrade() throws HiveMetaException {
+    * @throws MetaException
+    */
+   public void doUpgrade(String fromSchemaVer) throws HiveMetaException {
+-    if (MetaStoreSchemaInfo.getHiveSchemaVersion().equals(fromSchemaVer)) {
++    if (metaStoreSchemaInfo.getHiveSchemaVersion().equals(fromSchemaVer)) {
+       System.out.println("No schema upgrade required from version " + fromSchemaVer);
+       return;
+     }
+@@ -525,7 +526,7 @@ public void doUpgrade(String fromSchemaVer) throws HiveMetaException {
+         metaStoreSchemaInfo.getUpgradeScripts(fromSchemaVer);
+     testConnectionToMetastore();
+     System.out.println("Starting upgrade metastore schema from version " +
+-        fromSchemaVer + " to " + MetaStoreSchemaInfo.getHiveSchemaVersion());
++        fromSchemaVer + " to " + metaStoreSchemaInfo.getHiveSchemaVersion());
+     String scriptDir = metaStoreSchemaInfo.getMetaStoreScriptDir();
+     try {
+       for (String scriptFile : upgradeScripts) {
+@@ -551,7 +552,7 @@ public void doUpgrade(String fromSchemaVer) throws HiveMetaException {
+    * @throws MetaException
+    */
+   public void doInit() throws HiveMetaException {
+-    doInit(MetaStoreSchemaInfo.getHiveSchemaVersion());
++    doInit(metaStoreSchemaInfo.getHiveSchemaVersion());
+ 
+     // Revalidated the new version after upgrade
+     verifySchemaVersion();
+@@ -698,7 +699,7 @@ boolean validateSchemaVersions(Connection conn) throws HiveMetaException {
+     System.out.println("Validating schema version");
+     try {
+       String newSchemaVersion = getMetaStoreSchemaVersion(conn, true);
+-      assertCompatibleVersion(MetaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
++      assertCompatibleVersion(metaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
+     } catch (HiveMetaException hme) {
+       if (hme.getMessage().contains("Metastore schema version is not compatible")
+         || hme.getMessage().contains("Multiple versions were found in metastore")
+@@ -910,7 +911,7 @@ boolean validateColumnNullValues(Connection conn) throws HiveMetaException {
+   private void runPreUpgrade(String scriptDir, String scriptFile) {
+     for (int i = 0;; i++) {
+       String preUpgradeScript =
+-          MetaStoreSchemaInfo.getPreUpgradeScriptName(i, scriptFile);
++          metaStoreSchemaInfo.getPreUpgradeScriptName(i, scriptFile);
+       File preUpgradeScriptFile = new File(scriptDir, preUpgradeScript);
+       if (!preUpgradeScriptFile.isFile()) {
+         break;
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 67ee6bc..24b133d 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -494,6 +494,11 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+       " enabled the MS will be unusable."),
+     METASTORE_AUTO_START_MECHANISM_MODE("datanucleus.autoStartMechanismMode", "checked",
+         "throw exception if metadata tables are incorrect"),
++    METASTORE_SCHEMA_INFO_CLASS("hive.metastore.schema.info.class",
++        "org.apache.hadoop.hive.metastore.MetaStoreSchemaInfo",
++        "Fully qualified class name for the metastore schema information class \n"
++        + "which is used by schematool to fetch the schema information.\n"
++        + " This class should implement the IMetaStoreSchemaInfo interface"),
+     METASTORE_TRANSACTION_ISOLATION("datanucleus.transactionIsolation", "read-committed",
+         "Default transaction isolation level for identity generation."),
+     METASTORE_CACHE_LEVEL2("datanucleus.cache.level2", false,
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+index ecae3ff..417f801 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+@@ -41,6 +41,7 @@
+   private Driver driver;
+   private String metaStoreRoot;
+   private String testMetastoreDB;
++  private IMetaStoreSchemaInfo metastoreSchemaInfo;
+ 
+   @Override
+   protected void setUp() throws Exception {
+@@ -64,6 +65,8 @@ protected void setUp() throws Exception {
+     System.setProperty(HiveConf.ConfVars.METASTORECONNECTURLKEY.varname,
+         "jdbc:derby:" + testMetastoreDB + ";create=true");
+     metaStoreRoot = System.getProperty("test.tmp.dir");
++    metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(hiveConf,
++        System.getProperty("test.tmp.dir", "target/tmp"), "derby");
+   }
+ 
+   @Override
+@@ -122,7 +125,7 @@ public void testMetastoreVersion () throws Exception {
+     driver.run("show tables");
+ 
+     // correct version stored by Metastore during startup
+-    assertEquals(MetaStoreSchemaInfo.getHiveSchemaVersion(), getVersion(hiveConf));
++    assertEquals(metastoreSchemaInfo.getHiveSchemaVersion(), getVersion(hiveConf));
+     setVersion(hiveConf, "foo");
+     assertEquals("foo", getVersion(hiveConf));
+   }
+@@ -139,7 +142,7 @@ public void testVersionMatching () throws Exception {
+     driver.run("show tables");
+ 
+     hiveConf.setBoolVar(HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION, true);
+-    setVersion(hiveConf, MetaStoreSchemaInfo.getHiveSchemaVersion());
++    setVersion(hiveConf, metastoreSchemaInfo.getHiveSchemaVersion());
+     driver = new Driver(hiveConf);
+     CommandProcessorResponse proc = driver.run("show tables");
+     assertTrue(proc.getResponseCode() == 0);
+@@ -167,13 +170,11 @@ public void testVersionMisMatch () throws Exception {
+ 
+   //  write the given version to metastore
+   private String getVersion(HiveConf conf) throws HiveMetaException {
+-    MetaStoreSchemaInfo schemInfo = new MetaStoreSchemaInfo(metaStoreRoot, conf, "derby");
+     return getMetaStoreVersion();
+   }
+ 
+   //  write the given version to metastore
+   private void setVersion(HiveConf conf, String version) throws HiveMetaException {
+-    MetaStoreSchemaInfo schemInfo = new MetaStoreSchemaInfo(metaStoreRoot, conf, "derby");
+     setMetaStoreVersion(version, "setVersion test");
+   }
+ 
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
+index 95ba635..157873b 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestSchemaTool.java
+@@ -35,7 +35,9 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.HiveMetaException;
++import org.apache.hadoop.hive.metastore.IMetaStoreSchemaInfo;
+ import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfo;
++import org.apache.hadoop.hive.metastore.MetaStoreSchemaInfoFactory;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hive.beeline.HiveSchemaHelper.NestedScriptParser;
+ import org.apache.hive.beeline.HiveSchemaHelper.PostgresCommandParser;
+@@ -219,7 +221,9 @@ public void testSchemaUpgradeDryRun() throws Exception {
+    * @throws Exception
+    */
+   public void testSchemaInit() throws Exception {
+-    schemaTool.doInit(MetaStoreSchemaInfo.getHiveSchemaVersion());
++    IMetaStoreSchemaInfo metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(hiveConf,
++        System.getProperty("test.tmp.dir", "target/tmp"), "derby");
++    schemaTool.doInit(metastoreSchemaInfo.getHiveSchemaVersion());
+     schemaTool.verifySchemaVersion();
+   }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java b/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java
+new file mode 100644
+index 0000000..d662743
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/IMetaStoreSchemaInfo.java
+@@ -0,0 +1,92 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.hadoop.hive.common.classification.InterfaceAudience;
++import java.util.List;
++
++/**
++ * Defines the method which must be implemented to be used using schema tool to support metastore
++ * schema upgrades. The configuration hive.metastore.schema.info.class is used to create instances
++ * of this type by SchemaTool.
++ *
++ * Instances of this interface should be created using MetaStoreSchemaInfoFactory class which uses
++ * two Strings argument constructor to instantiate the implementations of this interface
++ */
++@InterfaceAudience.Private
++public interface IMetaStoreSchemaInfo {
++  String SQL_FILE_EXTENSION = ".sql";
++
++  /***
++   * Get the list of sql scripts required to upgrade from the give version to current.
++   *
++   * @param fromVersion
++   * @return
++   * @throws HiveMetaException
++   */
++  List<String> getUpgradeScripts(String fromVersion) throws HiveMetaException;
++
++  /***
++   * Get the name of the script to initialize the schema for given version
++   *
++   * @param toVersion Target version. If it's null, then the current server version is used
++   * @return
++   * @throws HiveMetaException
++   */
++  String generateInitFileName(String toVersion) throws HiveMetaException;
++
++  /**
++   * Find the directory of metastore scripts
++   *
++   * @return the path of directory where the sql scripts are
++   */
++  String getMetaStoreScriptDir();
++
++  /**
++   * Get the pre-upgrade script for a given script name. Schema tool runs the pre-upgrade scripts
++   * returned by this method before running any upgrade scripts. These scripts could contain setup
++   * statements may fail on some database versions and failure is ignorable.
++   *
++   * @param index - index number of the file. The preupgrade script name is derived using the given
++   *          index
++   * @param scriptName - upgrade script name
++   * @return name of the pre-upgrade script to be run before running upgrade script
++   */
++  String getPreUpgradeScriptName(int index, String scriptName);
++
++  /**
++   * Get hive distribution schema version. Schematool uses this version to identify
++   * the Hive version. It compares this version with the version found in metastore database
++   * to determine the upgrade or initialization scripts
++   * @return Hive schema version
++   */
++  String getHiveSchemaVersion();
++
++  /**
++   * A dbVersion is compatible with hive version if it is greater or equal to the hive version. This
++   * is result of the db schema upgrade design principles followed in hive project. The state where
++   * db schema version is ahead of hive software version is often seen when a 'rolling upgrade' or
++   * 'rolling downgrade' is happening. This is a state where hive is functional and returning non
++   * zero status for it is misleading.
++   *
++   * @param hiveVersion version of hive software
++   * @param dbVersion version of metastore rdbms schema
++   * @return true if versions are compatible
++   */
++  boolean isVersionCompatible(String productVersion, String dbVersion);
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
+index 669704a..e5e706d 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
+@@ -32,15 +32,13 @@
+ import com.google.common.collect.ImmutableMap;
+ 
+ 
+-public class MetaStoreSchemaInfo {
+-  private static String SQL_FILE_EXTENSION=".sql";
+-  private static String UPGRADE_FILE_PREFIX="upgrade-";
+-  private static String INIT_FILE_PREFIX="hive-schema-";
+-  private static String VERSION_UPGRADE_LIST = "upgrade.order";
+-  private static String PRE_UPGRADE_PREFIX = "pre-";
+-  private final String dbType;
+-  private final String hiveSchemaVersions[];
+-  private final HiveConf hiveConf;
++public class MetaStoreSchemaInfo implements IMetaStoreSchemaInfo {
++  protected static final String UPGRADE_FILE_PREFIX = "upgrade-";
++  private static final String INIT_FILE_PREFIX = "hive-schema-";
++  private static final String VERSION_UPGRADE_LIST = "upgrade.order";
++  private static final String PRE_UPGRADE_PREFIX = "pre-";
++  protected final String dbType;
++  private String[] hiveSchemaVersions;
+   private final String hiveHome;
+ 
+   // Some version upgrades often don't change schema. So they are equivalent to
+@@ -50,17 +48,18 @@
+       ImmutableMap.of("0.13.1", "0.13.0",
+           "1.0.0", "0.14.0");
+ 
+-  public MetaStoreSchemaInfo(String hiveHome, HiveConf hiveConf, String dbType) throws HiveMetaException {
++  public MetaStoreSchemaInfo(String hiveHome, String dbType) throws HiveMetaException {
+     this.hiveHome = hiveHome;
+     this.dbType = dbType;
+-    this.hiveConf = hiveConf;
++  }
++
++  private void loadAllUpgradeScripts(String dbType) throws HiveMetaException {
+     // load upgrade order for the given dbType
+     List<String> upgradeOrderList = new ArrayList<String>();
+     String upgradeListFile = getMetaStoreScriptDir() + File.separator +
+         VERSION_UPGRADE_LIST + "." + dbType;
+-    try {
+-      BufferedReader bfReader =
+-        new BufferedReader(new FileReader(upgradeListFile));
++    try (BufferedReader bfReader =
++        new BufferedReader(new FileReader(upgradeListFile))){
+       String currSchemaVersion;
+       while ((currSchemaVersion = bfReader.readLine()) != null) {
+         upgradeOrderList.add(currSchemaVersion.trim());
+@@ -79,6 +78,7 @@ public MetaStoreSchemaInfo(String hiveHome, HiveConf hiveConf, String dbType) th
+    * @return
+    * @throws HiveMetaException
+    */
++  @Override
+   public List<String> getUpgradeScripts(String fromVersion)
+       throws HiveMetaException {
+     List <String> upgradeScriptList = new ArrayList<String>();
+@@ -87,6 +87,7 @@ public MetaStoreSchemaInfo(String hiveHome, HiveConf hiveConf, String dbType) th
+     if (getHiveSchemaVersion().equals(fromVersion)) {
+       return upgradeScriptList;
+     }
++    loadAllUpgradeScripts(dbType);
+     // Find the list of scripts to execute for this upgrade
+     int firstScript = hiveSchemaVersions.length;
+     for (int i=0; i < hiveSchemaVersions.length; i++) {
+@@ -112,6 +113,7 @@ public MetaStoreSchemaInfo(String hiveHome, HiveConf hiveConf, String dbType) th
+    * @return
+    * @throws HiveMetaException
+    */
++  @Override
+   public String generateInitFileName(String toVersion) throws HiveMetaException {
+     if (toVersion == null) {
+       toVersion = getHiveSchemaVersion();
+@@ -130,6 +132,7 @@ public String generateInitFileName(String toVersion) throws HiveMetaException {
+    * Find the directory of metastore scripts
+    * @return
+    */
++  @Override
+   public String getMetaStoreScriptDir() {
+     return  hiveHome + File.separatorChar +
+      "scripts" + File.separatorChar + "metastore" +
+@@ -141,11 +144,13 @@ private String generateUpgradeFileName(String fileVersion) {
+     return UPGRADE_FILE_PREFIX +  fileVersion + "." + dbType + SQL_FILE_EXTENSION;
+   }
+ 
+-  public static String getPreUpgradeScriptName(int index, String upgradeScriptName) {
++  @Override
++  public String getPreUpgradeScriptName(int index, String upgradeScriptName) {
+     return PRE_UPGRADE_PREFIX + index + "-" + upgradeScriptName;
+   }
+ 
+-  public static String getHiveSchemaVersion() {
++  @Override
++  public String getHiveSchemaVersion() {
+     String hiveVersion = HiveVersionInfo.getShortVersion();
+     return getEquivalentVersion(hiveVersion);
+   }
+@@ -160,18 +165,8 @@ private static String getEquivalentVersion(String hiveVersion) {
+     }
+   }
+ 
+-  /**
+-   * A dbVersion is compatible with hive version if it is greater or equal to
+-   * the hive version. This is result of the db schema upgrade design principles
+-   * followed in hive project.
+-   *
+-   * @param hiveVersion
+-   *          version of hive software
+-   * @param dbVersion
+-   *          version of metastore rdbms schema
+-   * @return true if versions are compatible
+-   */
+-  public static boolean isVersionCompatible(String hiveVersion, String dbVersion) {
++  @Override
++  public boolean isVersionCompatible(String hiveVersion, String dbVersion) {
+     hiveVersion = getEquivalentVersion(hiveVersion);
+     dbVersion = getEquivalentVersion(dbVersion);
+     if (hiveVersion.equals(dbVersion)) {
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfoFactory.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfoFactory.java
+new file mode 100644
+index 0000000..1133cf2
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfoFactory.java
+@@ -0,0 +1,65 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.metastore;
++
++import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Factory class implementation to create instances of IMetaStoreSchemaInfo
++ * based on the provided configuration
++ */
++public class MetaStoreSchemaInfoFactory {
++  public static final Logger LOG = LoggerFactory.getLogger(MetaStoreSchemaInfoFactory.class);
++
++  public static IMetaStoreSchemaInfo get(Configuration conf) {
++    String hiveHome = System.getenv("HIVE_HOME");
++    if (hiveHome == null) {
++      LOG.debug("HIVE_HOME is not set. Using current directory instead");
++      hiveHome = ".";
++    }
++    return get(conf, hiveHome, null);
++  }
++
++  public static IMetaStoreSchemaInfo get(Configuration conf, String hiveHome, String dbType) {
++    String className = conf.get(HiveConf.ConfVars.METASTORE_SCHEMA_INFO_CLASS.varname,
++        HiveConf.ConfVars.METASTORE_SCHEMA_INFO_CLASS.defaultStrVal);
++    Class<?> clasz = null;
++    try {
++      clasz = conf.getClassByName(className);
++    } catch (ClassNotFoundException e) {
++      LOG.error("Unable to load class " + className, e);
++      throw new IllegalArgumentException(e);
++    }
++    Constructor<?> constructor = null;
++    try {
++      constructor = clasz.getConstructor(String.class, String.class);
++      constructor.setAccessible(true);
++      return (IMetaStoreSchemaInfo) constructor.newInstance(hiveHome, dbType);
++    } catch (NoSuchMethodException | InstantiationException | IllegalAccessException
++        | IllegalArgumentException | InvocationTargetException e) {
++      LOG.error("Unable to create instance of class " + className, e);
++      throw new IllegalArgumentException(e);
++    }
++  }
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index 9093d10..b5ce7c0 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -7278,6 +7278,9 @@ private synchronized void checkSchema() throws MetaException {
+       HiveConf.getBoolVar(getConf(), HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION);
+     // read the schema version stored in metastore db
+     String schemaVer = getMetaStoreSchemaVersion();
++    // version of schema for this version of hive
++    IMetaStoreSchemaInfo metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(getConf());
++    String hiveSchemaVer = metastoreSchemaInfo.getHiveSchemaVersion();
+     if (schemaVer == null) {
+       if (strictValidation) {
+         throw new MetaException("Version information not found in metastore. ");
+@@ -7285,26 +7288,26 @@ private synchronized void checkSchema() throws MetaException {
+         LOG.warn("Version information not found in metastore. "
+             + HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION.toString() +
+             " is not enabled so recording the schema version " +
+-            MetaStoreSchemaInfo.getHiveSchemaVersion());
+-        setMetaStoreSchemaVersion(MetaStoreSchemaInfo.getHiveSchemaVersion(),
++            hiveSchemaVer);
++        setMetaStoreSchemaVersion(hiveSchemaVer,
+           "Set by MetaStore " + USER + "@" + HOSTNAME);
+       }
+     } else {
+       // metastore schema version is different than Hive distribution needs
+-      if (schemaVer.equalsIgnoreCase(MetaStoreSchemaInfo.getHiveSchemaVersion())) {
++      if (schemaVer.equalsIgnoreCase(hiveSchemaVer)) {
+         LOG.debug("Found expected HMS version of " + schemaVer);
+       } else {
+         if (strictValidation) {
+           throw new MetaException("Hive Schema version "
+-              + MetaStoreSchemaInfo.getHiveSchemaVersion() +
++              + hiveSchemaVer +
+               " does not match metastore's schema version " + schemaVer +
+               " Metastore is not upgraded or corrupt");
+         } else {
+           LOG.error("Version information found in metastore differs " + schemaVer +
+-              " from expected schema version " + MetaStoreSchemaInfo.getHiveSchemaVersion() +
++              " from expected schema version " + hiveSchemaVer +
+               ". Schema verififcation is disabled " +
+               HiveConf.ConfVars.METASTORE_SCHEMA_VERIFICATION + " so setting version.");
+-          setMetaStoreSchemaVersion(MetaStoreSchemaInfo.getHiveSchemaVersion(),
++          setMetaStoreSchemaVersion(hiveSchemaVer,
+             "Set by MetaStore " + USER + "@" + HOSTNAME);
+         }
+       }
+@@ -7340,7 +7343,7 @@ private MVersionTable getMSchemaVersion() throws NoSuchObjectException, MetaExce
+       } catch (JDODataStoreException e) {
+         if (e.getCause() instanceof MissingTableException) {
+           throw new MetaException("Version table not found. " + "The metastore is not upgraded to "
+-              + MetaStoreSchemaInfo.getHiveSchemaVersion());
++              + MetaStoreSchemaInfoFactory.get(getConf()).getHiveSchemaVersion());
+         } else {
+           throw e;
+         }
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaFactory.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaFactory.java
+new file mode 100644
+index 0000000..99eec40
+--- /dev/null
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestMetaStoreSchemaFactory.java
+@@ -0,0 +1,67 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.metastore;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++
++public class TestMetaStoreSchemaFactory {
++  private HiveConf conf;
++
++  @Before
++  public void setup() {
++    conf = new HiveConf(this.getClass());
++  }
++
++  @Test
++  public void testDefaultConfig() {
++    IMetaStoreSchemaInfo metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(conf);
++    Assert.assertNotNull(metastoreSchemaInfo);
++  }
++
++  @Test
++  public void testWithConfigSet() {
++    conf.set(HiveConf.ConfVars.METASTORE_SCHEMA_INFO_CLASS.varname,
++        MetaStoreSchemaInfo.class.getCanonicalName());
++    IMetaStoreSchemaInfo metastoreSchemaInfo = MetaStoreSchemaInfoFactory.get(conf);
++    Assert.assertNotNull(metastoreSchemaInfo);
++    Assert.assertTrue("Unexpected instance type of the class MetaStoreSchemaInfo",
++        metastoreSchemaInfo instanceof MetaStoreSchemaInfo);
++  }
++
++  @Test
++  public void testConstructor() {
++    String className = conf.get(HiveConf.ConfVars.METASTORE_SCHEMA_INFO_CLASS.varname,
++        MetaStoreSchemaInfo.class.getCanonicalName());
++    Class<?> clasz = null;
++    try {
++      clasz = conf.getClassByName(className);
++      clasz.getConstructor(String.class, String.class);
++    } catch (NoSuchMethodException | IllegalArgumentException | ClassNotFoundException e) {
++      throw new IllegalArgumentException(e);
++    }
++  }
++
++  @Test(expected = IllegalArgumentException.class)
++  public void testInvalidClassName() {
++    conf.set(HiveConf.ConfVars.METASTORE_SCHEMA_INFO_CLASS.varname, "invalid.class.name");
++    MetaStoreSchemaInfoFactory.get(conf);
++  }
++}
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out.orig b/ql/src/test/results/clientpositive/show_functions.q.out.orig
+deleted file mode 100644
+index d79106f..0000000
+--- a/ql/src/test/results/clientpositive/show_functions.q.out.orig
++++ /dev/null
+@@ -1,367 +0,0 @@
+-PREHOOK: query: SHOW FUNCTIONS
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS
+-POSTHOOK: type: SHOWFUNCTIONS
+-!
+-!=
+-%
+-&
+-*
+-+
+--
+-/
+-<
+-<=
+-<=>
+-<>
+-=
+-==
+->
+->=
+-^
+-abs
+-acos
+-add_months
+-and
+-array
+-array_contains
+-ascii
+-asin
+-assert_true
+-atan
+-avg
+-base64
+-between
+-bin
+-case
+-ceil
+-ceiling
+-coalesce
+-collect_list
+-collect_set
+-compute_stats
+-concat
+-concat_ws
+-context_ngrams
+-conv
+-corr
+-cos
+-count
+-covar_pop
+-covar_samp
+-create_union
+-cume_dist
+-current_database
+-current_date
+-current_timestamp
+-current_user
+-date_add
+-date_sub
+-datediff
+-day
+-dayofmonth
+-decode
+-default.qtest_get_java_boolean
+-degrees
+-dense_rank
+-div
+-e
+-elt
+-encode
+-ewah_bitmap
+-ewah_bitmap_and
+-ewah_bitmap_empty
+-ewah_bitmap_or
+-exp
+-explode
+-field
+-find_in_set
+-first_value
+-floor
+-format_number
+-from_unixtime
+-from_utc_timestamp
+-get_json_object
+-greatest
+-hash
+-hex
+-histogram_numeric
+-hour
+-if
+-in
+-in_file
+-index
+-initcap
+-inline
+-instr
+-isnotnull
+-isnull
+-java_method
+-json_tuple
+-lag
+-last_day
+-last_value
+-lcase
+-lead
+-least
+-length
+-like
+-ln
+-locate
+-log
+-log10
+-log2
+-lower
+-lpad
+-ltrim
+-map
+-map_keys
+-map_values
+-matchpath
+-max
+-min
+-minute
+-month
+-named_struct
+-negative
+-ngrams
+-noop
+-noopstreaming
+-noopwithmap
+-noopwithmapstreaming
+-not
+-ntile
+-nvl
+-or
+-parse_url
+-parse_url_tuple
+-percent_rank
+-percentile
+-percentile_approx
+-pi
+-pmod
+-posexplode
+-positive
+-pow
+-power
+-printf
+-radians
+-rand
+-rank
+-reflect
+-reflect2
+-regexp
+-regexp_extract
+-regexp_replace
+-repeat
+-reverse
+-rlike
+-round
+-row_number
+-rpad
+-rtrim
+-second
+-sentences
+-sign
+-sin
+-size
+-sort_array
+-space
+-split
+-sqrt
+-stack
+-std
+-stddev
+-stddev_pop
+-stddev_samp
+-str_to_map
+-struct
+-substr
+-substring
+-sum
+-tan
+-to_date
+-to_unix_timestamp
+-to_utc_timestamp
+-translate
+-trim
+-ucase
+-unbase64
+-unhex
+-unix_timestamp
+-upper
+-var_pop
+-var_samp
+-variance
+-weekofyear
+-when
+-windowingtablefunction
+-xpath
+-xpath_boolean
+-xpath_double
+-xpath_float
+-xpath_int
+-xpath_long
+-xpath_number
+-xpath_short
+-xpath_string
+-year
+-|
+-~
+-PREHOOK: query: SHOW FUNCTIONS '^c.*'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS '^c.*'
+-POSTHOOK: type: SHOWFUNCTIONS
+-case
+-ceil
+-ceiling
+-coalesce
+-collect_list
+-collect_set
+-compute_stats
+-concat
+-concat_ws
+-context_ngrams
+-conv
+-corr
+-cos
+-count
+-covar_pop
+-covar_samp
+-create_union
+-cume_dist
+-current_database
+-current_date
+-current_timestamp
+-current_user
+-PREHOOK: query: SHOW FUNCTIONS '.*e$'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS '.*e$'
+-POSTHOOK: type: SHOWFUNCTIONS
+-assert_true
+-case
+-coalesce
+-current_database
+-current_date
+-decode
+-e
+-encode
+-explode
+-first_value
+-from_unixtime
+-in_file
+-inline
+-json_tuple
+-last_value
+-lcase
+-like
+-locate
+-minute
+-negative
+-ntile
+-parse_url_tuple
+-percentile
+-posexplode
+-positive
+-regexp_replace
+-reverse
+-rlike
+-size
+-space
+-to_date
+-translate
+-ucase
+-variance
+-xpath_double
+-PREHOOK: query: SHOW FUNCTIONS 'log.*'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS 'log.*'
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-log10
+-log2
+-PREHOOK: query: SHOW FUNCTIONS '.*date.*'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS '.*date.*'
+-POSTHOOK: type: SHOWFUNCTIONS
+-current_date
+-date_add
+-date_sub
+-datediff
+-to_date
+-PREHOOK: query: SHOW FUNCTIONS '***'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS '***'
+-POSTHOOK: type: SHOWFUNCTIONS
+-PREHOOK: query: SHOW FUNCTIONS LIKE 'When'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE 'When'
+-POSTHOOK: type: SHOWFUNCTIONS
+-when
+-PREHOOK: query: SHOW FUNCTIONS LIKE 'max|min'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE 'max|min'
+-POSTHOOK: type: SHOWFUNCTIONS
+-max
+-min
+-PREHOOK: query: SHOW FUNCTIONS LIKE 'xpath*|m*'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE 'xpath*|m*'
+-POSTHOOK: type: SHOWFUNCTIONS
+-map
+-map_keys
+-map_values
+-matchpath
+-max
+-min
+-minute
+-month
+-xpath
+-xpath_boolean
+-xpath_double
+-xpath_float
+-xpath_int
+-xpath_long
+-xpath_number
+-xpath_short
+-xpath_string
+-PREHOOK: query: SHOW FUNCTIONS LIKE 'nomatch'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE 'nomatch'
+-POSTHOOK: type: SHOWFUNCTIONS
+-PREHOOK: query: SHOW FUNCTIONS LIKE "log"
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE "log"
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-PREHOOK: query: SHOW FUNCTIONS LIKE 'log'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE 'log'
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-PREHOOK: query: SHOW FUNCTIONS LIKE `log`
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE `log`
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-PREHOOK: query: SHOW FUNCTIONS LIKE 'log*'
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE 'log*'
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-log10
+-log2
+-PREHOOK: query: SHOW FUNCTIONS LIKE "log*"
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE "log*"
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-log10
+-log2
+-PREHOOK: query: SHOW FUNCTIONS LIKE `log*`
+-PREHOOK: type: SHOWFUNCTIONS
+-POSTHOOK: query: SHOW FUNCTIONS LIKE `log*`
+-POSTHOOK: type: SHOWFUNCTIONS
+-log
+-log10
+-log2
+-- 
+1.7.9.5
+

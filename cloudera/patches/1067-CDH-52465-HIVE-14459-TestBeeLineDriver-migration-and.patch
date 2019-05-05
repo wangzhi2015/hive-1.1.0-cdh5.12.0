@@ -1,0 +1,2635 @@
+From deadd8e00be60787ddd2a66e3c232acbfb8bba89 Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Wed, 1 Mar 2017 23:21:34 +0100
+Subject: [PATCH 1067/1164] CDH-52465: HIVE-14459: TestBeeLineDriver -
+ migration and re-enable (Peter Vary via Zoltan
+ Haindrich reviewed by Vihang Karajgaonkar)
+
+Signed-off-by: Zoltan Haindrich <kirk@rxd.hu>
+(cherry picked from commit ba8de3077673e3a9486c8a9d1625b9640936eedc)
+
+Change-Id: I68f4c499e4d74433f33978cdc4011440ed31a3e7
+---
+ .../org/apache/hive/beeline/util/QFileClient.java  |   72 +++-
+ itests/hive-minikdc/pom.xml                        |    6 +
+ .../hive/jdbc/miniHS2/AbstractHiveService.java     |  159 -------
+ .../java/org/apache/hive/jdbc/miniHS2/MiniHS2.java |  435 --------------------
+ .../hadoop/hive/cli/DisabledTestBeeLineDriver.java |   62 ---
+ .../apache/hadoop/hive/cli/TestBeeLineDriver.java  |   62 +++
+ .../test/resources/testconfiguration.properties    |  152 +------
+ itests/util/pom.xml                                |    5 +
+ .../apache/hadoop/hive/cli/control/CliConfigs.java |   14 +-
+ .../hadoop/hive/cli/control/CoreBeeLineDriver.java |   95 ++---
+ .../hive/jdbc/miniHS2/AbstractHiveService.java     |  159 +++++++
+ .../java/org/apache/hive/jdbc/miniHS2/MiniHS2.java |  435 ++++++++++++++++++++
+ .../test/queries/clientpositive/escape_comments.q  |   20 +
+ .../clientpositive/beeline/escape_comments.q.out   |  432 +++++++++++++++++++
+ .../results/clientpositive/escape_comments.q.out   |  214 ++++++++++
+ 15 files changed, 1442 insertions(+), 880 deletions(-)
+ delete mode 100644 itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java
+ delete mode 100644 itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+ delete mode 100644 itests/qtest/src/test/java/org/apache/hadoop/hive/cli/DisabledTestBeeLineDriver.java
+ create mode 100644 itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestBeeLineDriver.java
+ create mode 100644 itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java
+ create mode 100644 itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+ create mode 100644 ql/src/test/queries/clientpositive/escape_comments.q
+ create mode 100644 ql/src/test/results/clientpositive/beeline/escape_comments.q.out
+ create mode 100644 ql/src/test/results/clientpositive/escape_comments.q.out
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java b/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java
+index b62a883..a5dc611 100644
+--- a/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java
++++ b/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java
+@@ -21,6 +21,7 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.PrintStream;
++import java.util.ArrayList;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.regex.Pattern;
+@@ -29,6 +30,8 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.util.Shell;
++import org.apache.hive.common.util.StreamPrinter;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hive.beeline.BeeLine;
+@@ -49,6 +52,8 @@
+   private File expectedDirectory;
+   private final File scratchDirectory;
+   private final File warehouseDirectory;
++  private final File initScript;
++  private final File cleanupScript;
+ 
+   private File testDataDirectory;
+   private File testScriptDirectory;
+@@ -73,11 +78,13 @@
+ 
+ 
+   public QFileClient(HiveConf hiveConf, String hiveRootDirectory, String qFileDirectory, String outputDirectory,
+-      String expectedDirectory) {
++      String expectedDirectory, String initScript, String cleanupScript) {
+     this.hiveRootDirectory = new File(hiveRootDirectory);
+     this.qFileDirectory = new File(qFileDirectory);
+     this.outputDirectory = new File(outputDirectory);
+     this.expectedDirectory = new File(expectedDirectory);
++    this.initScript = new File(initScript);
++    this.cleanupScript = new File(cleanupScript);
+     this.scratchDirectory = new File(hiveConf.getVar(ConfVars.SCRATCHDIR));
+     this.warehouseDirectory = new File(hiveConf.getVar(ConfVars.METASTOREWAREHOUSE));
+   }
+@@ -110,6 +117,9 @@ void initFilterSet() {
+     String timePattern = "(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+         + "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+         + "\\d{2} \\d{2}:\\d{2}:\\d{2} \\w+ 20\\d{2}";
++    // Pattern to remove the timestamp and other infrastructural info from the out file
++    String logPattern = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2},\\d*\\s+\\S+\\s+\\[" +
++                            ".*\\]\\s+\\S+:\\s+";
+     String unixTimePattern = "\\D" + currentTimePrefix + "\\d{6}\\D";
+     String unixTimeMillisPattern = "\\D" + currentTimePrefix + "\\d{9}\\D";
+ 
+@@ -119,12 +129,15 @@ void initFilterSet() {
+       + "|SCR|SEL|STATS|TS|UDTF|UNION)_\\d+\"";
+ 
+     filterSet = new RegexFilterSet()
++    .addFilter(logPattern,"")
++    .addFilter("Getting log thread is interrupted, since query is done!\n","")
+     .addFilter(scratchDirectory.toString() + "[\\w\\-/]+", "!!{hive.exec.scratchdir}!!")
+     .addFilter(warehouseDirectory.toString(), "!!{hive.metastore.warehouse.dir}!!")
+     .addFilter(expectedDirectory.toString(), "!!{expectedDirectory}!!")
+     .addFilter(outputDirectory.toString(), "!!{outputDirectory}!!")
+     .addFilter(qFileDirectory.toString(), "!!{qFileDirectory}!!")
+     .addFilter(hiveRootDirectory.toString(), "!!{hive.root}!!")
++    .addFilter("\\(queryId=[^\\)]*\\)","queryId=(!!{queryId}!!)")
+     .addFilter("file:/\\w\\S+", "file:/!!ELIDED!!")
+     .addFilter("pfile:/\\w\\S+", "pfile:/!!ELIDED!!")
+     .addFilter("hdfs:/\\w\\S+", "hdfs:/!!ELIDED!!")
+@@ -134,6 +147,7 @@ void initFilterSet() {
+     .addFilter("(\\D)" + currentTimePrefix + "\\d{9}(\\D)", "$1!!UNIXTIMEMILLIS!!$2")
+     .addFilter(userName, "!!{user.name}!!")
+     .addFilter(operatorPattern, "\"$1_!!ELIDED!!\"")
++    .addFilter("Time taken: [0-9\\.]* seconds", "Time taken: !!ELIDED!! seconds")
+     ;
+   };
+ 
+@@ -219,7 +233,7 @@ private void setUp() {
+         "USE `" + testname + "`;",
+         "set test.data.dir=" + testDataDirectory + ";",
+         "set test.script.dir=" + testScriptDirectory + ";",
+-        "!run " + testScriptDirectory + "/q_test_init.sql",
++        "!run " + testScriptDirectory + "/" + initScript,
+     });
+   }
+ 
+@@ -228,6 +242,7 @@ private void tearDown() {
+         "!set outputformat table",
+         "USE default;",
+         "DROP DATABASE IF EXISTS `" + testname + "` CASCADE;",
++        "!run " + testScriptDirectory + "/" + cleanupScript,
+     });
+   }
+ 
+@@ -295,12 +310,61 @@ public boolean hasExpectedResults() {
+     return expectedFile.exists();
+   }
+ 
+-  public boolean compareResults() throws IOException {
++  public boolean compareResults() throws IOException, InterruptedException {
+     if (!expectedFile.exists()) {
+       LOG.error("Expected results file does not exist: " + expectedFile);
+       return false;
+     }
+-    return FileUtils.contentEquals(expectedFile, outputFile);
++    return executeDiff();
++  }
++
++  private boolean executeDiff() throws IOException, InterruptedException {
++    ArrayList<String> diffCommandArgs = new ArrayList<String>();
++    diffCommandArgs.add("diff");
++
++    // Text file comparison
++    diffCommandArgs.add("-a");
++
++    if (Shell.WINDOWS) {
++      // Ignore changes in the amount of white space
++      diffCommandArgs.add("-b");
++
++      // Files created on Windows machines have different line endings
++      // than files created on Unix/Linux. Windows uses carriage return and line feed
++      // ("\r\n") as a line ending, whereas Unix uses just line feed ("\n").
++      // Also StringBuilder.toString(), Stream to String conversions adds extra
++      // spaces at the end of the line.
++      diffCommandArgs.add("--strip-trailing-cr"); // Strip trailing carriage return on input
++      diffCommandArgs.add("-B"); // Ignore changes whose lines are all blank
++    }
++
++    // Add files to compare to the arguments list
++    diffCommandArgs.add(getQuotedString(expectedFile));
++    diffCommandArgs.add(getQuotedString(outputFile));
++
++    System.out.println("Running: " + org.apache.commons.lang.StringUtils.join(diffCommandArgs,
++        ' '));
++    Process executor = Runtime.getRuntime().exec(diffCommandArgs.toArray(
++        new String[diffCommandArgs.size()]));
++
++    StreamPrinter errPrinter = new StreamPrinter(executor.getErrorStream(), null, System.err);
++    StreamPrinter outPrinter = new StreamPrinter(executor.getInputStream(), null, System.out);
++
++    outPrinter.start();
++    errPrinter.start();
++
++    int result = executor.waitFor();
++
++    outPrinter.join();
++    errPrinter.join();
++
++    executor.waitFor();
++
++    return (result == 0);
++  }
++
++  private static String getQuotedString(File file) {
++    return Shell.WINDOWS ? String.format("\"%s\"", file.getAbsolutePath()) : file.getAbsolutePath();
+   }
+ 
+   public void overwriteResults() {
+diff --git a/itests/hive-minikdc/pom.xml b/itests/hive-minikdc/pom.xml
+index a72146e..f9f4f78 100644
+--- a/itests/hive-minikdc/pom.xml
++++ b/itests/hive-minikdc/pom.xml
+@@ -116,6 +116,12 @@
+       <scope>test</scope>
+       <classifier>tests</classifier>
+     </dependency>
++    <dependency>
++      <groupId>org.apache.hive</groupId>
++      <artifactId>hive-it-util</artifactId>
++      <version>${project.version}</version>
++      <scope>test</scope>
++    </dependency>
+     <!-- test inter-project -->
+     <dependency>
+       <groupId>junit</groupId>
+diff --git a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java
+deleted file mode 100644
+index 2c1cd07..0000000
+--- a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java
++++ /dev/null
+@@ -1,159 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hive.jdbc.miniHS2;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+-
+-/***
+- * Base class for Hive service
+- * AbstractHiveService.
+- *
+- */
+-public abstract class AbstractHiveService {
+-  private HiveConf hiveConf = null;
+-  private String hostname;
+-  private int binaryPort;
+-  private int httpPort;
+-  private boolean startedHiveService = false;
+-  private List<String> addedProperties = new ArrayList<String>();
+-
+-  public AbstractHiveService(HiveConf hiveConf, String hostname, int binaryPort, int httpPort) {
+-    this.hiveConf = hiveConf;
+-    this.hostname = hostname;
+-    this.binaryPort = binaryPort;
+-    this.httpPort = httpPort;
+-  }
+-
+-  /**
+-   * Get Hive conf
+-   * @return
+-   */
+-  public HiveConf getHiveConf() {
+-    return hiveConf;
+-  }
+-
+-  /**
+-   * Get config property
+-   * @param propertyKey
+-   * @return
+-   */
+-  public String getConfProperty(String propertyKey) {
+-    return hiveConf.get(propertyKey);
+-  }
+-
+-  /**
+-   * Set config property
+-   * @param propertyKey
+-   * @param propertyValue
+-   */
+-  public void setConfProperty(String propertyKey, String propertyValue) {
+-    System.setProperty(propertyKey, propertyValue);
+-    hiveConf.set(propertyKey, propertyValue);
+-    addedProperties.add(propertyKey);
+-  }
+-
+-  /**
+-   * Create system properties set by this server instance. This ensures that
+-   * the changes made by current test are not impacting subsequent tests.
+-   */
+-  public void clearProperties() {
+-    for (String propKey : addedProperties ) {
+-      System.clearProperty(propKey);
+-    }
+-  }
+-
+-  /**
+-   * Retrieve warehouse directory
+-   * @return
+-   */
+-  public Path getWareHouseDir() {
+-    return new Path(hiveConf.getVar(ConfVars.METASTOREWAREHOUSE));
+-  }
+-
+-  public void setWareHouseDir(String wareHouseURI) {
+-    verifyNotStarted();
+-    System.setProperty(ConfVars.METASTOREWAREHOUSE.varname, wareHouseURI);
+-    hiveConf.setVar(ConfVars.METASTOREWAREHOUSE, wareHouseURI);
+-  }
+-
+-  /**
+-   * Set service host
+-   * @param hostName
+-   */
+-  public void setHost(String hostName) {
+-    this.hostname = hostName;
+-  }
+-
+-  // get service host
+-  public String getHost() {
+-    return hostname;
+-  }
+-
+-  /**
+-   * Set binary service port #
+-   * @param portNum
+-   */
+-  public void setBinaryPort(int portNum) {
+-    this.binaryPort = portNum;
+-  }
+-
+-  /**
+-   * Set http service port #
+-   * @param portNum
+-   */
+-  public void setHttpPort(int portNum) {
+-    this.httpPort = portNum;
+-  }
+-
+-  // Get binary service port #
+-  public int getBinaryPort() {
+-    return binaryPort;
+-  }
+-
+-  // Get http service port #
+-  public int getHttpPort() {
+-    return httpPort;
+-  }
+-
+-  public boolean isStarted() {
+-    return startedHiveService;
+-  }
+-
+-  protected void setStarted(boolean hiveServiceStatus) {
+-    this.startedHiveService =  hiveServiceStatus;
+-  }
+-
+-  protected void verifyStarted() {
+-    if (!isStarted()) {
+-      throw new IllegalStateException("HiveServer2 is not running");
+-    }
+-  }
+-
+-  protected void verifyNotStarted() {
+-    if (isStarted()) {
+-      throw new IllegalStateException("HiveServer2 already running");
+-    }
+-  }
+-
+-}
+diff --git a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+deleted file mode 100644
+index 4a84710..0000000
+--- a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
++++ /dev/null
+@@ -1,435 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hive.jdbc.miniHS2;
+-
+-import java.io.File;
+-import java.io.FileNotFoundException;
+-import java.io.IOException;
+-import java.util.HashMap;
+-import java.util.Map;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.TimeoutException;
+-
+-import com.google.common.base.Preconditions;
+-import org.apache.commons.io.FileUtils;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.fs.permission.FsPermission;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+-import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+-import org.apache.hadoop.hive.ql.exec.Utilities;
+-import org.apache.hadoop.hive.shims.HadoopShims.MiniDFSShim;
+-import org.apache.hadoop.hive.shims.HadoopShims.MiniMrShim;
+-import org.apache.hadoop.hive.shims.ShimLoader;
+-import org.apache.hive.service.Service;
+-import org.apache.hive.service.cli.CLIServiceClient;
+-import org.apache.hive.service.cli.SessionHandle;
+-import org.apache.hive.service.cli.thrift.ThriftBinaryCLIService;
+-import org.apache.hive.service.cli.thrift.ThriftCLIServiceClient;
+-import org.apache.hive.service.cli.thrift.ThriftHttpCLIService;
+-import org.apache.hive.service.server.HiveServer2;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-public class MiniHS2 extends AbstractHiveService {
+-
+-  private static final Logger LOG = LoggerFactory.getLogger(MiniHS2.class);
+-
+-  public static final String HS2_BINARY_MODE = "binary";
+-  public static final String HS2_HTTP_MODE = "http";
+-  private static final String driverName = "org.apache.hive.jdbc.HiveDriver";
+-  private static final FsPermission FULL_PERM = new FsPermission((short)00777);
+-  private static final FsPermission WRITE_ALL_PERM = new FsPermission((short)00733);
+-  private static final String tmpDir = System.getProperty("test.tmp.dir");
+-  private HiveServer2 hiveServer2 = null;
+-  private final File baseDir;
+-  private final Path baseFsDir;
+-  private MiniMrShim mr;
+-  private MiniDFSShim dfs;
+-  private FileSystem localFS;
+-  private boolean useMiniMR = false;
+-  private boolean useMiniKdc = false;
+-  private final String serverPrincipal;
+-  private final String serverKeytab;
+-  private final boolean isMetastoreRemote;
+-  private final boolean cleanupLocalDirOnStartup;
+-
+-  public static class Builder {
+-    private HiveConf hiveConf = new HiveConf();
+-    private boolean useMiniMR = false;
+-    private boolean cleanupLocalDirOnStartup = true;
+-    private boolean useMiniKdc = false;
+-    private String serverPrincipal;
+-    private String serverKeytab;
+-    private boolean isHTTPTransMode = false;
+-    private boolean isMetastoreRemote;
+-    private String authType = "KERBEROS";
+-
+-    public Builder() {
+-    }
+-
+-    public Builder withMiniMR() {
+-      this.useMiniMR = true;
+-      return this;
+-    }
+-
+-    public Builder withMiniKdc(String serverPrincipal, String serverKeytab) {
+-      this.useMiniKdc = true;
+-      this.serverPrincipal = serverPrincipal;
+-      this.serverKeytab = serverKeytab;
+-      return this;
+-    }
+-
+-    public Builder withAuthenticationType(String authType) {
+-      this.authType = authType;
+-      return this;
+-    }
+-
+-    public Builder withRemoteMetastore() {
+-      this.isMetastoreRemote = true;
+-      return this;
+-    }
+-
+-    public Builder withConf(HiveConf hiveConf) {
+-      this.hiveConf = hiveConf;
+-      return this;
+-    }
+-
+-    /**
+-     * Start HS2 with HTTP transport mode, default is binary mode
+-     * @return this Builder
+-     */
+-    public Builder withHTTPTransport(){
+-      this.isHTTPTransMode = true;
+-      return this;
+-    }
+-
+-    public Builder cleanupLocalDirOnStartup(boolean val) {
+-      this.cleanupLocalDirOnStartup = val;
+-      return this;
+-    }
+-
+-    public MiniHS2 build() throws Exception {
+-      if (useMiniMR && useMiniKdc) {
+-        throw new IOException("Can't create secure miniMr ... yet");
+-      }
+-      if (isHTTPTransMode) {
+-        hiveConf.setVar(ConfVars.HIVE_SERVER2_TRANSPORT_MODE, HS2_HTTP_MODE);
+-      } else {
+-        hiveConf.setVar(ConfVars.HIVE_SERVER2_TRANSPORT_MODE, HS2_BINARY_MODE);
+-      }
+-      return new MiniHS2(hiveConf, useMiniMR, useMiniKdc, serverPrincipal, serverKeytab,
+-          isMetastoreRemote, authType, cleanupLocalDirOnStartup);
+-    }
+-  }
+-
+-  public MiniMrShim getMr() {
+-    return mr;
+-  }
+-
+-  public void setMr(MiniMrShim mr) {
+-    this.mr = mr;
+-  }
+-
+-  public MiniDFSShim getDfs() {
+-    return dfs;
+-  }
+-
+-  public void setDfs(MiniDFSShim dfs) {
+-    this.dfs = dfs;
+-  }
+-
+-  public FileSystem getLocalFS() {
+-    return localFS;
+-  }
+-
+-  public boolean isUseMiniMR() {
+-    return useMiniMR;
+-  }
+-
+-  public void setUseMiniMR(boolean useMiniMR) {
+-    this.useMiniMR = useMiniMR;
+-  }
+-
+-  public boolean isUseMiniKdc() {
+-    return useMiniKdc;
+-  }
+-
+-  private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+-      String serverPrincipal, String serverKeytab, boolean isMetastoreRemote, String authType, boolean cleanupLocalDirOnStartup) throws Exception {
+-    super(hiveConf, "localhost", MetaStoreUtils.findFreePort(), MetaStoreUtils.findFreePort());
+-    this.useMiniMR = useMiniMR;
+-    hiveConf.setLongVar(ConfVars.HIVE_SERVER2_MAX_START_ATTEMPTS, 3l);
+-    hiveConf.setTimeVar(ConfVars.HIVE_SERVER2_SLEEP_INTERVAL_BETWEEN_START_ATTEMPTS, 10,
+-        TimeUnit.SECONDS);
+-    this.useMiniKdc = useMiniKdc;
+-    this.serverPrincipal = serverPrincipal;
+-    this.serverKeytab = serverKeytab;
+-    this.isMetastoreRemote = isMetastoreRemote;
+-    this.cleanupLocalDirOnStartup = cleanupLocalDirOnStartup;
+-    baseDir = getBaseDir();
+-    localFS = FileSystem.getLocal(hiveConf);
+-    FileSystem fs;
+-
+-    if (useMiniMR) {
+-      dfs = ShimLoader.getHadoopShims().getMiniDfs(hiveConf, 4, true, null);
+-      fs = dfs.getFileSystem();
+-      mr = ShimLoader.getHadoopShims().getMiniMrCluster(hiveConf, 4,
+-          fs.getUri().toString(), 1);
+-      // store the config in system properties
+-      mr.setupConfiguration(getHiveConf());
+-      baseFsDir =  new Path(new Path(fs.getUri()), "/base");
+-    } else {
+-      fs = FileSystem.getLocal(hiveConf);
+-      baseFsDir = new Path("file://"+ baseDir.toURI().getPath());
+-      if (cleanupLocalDirOnStartup) {
+-        // Cleanup baseFsDir since it can be shared across tests.
+-        LOG.info("Attempting to cleanup baseFsDir: {} while setting up MiniHS2", baseDir);
+-        Preconditions.checkState(baseFsDir.depth() >= 3); // Avoid "/tmp", directories closer to "/"
+-        fs.delete(baseFsDir, true);
+-      }
+-    }
+-    if (useMiniKdc) {
+-      hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL, serverPrincipal);
+-      hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB, serverKeytab);
+-      hiveConf.setVar(ConfVars.HIVE_SERVER2_AUTHENTICATION, authType);
+-    }
+-    String metaStoreURL =
+-        "jdbc:derby:;databaseName=" + baseDir.getAbsolutePath() + File.separator
+-            + "test_metastore;create=true";
+-    fs.mkdirs(baseFsDir);
+-    Path wareHouseDir = new Path(baseFsDir, "warehouse");
+-    // Create warehouse with 777, so that user impersonation has no issues.
+-    FileSystem.mkdirs(fs, wareHouseDir, FULL_PERM);
+-
+-    fs.mkdirs(wareHouseDir);
+-    setWareHouseDir(wareHouseDir.toString());
+-    System.setProperty(HiveConf.ConfVars.METASTORECONNECTURLKEY.varname, metaStoreURL);
+-    hiveConf.setVar(HiveConf.ConfVars.METASTORECONNECTURLKEY, metaStoreURL);
+-    // reassign a new port, just in case if one of the MR services grabbed the last one
+-    setBinaryPort(MetaStoreUtils.findFreePort());
+-    hiveConf.setVar(ConfVars.HIVE_SERVER2_THRIFT_BIND_HOST, getHost());
+-    hiveConf.setIntVar(ConfVars.HIVE_SERVER2_THRIFT_PORT, getBinaryPort());
+-    hiveConf.setIntVar(ConfVars.HIVE_SERVER2_THRIFT_HTTP_PORT, getHttpPort());
+-
+-    Path scratchDir = new Path(baseFsDir, "scratch");
+-    // Create root scratchdir with write all, so that user impersonation has no issues.
+-    Utilities.createDirsWithPermission(hiveConf, scratchDir, WRITE_ALL_PERM, true);
+-    System.setProperty(HiveConf.ConfVars.SCRATCHDIR.varname, scratchDir.toString());
+-    hiveConf.setVar(ConfVars.SCRATCHDIR, scratchDir.toString());
+-
+-    String localScratchDir = baseDir.getPath() + File.separator + "scratch";
+-    System.setProperty(HiveConf.ConfVars.LOCALSCRATCHDIR.varname, localScratchDir);
+-    hiveConf.setVar(ConfVars.LOCALSCRATCHDIR, localScratchDir);
+-  }
+-
+-  public MiniHS2(HiveConf hiveConf) throws Exception {
+-    this(hiveConf, false);
+-  }
+-
+-  public MiniHS2(HiveConf hiveConf, boolean useMiniMR) throws Exception {
+-    this(hiveConf, useMiniMR, false, null, null, false, "KERBEROS", true);
+-  }
+-
+-  public void start(Map<String, String> confOverlay) throws Exception {
+-    if (isMetastoreRemote) {
+-      int metaStorePort = MetaStoreUtils.findFreePort();
+-      getHiveConf().setVar(ConfVars.METASTOREURIS, "thrift://localhost:" + metaStorePort);
+-      MetaStoreUtils.startMetaStore(metaStorePort,
+-      ShimLoader.getHadoopThriftAuthBridge(), getHiveConf());
+-    }
+-
+-    hiveServer2 = new HiveServer2();
+-    // Set confOverlay parameters
+-    for (Map.Entry<String, String> entry : confOverlay.entrySet()) {
+-      setConfProperty(entry.getKey(), entry.getValue());
+-    }
+-    hiveServer2.init(getHiveConf());
+-    hiveServer2.start();
+-    waitForStartup();
+-    setStarted(true);
+-  }
+-
+-  public void stop() {
+-    verifyStarted();
+-    // Currently there is no way to stop the MetaStore service. It will be stopped when the
+-    // test JVM exits. This is how other tests are also using MetaStore server.
+-
+-    hiveServer2.stop();
+-    setStarted(false);
+-    try {
+-      if (mr != null) {
+-        mr.shutdown();
+-        mr = null;
+-      }
+-      if (dfs != null) {
+-        dfs.shutdown();
+-        dfs = null;
+-      }
+-    } catch (IOException e) {
+-      // Ignore errors cleaning up miniMR
+-    }
+-  }
+-
+-  public void cleanup() {
+-    FileUtils.deleteQuietly(baseDir);
+-  }
+-
+-  public CLIServiceClient getServiceClient() {
+-    verifyStarted();
+-    return getServiceClientInternal();
+-  }
+-
+-  public CLIServiceClient getServiceClientInternal() {
+-    for (Service service : hiveServer2.getServices()) {
+-      if (service instanceof ThriftBinaryCLIService) {
+-        return new ThriftCLIServiceClient((ThriftBinaryCLIService) service);
+-      }
+-      if (service instanceof ThriftHttpCLIService) {
+-        return new ThriftCLIServiceClient((ThriftHttpCLIService) service);
+-      }
+-    }
+-    throw new IllegalStateException("HiveServer2 not running Thrift service");
+-  }
+-
+-  /**
+-   * return connection URL for this server instance
+-   * @return
+-   */
+-  public String getJdbcURL() {
+-    return getJdbcURL("default");
+-  }
+-
+-  /**
+-   * return connection URL for this server instance
+-   * @param dbName - DB name to be included in the URL
+-   * @return
+-   */
+-  public String getJdbcURL(String dbName) {
+-    return getJdbcURL(dbName, "");
+-  }
+-
+-  /**
+-   * return connection URL for this server instance
+-   * @param dbName - DB name to be included in the URL
+-   * @param sessionConfExt - Addional string to be appended to sessionConf part of url
+-   * @return
+-   */
+-  public String getJdbcURL(String dbName, String sessionConfExt) {
+-    return getJdbcURL(dbName, sessionConfExt, "");
+-  }
+-
+-  /**
+-   * return connection URL for this server instance
+-   * @param dbName - DB name to be included in the URL
+-   * @param sessionConfExt - Addional string to be appended to sessionConf part of url
+-   * @param hiveConfExt - Additional string to be appended to HiveConf part of url (excluding the ?)
+-   * @return
+-   */
+-  public String getJdbcURL(String dbName, String sessionConfExt, String hiveConfExt) {
+-    sessionConfExt = (sessionConfExt == null ? "" : sessionConfExt);
+-    hiveConfExt = (hiveConfExt == null ? "" : hiveConfExt);
+-    String krbConfig = "";
+-    if (isUseMiniKdc()) {
+-      krbConfig = ";principal=" + serverPrincipal;
+-    }
+-    if (isHttpTransportMode()) {
+-      hiveConfExt = "hive.server2.transport.mode=http;hive.server2.thrift.http.path=cliservice;"
+-          + hiveConfExt;
+-    }
+-    if (!hiveConfExt.trim().equals("")) {
+-      hiveConfExt = "?" + hiveConfExt;
+-    }
+-    return getBaseJdbcURL() + dbName + krbConfig + sessionConfExt + hiveConfExt;
+-  }
+-
+-  /**
+-   * Build base JDBC URL
+-   * @return
+-   */
+-  public String getBaseJdbcURL() {
+-    if(isHttpTransportMode()) {
+-      return "jdbc:hive2://" + getHost() + ":" + getHttpPort() + "/";
+-    }
+-    else {
+-      return "jdbc:hive2://" + getHost() + ":" + getBinaryPort() + "/";
+-    }
+-  }
+-
+-  private boolean isHttpTransportMode() {
+-    String transportMode = getConfProperty(ConfVars.HIVE_SERVER2_TRANSPORT_MODE.varname);
+-    return transportMode != null && (transportMode.equalsIgnoreCase(HS2_HTTP_MODE));
+-  }
+-
+-  public static String getJdbcDriverName() {
+-    return driverName;
+-  }
+-
+-  public MiniMrShim getMR() {
+-    return mr;
+-  }
+-
+-  public MiniDFSShim getDFS() {
+-    return dfs;
+-  }
+-
+-  private void waitForStartup() throws Exception {
+-    int waitTime = 0;
+-    long startupTimeout = 1000L * 1000L;
+-    CLIServiceClient hs2Client = getServiceClientInternal();
+-    SessionHandle sessionHandle = null;
+-    do {
+-      Thread.sleep(500L);
+-      waitTime += 500L;
+-      if (waitTime > startupTimeout) {
+-        throw new TimeoutException("Couldn't access new HiveServer2: " + getJdbcURL());
+-      }
+-      try {
+-        Map <String, String> sessionConf = new HashMap<String, String>();
+-        /**
+-        if (isUseMiniKdc()) {
+-          getMiniKdc().loginUser(getMiniKdc().getDefaultUserPrincipal());
+-          sessionConf.put("principal", serverPrincipal);
+-        }
+-         */
+-        sessionHandle = hs2Client.openSession("foo", "bar", sessionConf);
+-      } catch (Exception e) {
+-        // service not started yet
+-        continue;
+-      }
+-      hs2Client.closeSession(sessionHandle);
+-      break;
+-    } while (true);
+-  }
+-
+-  static File getBaseDir() {
+-    File baseDir = new File(tmpDir + "/local_base");
+-    return baseDir;
+-  }
+-
+-  public static void cleanupLocalDir() throws IOException {
+-    File baseDir = getBaseDir();
+-    try {
+-      org.apache.hadoop.hive.common.FileUtils.deleteDirectory(baseDir);
+-    } catch (FileNotFoundException e) {
+-      // Ignore. Safe if it does not exist.
+-    }
+-  }
+-}
+diff --git a/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/DisabledTestBeeLineDriver.java b/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/DisabledTestBeeLineDriver.java
+deleted file mode 100644
+index cb276e6..0000000
+--- a/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/DisabledTestBeeLineDriver.java
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hive.cli;
+-
+-import java.io.File;
+-import java.util.List;
+-
+-import org.apache.hadoop.hive.cli.control.CliAdapter;
+-import org.apache.hadoop.hive.cli.control.CliConfigs;
+-import org.junit.ClassRule;
+-import org.junit.Rule;
+-import org.junit.Test;
+-import org.junit.rules.TestRule;
+-import org.junit.runner.RunWith;
+-import org.junit.runners.Parameterized;
+-import org.junit.runners.Parameterized.Parameters;
+-
+-@RunWith(Parameterized.class)
+-public class DisabledTestBeeLineDriver {
+-
+-  static CliAdapter adapter = new CliConfigs.BeeLineConfig().getCliAdapter();
+-
+-  @Parameters(name = "{0}")
+-  public static List<Object[]> getParameters() throws Exception {
+-    return adapter.getParameters();
+-  }
+-
+-  @ClassRule
+-  public static TestRule cliClassRule = adapter.buildClassRule();
+-
+-  @Rule
+-  public TestRule cliTestRule = adapter.buildTestRule();
+-
+-  private String name;
+-  private File qfile;
+-
+-  public DisabledTestBeeLineDriver(String name, File qfile) {
+-    this.name = name;
+-    this.qfile = qfile;
+-  }
+-
+-  @Test
+-  public void testCliDriver() throws Exception {
+-    adapter.runTest(name, qfile);
+-  }
+-
+-}
+diff --git a/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestBeeLineDriver.java b/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestBeeLineDriver.java
+new file mode 100644
+index 0000000..24eeb9d
+--- /dev/null
++++ b/itests/qtest/src/test/java/org/apache/hadoop/hive/cli/TestBeeLineDriver.java
+@@ -0,0 +1,62 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.cli;
++
++import java.io.File;
++import java.util.List;
++
++import org.apache.hadoop.hive.cli.control.CliAdapter;
++import org.apache.hadoop.hive.cli.control.CliConfigs;
++import org.junit.ClassRule;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TestRule;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameters;
++
++@RunWith(Parameterized.class)
++public class TestBeeLineDriver {
++
++  static CliAdapter adapter = new CliConfigs.BeeLineConfig().getCliAdapter();
++
++  @Parameters(name = "{0}")
++  public static List<Object[]> getParameters() throws Exception {
++    return adapter.getParameters();
++  }
++
++  @ClassRule
++  public static TestRule cliClassRule = adapter.buildClassRule();
++
++  @Rule
++  public TestRule cliTestRule = adapter.buildTestRule();
++
++  private String name;
++  private File qfile;
++
++  public TestBeeLineDriver(String name, File qfile) {
++    this.name = name;
++    this.qfile = qfile;
++  }
++
++  @Test
++  public void testCliDriver() throws Exception {
++    adapter.runTest(name, qfile);
++  }
++
++}
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index 808512e..61d61fe 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -331,157 +331,7 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_with_trash.q \
+   encryption_ctas.q
+ 
+-beeline.positive.exclude=add_part_exist.q,\
+-  alter1.q,\
+-  alter2.q,\
+-  alter4.q,\
+-  alter5.q,\
+-  alter_rename_partition.q,\
+-  alter_rename_partition_authorization.q,\
+-  archive.q,\
+-  archive_corrupt.q,\
+-  archive_mr_1806.q,\
+-  archive_multi.q,\
+-  archive_multi_mr_1806.q,\
+-  authorization_1.q,\
+-  authorization_2.q,\
+-  authorization_4.q,\
+-  authorization_5.q,\
+-  authorization_6.q,\
+-  authorization_7.q,\
+-  ba_table1.q,\
+-  ba_table2.q,\
+-  ba_table3.q,\
+-  ba_table_udfs.q,\
+-  binary_table_bincolserde.q,\
+-  binary_table_colserde.q,\
+-  cluster.q,\
+-  columnarserde_create_shortcut.q,\
+-  combine2.q,\
+-  constant_prop.q,\
+-  create_nested_type.q,\
+-  create_or_replace_view.q,\
+-  create_struct_table.q,\
+-  create_union_table.q,\
+-  database.q,\
+-  database_location.q,\
+-  database_properties.q,\
+-  ddltime.q,\
+-  describe_database_json.q,\
+-  drop_database_removes_partition_dirs.q,\
+-  escape1.q,\
+-  escape2.q,\
+-  exim_00_nonpart_empty.q,\
+-  exim_01_nonpart.q,\
+-  exim_02_00_part_empty.q,\
+-  exim_02_part.q,\
+-  exim_03_nonpart_over_compat.q,\
+-  exim_04_all_part.q,\
+-  exim_04_evolved_parts.q,\
+-  exim_05_some_part.q,\
+-  exim_06_one_part.q,\
+-  exim_07_all_part_over_nonoverlap.q,\
+-  exim_08_nonpart_rename.q,\
+-  exim_09_part_spec_nonoverlap.q,\
+-  exim_10_external_managed.q,\
+-  exim_11_managed_external.q,\
+-  exim_12_external_location.q,\
+-  exim_13_managed_location.q,\
+-  exim_14_managed_location_over_existing.q,\
+-  exim_15_external_part.q,\
+-  exim_16_part_external.q,\
+-  exim_17_part_managed.q,\
+-  exim_18_part_external.q,\
+-  exim_19_00_part_external_location.q,\
+-  exim_19_part_external_location.q,\
+-  exim_20_part_managed_location.q,\
+-  exim_21_export_authsuccess.q,\
+-  exim_22_import_exist_authsuccess.q,\
+-  exim_23_import_part_authsuccess.q,\
+-  exim_24_import_nonexist_authsuccess.q,\
+-  global_limit.q,\
+-  groupby_complex_types.q,\
+-  groupby_complex_types_multi_single_reducer.q,\
+-  index_auth.q,\
+-  index_auto.q,\
+-  index_auto_empty.q,\
+-  index_bitmap.q,\
+-  index_bitmap1.q,\
+-  index_bitmap2.q,\
+-  index_bitmap3.q,\
+-  index_bitmap_auto.q,\
+-  index_bitmap_rc.q,\
+-  index_compact.q,\
+-  index_compact_1.q,\
+-  index_compact_2.q,\
+-  index_compact_3.q,\
+-  index_stale_partitioned.q,\
+-  init_file.q,\
+-  input16.q,\
+-  input16_cc.q,\
+-  input46.q,\
+-  input_columnarserde.q,\
+-  input_dynamicserde.q,\
+-  input_lazyserde.q,\
+-  input_testxpath3.q,\
+-  input_testxpath4.q,\
+-  insert2_overwrite_partitions.q,\
+-  insertexternal1.q,\
+-  join_thrift.q,\
+-  lateral_view.q,\
+-  load_binary_data.q,\
+-  load_exist_part_authsuccess.q,\
+-  load_nonpart_authsuccess.q,\
+-  load_part_authsuccess.q,\
+-  loadpart_err.q,\
+-  lock1.q,\
+-  lock2.q,\
+-  lock3.q,\
+-  lock4.q,\
+-  merge_dynamic_partition.q,\
+-  multi_insert.q,\
+-  multi_insert_move_tasks_share_dependencies.q,\
+-  null_column.q,\
+-  ppd_clusterby.q,\
+-  query_with_semi.q,\
+-  rename_column.q,\
+-  sample6.q,\
+-  sample_islocalmode_hook.q,\
+-  set_processor_namespaces.q,\
+-  show_tables.q,\
+-  source.q,\
+-  split_sample.q,\
+-  str_to_map.q,\
+-  transform1.q,\
+-  udaf_collect_set.q,\
+-  udaf_context_ngrams.q,\
+-  udaf_histogram_numeric.q,\
+-  udaf_ngrams.q,\
+-  udaf_percentile_approx.q,\
+-  udf_array.q,\
+-  udf_bitmap_and.q,\
+-  udf_bitmap_or.q,\
+-  udf_explode.q,\
+-  udf_format_number.q,\
+-  udf_map.q,\
+-  udf_map_keys.q,\
+-  udf_map_values.q,\
+-  udf_max.q,\
+-  udf_min.q,\
+-  udf_named_struct.q,\
+-  udf_percentile.q,\
+-  udf_printf.q,\
+-  udf_sentences.q,\
+-  udf_sort_array.q,\
+-  udf_split.q,\
+-  udf_struct.q,\
+-  udf_substr.q,\
+-  udf_translate.q,\
+-  udf_union.q,\
+-  udf_xpath.q,\
+-  udtf_stack.q,\
+-  view.q,\
+-  virtual_column.q
++beeline.positive.include=escape_comments.q
+ 
+ minimr.query.negative.files=cluster_tasklog_retrieval.q,\
+   file_with_header_footer_negative.q,\
+diff --git a/itests/util/pom.xml b/itests/util/pom.xml
+index a21c095..1735da0 100644
+--- a/itests/util/pom.xml
++++ b/itests/util/pom.xml
+@@ -57,6 +57,11 @@
+     </dependency>
+     <dependency>
+       <groupId>org.apache.hive</groupId>
++      <artifactId>hive-beeline</artifactId>
++      <version>${project.version}</version>
++    </dependency>
++    <dependency>
++      <groupId>org.apache.hive</groupId>
+       <artifactId>hive-hbase-handler</artifactId>
+       <version>${project.version}</version>
+     </dependency>
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java
+index 59fb293..1c58462 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CliConfigs.java
+@@ -352,19 +352,17 @@ public ContribNegativeCliConfig() {
+ 
+   public static class BeeLineConfig extends AbstractCliConfig {
+     public BeeLineConfig() {
+-      // FIXME: beeline is disabled...
+-      super(null);
+-      // super(CoreBeeLineDriver.class);
++      super(CoreBeeLineDriver.class);
+       try {
+         setQueryDir("ql/src/test/queries/clientpositive");
+ 
+-        excludesFrom(testConfigProps, "beeline.positive.exclude");
++        includesFrom(testConfigProps, "beeline.positive.include");
+ 
+-        setResultsDir("ql/src/test/results/clientpositive");
++        setResultsDir("ql/src/test/results/clientpositive/beeline");
+         setLogDir("itests/qtest/target/qfile-results/beelinepositive");
+ 
+-        setInitScript("q_test_init.sql");
+-        setCleanupScript("q_test_cleanup.sql");
++        setInitScript("q_test_init_src.sql");
++        setCleanupScript("q_test_cleanup_src.sql");
+ 
+         setHiveConfDir("");
+         setClusterType(MiniClusterType.none);
+@@ -382,8 +380,6 @@ public AccumuloCliConfig() {
+       try {
+         setQueryDir("accumulo-handler/src/test/queries/positive");
+ 
+-        excludesFrom(testConfigProps, "beeline.positive.exclude");
+-
+         setResultsDir("accumulo-handler/src/test/results/positive");
+         setLogDir("itests/qtest/target/qfile-results/accumulo-handler/positive");
+ 
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
+index e5144e3..aba1fde 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
+@@ -16,104 +16,87 @@
+  * limitations under the License.
+  */
+ package org.apache.hadoop.hive.cli.control;
+-//beeline is excluded by default
+-//AFAIK contains broken tests
+-//and produces compile errors...i'll comment out this whole class for now...
+-/*
+ 
+ import static org.junit.Assert.fail;
+-import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.*;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.ql.QTestUtil;
+ import org.apache.hive.beeline.util.QFileClient;
+-import org.apache.hive.service.server.HiveServer2;
++import org.apache.hive.jdbc.miniHS2.MiniHS2;
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+-// HIVE-14444: i've dropped this: @RunWith(ConcurrentTestRunner.class)
++
++import java.util.HashMap;
++
+ public class CoreBeeLineDriver extends CliAdapter {
+   private final String hiveRootDirectory = AbstractCliConfig.HIVE_ROOT;
+   private final String queryDirectory;
+   private final String logDirectory;
+   private final String resultsDirectory;
++  private final String initScript;
++  private final String cleanupScript;
+   private boolean overwrite = false;
+-  private static String scratchDirectory;
+-  private static QTestUtil.QTestSetup miniZKCluster = null;
+-
+-  private static HiveServer2 hiveServer2;
++  private MiniHS2 miniHS2;
++//  private static QTestUtil.QTestSetup miniZKCluster = null;
+ 
+   public CoreBeeLineDriver(AbstractCliConfig testCliConfig) {
+     super(testCliConfig);
+     queryDirectory = testCliConfig.getQueryDirectory();
+     logDirectory = testCliConfig.getLogDir();
+     resultsDirectory = testCliConfig.getResultsDir();
++    initScript = testCliConfig.getInitScript();
++    cleanupScript = testCliConfig.getCleanupScript();
+   }
+ 
+   @Override
+   @BeforeClass
+   public void beforeClass() throws Exception {
+-    HiveConf hiveConf = new HiveConf();
+-    hiveConf.logVars(System.err);
+-    System.err.flush();
+-
+-    scratchDirectory = hiveConf.getVar(SCRATCHDIR);
+-
+     String testOutputOverwrite = System.getProperty("test.output.overwrite");
+     if (testOutputOverwrite != null && "true".equalsIgnoreCase(testOutputOverwrite)) {
+       overwrite = true;
+     }
+ 
+-    miniZKCluster = new QTestUtil.QTestSetup();
+-    miniZKCluster.preTest(hiveConf);
+-
+-    System.setProperty("hive.zookeeper.quorum",
+-        hiveConf.get("hive.zookeeper.quorum"));
+-    System.setProperty("hive.zookeeper.client.port",
+-        hiveConf.get("hive.zookeeper.client.port"));
+-
+     String disableserver = System.getProperty("test.service.disable.server");
+     if (null != disableserver && disableserver.equalsIgnoreCase("true")) {
+-      System.err.println("test.service.disable.server=true "
+-        + "Skipping HiveServer2 initialization!");
++      System.err.println("test.service.disable.server=true Skipping HiveServer2 initialization!");
+       return;
+     }
+ 
+-    hiveServer2 = new HiveServer2();
+-    hiveServer2.init(hiveConf);
+-    System.err.println("Starting HiveServer2...");
+-    hiveServer2.start();
+-    Thread.sleep(5000);
++    HiveConf hiveConf = new HiveConf();
++    // We do not need Zookeeper at the moment
++    hiveConf.set(HiveConf.ConfVars.HIVE_LOCK_MANAGER.varname,
++        "org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager");
++
++    // But if we need later we can enable it with this, or create one ourself
++//    miniZKCluster = new QTestUtil.QTestSetup();
++//    miniZKCluster.preTest(hiveConf);
++
++    hiveConf.logVars(System.err);
++    System.err.flush();
++
++    miniHS2 = new MiniHS2.Builder().withConf(hiveConf).cleanupLocalDirOnStartup(true).build();
++
++    miniHS2.start(new HashMap<String, String>());
+   }
+ 
+ 
+   @Override
+   @AfterClass
+-  public void shutdown() {
+-    try {
+-      if (hiveServer2 != null) {
+-        System.err.println("Stopping HiveServer2...");
+-        hiveServer2.stop();
+-      }
+-    } catch (Throwable t) {
+-      t.printStackTrace();
+-    }
+-
+-    if (miniZKCluster != null) {
+-      try {
+-        miniZKCluster.tearDown();
+-      } catch (Exception e) {
+-        e.printStackTrace();
+-      }
++  public void shutdown() throws Exception {
++    if (miniHS2 != null) {
++      miniHS2.stop();
+     }
++//    if (miniZKCluster != null) {
++//      miniZKCluster.tearDown();
++//    }
+   }
+ 
+   public void runTest(String qFileName) throws Exception {
+-    QFileClient qClient = new QFileClient(new HiveConf(), hiveRootDirectory,
+-        queryDirectory, logDirectory, resultsDirectory)
++    QFileClient qClient = new QFileClient(miniHS2.getHiveConf(), hiveRootDirectory,
++        queryDirectory, logDirectory, resultsDirectory, initScript, cleanupScript)
+     .setQFileName(qFileName)
+     .setUsername("user")
+     .setPassword("password")
+-    .setJdbcUrl("jdbc:hive2://localhost:10000")
++    .setJdbcUrl(miniHS2.getJdbcURL())
+     .setJdbcDriver("org.apache.hive.jdbc.HiveDriver")
+     .setTestDataDirectory(hiveRootDirectory + "/data/files")
+     .setTestScriptDirectory(hiveRootDirectory + "/data/scripts");
+@@ -150,22 +133,14 @@ public void runTest(String qFileName) throws Exception {
+ 
+   @Override
+   public void setUp() {
+-    // TODO Auto-generated method stub
+-
+   }
+ 
+   @Override
+   public void tearDown() {
+-    // TODO Auto-generated method stub
+-
+   }
+ 
+   @Override
+   public void runTest(String name, String name2, String absolutePath) throws Exception {
+     runTest(name2);
+   }
+-
+ }
+-
+-
+-*/
+\ No newline at end of file
+diff --git a/itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java b/itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java
+new file mode 100644
+index 0000000..2c1cd07
+--- /dev/null
++++ b/itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/AbstractHiveService.java
+@@ -0,0 +1,159 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.jdbc.miniHS2;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
++
++/***
++ * Base class for Hive service
++ * AbstractHiveService.
++ *
++ */
++public abstract class AbstractHiveService {
++  private HiveConf hiveConf = null;
++  private String hostname;
++  private int binaryPort;
++  private int httpPort;
++  private boolean startedHiveService = false;
++  private List<String> addedProperties = new ArrayList<String>();
++
++  public AbstractHiveService(HiveConf hiveConf, String hostname, int binaryPort, int httpPort) {
++    this.hiveConf = hiveConf;
++    this.hostname = hostname;
++    this.binaryPort = binaryPort;
++    this.httpPort = httpPort;
++  }
++
++  /**
++   * Get Hive conf
++   * @return
++   */
++  public HiveConf getHiveConf() {
++    return hiveConf;
++  }
++
++  /**
++   * Get config property
++   * @param propertyKey
++   * @return
++   */
++  public String getConfProperty(String propertyKey) {
++    return hiveConf.get(propertyKey);
++  }
++
++  /**
++   * Set config property
++   * @param propertyKey
++   * @param propertyValue
++   */
++  public void setConfProperty(String propertyKey, String propertyValue) {
++    System.setProperty(propertyKey, propertyValue);
++    hiveConf.set(propertyKey, propertyValue);
++    addedProperties.add(propertyKey);
++  }
++
++  /**
++   * Create system properties set by this server instance. This ensures that
++   * the changes made by current test are not impacting subsequent tests.
++   */
++  public void clearProperties() {
++    for (String propKey : addedProperties ) {
++      System.clearProperty(propKey);
++    }
++  }
++
++  /**
++   * Retrieve warehouse directory
++   * @return
++   */
++  public Path getWareHouseDir() {
++    return new Path(hiveConf.getVar(ConfVars.METASTOREWAREHOUSE));
++  }
++
++  public void setWareHouseDir(String wareHouseURI) {
++    verifyNotStarted();
++    System.setProperty(ConfVars.METASTOREWAREHOUSE.varname, wareHouseURI);
++    hiveConf.setVar(ConfVars.METASTOREWAREHOUSE, wareHouseURI);
++  }
++
++  /**
++   * Set service host
++   * @param hostName
++   */
++  public void setHost(String hostName) {
++    this.hostname = hostName;
++  }
++
++  // get service host
++  public String getHost() {
++    return hostname;
++  }
++
++  /**
++   * Set binary service port #
++   * @param portNum
++   */
++  public void setBinaryPort(int portNum) {
++    this.binaryPort = portNum;
++  }
++
++  /**
++   * Set http service port #
++   * @param portNum
++   */
++  public void setHttpPort(int portNum) {
++    this.httpPort = portNum;
++  }
++
++  // Get binary service port #
++  public int getBinaryPort() {
++    return binaryPort;
++  }
++
++  // Get http service port #
++  public int getHttpPort() {
++    return httpPort;
++  }
++
++  public boolean isStarted() {
++    return startedHiveService;
++  }
++
++  protected void setStarted(boolean hiveServiceStatus) {
++    this.startedHiveService =  hiveServiceStatus;
++  }
++
++  protected void verifyStarted() {
++    if (!isStarted()) {
++      throw new IllegalStateException("HiveServer2 is not running");
++    }
++  }
++
++  protected void verifyNotStarted() {
++    if (isStarted()) {
++      throw new IllegalStateException("HiveServer2 already running");
++    }
++  }
++
++}
+diff --git a/itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java b/itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+new file mode 100644
+index 0000000..4a84710
+--- /dev/null
++++ b/itests/util/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+@@ -0,0 +1,435 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.jdbc.miniHS2;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import com.google.common.base.Preconditions;
++import org.apache.commons.io.FileUtils;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
++import org.apache.hadoop.hive.metastore.MetaStoreUtils;
++import org.apache.hadoop.hive.ql.exec.Utilities;
++import org.apache.hadoop.hive.shims.HadoopShims.MiniDFSShim;
++import org.apache.hadoop.hive.shims.HadoopShims.MiniMrShim;
++import org.apache.hadoop.hive.shims.ShimLoader;
++import org.apache.hive.service.Service;
++import org.apache.hive.service.cli.CLIServiceClient;
++import org.apache.hive.service.cli.SessionHandle;
++import org.apache.hive.service.cli.thrift.ThriftBinaryCLIService;
++import org.apache.hive.service.cli.thrift.ThriftCLIServiceClient;
++import org.apache.hive.service.cli.thrift.ThriftHttpCLIService;
++import org.apache.hive.service.server.HiveServer2;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class MiniHS2 extends AbstractHiveService {
++
++  private static final Logger LOG = LoggerFactory.getLogger(MiniHS2.class);
++
++  public static final String HS2_BINARY_MODE = "binary";
++  public static final String HS2_HTTP_MODE = "http";
++  private static final String driverName = "org.apache.hive.jdbc.HiveDriver";
++  private static final FsPermission FULL_PERM = new FsPermission((short)00777);
++  private static final FsPermission WRITE_ALL_PERM = new FsPermission((short)00733);
++  private static final String tmpDir = System.getProperty("test.tmp.dir");
++  private HiveServer2 hiveServer2 = null;
++  private final File baseDir;
++  private final Path baseFsDir;
++  private MiniMrShim mr;
++  private MiniDFSShim dfs;
++  private FileSystem localFS;
++  private boolean useMiniMR = false;
++  private boolean useMiniKdc = false;
++  private final String serverPrincipal;
++  private final String serverKeytab;
++  private final boolean isMetastoreRemote;
++  private final boolean cleanupLocalDirOnStartup;
++
++  public static class Builder {
++    private HiveConf hiveConf = new HiveConf();
++    private boolean useMiniMR = false;
++    private boolean cleanupLocalDirOnStartup = true;
++    private boolean useMiniKdc = false;
++    private String serverPrincipal;
++    private String serverKeytab;
++    private boolean isHTTPTransMode = false;
++    private boolean isMetastoreRemote;
++    private String authType = "KERBEROS";
++
++    public Builder() {
++    }
++
++    public Builder withMiniMR() {
++      this.useMiniMR = true;
++      return this;
++    }
++
++    public Builder withMiniKdc(String serverPrincipal, String serverKeytab) {
++      this.useMiniKdc = true;
++      this.serverPrincipal = serverPrincipal;
++      this.serverKeytab = serverKeytab;
++      return this;
++    }
++
++    public Builder withAuthenticationType(String authType) {
++      this.authType = authType;
++      return this;
++    }
++
++    public Builder withRemoteMetastore() {
++      this.isMetastoreRemote = true;
++      return this;
++    }
++
++    public Builder withConf(HiveConf hiveConf) {
++      this.hiveConf = hiveConf;
++      return this;
++    }
++
++    /**
++     * Start HS2 with HTTP transport mode, default is binary mode
++     * @return this Builder
++     */
++    public Builder withHTTPTransport(){
++      this.isHTTPTransMode = true;
++      return this;
++    }
++
++    public Builder cleanupLocalDirOnStartup(boolean val) {
++      this.cleanupLocalDirOnStartup = val;
++      return this;
++    }
++
++    public MiniHS2 build() throws Exception {
++      if (useMiniMR && useMiniKdc) {
++        throw new IOException("Can't create secure miniMr ... yet");
++      }
++      if (isHTTPTransMode) {
++        hiveConf.setVar(ConfVars.HIVE_SERVER2_TRANSPORT_MODE, HS2_HTTP_MODE);
++      } else {
++        hiveConf.setVar(ConfVars.HIVE_SERVER2_TRANSPORT_MODE, HS2_BINARY_MODE);
++      }
++      return new MiniHS2(hiveConf, useMiniMR, useMiniKdc, serverPrincipal, serverKeytab,
++          isMetastoreRemote, authType, cleanupLocalDirOnStartup);
++    }
++  }
++
++  public MiniMrShim getMr() {
++    return mr;
++  }
++
++  public void setMr(MiniMrShim mr) {
++    this.mr = mr;
++  }
++
++  public MiniDFSShim getDfs() {
++    return dfs;
++  }
++
++  public void setDfs(MiniDFSShim dfs) {
++    this.dfs = dfs;
++  }
++
++  public FileSystem getLocalFS() {
++    return localFS;
++  }
++
++  public boolean isUseMiniMR() {
++    return useMiniMR;
++  }
++
++  public void setUseMiniMR(boolean useMiniMR) {
++    this.useMiniMR = useMiniMR;
++  }
++
++  public boolean isUseMiniKdc() {
++    return useMiniKdc;
++  }
++
++  private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
++      String serverPrincipal, String serverKeytab, boolean isMetastoreRemote, String authType, boolean cleanupLocalDirOnStartup) throws Exception {
++    super(hiveConf, "localhost", MetaStoreUtils.findFreePort(), MetaStoreUtils.findFreePort());
++    this.useMiniMR = useMiniMR;
++    hiveConf.setLongVar(ConfVars.HIVE_SERVER2_MAX_START_ATTEMPTS, 3l);
++    hiveConf.setTimeVar(ConfVars.HIVE_SERVER2_SLEEP_INTERVAL_BETWEEN_START_ATTEMPTS, 10,
++        TimeUnit.SECONDS);
++    this.useMiniKdc = useMiniKdc;
++    this.serverPrincipal = serverPrincipal;
++    this.serverKeytab = serverKeytab;
++    this.isMetastoreRemote = isMetastoreRemote;
++    this.cleanupLocalDirOnStartup = cleanupLocalDirOnStartup;
++    baseDir = getBaseDir();
++    localFS = FileSystem.getLocal(hiveConf);
++    FileSystem fs;
++
++    if (useMiniMR) {
++      dfs = ShimLoader.getHadoopShims().getMiniDfs(hiveConf, 4, true, null);
++      fs = dfs.getFileSystem();
++      mr = ShimLoader.getHadoopShims().getMiniMrCluster(hiveConf, 4,
++          fs.getUri().toString(), 1);
++      // store the config in system properties
++      mr.setupConfiguration(getHiveConf());
++      baseFsDir =  new Path(new Path(fs.getUri()), "/base");
++    } else {
++      fs = FileSystem.getLocal(hiveConf);
++      baseFsDir = new Path("file://"+ baseDir.toURI().getPath());
++      if (cleanupLocalDirOnStartup) {
++        // Cleanup baseFsDir since it can be shared across tests.
++        LOG.info("Attempting to cleanup baseFsDir: {} while setting up MiniHS2", baseDir);
++        Preconditions.checkState(baseFsDir.depth() >= 3); // Avoid "/tmp", directories closer to "/"
++        fs.delete(baseFsDir, true);
++      }
++    }
++    if (useMiniKdc) {
++      hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL, serverPrincipal);
++      hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB, serverKeytab);
++      hiveConf.setVar(ConfVars.HIVE_SERVER2_AUTHENTICATION, authType);
++    }
++    String metaStoreURL =
++        "jdbc:derby:;databaseName=" + baseDir.getAbsolutePath() + File.separator
++            + "test_metastore;create=true";
++    fs.mkdirs(baseFsDir);
++    Path wareHouseDir = new Path(baseFsDir, "warehouse");
++    // Create warehouse with 777, so that user impersonation has no issues.
++    FileSystem.mkdirs(fs, wareHouseDir, FULL_PERM);
++
++    fs.mkdirs(wareHouseDir);
++    setWareHouseDir(wareHouseDir.toString());
++    System.setProperty(HiveConf.ConfVars.METASTORECONNECTURLKEY.varname, metaStoreURL);
++    hiveConf.setVar(HiveConf.ConfVars.METASTORECONNECTURLKEY, metaStoreURL);
++    // reassign a new port, just in case if one of the MR services grabbed the last one
++    setBinaryPort(MetaStoreUtils.findFreePort());
++    hiveConf.setVar(ConfVars.HIVE_SERVER2_THRIFT_BIND_HOST, getHost());
++    hiveConf.setIntVar(ConfVars.HIVE_SERVER2_THRIFT_PORT, getBinaryPort());
++    hiveConf.setIntVar(ConfVars.HIVE_SERVER2_THRIFT_HTTP_PORT, getHttpPort());
++
++    Path scratchDir = new Path(baseFsDir, "scratch");
++    // Create root scratchdir with write all, so that user impersonation has no issues.
++    Utilities.createDirsWithPermission(hiveConf, scratchDir, WRITE_ALL_PERM, true);
++    System.setProperty(HiveConf.ConfVars.SCRATCHDIR.varname, scratchDir.toString());
++    hiveConf.setVar(ConfVars.SCRATCHDIR, scratchDir.toString());
++
++    String localScratchDir = baseDir.getPath() + File.separator + "scratch";
++    System.setProperty(HiveConf.ConfVars.LOCALSCRATCHDIR.varname, localScratchDir);
++    hiveConf.setVar(ConfVars.LOCALSCRATCHDIR, localScratchDir);
++  }
++
++  public MiniHS2(HiveConf hiveConf) throws Exception {
++    this(hiveConf, false);
++  }
++
++  public MiniHS2(HiveConf hiveConf, boolean useMiniMR) throws Exception {
++    this(hiveConf, useMiniMR, false, null, null, false, "KERBEROS", true);
++  }
++
++  public void start(Map<String, String> confOverlay) throws Exception {
++    if (isMetastoreRemote) {
++      int metaStorePort = MetaStoreUtils.findFreePort();
++      getHiveConf().setVar(ConfVars.METASTOREURIS, "thrift://localhost:" + metaStorePort);
++      MetaStoreUtils.startMetaStore(metaStorePort,
++      ShimLoader.getHadoopThriftAuthBridge(), getHiveConf());
++    }
++
++    hiveServer2 = new HiveServer2();
++    // Set confOverlay parameters
++    for (Map.Entry<String, String> entry : confOverlay.entrySet()) {
++      setConfProperty(entry.getKey(), entry.getValue());
++    }
++    hiveServer2.init(getHiveConf());
++    hiveServer2.start();
++    waitForStartup();
++    setStarted(true);
++  }
++
++  public void stop() {
++    verifyStarted();
++    // Currently there is no way to stop the MetaStore service. It will be stopped when the
++    // test JVM exits. This is how other tests are also using MetaStore server.
++
++    hiveServer2.stop();
++    setStarted(false);
++    try {
++      if (mr != null) {
++        mr.shutdown();
++        mr = null;
++      }
++      if (dfs != null) {
++        dfs.shutdown();
++        dfs = null;
++      }
++    } catch (IOException e) {
++      // Ignore errors cleaning up miniMR
++    }
++  }
++
++  public void cleanup() {
++    FileUtils.deleteQuietly(baseDir);
++  }
++
++  public CLIServiceClient getServiceClient() {
++    verifyStarted();
++    return getServiceClientInternal();
++  }
++
++  public CLIServiceClient getServiceClientInternal() {
++    for (Service service : hiveServer2.getServices()) {
++      if (service instanceof ThriftBinaryCLIService) {
++        return new ThriftCLIServiceClient((ThriftBinaryCLIService) service);
++      }
++      if (service instanceof ThriftHttpCLIService) {
++        return new ThriftCLIServiceClient((ThriftHttpCLIService) service);
++      }
++    }
++    throw new IllegalStateException("HiveServer2 not running Thrift service");
++  }
++
++  /**
++   * return connection URL for this server instance
++   * @return
++   */
++  public String getJdbcURL() {
++    return getJdbcURL("default");
++  }
++
++  /**
++   * return connection URL for this server instance
++   * @param dbName - DB name to be included in the URL
++   * @return
++   */
++  public String getJdbcURL(String dbName) {
++    return getJdbcURL(dbName, "");
++  }
++
++  /**
++   * return connection URL for this server instance
++   * @param dbName - DB name to be included in the URL
++   * @param sessionConfExt - Addional string to be appended to sessionConf part of url
++   * @return
++   */
++  public String getJdbcURL(String dbName, String sessionConfExt) {
++    return getJdbcURL(dbName, sessionConfExt, "");
++  }
++
++  /**
++   * return connection URL for this server instance
++   * @param dbName - DB name to be included in the URL
++   * @param sessionConfExt - Addional string to be appended to sessionConf part of url
++   * @param hiveConfExt - Additional string to be appended to HiveConf part of url (excluding the ?)
++   * @return
++   */
++  public String getJdbcURL(String dbName, String sessionConfExt, String hiveConfExt) {
++    sessionConfExt = (sessionConfExt == null ? "" : sessionConfExt);
++    hiveConfExt = (hiveConfExt == null ? "" : hiveConfExt);
++    String krbConfig = "";
++    if (isUseMiniKdc()) {
++      krbConfig = ";principal=" + serverPrincipal;
++    }
++    if (isHttpTransportMode()) {
++      hiveConfExt = "hive.server2.transport.mode=http;hive.server2.thrift.http.path=cliservice;"
++          + hiveConfExt;
++    }
++    if (!hiveConfExt.trim().equals("")) {
++      hiveConfExt = "?" + hiveConfExt;
++    }
++    return getBaseJdbcURL() + dbName + krbConfig + sessionConfExt + hiveConfExt;
++  }
++
++  /**
++   * Build base JDBC URL
++   * @return
++   */
++  public String getBaseJdbcURL() {
++    if(isHttpTransportMode()) {
++      return "jdbc:hive2://" + getHost() + ":" + getHttpPort() + "/";
++    }
++    else {
++      return "jdbc:hive2://" + getHost() + ":" + getBinaryPort() + "/";
++    }
++  }
++
++  private boolean isHttpTransportMode() {
++    String transportMode = getConfProperty(ConfVars.HIVE_SERVER2_TRANSPORT_MODE.varname);
++    return transportMode != null && (transportMode.equalsIgnoreCase(HS2_HTTP_MODE));
++  }
++
++  public static String getJdbcDriverName() {
++    return driverName;
++  }
++
++  public MiniMrShim getMR() {
++    return mr;
++  }
++
++  public MiniDFSShim getDFS() {
++    return dfs;
++  }
++
++  private void waitForStartup() throws Exception {
++    int waitTime = 0;
++    long startupTimeout = 1000L * 1000L;
++    CLIServiceClient hs2Client = getServiceClientInternal();
++    SessionHandle sessionHandle = null;
++    do {
++      Thread.sleep(500L);
++      waitTime += 500L;
++      if (waitTime > startupTimeout) {
++        throw new TimeoutException("Couldn't access new HiveServer2: " + getJdbcURL());
++      }
++      try {
++        Map <String, String> sessionConf = new HashMap<String, String>();
++        /**
++        if (isUseMiniKdc()) {
++          getMiniKdc().loginUser(getMiniKdc().getDefaultUserPrincipal());
++          sessionConf.put("principal", serverPrincipal);
++        }
++         */
++        sessionHandle = hs2Client.openSession("foo", "bar", sessionConf);
++      } catch (Exception e) {
++        // service not started yet
++        continue;
++      }
++      hs2Client.closeSession(sessionHandle);
++      break;
++    } while (true);
++  }
++
++  static File getBaseDir() {
++    File baseDir = new File(tmpDir + "/local_base");
++    return baseDir;
++  }
++
++  public static void cleanupLocalDir() throws IOException {
++    File baseDir = getBaseDir();
++    try {
++      org.apache.hadoop.hive.common.FileUtils.deleteDirectory(baseDir);
++    } catch (FileNotFoundException e) {
++      // Ignore. Safe if it does not exist.
++    }
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/escape_comments.q b/ql/src/test/queries/clientpositive/escape_comments.q
+new file mode 100644
+index 0000000..8c38690
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/escape_comments.q
+@@ -0,0 +1,20 @@
++create database escape_comments_db comment 'a\nb';
++use escape_comments_db;
++create table escape_comments_tbl1
++(col1 string comment 'a\nb\'\;') comment 'a\nb'
++partitioned by (p1 string comment 'a\nb');
++create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb'
++as select col1 from escape_comments_tbl1;
++create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb';
++
++describe database extended escape_comments_db;
++describe database escape_comments_db;
++show create table escape_comments_tbl1;
++describe formatted escape_comments_tbl1;
++describe pretty escape_comments_tbl1;
++describe escape_comments_tbl1;
++show create table escape_comments_view1;
++describe formatted escape_comments_view1;
++show formatted index on escape_comments_tbl1;
++
++drop database escape_comments_db cascade;
+diff --git a/ql/src/test/results/clientpositive/beeline/escape_comments.q.out b/ql/src/test/results/clientpositive/beeline/escape_comments.q.out
+new file mode 100644
+index 0000000..37a5a6d
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/beeline/escape_comments.q.out
+@@ -0,0 +1,432 @@
++>>>  !run !!{qFileDirectory}!!/escape_comments.q
++>>>  create database escape_comments_db comment 'a\nb';
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): create database escape_comments_db comment 'a\nb'
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): create database escape_comments_db comment 'a\nb'
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Output: database:escape_comments_db
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Output: database:escape_comments_db
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query create database escape_comments_db comment 'a\nb'
++No rows affected 
++>>>  use escape_comments_db;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): use escape_comments_db
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): use escape_comments_db
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: database:escape_comments_db
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: database:escape_comments_db
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query use escape_comments_db
++No rows affected 
++>>>  create table escape_comments_tbl1 
++(col1 string comment 'a\nb\'\;') comment 'a\nb' 
++partitioned by (p1 string comment 'a\nb');
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): create table escape_comments_tbl1 
++(col1 string comment 'a\nb\';') comment 'a\nb' 
++partitioned by (p1 string comment 'a\nb')
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): create table escape_comments_tbl1 
++(col1 string comment 'a\nb\';') comment 'a\nb' 
++partitioned by (p1 string comment 'a\nb')
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Output: database:escape_comments_db
++ERROR : PREHOOK: Output: escape_comments_db@escape_comments_tbl1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Output: database:escape_comments_db
++ERROR : POSTHOOK: Output: escape_comments_db@escape_comments_tbl1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query create table escape_comments_tbl1 
++(col1 string comment 'a\nb\';') comment 'a\nb' 
++partitioned by (p1 string comment 'a\nb')
++No rows affected 
++>>>  create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb' 
++as select col1 from escape_comments_tbl1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb' 
++as select col1 from escape_comments_tbl1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:col1, type:string, comment:null)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb' 
++as select col1 from escape_comments_tbl1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++ERROR : PREHOOK: Output: database:escape_comments_db
++ERROR : PREHOOK: Output: escape_comments_db@escape_comments_view1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++ERROR : POSTHOOK: Output: database:escape_comments_db
++ERROR : POSTHOOK: Output: escape_comments_db@escape_comments_view1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb' 
++as select col1 from escape_comments_tbl1
++No rows affected 
++>>>  create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb';
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb'
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb'
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++ERROR : POSTHOOK: Output: escape_comments_db@escape_comments_db__escape_comments_tbl1_index2__
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb'
++No rows affected 
++>>>  
++>>>  describe database extended escape_comments_db;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): describe database extended escape_comments_db
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:db_name, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer), FieldSchema(name:location, type:string, comment:from deserializer), FieldSchema(name:owner_name, type:string, comment:from deserializer), FieldSchema(name:owner_type, type:string, comment:from deserializer), FieldSchema(name:parameters, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): describe database extended escape_comments_db
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query describe database extended escape_comments_db
++'db_name','comment','location','owner_name','owner_type','parameters'
++'escape_comments_db','a','NULL','NULL','NULL','NULL'
++'b','location/in/test','user','USER','','NULL'
++2 rows selected 
++>>>  describe database escape_comments_db;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): describe database escape_comments_db
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:db_name, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer), FieldSchema(name:location, type:string, comment:from deserializer), FieldSchema(name:owner_name, type:string, comment:from deserializer), FieldSchema(name:owner_type, type:string, comment:from deserializer), FieldSchema(name:parameters, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): describe database escape_comments_db
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query describe database escape_comments_db
++'db_name','comment','location','owner_name','owner_type','parameters'
++'escape_comments_db','a','NULL','NULL','NULL','NULL'
++'b','location/in/test','user','USER','','NULL'
++2 rows selected 
++>>>  show create table escape_comments_tbl1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): show create table escape_comments_tbl1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:createtab_stmt, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): show create table escape_comments_tbl1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query show create table escape_comments_tbl1
++'createtab_stmt'
++'CREATE TABLE `escape_comments_tbl1`('
++'  `col1` string COMMENT 'a'
++'b\'\;')'
++'COMMENT 'a'
++'b''
++'PARTITIONED BY ( '
++'  `p1` string COMMENT 'a'
++'b')'
++'ROW FORMAT SERDE '
++'  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' '
++'STORED AS INPUTFORMAT '
++'  'org.apache.hadoop.mapred.TextInputFormat' '
++'OUTPUTFORMAT '
++'  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat''
++'LOCATION'
++'  '!!{hive.metastore.warehouse.dir}!!/escape_comments_db.db/escape_comments_tbl1''
++'TBLPROPERTIES ('
++'  'transient_lastDdlTime'='!!UNIXTIME!!')'
++18 rows selected 
++>>>  describe formatted escape_comments_tbl1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): describe formatted escape_comments_tbl1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:col_name, type:string, comment:from deserializer), FieldSchema(name:data_type, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): describe formatted escape_comments_tbl1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query describe formatted escape_comments_tbl1
++'col_name','data_type','comment'
++'# col_name            ','data_type           ','comment             '
++'','NULL','NULL'
++'col1','string','a'
++'b';','NULL','NULL'
++'','NULL','NULL'
++'# Partition Information','NULL','NULL'
++'# col_name            ','data_type           ','comment             '
++'','NULL','NULL'
++'p1','string','a'
++'b','NULL','NULL'
++'','NULL','NULL'
++'# Detailed Table Information','NULL','NULL'
++'Database:           ','escape_comments_db  ','NULL'
++'Owner:              ','user                ','NULL'
++'CreateTime:         ','!!TIMESTAMP!!','NULL'
++'LastAccessTime:     ','UNKNOWN             ','NULL'
++'Protect Mode:       ','None                ','NULL'
++'Retention:          ','0                   ','NULL'
++'Location:           ','!!{hive.metastore.warehouse.dir}!!/escape_comments_db.db/escape_comments_tbl1','NULL'
++'Table Type:         ','MANAGED_TABLE       ','NULL'
++'Table Parameters:','NULL','NULL'
++'','comment             ','a\nb                '
++'','transient_lastDdlTime','!!UNIXTIME!!          '
++'','NULL','NULL'
++'# Storage Information','NULL','NULL'
++'SerDe Library:      ','org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe','NULL'
++'InputFormat:        ','org.apache.hadoop.mapred.TextInputFormat','NULL'
++'OutputFormat:       ','org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat','NULL'
++'Compressed:         ','No                  ','NULL'
++'Num Buckets:        ','-1                  ','NULL'
++'Bucket Columns:     ','[]                  ','NULL'
++'Sort Columns:       ','[]                  ','NULL'
++'Storage Desc Params:','NULL','NULL'
++'','serialization.format','1                   '
++34 rows selected 
++>>>  describe pretty escape_comments_tbl1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): describe pretty escape_comments_tbl1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:col_name, type:string, comment:from deserializer), FieldSchema(name:data_type, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): describe pretty escape_comments_tbl1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query describe pretty escape_comments_tbl1
++'col_name','data_type','comment'
++'col_name data_type     comment','NULL','NULL'
++'','NULL','NULL'
++'col1     string        a','NULL','NULL'
++'                       b';','NULL','NULL'
++'p1       string        a','NULL','NULL'
++'                       b','NULL','NULL'
++'','NULL','NULL'
++'# Partition Information','NULL','NULL'
++'col_name data_type     comment','NULL','NULL'
++'','NULL','NULL'
++'p1       string        a','NULL','NULL'
++'                       b','NULL','NULL'
++12 rows selected 
++>>>  describe escape_comments_tbl1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): describe escape_comments_tbl1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:col_name, type:string, comment:from deserializer), FieldSchema(name:data_type, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): describe escape_comments_tbl1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query describe escape_comments_tbl1
++'col_name','data_type','comment'
++'col1','string','a'
++'b';','NULL','NULL'
++'p1','string','a'
++'b','NULL','NULL'
++'','NULL','NULL'
++'# Partition Information','NULL','NULL'
++'# col_name            ','data_type           ','comment             '
++'','NULL','NULL'
++'p1','string','a'
++'b','NULL','NULL'
++10 rows selected 
++>>>  show create table escape_comments_view1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): show create table escape_comments_view1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:createtab_stmt, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): show create table escape_comments_view1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_view1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_view1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query show create table escape_comments_view1
++'createtab_stmt'
++'CREATE VIEW `escape_comments_view1` AS SELECT `col1` AS `col1` FROM (select `escape_comments_tbl1`.`col1` from `escape_comments_db`.`escape_comments_tbl1`) `escape_comments_db.escape_comments_view1`'
++1 row selected 
++>>>  describe formatted escape_comments_view1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): describe formatted escape_comments_view1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:col_name, type:string, comment:from deserializer), FieldSchema(name:data_type, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): describe formatted escape_comments_view1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: escape_comments_db@escape_comments_view1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: escape_comments_db@escape_comments_view1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query describe formatted escape_comments_view1
++'col_name','data_type','comment'
++'# col_name            ','data_type           ','comment             '
++'','NULL','NULL'
++'col1','string','a'
++'b','NULL','NULL'
++'','NULL','NULL'
++'# Detailed Table Information','NULL','NULL'
++'Database:           ','escape_comments_db  ','NULL'
++'Owner:              ','user                ','NULL'
++'CreateTime:         ','!!TIMESTAMP!!','NULL'
++'LastAccessTime:     ','UNKNOWN             ','NULL'
++'Protect Mode:       ','None                ','NULL'
++'Retention:          ','0                   ','NULL'
++'Table Type:         ','VIRTUAL_VIEW        ','NULL'
++'Table Parameters:','NULL','NULL'
++'','comment             ','a\nb                '
++'','transient_lastDdlTime','!!UNIXTIME!!          '
++'','NULL','NULL'
++'# Storage Information','NULL','NULL'
++'SerDe Library:      ','null                ','NULL'
++'InputFormat:        ','org.apache.hadoop.mapred.TextInputFormat','NULL'
++'OutputFormat:       ','org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat','NULL'
++'Compressed:         ','No                  ','NULL'
++'Num Buckets:        ','-1                  ','NULL'
++'Bucket Columns:     ','[]                  ','NULL'
++'Sort Columns:       ','[]                  ','NULL'
++'','NULL','NULL'
++'# View Information','NULL','NULL'
++'View Original Text: ','select col1 from escape_comments_tbl1','NULL'
++'View Expanded Text: ','SELECT `col1` AS `col1` FROM (select `escape_comments_tbl1`.`col1` from `escape_comments_db`.`escape_comments_tbl1`) `escape_comments_db.escape_comments_view1`','NULL'
++29 rows selected 
++>>>  show formatted index on escape_comments_tbl1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): show formatted index on escape_comments_tbl1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:[FieldSchema(name:idx_name, type:string, comment:from deserializer), FieldSchema(name:tab_name, type:string, comment:from deserializer), FieldSchema(name:col_names, type:string, comment:from deserializer), FieldSchema(name:idx_tab_name, type:string, comment:from deserializer), FieldSchema(name:idx_type, type:string, comment:from deserializer), FieldSchema(name:comment, type:string, comment:from deserializer)], properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): show formatted index on escape_comments_tbl1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query show formatted index on escape_comments_tbl1
++'idx_name','tab_name','col_names','idx_tab_name','idx_type','comment'
++'idx_name            ','tab_name            ','col_names           ','idx_tab_name        ','idx_type            ','comment             '
++'','NULL','NULL','NULL','NULL','NULL'
++'','NULL','NULL','NULL','NULL','NULL'
++'index2              ','escape_comments_tbl1','col1                ','escape_comments_db__escape_comments_tbl1_index2__','compact             ','a'
++'b                 ','','NULL','NULL','NULL','NULL'
++5 rows selected 
++>>>  
++>>>  drop database escape_comments_db cascade;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): drop database escape_comments_db cascade
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): drop database escape_comments_db cascade
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: database:escape_comments_db
++ERROR : PREHOOK: Output: database:escape_comments_db
++ERROR : PREHOOK: Output: escape_comments_db@escape_comments_db__escape_comments_tbl1_index2__
++ERROR : PREHOOK: Output: escape_comments_db@escape_comments_tbl1
++ERROR : PREHOOK: Output: escape_comments_db@escape_comments_view1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: database:escape_comments_db
++ERROR : POSTHOOK: Output: database:escape_comments_db
++ERROR : POSTHOOK: Output: escape_comments_db@escape_comments_db__escape_comments_tbl1_index2__
++ERROR : POSTHOOK: Output: escape_comments_db@escape_comments_tbl1
++ERROR : POSTHOOK: Output: escape_comments_db@escape_comments_view1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query drop database escape_comments_db cascade
++No rows affected 
++>>>  !record
+diff --git a/ql/src/test/results/clientpositive/escape_comments.q.out b/ql/src/test/results/clientpositive/escape_comments.q.out
+new file mode 100644
+index 0000000..f262487
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/escape_comments.q.out
+@@ -0,0 +1,214 @@
++PREHOOK: query: create database escape_comments_db comment 'a\nb'
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:escape_comments_db
++POSTHOOK: query: create database escape_comments_db comment 'a\nb'
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:escape_comments_db
++PREHOOK: query: use escape_comments_db
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:escape_comments_db
++POSTHOOK: query: use escape_comments_db
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:escape_comments_db
++PREHOOK: query: create table escape_comments_tbl1
++(col1 string comment 'a\nb\';') comment 'a\nb'
++partitioned by (p1 string comment 'a\nb')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:escape_comments_db
++PREHOOK: Output: escape_comments_db@escape_comments_tbl1
++POSTHOOK: query: create table escape_comments_tbl1
++(col1 string comment 'a\nb\';') comment 'a\nb'
++partitioned by (p1 string comment 'a\nb')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:escape_comments_db
++POSTHOOK: Output: escape_comments_db@escape_comments_tbl1
++PREHOOK: query: create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb'
++as select col1 from escape_comments_tbl1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++PREHOOK: Output: database:escape_comments_db
++PREHOOK: Output: escape_comments_db@escape_comments_view1
++POSTHOOK: query: create view escape_comments_view1 (col1 comment 'a\nb') comment 'a\nb'
++as select col1 from escape_comments_tbl1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: Output: database:escape_comments_db
++POSTHOOK: Output: escape_comments_db@escape_comments_view1
++PREHOOK: query: create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb'
++PREHOOK: type: CREATEINDEX
++PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: query: create index index2 on table escape_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment 'a\nb'
++POSTHOOK: type: CREATEINDEX
++POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: Output: escape_comments_db@escape_comments_db__escape_comments_tbl1_index2__
++PREHOOK: query: describe database extended escape_comments_db
++PREHOOK: type: DESCDATABASE
++POSTHOOK: query: describe database extended escape_comments_db
++POSTHOOK: type: DESCDATABASE
++escape_comments_db	a	 	 	 	 
++b	location/in/test	hive_test_user	USER		 
++PREHOOK: query: describe database escape_comments_db
++PREHOOK: type: DESCDATABASE
++POSTHOOK: query: describe database escape_comments_db
++POSTHOOK: type: DESCDATABASE
++escape_comments_db	a	 	 	 	 
++b	location/in/test	hive_test_user	USER		 
++PREHOOK: query: show create table escape_comments_tbl1
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: query: show create table escape_comments_tbl1
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++CREATE TABLE `escape_comments_tbl1`(
++  `col1` string COMMENT 'a
++b\'\;')
++COMMENT 'a
++b'
++PARTITIONED BY ( 
++  `p1` string COMMENT 'a
++b')
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++#### A masked pattern was here ####
++PREHOOK: query: describe formatted escape_comments_tbl1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: query: describe formatted escape_comments_tbl1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++# col_name            	data_type           	comment             
++	 	 
++col1                	string              	a                   
++                    	                    	b';
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++p1                  	string              	a                   
++                    	                    	b
++	 	 
++# Detailed Table Information	 	 
++Database:           	escape_comments_db  	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	comment             	a\nb                
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: describe pretty escape_comments_tbl1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: query: describe pretty escape_comments_tbl1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++col_name data_type     comment	 	 
++	 	 
++col1     string        a	 	 
++                       b';	 	 
++p1       string        a	 	 
++                       b	 	 
++	 	 
++# Partition Information	 	 
++col_name data_type     comment	 	 
++	 	 
++p1       string        a	 	 
++                       b	 	 
++PREHOOK: query: describe escape_comments_tbl1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: escape_comments_db@escape_comments_tbl1
++POSTHOOK: query: describe escape_comments_tbl1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: escape_comments_db@escape_comments_tbl1
++col1                	string              	a                   
++                    	                    	b';
++p1                  	string              	a                   
++                    	                    	b
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++p1                  	string              	a                   
++                    	                    	b
++PREHOOK: query: show create table escape_comments_view1
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: escape_comments_db@escape_comments_view1
++POSTHOOK: query: show create table escape_comments_view1
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: escape_comments_db@escape_comments_view1
++CREATE VIEW `escape_comments_view1` AS SELECT `col1` AS `col1` FROM (select `escape_comments_tbl1`.`col1` from `escape_comments_db`.`escape_comments_tbl1`) `escape_comments_db.escape_comments_view1`
++PREHOOK: query: describe formatted escape_comments_view1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: escape_comments_db@escape_comments_view1
++POSTHOOK: query: describe formatted escape_comments_view1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: escape_comments_db@escape_comments_view1
++# col_name            	data_type           	comment             
++	 	 
++col1                	string              	a                   
++                    	                    	b
++	 	 
++# Detailed Table Information	 	 
++Database:           	escape_comments_db  	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++Table Type:         	VIRTUAL_VIEW        	 
++Table Parameters:	 	 
++	comment             	a\nb                
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	null                	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++	 	 
++# View Information	 	 
++View Original Text: 	select col1 from escape_comments_tbl1	 
++View Expanded Text: 	SELECT `col1` AS `col1` FROM (select `escape_comments_tbl1`.`col1` from `escape_comments_db`.`escape_comments_tbl1`) `escape_comments_db.escape_comments_view1`	 
++PREHOOK: query: show formatted index on escape_comments_tbl1
++PREHOOK: type: SHOWINDEXES
++POSTHOOK: query: show formatted index on escape_comments_tbl1
++POSTHOOK: type: SHOWINDEXES
++idx_name            	tab_name            	col_names           	idx_tab_name        	idx_type            	comment             
++	 	 	 	 	 
++	 	 	 	 	 
++index2              	escape_comments_tbl1	col1                	escape_comments_db__escape_comments_tbl1_index2__	compact             	a
++b                 		 	 	 	 
++PREHOOK: query: drop database escape_comments_db cascade
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:escape_comments_db
++PREHOOK: Output: database:escape_comments_db
++PREHOOK: Output: escape_comments_db@escape_comments_db__escape_comments_tbl1_index2__
++PREHOOK: Output: escape_comments_db@escape_comments_tbl1
++PREHOOK: Output: escape_comments_db@escape_comments_view1
++POSTHOOK: query: drop database escape_comments_db cascade
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:escape_comments_db
++POSTHOOK: Output: database:escape_comments_db
++POSTHOOK: Output: escape_comments_db@escape_comments_db__escape_comments_tbl1_index2__
++POSTHOOK: Output: escape_comments_db@escape_comments_tbl1
++POSTHOOK: Output: escape_comments_db@escape_comments_view1
+-- 
+1.7.9.5
+

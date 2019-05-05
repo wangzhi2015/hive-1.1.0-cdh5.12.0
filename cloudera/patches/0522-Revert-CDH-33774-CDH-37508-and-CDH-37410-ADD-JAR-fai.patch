@@ -1,0 +1,943 @@
+From fb3511097b6720fe773bc6ed56b115f7e403fe2f Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Mon, 29 Feb 2016 11:34:52 -0600
+Subject: [PATCH 0522/1164] Revert "CDH-33774, CDH-37508 and CDH-37410: ADD
+ JAR failing with URL schemes other than
+ file/ivy/hdfs"
+
+Commit on CDH-37410 is causing NPE errors on our Cloudera cluster just after Code freeze.
+Reverting all commits involved.
+
+This reverts commit 81ddf824484f6203a855281cf538667792a5b07b.
+
+Change-Id: Iae836c9f3aeca5ff4e6f910ad106abb5950ff690
+---
+ conf/ivysettings.xml                               |   37 ---
+ itests/pom.xml                                     |    3 -
+ packaging/src/main/assembly/bin.xml                |    1 -
+ .../hadoop/hive/ql/session/DependencyResolver.java |  179 -----------
+ .../hadoop/hive/ql/session/SessionState.java       |  202 ++-----------
+ .../hadoop/hive/ql/session/TestAddResource.java    |  318 --------------------
+ ql/src/test/queries/clientpositive/add_jar_pfile.q |    8 -
+ .../results/clientpositive/add_jar_pfile.q.out     |   12 -
+ 8 files changed, 27 insertions(+), 733 deletions(-)
+ delete mode 100644 conf/ivysettings.xml
+ delete mode 100644 ql/src/java/org/apache/hadoop/hive/ql/session/DependencyResolver.java
+ delete mode 100644 ql/src/test/org/apache/hadoop/hive/ql/session/TestAddResource.java
+ delete mode 100644 ql/src/test/queries/clientpositive/add_jar_pfile.q
+ delete mode 100644 ql/src/test/results/clientpositive/add_jar_pfile.q.out
+
+diff --git a/conf/ivysettings.xml b/conf/ivysettings.xml
+deleted file mode 100644
+index bda842a..0000000
+--- a/conf/ivysettings.xml
++++ /dev/null
+@@ -1,37 +0,0 @@
+-
+-<!--
+-   Licensed to the Apache Software Foundation (ASF) under one or more
+-   contributor license agreements.  See the NOTICE file distributed with
+-   this work for additional information regarding copyright ownership.
+-   The ASF licenses this file to You under the Apache License, Version 2.0
+-   (the "License"); you may not use this file except in compliance with
+-   the License.  You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-   Unless required by applicable law or agreed to in writing, software
+-   distributed under the License is distributed on an "AS IS" BASIS,
+-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-   See the License for the specific language governing permissions and
+-   limitations under the License.
+-   -->
+-
+-<!--This file is used by grapes to download dependencies from a maven repository.
+-    This is just a template and can be edited to add more repositories.
+--->
+-
+-<ivysettings>
+-  <!--name of the defaultResolver should always be 'downloadGrapes'. -->
+-  <settings defaultResolver="downloadGrapes"/>
+-  <resolvers>
+-    <!-- more resolvers can be added here -->
+-    <chain name="downloadGrapes">
+-      <!-- This resolver uses ibiblio to find artifacts, compatible with maven2 repository -->
+-      <ibiblio name="central" m2compatible="true"/>
+-      <!-- File resolver to add jars from the local system. -->
+-      <filesystem name="test" checkmodified="true">
+-        <artifact pattern="/tmp/[module]-[revision](-[classifier]).jar" />
+-      </filesystem>
+-    </chain>
+-  </resolvers>
+-</ivysettings>
+diff --git a/itests/pom.xml b/itests/pom.xml
+index 571527f..d9a36fd 100644
+--- a/itests/pom.xml
++++ b/itests/pom.xml
+@@ -102,9 +102,6 @@
+                     exit 1
+                   fi
+                   cp -f $HIVE_ROOT/data/conf/spark/log4j.properties $BASE_DIR/spark/conf/
+-                  sed '/package /d' ${basedir}/${hive.path.to.root}/contrib/src/java/org/apache/hadoop/hive/contrib/udf/example/UDFExampleAdd.java > /tmp/UDFExampleAdd.java
+-                  javac -cp  ${settings.localRepository}/org/apache/hive/hive-exec/${project.version}/hive-exec-${project.version}.jar /tmp/UDFExampleAdd.java -d /tmp
+-                  jar -cf /tmp/udfexampleadd-1.0.jar -C /tmp UDFExampleAdd.class
+                 </echo>
+               </target>
+             </configuration>
+diff --git a/packaging/src/main/assembly/bin.xml b/packaging/src/main/assembly/bin.xml
+index 2cda623..260d8a3 100644
+--- a/packaging/src/main/assembly/bin.xml
++++ b/packaging/src/main/assembly/bin.xml
+@@ -146,7 +146,6 @@
+       <directory>${project.parent.basedir}/conf</directory>
+       <includes>
+         <include>*.template</include>
+-        <include>ivysettings.xml</include>
+       </includes>
+       <outputDirectory>conf</outputDirectory>
+     </fileSet>
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/DependencyResolver.java b/ql/src/java/org/apache/hadoop/hive/ql/session/DependencyResolver.java
+deleted file mode 100644
+index 27bf3e4..0000000
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/DependencyResolver.java
++++ /dev/null
+@@ -1,179 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.hive.ql.session;
+-
+-import java.net.URI;
+-import java.net.URISyntaxException;
+-import java.util.Arrays;
+-import java.util.HashMap;
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Map;
+-import java.io.File;
+-import java.io.IOException;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
+-import groovy.grape.Grape;
+-import groovy.grape.GrapeIvy;
+-import groovy.lang.GroovyClassLoader;
+-
+-
+-public class DependencyResolver {
+-
+-  private static final String HIVE_HOME = "HIVE_HOME";
+-  private static final String HIVE_CONF_DIR = "HIVE_CONF_DIR";
+-  private String ivysettingsPath;
+-  private static LogHelper _console = new LogHelper(LogFactory.getLog("DependencyResolver"));
+-
+-  public DependencyResolver() {
+-
+-    // Check if HIVE_CONF_DIR is defined
+-    if (System.getenv().containsKey(HIVE_CONF_DIR)) {
+-      ivysettingsPath = System.getenv().get(HIVE_CONF_DIR) + "/ivysettings.xml";
+-    }
+-
+-    // If HIVE_CONF_DIR is not defined or file is not found in HIVE_CONF_DIR then check HIVE_HOME/conf
+-    if (ivysettingsPath == null || !(new File(ivysettingsPath).exists())) {
+-      if (System.getenv().containsKey(HIVE_HOME)) {
+-        ivysettingsPath = System.getenv().get(HIVE_HOME) + "/conf/ivysettings.xml";
+-      }
+-    }
+-
+-    // If HIVE_HOME is not defined or file is not found in HIVE_HOME/conf then load default ivysettings.xml from class loader
+-    if (ivysettingsPath == null || !(new File(ivysettingsPath).exists())) {
+-      ivysettingsPath = ClassLoader.getSystemResource("ivysettings.xml").getFile();
+-      _console.printInfo("ivysettings.xml file not found in HIVE_HOME or HIVE_CONF_DIR," + ivysettingsPath + " will be used");
+-    }
+-
+-  }
+-
+-  /**
+-   *
+-   * @param uri
+-   * @return List of URIs of downloaded jars
+-   * @throws URISyntaxException
+-   * @throws IOException
+-   */
+-  public List<URI> downloadDependencies(URI uri) throws URISyntaxException, IOException {
+-    Map<String, Object> dependencyMap = new HashMap<String, Object>();
+-    String authority = uri.getAuthority();
+-    if (authority == null) {
+-      throw new URISyntaxException(authority, "Invalid url: Expected 'org:module:version', found null");
+-    }
+-    String[] authorityTokens = authority.toLowerCase().split(":");
+-
+-    if (authorityTokens.length != 3) {
+-      throw new URISyntaxException(authority, "Invalid url: Expected 'org:module:version', found " + authority);
+-    }
+-
+-    dependencyMap.put("org", authorityTokens[0]);
+-    dependencyMap.put("module", authorityTokens[1]);
+-    dependencyMap.put("version", authorityTokens[2]);
+-    Map<String, Object> queryMap = parseQueryString(uri.getQuery());
+-    if (queryMap != null) {
+-      dependencyMap.putAll(queryMap);
+-    }
+-    return grab(dependencyMap);
+-  }
+-
+-  /**
+-   * @param queryString
+-   * @return queryMap Map which contains grape parameters such as transitive, exclude, ext and classifier.
+-   * Example: Input:  ext=jar&exclude=org.mortbay.jetty:jetty&transitive=true
+-   *          Output:  {[ext]:[jar], [exclude]:{[group]:[org.mortbay.jetty], [module]:[jetty]}, [transitive]:[true]}
+-   * @throws URISyntaxException
+-   */
+-  private Map<String, Object> parseQueryString(String queryString) throws URISyntaxException {
+-    if (queryString == null || queryString.isEmpty()) {
+-      return null;
+-    }
+-    List<Map<String, String>> excludeList = new LinkedList<Map<String, String>>();
+-    Map<String, Object> queryMap = new HashMap<String, Object>();
+-    String[] mapTokens = queryString.split("&");
+-    for (String tokens : mapTokens) {
+-      String[] mapPair = tokens.split("=");
+-      if (mapPair.length != 2) {
+-        throw new RuntimeException("Invalid query string: " + queryString);
+-      }
+-      if (mapPair[0].equals("exclude")) {
+-        excludeList.addAll(computeExcludeList(mapPair[1]));
+-      } else if (mapPair[0].equals("transitive")) {
+-        if (mapPair[1].toLowerCase().equals("true")) {
+-          queryMap.put(mapPair[0], true);
+-        } else {
+-          queryMap.put(mapPair[0], false);
+-        }
+-      } else {
+-        queryMap.put(mapPair[0], mapPair[1]);
+-      }
+-    }
+-    if (!excludeList.isEmpty()) {
+-      queryMap.put("exclude", excludeList);
+-    }
+-    return queryMap;
+-  }
+-
+-  private List<Map<String, String>> computeExcludeList(String excludeString) throws URISyntaxException {
+-    String excludes[] = excludeString.split(",");
+-    List<Map<String, String>> excludeList = new LinkedList<Map<String, String>>();
+-    for (String exclude : excludes) {
+-      Map<String, String> tempMap = new HashMap<String, String>();
+-      String args[] = exclude.split(":");
+-      if (args.length != 2) {
+-        throw new URISyntaxException(excludeString,
+-            "Invalid exclude string: expected 'org:module,org:module,..', found " + excludeString);
+-      }
+-      tempMap.put("group", args[0]);
+-      tempMap.put("module", args[1]);
+-      excludeList.add(tempMap);
+-    }
+-    return excludeList;
+-  }
+-
+-  /**
+-   *
+-   * @param dependencies
+-   * @return List of URIs of downloaded jars
+-   * @throws IOException
+-   */
+-  private List<URI> grab(Map<String, Object> dependencies) throws IOException {
+-    Map<String, Object> args = new HashMap<String, Object>();
+-    URI[] localUrls;
+-
+-    //grape expects excludes key in args map
+-    if (dependencies.containsKey("exclude")) {
+-      args.put("excludes", dependencies.get("exclude"));
+-    }
+-
+-    //Set transitive to true by default
+-    if (!dependencies.containsKey("transitive")) {
+-      dependencies.put("transitive", true);
+-    }
+-
+-    args.put("classLoader", new GroovyClassLoader());
+-    System.setProperty("grape.config", ivysettingsPath);
+-    System.setProperty("groovy.grape.report.downloads", "true");
+-    localUrls = Grape.resolve(args, dependencies);
+-    if (localUrls == null) {
+-      throw new IOException("Not able to download all the dependencies..");
+-    }
+-    return Arrays.asList(localUrls);
+-  }
+-}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index f3a8466..2987a7d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -24,7 +24,6 @@
+ import java.io.InputStream;
+ import java.io.PrintStream;
+ import java.net.URI;
+-import java.net.URISyntaxException;
+ import java.net.URLClassLoader;
+ import java.sql.Timestamp;
+ import java.util.ArrayList;
+@@ -33,7 +32,6 @@
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+-import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -84,7 +82,6 @@
+ import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.ReflectionUtils;
+-import org.apache.hadoop.util.Shell;
+ 
+ import com.google.common.base.Preconditions;
+ 
+@@ -276,9 +273,6 @@
+    */
+   private Timestamp queryCurrentTimestamp;
+ 
+-  private ResourceMaps resourceMaps;
+-
+-  private DependencyResolver dependencyResolver;
+   /**
+    * Get the lineage state stored in this session.
+    *
+@@ -360,8 +354,6 @@ public SessionState(HiveConf conf, String userName) {
+     this.userName = userName;
+     isSilent = conf.getBoolVar(HiveConf.ConfVars.HIVESESSIONSILENT);
+     ls = new LineageState();
+-    resourceMaps = new ResourceMaps();
+-    dependencyResolver = new DependencyResolver();
+     // Must be deterministic order map for consistent q-test output across Java versions
+     overriddenConfigurations = new LinkedHashMap<String, String>();
+     overriddenConfigurations.putAll(HiveConf.getConfSystemProperties());
+@@ -1112,7 +1104,8 @@ public static ResourceType find_resource_type(String s) {
+     return null;
+   }
+ 
+-
++  private final HashMap<ResourceType, Set<String>> resource_map =
++      new HashMap<ResourceType, Set<String>>();
+ 
+   public String add_resource(ResourceType t, String value) throws RuntimeException {
+     return add_resource(t, value, false);
+@@ -1135,97 +1128,37 @@ public String add_resource(ResourceType t, String value, boolean convertToUnix)
+ 
+   public List<String> add_resources(ResourceType t, Collection<String> values, boolean convertToUnix)
+       throws RuntimeException {
+-    Set<String> resourceSet = resourceMaps.getResourceSet(t);
+-    Map<String, Set<String>> resourcePathMap = resourceMaps.getResourcePathMap(t);
+-    Map<String, Set<String>> reverseResourcePathMap = resourceMaps.getReverseResourcePathMap(t);
++    Set<String> resourceMap = getResourceMap(t);
++
+     List<String> localized = new ArrayList<String>();
+     try {
+       for (String value : values) {
+-        String key;
+-
+-        //get the local path of downloaded jars.
+-        List<URI> downloadedURLs = resolveAndDownload(t, value, convertToUnix);
+-
+-        if (getURLType(value).equals("ivy")) {
+-          // get the key to store in map
+-          key = createURI(value).getAuthority();
+-        } else {
+-          // for local file and hdfs, key and value are same.
+-          key = downloadedURLs.get(0).toString();
+-        }
+-        Set<String> downloadedValues = new HashSet<String>();
+-
+-        for (URI uri : downloadedURLs) {
+-          String resourceValue = uri.toString();
+-          downloadedValues.add(resourceValue);
+-          localized.add(resourceValue);
+-          if (reverseResourcePathMap.containsKey(resourceValue)) {
+-            if (!reverseResourcePathMap.get(resourceValue).contains(key)) {
+-              reverseResourcePathMap.get(resourceValue).add(key);
+-            }
+-          } else {
+-            Set<String> addSet = new HashSet<String>();
+-            addSet.add(key);
+-            reverseResourcePathMap.put(resourceValue, addSet);
+-
+-          }
+-        }
+-        resourcePathMap.put(key, downloadedValues);
++        localized.add(downloadResource(value, convertToUnix));
+       }
+-      t.preHook(resourceSet, localized);
++
++      t.preHook(resourceMap, localized);
+ 
+     } catch (RuntimeException e) {
+-      getConsole().printError(e.getMessage(), "\n" + org.apache.hadoop.util.StringUtils.stringifyException(e));
++      getConsole().printError(e.getMessage(), "\n"
++          + org.apache.hadoop.util.StringUtils.stringifyException(e));
+       throw e;
+-    } catch (URISyntaxException e) {
+-      getConsole().printError(e.getMessage());
+-      throw new RuntimeException(e);
+-    } catch (IOException e) {
+-      getConsole().printError(e.getMessage());
+-      throw new RuntimeException(e);
+     }
+-    getConsole().printInfo("Added resources: " + values);
+-    resourceSet.addAll(localized);
+-    return localized;
+-  }
+ 
+-  /**
+-   * @param path
+-   * @return URI corresponding to the path.
+-   */
+-  private static URI createURI(String path) throws URISyntaxException {
+-    if (!Shell.WINDOWS) {
+-      // If this is not windows shell, path better follow unix convention.
+-      // Else, the below call will throw an URISyntaxException
+-      return new URI(path);
+-    } else {
+-      return new Path(path).toUri();
+-    }
+-  }
++    getConsole().printInfo("Added resources: " + values);
++    resourceMap.addAll(localized);
+ 
+-  private static String getURLType(String value) throws URISyntaxException {
+-    URI uri = createURI(value);
+-    String scheme = uri.getScheme() == null ? null : uri.getScheme().toLowerCase();
+-    if (scheme == null || scheme.equals("file")) {
+-      return "file";
+-    }
+-    return scheme;
++    return localized;
+   }
+ 
+-  List<URI> resolveAndDownload(ResourceType t, String value, boolean convertToUnix) throws URISyntaxException,
+-      IOException {
+-    URI uri = createURI(value);
+-    if (getURLType(value).equals("file")) {
+-      return Arrays.asList(uri);
+-    } else if (getURLType(value).equals("ivy")) {
+-      return dependencyResolver.downloadDependencies(uri);
+-    } else {
+-      return Arrays.asList(createURI(downloadResource(value, convertToUnix)));
++  private Set<String> getResourceMap(ResourceType t) {
++    Set<String> result = resource_map.get(t);
++    if (result == null) {
++      result = new HashSet<String>();
++      resource_map.put(t, result);
+     }
++    return result;
+   }
+ 
+-
+-
+   /**
+    * Returns  true if it is from any external File Systems except local
+    */
+@@ -1249,7 +1182,7 @@ private String downloadResource(String value, boolean convertToUnix) {
+         throw new RuntimeException("Couldn't create directory " + resourceDir);
+       }
+       try {
+-        FileSystem fs = FileSystem.get(createURI(value), conf);
++        FileSystem fs = FileSystem.get(new URI(value), conf);
+         fs.copyToLocalFile(new Path(value), new Path(destinationFile.getCanonicalPath()));
+         value = destinationFile.getCanonicalPath();
+ 
+@@ -1270,49 +1203,16 @@ private String downloadResource(String value, boolean convertToUnix) {
+     return value;
+   }
+ 
+-  public void delete_resources(ResourceType t, List<String> values) {
+-    Set<String> resources = resourceMaps.getResourceSet(t);
+-    if (resources == null || resources.isEmpty()) {
+-      return;
+-    }
+-
+-    Map<String, Set<String>> resourcePathMap = resourceMaps.getResourcePathMap(t);
+-    Map<String, Set<String>> reverseResourcePathMap = resourceMaps.getReverseResourcePathMap(t);
+-    List<String> deleteList = new LinkedList<String>();
+-    for (String value : values) {
+-      String key = value;
+-      try {
+-        if (getURLType(value).equals("ivy")) {
+-          key = createURI(value).getAuthority();
+-        }
+-      } catch (URISyntaxException e) {
+-        throw new RuntimeException("Invalid uri string " + value + ", " + e.getMessage());
+-      }
+-
+-      // get all the dependencies to delete
+-
+-      Set<String> resourcePaths = resourcePathMap.get(key);
+-      if (resourcePaths == null) {
+-        return;
+-      }
+-      for (String resourceValue : resourcePaths) {
+-        reverseResourcePathMap.get(resourceValue).remove(key);
+-
+-        // delete a dependency only if no other resource depends on it.
+-        if (reverseResourcePathMap.get(resourceValue).isEmpty()) {
+-          deleteList.add(resourceValue);
+-          reverseResourcePathMap.remove(resourceValue);
+-        }
+-      }
+-      resourcePathMap.remove(key);
++  public void delete_resources(ResourceType t, List<String> value) {
++    Set<String> resources = resource_map.get(t);
++    if (resources != null && !resources.isEmpty()) {
++      t.postHook(resources, value);
++      resources.removeAll(value);
+     }
+-    t.postHook(resources, deleteList);
+-    resources.removeAll(deleteList);
+   }
+ 
+-
+   public Set<String> list_resource(ResourceType t, List<String> filter) {
+-    Set<String> orig = resourceMaps.getResourceSet(t);
++    Set<String> orig = resource_map.get(t);
+     if (orig == null) {
+       return null;
+     }
+@@ -1330,10 +1230,10 @@ public void delete_resources(ResourceType t, List<String> values) {
+   }
+ 
+   public void delete_resources(ResourceType t) {
+-    Set<String> resources = resourceMaps.getResourceSet(t);
++    Set<String> resources = resource_map.get(t);
+     if (resources != null && !resources.isEmpty()) {
+       delete_resources(t, new ArrayList<String>(resources));
+-      resourceMaps.getResourceMap().remove(t);
++      resource_map.remove(t);
+     }
+   }
+ 
+@@ -1627,51 +1527,3 @@ public Timestamp getQueryCurrentTimestamp() {
+     return queryCurrentTimestamp;
+   }
+ }
+-
+-class ResourceMaps {
+-
+-  private final Map<SessionState.ResourceType, Set<String>> resource_map;
+-  //Given jar to add is stored as key  and all its transitive dependencies as value. Used for deleting transitive dependencies.
+-  private final Map<SessionState.ResourceType, Map<String, Set<String>>> resource_path_map;
+-  // stores all the downloaded resources as key and the jars which depend on these resources as values in form of a list. Used for deleting transitive dependencies.
+-  private final Map<SessionState.ResourceType, Map<String, Set<String>>> reverse_resource_path_map;
+-
+-  public ResourceMaps() {
+-    resource_map = new HashMap<SessionState.ResourceType, Set<String>>();
+-    resource_path_map = new HashMap<SessionState.ResourceType, Map<String, Set<String>>>();
+-    reverse_resource_path_map = new HashMap<SessionState.ResourceType, Map<String, Set<String>>>();
+-
+-  }
+-
+-  public Map<SessionState.ResourceType, Set<String>> getResourceMap() {
+-    return resource_map;
+-  }
+-
+-  public Set<String> getResourceSet(SessionState.ResourceType t) {
+-    Set<String> result = resource_map.get(t);
+-    if (result == null) {
+-      result = new HashSet<String>();
+-      resource_map.put(t, result);
+-    }
+-    return result;
+-  }
+-
+-  public Map<String, Set<String>> getResourcePathMap(SessionState.ResourceType t) {
+-    Map<String, Set<String>> result = resource_path_map.get(t);
+-    if (result == null) {
+-      result = new HashMap<String, Set<String>>();
+-      resource_path_map.put(t, result);
+-    }
+-    return result;
+-  }
+-
+-  public Map<String, Set<String>> getReverseResourcePathMap(SessionState.ResourceType t) {
+-    Map<String, Set<String>> result = reverse_resource_path_map.get(t);
+-    if (result == null) {
+-      result = new HashMap<String, Set<String>>();
+-      reverse_resource_path_map.put(t, result);
+-    }
+-    return result;
+-  }
+-
+-}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/session/TestAddResource.java b/ql/src/test/org/apache/hadoop/hive/ql/session/TestAddResource.java
+deleted file mode 100644
+index c63498d..0000000
+--- a/ql/src/test/org/apache/hadoop/hive/ql/session/TestAddResource.java
++++ /dev/null
+@@ -1,318 +0,0 @@
+-package org.apache.hadoop.hive.ql.session;
+-
+-import static org.junit.Assert.assertEquals;
+-
+-import java.io.File;
+-import java.io.IOException;
+-import java.io.Writer;
+-import java.net.URI;
+-import java.net.URISyntaxException;
+-import java.util.Collections;
+-import java.util.HashSet;
+-import java.util.LinkedList;
+-import java.util.List;
+-import java.util.Set;
+-
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.junit.After;
+-import org.junit.Before;
+-import org.junit.Test;
+-import org.mockito.Mockito;
+-import org.apache.hadoop.hive.ql.session.SessionState.ResourceType;
+-import org.apache.hadoop.hive.ql.session.SessionState;
+-
+-import java.io.BufferedWriter;
+-import java.io.FileWriter;
+-
+-
+-public class TestAddResource {
+-
+-  private static final String TEST_JAR_DIR = System.getProperty("test.tmp.dir", ".") + "/";
+-  private HiveConf conf;
+-  private ResourceType t;
+-
+-  @Before
+-  public void setup() throws IOException {
+-    conf = new HiveConf();
+-    t = ResourceType.JAR;
+-
+-    //Generate test jar files
+-    for (int i = 1; i <= 5; i++) {
+-      Writer output = null;
+-      String dataFile = TEST_JAR_DIR + "testjar" + i + ".jar";
+-      File file = new File(dataFile);
+-      output = new BufferedWriter(new FileWriter(file));
+-      output.write("sample");
+-      output.close();
+-    }
+-  }
+-
+-  // Check that all the jars are added to the classpath
+-  @Test
+-  public void testSanity() throws URISyntaxException, IOException {
+-    SessionState ss = Mockito.spy(SessionState.start(conf).get());
+-    String query = "testQuery";
+-
+-    // add all the dependencies to a list
+-    List<URI> list = new LinkedList<URI>();
+-    List<String> addList = new LinkedList<String>();
+-    list.add(new URI(TEST_JAR_DIR + "testjar1.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar2.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar5.jar"));
+-
+-    //return all the dependency urls
+-    Mockito.when(ss.resolveAndDownload(t, query, false)).thenReturn(list);
+-    addList.add(query);
+-    ss.add_resources(t, addList);
+-    Set<String> dependencies = ss.list_resource(t, null);
+-    LinkedList<URI> actual = new LinkedList<URI>();
+-    for (String dependency : dependencies) {
+-      actual.add(new URI(dependency));
+-    }
+-
+-    // sort both the lists
+-    Collections.sort(list);
+-    Collections.sort(actual);
+-
+-    assertEquals(list, actual);
+-    ss.close();
+-
+-  }
+-
+-  // add same jar multiple times and check that dependencies are added only once.
+-  @Test
+-  public void testDuplicateAdds() throws URISyntaxException, IOException {
+-
+-    SessionState ss = Mockito.spy(SessionState.start(conf).get());
+-
+-    String query = "testQuery";
+-
+-    List<URI> list = new LinkedList<URI>();
+-    List<String> addList = new LinkedList<String>();
+-    list.add(new URI(TEST_JAR_DIR + "testjar1.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar2.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list.add(new URI(TEST_JAR_DIR + "testjar5.jar"));
+-
+-    Collections.sort(list);
+-
+-    Mockito.when(ss.resolveAndDownload(t, query, false)).thenReturn(list);
+-    for (int i = 0; i < 10; i++) {
+-      addList.add(query);
+-    }
+-    ss.add_resources(t, addList);
+-    Set<String> dependencies = ss.list_resource(t, null);
+-    LinkedList<URI> actual = new LinkedList<URI>();
+-    for (String dependency : dependencies) {
+-      actual.add(new URI(dependency));
+-    }
+-
+-    Collections.sort(actual);
+-    assertEquals(list, actual);
+-    ss.close();
+-
+-  }
+-
+-  // test when two jars with shared dependencies are added, the classloader contains union of the dependencies
+-  @Test
+-  public void testUnion() throws URISyntaxException, IOException {
+-
+-    HiveConf conf = new HiveConf();
+-    SessionState ss = Mockito.spy(SessionState.start(conf).get());
+-    ResourceType t = ResourceType.JAR;
+-    String query1 = "testQuery1";
+-    String query2 = "testQuery2";
+-    List<String> addList = new LinkedList<String>();
+-    // add dependencies for the jars
+-    List<URI> list1 = new LinkedList<URI>();
+-    List<URI> list2 = new LinkedList<URI>();
+-    list1.add(new URI(TEST_JAR_DIR + "testjar1.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar2.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar5.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-
+-    Mockito.when(ss.resolveAndDownload(t, query1, false)).thenReturn(list1);
+-    Mockito.when(ss.resolveAndDownload(t, query2, false)).thenReturn(list2);
+-    addList.add(query1);
+-    addList.add(query2);
+-    ss.add_resources(t, addList);
+-
+-    Set<String> dependencies = ss.list_resource(t, null);
+-    LinkedList<URI> actual = new LinkedList<URI>();
+-    for (String dependency : dependencies) {
+-      actual.add(new URI(dependency));
+-    }
+-    List<URI> expected = union(list1, list2);
+-
+-    Collections.sort(expected);
+-    Collections.sort(actual);
+-
+-    assertEquals(expected, actual);
+-    ss.close();
+-
+-  }
+-
+-  // Test when two jars are added with shared dependencies and one jar is deleted, the shared dependencies should not be deleted
+-  @Test
+-  public void testDeleteJar() throws URISyntaxException, IOException {
+-    SessionState ss = Mockito.spy(SessionState.start(conf).get());
+-
+-    String query1 = "testQuery1";
+-    String query2 = "testQuery2";
+-
+-    List<URI> list1 = new LinkedList<URI>();
+-    List<URI> list2 = new LinkedList<URI>();
+-    List<String> addList = new LinkedList<String>();
+-    list1.add(new URI(TEST_JAR_DIR + "testjar1.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar2.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar5.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-
+-    Collections.sort(list1);
+-    Collections.sort(list2);
+-
+-    Mockito.when(ss.resolveAndDownload(t, query1, false)).thenReturn(list1);
+-    Mockito.when(ss.resolveAndDownload(t, query2, false)).thenReturn(list2);
+-    addList.add(query1);
+-    addList.add(query2);
+-    ss.add_resources(t, addList);
+-    List<String> deleteList = new LinkedList<String>();
+-    deleteList.add(list1.get(0).toString());
+-    // delete jar and its dependencies added using query1
+-    ss.delete_resources(t, deleteList);
+-
+-    Set<String> dependencies = ss.list_resource(t, null);
+-    LinkedList<URI> actual = new LinkedList<URI>();
+-    for (String dependency : dependencies) {
+-      actual.add(new URI(dependency));
+-    }
+-    List<URI> expected = list2;
+-    Collections.sort(expected);
+-    Collections.sort(actual);
+-    assertEquals(expected, actual);
+-
+-    deleteList.clear();
+-    deleteList.add(list2.get(0).toString());
+-    // delete remaining jars
+-    ss.delete_resources(t, deleteList);
+-    dependencies = ss.list_resource(t, null);
+-    assertEquals(dependencies.isEmpty(), true);
+-
+-    ss.close();
+-
+-  }
+-
+-  // same test as above but with 3 jars sharing dependencies
+-  @Test
+-  public void testDeleteJarMultiple() throws URISyntaxException, IOException {
+-    SessionState ss = Mockito.spy(SessionState.start(conf).get());
+-
+-    String query1 = "testQuery1";
+-    String query2 = "testQuery2";
+-    String query3 = "testQuery3";
+-
+-    List<URI> list1 = new LinkedList<URI>();
+-    List<URI> list2 = new LinkedList<URI>();
+-    List<URI> list3 = new LinkedList<URI>();
+-    List<String> addList = new LinkedList<String>();
+-    list1.add(new URI(TEST_JAR_DIR + "testjar1.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar2.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list1.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar5.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar3.jar"));
+-    list2.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list3.add(new URI(TEST_JAR_DIR + "testjar4.jar"));
+-    list3.add(new URI(TEST_JAR_DIR + "testjar2.jar"));
+-    list3.add(new URI(TEST_JAR_DIR + "testjar5.jar"));
+-
+-    Collections.sort(list1);
+-    Collections.sort(list2);
+-    Collections.sort(list3);
+-
+-    Mockito.when(ss.resolveAndDownload(t, query1, false)).thenReturn(list1);
+-    Mockito.when(ss.resolveAndDownload(t, query2, false)).thenReturn(list2);
+-    Mockito.when(ss.resolveAndDownload(t, query3, false)).thenReturn(list3);
+-    addList.add(query1);
+-    addList.add(query2);
+-    addList.add(query3);
+-    ss.add_resources(t, addList);
+-
+-    List<String> deleteList = new LinkedList<String>();
+-    deleteList.add(list1.get(0).toString());
+-    // delete jar added using query1
+-    ss.delete_resources(t, deleteList);
+-
+-    Set<String> dependencies = ss.list_resource(t, null);
+-    LinkedList<URI> actual = new LinkedList<URI>();
+-    for (String dependency : dependencies) {
+-      actual.add(new URI(dependency));
+-    }
+-    List<URI> expected = union(list2, list3);
+-    Collections.sort(expected);
+-    Collections.sort(actual);
+-    assertEquals(expected, actual);
+-
+-    actual.clear();
+-    expected.clear();
+-
+-    deleteList.clear();
+-    deleteList.add(list2.get(0).toString());
+-    // delete jars added using query2
+-    ss.delete_resources(t, deleteList);
+-    dependencies = ss.list_resource(t, null);
+-    actual = new LinkedList<URI>();
+-    for (String dependency : dependencies) {
+-      actual.add(new URI(dependency));
+-    }
+-    expected = new LinkedList<URI>(list3);
+-    Collections.sort(expected);
+-    Collections.sort(actual);
+-    assertEquals(expected, actual);
+-
+-    actual.clear();
+-    expected.clear();
+-
+-    // delete remaining jars
+-    deleteList.clear();
+-    deleteList.add(list3.get(0).toString());
+-    ss.delete_resources(t, deleteList);
+-
+-    dependencies = ss.list_resource(t, null);
+-    assertEquals(dependencies.isEmpty(), true);
+-
+-    ss.close();
+-  }
+-
+-  @After
+-  public void tearDown() {
+-    // delete sample jars
+-    for (int i = 1; i <= 5; i++) {
+-      String dataFile = TEST_JAR_DIR + "testjar" + i + ".jar";
+-
+-      File f = new File(dataFile);
+-      if (!f.delete()) {
+-        throw new RuntimeException("Could not delete the data file");
+-      }
+-    }
+-  }
+-
+-  private <T> List<T> union(List<T> list1, List<T> list2) {
+-    Set<T> set = new HashSet<T>();
+-
+-    set.addAll(list1);
+-    set.addAll(list2);
+-
+-    return new LinkedList<T>(set);
+-  }
+-
+-}
+diff --git a/ql/src/test/queries/clientpositive/add_jar_pfile.q b/ql/src/test/queries/clientpositive/add_jar_pfile.q
+deleted file mode 100644
+index ed55518..0000000
+--- a/ql/src/test/queries/clientpositive/add_jar_pfile.q
++++ /dev/null
+@@ -1,8 +0,0 @@
+-
+-dfs -copyFromLocal ${system:maven.local.repository}/org/apache/hive/hive-contrib/${system:hive.version}/hive-contrib-${system:hive.version}.jar pfile://${system:test.tmp.dir}/hive-contrib-${system:hive.version}.jar;
+-
+-add jar pfile://${system:test.tmp.dir}/hive-contrib-${system:hive.version}.jar;
+-
+-CREATE TEMPORARY FUNCTION example_add AS 'org.apache.hadoop.hive.contrib.udf.example.UDFExampleAdd';
+-
+-DROP TEMPORARY FUNCTION example_add;
+diff --git a/ql/src/test/results/clientpositive/add_jar_pfile.q.out b/ql/src/test/results/clientpositive/add_jar_pfile.q.out
+deleted file mode 100644
+index 60c65cc..0000000
+--- a/ql/src/test/results/clientpositive/add_jar_pfile.q.out
++++ /dev/null
+@@ -1,12 +0,0 @@
+-PREHOOK: query: CREATE TEMPORARY FUNCTION example_add AS 'org.apache.hadoop.hive.contrib.udf.example.UDFExampleAdd'
+-PREHOOK: type: CREATEFUNCTION
+-PREHOOK: Output: example_add
+-POSTHOOK: query: CREATE TEMPORARY FUNCTION example_add AS 'org.apache.hadoop.hive.contrib.udf.example.UDFExampleAdd'
+-POSTHOOK: type: CREATEFUNCTION
+-POSTHOOK: Output: example_add
+-PREHOOK: query: DROP TEMPORARY FUNCTION example_add
+-PREHOOK: type: DROPFUNCTION
+-PREHOOK: Output: example_add
+-POSTHOOK: query: DROP TEMPORARY FUNCTION example_add
+-POSTHOOK: type: DROPFUNCTION
+-POSTHOOK: Output: example_add
+-- 
+1.7.9.5
+

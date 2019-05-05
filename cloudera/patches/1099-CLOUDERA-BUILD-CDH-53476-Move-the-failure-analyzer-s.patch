@@ -1,0 +1,1177 @@
+From 8212e26ee927d03fc19488b99f29acb50cc86632 Mon Sep 17 00:00:00 2001
+From: Zsombor Klara <zsombor.klara@cloudera.com>
+Date: Fri, 5 May 2017 14:48:07 +0200
+Subject: [PATCH 1099/1164] CLOUDERA-BUILD: CDH-53476: Move the failure
+ analyzer script to the Hive source
+
+Change-Id: Ifd736c7827219d45bf678a576958b66314d11681
+---
+ cloudera/jenkins/InfraErrorCheck.groovy |   72 +++++++
+ cloudera/jenkins/failure_analyzis.py    |  343 +++++++++++++++++++++++++++++++
+ cloudera/jenkins/result_writer.py       |  117 +++++++++++
+ cloudera/jenkins/test_runner.py         |  285 +++++++++++++++++++++++++
+ cloudera/jenkins/util.py                |   81 ++++++++
+ cloudera/jenkins/xunitparser.py         |  218 ++++++++++++++++++++
+ 6 files changed, 1116 insertions(+)
+ create mode 100644 cloudera/jenkins/InfraErrorCheck.groovy
+ create mode 100755 cloudera/jenkins/failure_analyzis.py
+ create mode 100644 cloudera/jenkins/result_writer.py
+ create mode 100644 cloudera/jenkins/test_runner.py
+ create mode 100644 cloudera/jenkins/util.py
+ create mode 100644 cloudera/jenkins/xunitparser.py
+
+diff --git a/cloudera/jenkins/InfraErrorCheck.groovy b/cloudera/jenkins/InfraErrorCheck.groovy
+new file mode 100644
+index 0000000..9ea57b8
+--- /dev/null
++++ b/cloudera/jenkins/InfraErrorCheck.groovy
+@@ -0,0 +1,72 @@
++import hudson.tasks.junit.TestResultAction;
++
++String downstreamBaseUrl = "https://playground-01.jenkins.cloudera.com/job/Hive%20Build%20Failure%20Check/";
++String downstreamBuildUrl = downstreamBaseUrl + "buildWithParameters?token=DnF8AkpfSaso8tEBtT5R";
++
++InfraError[] INFRA_ERRORS = [
++        new InfraError("No space left on device", "No space left on device", "folder.gif"),
++        new InfraError("Aborting drone during", "Error creating drones", "warning.gif"),
++        new InfraError("Error creating group", "Error creating drones", "warning.gif"),
++        new InfraError("Failed to transfer file:", "Artifactory error", "warning.gif"),
++        new InfraError("COMPILATION ERROR", "Compilation error", "error.gif"),
++];
++
++
++class InfraError {
++    String pattern;
++    String label;
++    String badge;
++
++    InfraError(String pattern, String label, String badge) {
++        this.pattern = pattern;
++        this.label = label;
++        this.badge = badge;
++    }
++}
++
++def String startDownstreamUrl(String url) {
++    queueItemUrl = url.toURL();
++    queueItemJobConnection = queueItemUrl.openConnection();
++    String jobItemLocation = queueItemJobConnection. getHeaderField("Location");
++    queueItemJobConnection.disconnect();
++
++    // The build number is not available at trigger time, just after the job is started. We try to wait for the result
++    sleep(10000);
++
++    jobItemUrl = (jobItemLocation + "api/xml").toURL();
++    jobDescription = jobItemUrl.getText();
++
++    def leftItem = new XmlParser().parseText(jobDescription)
++    return jobUrl = leftItem.executable.url.text();
++}
++
++for(InfraError error in INFRA_ERRORS) {
++    if(manager.logContains(".*" + error.pattern + ".*")) {
++        manager.build.setDescription(error.label);
++        manager.build.setResult(error.result);
++
++        manager.createSummary(error.badge).appendText("<h1>" + error.label + "</h1>", false, false, false, "black");
++    }
++}
++
++TestResultAction testResults = manager.build.getAction(TestResultAction.class);
++if(testResults!=null && testResults.getFailedTests().size()>0) {
++    String buildUrl = manager.build.getEnvironment(manager.listener)['BUILD_URL'];
++    String downstreamUrl = downstreamBuildUrl + "&BUILD_URL=" + buildUrl;
++    manager.listener.logger.println("Calculated downstream job start url: " + downstreamUrl);
++
++    def jobUrl = null;
++    try {
++        jobUrl = startDownstreamUrl(downstreamUrl);
++    } catch(Exception ex) {
++        manager.listener.logger.println("Exception " + ex);
++    }
++    manager.listener.logger.println("Downstream job url: " + jobUrl );
++
++    manager.addBadge("db_out.gif", "Analyzis started");
++    if(jobUrl?.trim()) {
++        manager.build.setDescription("Analyzis is <a href='" + jobUrl + "'>here</a>");
++    } else {
++        manager.build.setDescription("Look for the results <a href='" + downstreamBaseUrl + "'>here</a>");
++    }
++}
+diff --git a/cloudera/jenkins/failure_analyzis.py b/cloudera/jenkins/failure_analyzis.py
+new file mode 100755
+index 0000000..f41a54b
+--- /dev/null
++++ b/cloudera/jenkins/failure_analyzis.py
+@@ -0,0 +1,343 @@
++#!/usr/local/bin/python
++
++import argparse
++import sys
++import subprocess
++import logging
++import random
++import shutil
++import os
++import test_runner
++import result_writer
++import xunitparser
++import util
++import urllib2
++import json
++import re
++
++MAX_FAILURE_TO_ANALYZE_COUNT = 3
++FLAKY_TEST_DECISION_COUNT = 3
++FLAKY_TEST_RUN_COUNT = 5
++FAILED_TEST_CHECK_BEHIND_COUNT = 10
++
++
++class Analyzer(object):
++    def __init__(self, source_dir, data_dir, build_url, hadoop):
++        self.hadoop = hadoop
++        logging.debug("Analyzer(%s, %s, %s)", source_dir, data_dir, build_url)
++        self.source_dir = source_dir
++        self.data_dir = data_dir
++        self.build_url = build_url
++        self.source_hash = self.__get_build_hash()
++
++        self.__prepare_data_dir()
++        self.result_writer = result_writer.ResultWriter(self.data_dir, self.build_url)
++
++        self.__download_data()
++        self.failed_test_cases = self.__get_test_cases()
++        self.test_runner = test_runner.TestRunner(self.source_dir, self.data_dir, self.source_hash, hadoop)
++
++    def __get_test_cases(self):
++        """
++        Get and normalize the test cases
++        :return: the array of the failed test cases
++        """
++        failed_tests = util.get_test_results(self.data_dir, True)
++        failed_classes = self.__get_missing_test_cases()
++        """ Collect the test cases where the whole class failed (setup problem) and add them to the
++        failed test classes. Good for removing duplicates and generalizing these TestCase objects
++        """
++        failed_classes.extend(
++            [test_case.classname.split(".")[-1] for test_case in failed_tests if
++             test_case.classname == test_case.methodname and test_case.classname.split(".")[-1] not in failed_classes])
++        failed_classes = list(set(failed_classes))
++        """ Remove instances of failed classes form the tests if any """
++        failed_tests[:] = \
++            [test_case for test_case in failed_tests if
++             test_case.classname.split(".")[-1] not in failed_classes]
++        """ Add the testcase instance to the failed_tests list generated from the failed_classes """
++        for failed_class in failed_classes:
++            test_case = xunitparser.TestCase(failed_class, "")
++            test_case.seed('error')
++            failed_tests.append(test_case)
++
++        """ Print out the found test cases """
++        logging.debug("Found failed test cases:")
++        for failed_test_case in failed_tests:
++            logging.debug(" - %s %s", failed_test_case.classname, failed_test_case.methodname)
++        return failed_tests
++
++    def analyze(self):
++        """ Analyzes the test results """
++        logging.debug("analyze()")
++        """
++        Check if there is many test failures, and select MAX_FAILURE_TO_TRACK to check only those
++        """
++        tracked_test_cases = self.failed_test_cases
++        if len(self.failed_test_cases) > MAX_FAILURE_TO_ANALYZE_COUNT:
++            tracked_test_cases = random.sample(self.failed_test_cases, MAX_FAILURE_TO_ANALYZE_COUNT)
++            logging.info("Number of testcases is bigger than maximum (%s vs. %s)",
++                         len(self.failed_test_cases), MAX_FAILURE_TO_ANALYZE_COUNT)
++            logging.info("Tracking the following:")
++            for case in tracked_test_cases:
++                logging.info(" - %s %s", case.classname, case.methodname)
++
++        failures = []
++        for case in tracked_test_cases:
++            """ Runs the test again for FLAKY_TEST_DECISION_COUNT times """
++            found_success = False
++            found_failure = False
++            for _ in xrange(0, FLAKY_TEST_DECISION_COUNT):
++                checked_test_case = self.test_runner.rerun_test(case, False)
++                if checked_test_case is None:
++                    logging.info("Could not find failed testcase in source %s %s", case.classname, case.methodname)
++                    sys.exit(1)
++                if checked_test_case.good:
++                    found_success = True
++                else:
++                    found_failure = True
++                if found_failure and found_success:
++                    """ If found goof and bad results too """
++                    self.__analyze_flaky(case)
++                    break
++
++            if found_success and not found_failure:
++                """
++                If all of the runs are successful run it in the same group when the failure happened
++                """
++                found_group_success = False
++                for _ in xrange(0, FLAKY_TEST_DECISION_COUNT):
++                    checked_test_case = self.test_runner.rerun_test(case, True)
++                    if checked_test_case.good:
++                        """ If there is at least a good result then the test is flaky """
++                        found_group_success = True
++                        self.__analyze_flaky(case)
++                        break
++
++                if not found_group_success:
++                    """ If every group run failed then report a group run error """
++                    group = []
++                    for group_case in case.suite:
++                        group.append((group_case.classname, group_case.methodname))
++                    self.result_writer.feedback_group_error(case.classname, case.methodname, group)
++
++            if found_failure and not found_success:
++                """
++                If the run is still failing then mark it to check later together with every
++                failing tests
++                """
++                failures.append(case)
++
++        """ If there are any failure the check which commit is to blame """
++        if len(failures) > 0:
++            self.__analyze_failures(failures)
++
++        """ If the run is finished remove the badge from the parent build """
++        """ we need a username and a password for it to work :( """
++        """ util.run_and_wait(["wget", args.build + "/parent/parent/plugin/groovy-postbuild/removeBadges"], "Error removing badge") """
++        self.result_writer.finalize_result()
++
++    def __prepare_data_dir(self):
++        """
++        Cleans up the previous results and creates the data directory
++        :return: The data directory to use
++        """
++        logging.debug("__prepare_data_dir()")
++
++        logging.debug("Removing previous downloaded data")
++        shutil.rmtree(self.data_dir, ignore_errors=True)
++        os.makedirs(self.data_dir)
++
++    def __download_data(self):
++        """
++        Downloads the test results to the data directory
++        :return: -
++        """
++        logging.debug("__download_data()")
++
++        with util.ChangeDir(self.data_dir):
++            util.run_and_wait(["wget", self.build_url + "/artifact/*zip*/archive.zip"], "Error downloading test results")
++            util.run_and_wait(["unzip", "archive.zip"], "Error uncompressing test results")
++            util.run_and_wait(["wget", self.build_url + "/consoleText"], "Error downloading console text")
++
++    def __get_missing_test_cases(self):
++        """
++        Calulcates the missing test_cases using the console output
++        :return: the list of the missed test_cases
++        """
++        logging.debug("__get_missing_test_cases()")
++
++        result = []
++        missed = r".* - ([\S]+) - did not produce a TEST-\*.xml file"
++        console_file_name = os.path.join(self.data_dir, "consoleText")
++        with open(console_file_name) as console_file:
++            for line in console_file:
++                match = re.search(missed, line)
++                if match:
++                    if match.group(1) not in result:
++                        result.append(match.group(1))
++        if result:
++            logging.info("Found testcase(s) with missing result Test-*.xml: %s", result)
++        else:
++            logging.info("No missing testcase found")
++        return result
++
++    def __get_build_hash(self):
++        """
++        Downloads the build parameters using the jenkins python api, and gets the git hash of the
++        last commit
++        :return: hash of the build
++        """
++        logging.debug("__get_build_hash()")
++
++        response = urllib2.urlopen(self.build_url + "/api/python")
++        raw = response.read().decode("utf-8")
++        raw = raw.replace(":False", ":\"False\"")
++        raw = raw.replace(":True", ":\"True\"")
++        raw = raw.replace(":None", ":\"None\"")
++        logging.debug("Downloaded raw: %s", raw)
++        data = json.loads(raw)
++        for action in data['actions']:
++            if 'lastBuiltRevision' in action:
++                found_hash = action['lastBuiltRevision']['SHA1']
++                logging.info("Found hash: %s", found_hash)
++                return found_hash
++        logging.info("Git hash not found")
++        sys.exit(1)
++
++    def __analyze_flaky(self, test_case):
++        """
++        Analyze a flaky tests by running it FLAKY_TEST_RUN_NUMBER times, and reporting the statistics
++        :param test_case: The testcase to run again
++        :return: The list of the results of the new runs
++        """
++        logging.debug("__analyze_flaky(%s)", test_case)
++
++        new_results = []
++        flaky_successes = 0
++        flaky_failures = 0
++        for _ in xrange(0, FLAKY_TEST_RUN_COUNT):
++            test_result = self.test_runner.rerun_test(test_case, False)
++            new_results.append(test_result)
++            if test_result.good:
++                flaky_successes += 1
++            else:
++                flaky_failures += 1
++
++        self.result_writer.feedback_flaky_response(test_case.classname, test_case.methodname, flaky_failures, flaky_successes)
++        return new_results
++
++    def __analyze_failures(self, test_case_array):
++        """
++        Analyze a failed tests by checking out previous versions of the code and running it again
++        until all of the is successful, or FAILED_TEST_MAX_CHECK_NUMBER is reached. Reporting the
++        commit_id when the test is failed the first time, or if when the test is first appeared in the
++        code
++        :param test_case_array: The array of the failed testcases to run again
++        :return: The list of the results of the new runs
++        """
++        logging.debug("__analyze_failure(%s)", test_case_array)
++
++        last_commit_ids = self.__get_last_commit_ids(FAILED_TEST_CHECK_BEHIND_COUNT)
++        bad_commit_id = last_commit_ids.pop(0)
++        for commit_id in last_commit_ids:
++            logging.debug("Analyzing %s commit", commit_id)
++            self.test_runner.rollback_source(commit_id)
++            for test_case in test_case_array:
++                """ Run the tests which are still failing """
++                test_result = self.test_runner.rerun_test(test_case, False)
++                if test_result is None or test_result.good:
++                    """ If the test was successfull remove from the list and report the commit """
++                    test_case_array.remove(test_case)
++                    log = self.__get_commit_log(bad_commit_id)
++                    self.result_writer.feedback_failed_response(test_case.classname, test_case.methodname, bad_commit_id, log)
++                    return
++                bad_commit_id = commit_id
++
++        for test_case in test_case_array:
++            self.result_writer.feedback_no_result(test_case.classname, test_case.methodname)
++        return
++
++    def __get_last_commit_ids(self, max_number):
++        """
++        Return the last commit ids for the given git repository
++        :param max_number: The maximum number of the result list
++        :return:
++        """
++        logging.debug("__get_commit_list(%s)", max_number)
++
++        last_commit_ids = []
++        with util.ChangeDir(self.source_dir):
++            try:
++                text = subprocess.check_output(["git", "log", "--pretty=format:%H", "-n", str(max_number)])
++                for line in text.splitlines():
++                    last_commit_ids.append(line)
++            except subprocess.CalledProcessError, e:
++                logging.debug("Error while trying to get the commit list: %s", e)
++        logging.debug("Commit list generated %s", last_commit_ids)
++        return last_commit_ids
++
++    def __get_commit_log(self, commit_id):
++        """
++        Get the commit log data for the given commit id
++        :param commit_id: The commitId we are looking for
++        :return: The commit log information string
++        """
++        logging.debug("__get_commit_log(%s)", commit_id)
++        with util.ChangeDir(self.source_dir):
++            try:
++                command = ["git", "log", "-1", "--format=fuller", commit_id]
++                logging.debug("Executing: %s", command)
++                return subprocess.check_output(command)
++            except subprocess.CalledProcessError, e:
++                logging.error("Error while trying to get the commit data: %s", e)
++                sys.exit(1)
++
++
++#
++# This command runs the failure analyzis described in CDH-48184
++#
++if __name__ == "__main__":
++    """ Parse command line arguments """
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--build")
++    parser.add_argument("--log")
++    parser.add_argument("--source")
++    parser.add_argument("--hadoop")
++    args = parser.parse_args()
++
++    if args.log is not None:
++        numeric_level = getattr(logging, args.log.upper(), None)
++        if not isinstance(numeric_level, int):
++            raise ValueError("Invalid log level: %s", args.log)
++        logging.basicConfig(level=numeric_level)
++    else:
++        logging.basicConfig(level=logging.INFO)
++
++    if args.build is None:
++        print "The parameter '--build' was not found."
++        print "Please specify the jenkins build Url with '--build <url>' like --build http://unittest.jenkins.cloudera.com/job/Hive-Post-Commit-For-Test/42"
++        sys.exit(1)
++    else:
++        if args.build[-1] == '/':
++            args.build = args.build[:-1]
++
++    if args.hadoop is None:
++        args.hadoop = 2
++    else:
++        if not args.hadoop.isdigit():
++            print "The parameter '--hadoop' is not an integer."
++            sys.exit(1)
++
++
++    """ Used for testing purposes """
++    source = "."
++    if args.source is not None:
++        source = args.source
++
++    analyzer = Analyzer(source, os.path.join(source, "tmp"), args.build, args.hadoop)
++    analyzer.analyze()
++
++    print "\n\n\n\n\nResults:"
++    with open(os.path.join(os.path.join(source, "tmp"), result_writer.RESULT_TXT_FILE), "r") as result_file:
++        print result_file.read()
+diff --git a/cloudera/jenkins/result_writer.py b/cloudera/jenkins/result_writer.py
+new file mode 100644
+index 0000000..89d0475
+--- /dev/null
++++ b/cloudera/jenkins/result_writer.py
+@@ -0,0 +1,117 @@
++import os
++import logging
++
++RESULT_HTML_FILE = "results.html"
++RESULT_TXT_FILE = "results.txt"
++RESULT_SUMMARY_FILE = "summary.html"
++
++
++class ResultWriter(object):
++    """ Object for rendering an analyzis result """
++
++    def __init__(self, root_dir, build_url):
++        logging.debug("ResultWriter(%s, %s)", root_dir, build_url)
++        self.html_file = os.path.join(root_dir, RESULT_HTML_FILE)
++        self.txt_file = os.path.join(root_dir, RESULT_TXT_FILE)
++        self.summary_file = os.path.join(root_dir, RESULT_SUMMARY_FILE)
++        with open(self.html_file, "a") as result_file:
++            result_file.write("Analyzis is started for <a href='%s'>%s</a>" % (build_url, build_url))
++        with open(self.txt_file, "a") as result_file:
++            result_file.write("Analyzis is started for %s\n\n" % build_url)
++        with open(self.summary_file, "a") as result_file:
++            result_file.write("Analyzis of <a href='%s'>%s#%s</a>\n" % (build_url, build_url.split("/")[-2], build_url.split("/")[-1]))
++
++    def finalize_result(self):
++        """ Print the closing lines """
++        logging.debug("finalize_result()")
++        with open(self.html_file, "a") as result_file:
++            result_file.write("<br/>Analyzis successful")
++        with open(self.txt_file, "a") as result_file:
++            result_file.write("Analyzis successful")
++
++    def feedback_flaky_response(self, classname, method, failures, successes):
++        """
++        Handles the feedback for the failed tests
++        :param classname: The flaky test classname
++        :param method: The flaky test method, or query test runner and query
++        :param failures: The number of failures during testing
++        :param successes: The number of successful runs during testing
++        :return: -
++        """
++        logging.debug("feedback_flaky_response(%s, %s, %s, %s)", classname, method, failures, successes)
++
++        logging.info("Testcase %s %s flaky test analyzis resulted in %s/%s failures/successes",
++                     classname, method, failures, successes)
++
++        with open(self.html_file, "a") as result_file:
++            result_file.write("<br/><b>%s - %s is flaky</b> (%s/%s - failure/success)\n" % (classname, method, failures, successes))
++        with open(self.txt_file, "a") as result_file:
++            result_file.write("%s - %s is flaky (%s/%s - failure/success)\n" % (classname, method, failures, successes))
++        with open(self.summary_file, "a") as result_file:
++            result_file.write("<br/>Flaky %s#%s\n" % (classname.split(".")[-1], method))
++
++    def feedback_failed_response(self, classname, method, commit_id, commit_log):
++        """
++        Handles the feedback for the flaky tests
++        :param classname: The flaky test classname
++        :param method: The flaky test method, or query test runner and query
++        :param commit_id: The commit hash to blame
++        :param commit_log: The commit log
++        :return: -
++        """
++        logging.debug("feedback_failed_response(%s, %s, %s, %s)", classname, method, commit_id, commit_log)
++
++        logging.info("Testcase %s %s failed %s commit is blamed", classname, method, commit_id)
++        logging.info("Commit:\n\n%s", commit_log)
++
++        with open(self.html_file, "a") as result_file:
++            result_file.write("<br/><b>%s - %s is broken by %s</b><br/><pre>%s</pre>\n" % (classname, method, commit_id, commit_log))
++        with open(self.txt_file, "a") as result_file:
++            result_file.write("%s - %s is broken by %s\n%s\n" % (classname, method, commit_id, commit_log))
++        with open(self.summary_file, "a") as result_file:
++            result_file.write("<br/>Broken %s#%s by %s\n" % (classname.split(".")[-1], method, commit_id))
++
++    def feedback_group_error(self, classname, method, group):
++        """
++        Handles the feedback for group errors
++        :param classname: The failed test classname
++        :param method: The failed test methodname
++        :param group: The list of the classname, methodname of the group causing the failure
++        :return: -
++        """
++        logging.debug("feedback_group_error(%s, %s, %s)", classname, method, group)
++
++        logging.info("Testcase %s %s failed in the following group", classname, method)
++        for (test_class, test_method) in group:
++            logging.info(" - %s %s", test_class, test_method)
++
++        result_html_file = open(self.html_file, "a")
++        result_txt_file = open(self.txt_file, "a")
++        result_summary_file = open(self.summary_file, "a")
++
++        result_html_file.write("<br/><b>%s - %s is broken if run in this group<br/><ul>\n" % (classname, method))
++        result_txt_file.write(">%s - %s is broken if run in this group\n" % (classname, method))
++        result_summary_file.write("<br/>Group error %s#%s\n" % (classname.split(".")[-1], method))
++        for (test_class, test_method) in group:
++            result_html_file.write("<li>%s %s</li>\n" % (test_class, test_method))
++            result_txt_file.write("- %s %s\n" % (test_class, test_method))
++        result_html_file.write("</ul>\n")
++        result_txt_file.write("\n")
++
++    def feedback_no_result(self, classname, method):
++        """
++        Handles the feedback for the failures where no commit could be blamed
++        :param classname: The failed test classname
++        :param method: The failed test methodname
++        :return: -
++        """
++        logging.debug("feedback_no_result(%s, %s)", classname, method)
++
++        logging.info("Was not able to find the commit to blame for testcase %s %s", classname, method)
++
++        with open(self.html_file, "a") as result_file:
++            result_file.write("<br/><b>%s - %s is broken</b> but no braking commit found\n" % (classname, method))
++        with open(self.txt_file, "a") as result_file:
++            result_file.write("%s - %s is broken but no braking commit found\n" % (classname, method))
++        with open(self.summary_file, "a") as result_file:
++            result_file.write("<br/>Pass on %s#%s\n" % (classname.split(".")[-1], method))
+diff --git a/cloudera/jenkins/test_runner.py b/cloudera/jenkins/test_runner.py
+new file mode 100644
+index 0000000..eb27754
+--- /dev/null
++++ b/cloudera/jenkins/test_runner.py
+@@ -0,0 +1,285 @@
++import logging
++import os
++import sys
++import util
++import shutil
++import xunitparser
++
++
++class TestRunner(object):
++    """
++    Running the specific test on the hive source
++    """
++
++    def __init__(self, root_dir, log_dir, commit_id, hadoop_nr):
++        logging.debug("TestRunner(%s, %s, %s)", root_dir, log_dir, commit_id)
++        self.hadoop_param = "-Phadoop-%s" % hadoop_nr
++
++        if root_dir is None or log_dir is None or commit_id is None:
++            logging.error("root_dir, log_dir, commit_id should not be null")
++            sys.exit(1)
++        self.root_dir = root_dir
++        self.log_dir = log_dir
++        self.commit_id = commit_id
++        self.__prepare_source(True)
++
++    def rollback_source(self, commit_id):
++        """
++        Rolls back the source to the given commit, and builds the project
++        :param commit_id: The commit to roll back to
++        :return: -
++        """
++        logging.debug("rollback_source(%s)", commit_id)
++        self.commit_id = commit_id
++        self.__prepare_source(False)
++
++    def rerun_test(self, test_case, full_batch):
++        """
++        Rerun a given testcase
++        :param test_case: The testcase to run again
++        :param full_batch: If true, then the full batch is run, if false only the single testcase
++        :return: The result of the new run
++        """
++        logging.debug("rerun_test(%s, %s)", test_case, full_batch)
++
++        file_name = test_case.classname.split(".")[-1] + ".java"
++        logging.debug("Looking for %s", file_name)
++        test_file = util.find(file_name, self.root_dir)
++        logging.debug("Found %s", test_file)
++
++        if test_file is None:
++            logging.error("Skipping test_case, file_name %s not found", file_name)
++            return None
++
++        (module_root, name) = os.path.split(test_file)
++        while name and name != "src" and name != "target":
++            (module_root, name) = os.path.split(module_root)
++        logging.debug("Module root is %s", module_root)
++
++        logging.debug("Removing previous test results")
++        shutil.rmtree(os.path.join(module_root, "target", "surefire-reports"), ignore_errors=True)
++
++        if os.path.split(module_root)[-1].startswith("qtest"):
++            if not test_case.methodname:
++                logging.info("Do not want to replay %s", test_case.classname)
++                sys.exit(1)
++            command = self.__get_query_test_command(test_case, full_batch)
++            new_test_result = self.__run_test(module_root, command, test_case.classname, test_case.methodname)
++        else:
++            if not test_case.methodname:
++                command = self.__get_junit_test_class_command(test_case.classname)
++                new_test_result = self.__run_test_class(module_root, command, test_case.classname)
++            else:
++                command = self.__get_junit_test_command(test_case, full_batch)
++                new_test_result = self.__run_test(module_root, command, test_case.classname, test_case.methodname)
++
++        base_dir = os.path.join(self.log_dir, "rerun", test_case.classname + "_" + test_case.methodname)
++        test_result_dir = self.__generate_new_test_results_dir_name(base_dir)
++        self.__store_test_results(module_root, test_result_dir)
++        if new_test_result is not None:
++            logging.debug("Test result is %s %s", new_test_result, new_test_result.good)
++        else:
++            logging.debug("No test result generated")
++        return new_test_result
++
++    def __prepare_source(self, clean=True):
++        """
++        Prepares the source code. Checks out the current revision, and builds the project
++        :param clean: If true, then run clean before building the source
++        :return: -
++        """
++        logging.debug("__prepare_source(%s)", clean)
++
++        with util.ChangeDir(self.root_dir):
++            command = ["git", "fetch", "--all"]
++
++            util.run_and_wait(command, "Error fetching repository data")
++
++            command = ["git", "checkout", self.commit_id]
++            util.run_and_wait(command, "Error checking out hash: " + self.commit_id)
++
++            command = ["mvn", "install", "-Phadoop-2", "-DskipTests"]
++            if clean:
++                command.insert(1, "clean")
++            util.run_and_wait(command, "Error building project")
++
++        with util.ChangeDir(os.path.join(self.root_dir, "itests")):
++            command = ["mvn", "install", "-Phadoop-2", "-DskipTests"]
++            if clean:
++                command.insert(1, "clean")
++            util.run_and_wait(command, "Error building project")
++
++    def __get_query_test_command(self, test_case, full_batch):
++        """
++        Generates a qtest running mvn command
++        :param test_case: The testcase to run again
++        :param full_batch: Should the test run the full batch or only the test standalone
++        :return: The command list
++        """
++        if full_batch:
++            query_list = ""
++            for batch_case in test_case.suite:
++                query_list += TestRunner.__get_queryfile_from_methodname(batch_case.methodname) + ","
++            query_list = query_list[:-1]
++        else:
++            query_list = TestRunner.__get_queryfile_from_methodname(test_case.methodname)
++        return ["mvn", "clean", "test", self.hadoop_param, "-Dtest=" + test_case.classname, "-Dqfile=" + query_list]
++
++    @staticmethod
++    def __get_queryfile_from_methodname(methodname):
++        """
++        Gets the query file name from the method name for 5.8, and 5.9 and above formats
++        :param methodname: The test method name
++        :return: The query file name
++        """
++        if "[" in methodname:
++            return methodname.split("[")[-1][:-1] + ".q"
++        else:
++            (first, sep, result) = methodname.partition('_')
++            return result + ".q"
++
++    def __get_junit_test_class_command(self, testclass):
++        """
++        Generates a junit test running mvn command which runs every test in the testclass
++        :param testclass: The testcase to run again
++        :return: The command list
++        """
++        return ["mvn", "clean", "test", self.hadoop_param, "-Dtest=" + testclass]
++
++    def __get_junit_test_command(self, test_case, full_batch):
++        """
++        Generates a junit test running mvn command. If the test_case is a parametrized test then
++        run the entire class of tests again, since surefire 2.16 is not able to run parametrized
++        test methods
++        :param test_case: The testcase to run again
++        :param full_batch: Should the test run the full batch or only the test standalone
++        :return: The command list
++        """
++        if full_batch:
++            test_list = ""
++            for batch_case in test_case.suite:
++                test_list += batch_case.classname + ","
++            test_list = test_list[:-1]
++        else:
++            if "[" in test_case.methodname:
++                test_list = test_case.classname
++            else:
++                test_list = test_case.classname + "#" + test_case.methodname
++        return ["mvn", "clean", "test", self.hadoop_param, "-Dtest=" + test_list]
++
++    @staticmethod
++    def __run_test_command(module_root, command):
++        """
++        Runs a test, and parses the result
++        :param module_root: The root module to run from
++        :param command: The command that runs the test
++        :return: test_case: The result of the test run, if any
++        """
++        logging.debug("__run_test_command(%s, %s)", module_root, command)
++
++        with util.ChangeDir(module_root):
++            util.run_and_wait(command)
++        return util.get_test_results(os.path.join(module_root, "target", "surefire-reports"), False)
++
++    @staticmethod
++    def __run_test_class(module_root, command, classname):
++        """
++        Runs every test in a test class, and parses the result. If there is no result,
++        or at least one error, return error. Else return success.
++        :param module_root: The root module to run from
++        :param command: The command that runs the test
++        :param classname: The class name to look for in the results
++        :return: test_case[]: The array of the results of the test run, if any
++        """
++        logging.debug("__run_test_class(%s, %s, %s)", module_root, command, classname)
++
++        every_result = TestRunner.__run_test_command(module_root, command)
++        test_case = xunitparser.TestCase(classname, "")
++        found = False
++        for case in every_result:
++            if case.classname.split(".")[-1] == classname:
++                if not case.good:
++                    test_case.seed(case.result)
++                    logging.debug("Found failed case: %s", case)
++                    return test_case
++                found = True
++        if not found:
++            logging.debug("Not found any result, so returning failed case")
++            test_case.seed('error')
++        else:
++            logging.debug("Found only successful cases")
++            test_case.seed('success')
++        return test_case
++
++    @staticmethod
++    def __run_test(module_root, command, classname, methodname):
++        """
++        Runs a specific test, and parses the result
++        :param module_root: The root module to run from
++        :param command: The command that runs the test
++        :param classname: The class name to look for in the results
++        :param methodname: The method name to look for in the results
++        :return: test_case: The result of the test run, if any
++        """
++        logging.debug("__run_test(%s, %s, %s, %s)", module_root, command, classname, methodname)
++
++        every_result = TestRunner.__run_test_command(module_root, command)
++        for case in every_result:
++            if case.classname == classname and case.methodname == methodname:
++                return case
++        logging.debug("Test produced no result")
++
++    @staticmethod
++    def __generate_new_test_results_dir_name(destination_dir):
++        """
++        Generates a test results dir where the logs could be stored for the give test. It creates a
++        new subdirectory in the destination_dir starting with 0
++        :param destination_dir: The main directory to store the logs
++        :return: The generated new directory
++        """
++        logging.debug("generate_new_test_results_dir(%s)", destination_dir)
++
++        next_child = 0
++        if os.path.exists(destination_dir):
++            for subdir_name in os.listdir(destination_dir):
++                try:
++                    subdir_num = int(subdir_name)
++                except ValueError:
++                    logging.debug("Unexpected directory name in %s: %s", destination_dir, subdir_name)
++                    continue
++
++                if os.path.isdir(os.path.join(destination_dir, subdir_name)) and next_child <= subdir_num:
++                    next_child = subdir_num + 1
++
++        new_test_results_dir_name = os.path.join(destination_dir, str(next_child))
++        logging.debug("Generated new test results directory name: %s", new_test_results_dir_name)
++        return new_test_results_dir_name
++
++    @staticmethod
++    def __store_test_results(source_dir, destination_dir):
++        """
++        Move the test results from the source dir to the destination dir
++        :param source_dir: The directory to move from
++        :param destination_dir: The directory to move to
++        :return: -
++        """
++        logging.debug("store_test_results(%s, %s)", source_dir, destination_dir)
++
++        if not os.path.exists(destination_dir):
++            os.makedirs(destination_dir)
++            logging.debug("Directory created %s", destination_dir)
++
++        shutil.move(os.path.join(source_dir, "target", "surefire-reports"), destination_dir)
++        logging.debug("Reports moved")
++
++        log_dir = os.path.join(source_dir, "target", "tmp", "log")
++        if os.path.exists(log_dir):
++            shutil.move(log_dir, destination_dir)
++            logging.debug("Logs moved")
++
++        query_out_dir = os.path.join(source_dir, "target", "qfile-results")
++        if os.path.exists(query_out_dir):
++            for root, dirs, files in os.walk(query_out_dir):
++                for name in files:
++                    shutil.move(os.path.join(root, name), destination_dir)
++            logging.debug("Query results moved")
+diff --git a/cloudera/jenkins/util.py b/cloudera/jenkins/util.py
+new file mode 100644
+index 0000000..1e1547b
+--- /dev/null
++++ b/cloudera/jenkins/util.py
+@@ -0,0 +1,81 @@
++import os
++import sys
++import logging
++import subprocess
++import xunitparser
++
++
++class ChangeDir(object):
++    """ Context Manager to change current directory. """
++    def __init__(self, newPath):
++        self.newPath = os.path.expanduser(newPath)
++
++    def __enter__(self):
++        """
++        Change directory with the new path
++        :return: -
++        """
++        self.savedPath = os.getcwd()
++        os.chdir(self.newPath)
++
++    def __exit__(self, etype, value, traceback):
++        """
++        Return back to previous directory
++        :param etype: Not used
++        :param value: Not used
++        :param traceback: Not used
++        :return:
++        """
++        os.chdir(self.savedPath)
++
++
++def find(name, directory):
++    """
++    Find the given file in the given directory recursively
++    :param name: The file to look for
++    :param directory: The root directory
++    :return: The full path
++    """
++    for root, dirs, files in os.walk(directory):
++        if name in files:
++            return os.path.join(root, name)
++
++
++def run_and_wait(command, error_message=None):
++    """
++    Executing the specific shell command and waiting for the results. If error_message is set
++    then sys.exit() in case of failure with the same code as the command
++    :param command: The command to run
++    :param error_message: The message to print in case of failure before exit
++    :return:
++    """
++    logging.debug("run_command(%s)", command)
++    process = subprocess.Popen(command)
++    result = process.wait()
++    if result != 0 and error_message is not None:
++        logging.error(error_message)
++        sys.exit(result)
++    return result
++
++
++def get_test_results(result_dir, only_failed):
++    """
++    Returns the list of the testcases in the given directory
++    :param result_dir: The directory where the junit xml-s are sitting
++    :param only_failed: Collect only failed results
++    :return: the list of the failed test_cases
++    """
++    logging.debug("get_test_results(%s, %s)", result_dir, only_failed)
++
++    result = []
++    for root, dirs, files in os.walk(result_dir):
++        for filename in files:
++            logging.debug("Checking file: %s/%s", root, filename)
++            if filename.endswith(".xml"):
++                test_suite, test_result = xunitparser.parse(open(os.path.join(root, filename)))
++                for test_case in test_suite:
++                    if not test_case.good or not only_failed:
++                        logging.info("Test case data to process: %s %s", test_case.classname, test_case.methodname)
++                        test_case.suite = test_suite
++                        result.append(test_case)
++    return result
+diff --git a/cloudera/jenkins/xunitparser.py b/cloudera/jenkins/xunitparser.py
+new file mode 100644
+index 0000000..b0095dc
+--- /dev/null
++++ b/cloudera/jenkins/xunitparser.py
+@@ -0,0 +1,218 @@
++import math
++import unittest
++from datetime import timedelta
++from xml.etree import ElementTree
++
++
++def to_timedelta(val):
++    if val is None:
++        return None
++
++    val = val.replace(",","")
++    secs = float(val)
++    if math.isnan(secs):
++        return None
++
++    return timedelta(seconds=secs)
++
++
++class TestResult(unittest.TestResult):
++    def _exc_info_to_string(self, err, test):
++        err = (e for e in err if e)
++        return ': '.join(err)
++
++
++class TestCase(unittest.TestCase):
++    TR_CLASS = TestResult
++    stdout = None
++    stderr = None
++
++    def __init__(self, classname, methodname):
++        super(TestCase, self).__init__()
++        self.classname = classname
++        self.methodname = methodname
++
++    def __str__(self):
++        return "%s (%s)" % (self.methodname, self.classname)
++
++    def __repr__(self):
++        return "<%s testMethod=%s>" % \
++               (self.classname, self.methodname)
++
++    def __hash__(self):
++        return hash((type(self), self.classname, self.methodname))
++
++    def id(self):
++        return "%s.%s" % (self.classname, self.methodname)
++
++    def seed(self, result, typename=None, message=None, trace=None):
++        """ Provide the expected result """
++        self.result, self.typename, self.message, self.trace = result, typename, message, trace
++
++    def run(self, tr=None):
++        """ Fake run() that produces the seeded result """
++        tr = tr or self.TR_CLASS()
++
++        tr.startTest(self)
++        if self.result == 'success':
++            tr.addSuccess(self)
++        elif self.result == 'skipped':
++            tr.addSkip(self, '%s: %s' % (self.typename, self._textMessage()))
++        elif self.result == 'error':
++            tr.addError(self, (self.typename, self._textMessage()))
++        elif self.result == 'failure':
++            tr.addFailure(self, (self.typename, self._textMessage()))
++        tr.stopTest(self)
++
++        return tr
++
++    def _textMessage(self):
++        msg = (e for e in (self.message, self.trace) if e)
++        return '\n\n'.join(msg) or None
++
++    @property
++    def alltext(self):
++        err = (e for e in (self.typename, self.message) if e)
++        err = ': '.join(err)
++        txt = (e for e in (err, self.trace) if e)
++        return '\n\n'.join(txt) or None
++
++    def setUp(self):
++        """ Dummy method so __init__ does not fail """
++        pass
++
++    def tearDown(self):
++        """ Dummy method so __init__ does not fail """
++        pass
++
++    def runTest(self):
++        """ Dummy method so __init__ does not fail """
++        self.run()
++
++    @property
++    def basename(self):
++        return self.classname.rpartition('.')[2]
++
++    @property
++    def success(self):
++        return self.result == 'success'
++
++    @property
++    def skipped(self):
++        return self.result == 'skipped'
++
++    @property
++    def failed(self):
++        return self.result == 'failure'
++
++    @property
++    def errored(self):
++        return self.result == 'error'
++
++    @property
++    def good(self):
++        return self.skipped or self.success
++
++    @property
++    def bad(self):
++        return not self.good
++
++    @property
++    def stdall(self):
++        """ All system output """
++        return '\n'.join([out for out in (self.stdout, self.stderr) if out])
++
++
++class TestSuite(unittest.TestSuite):
++    def __init__(self, *args, **kwargs):
++        super(TestSuite, self).__init__(*args, **kwargs)
++        self.properties = {}
++        self.stdout = None
++        self.stderr = None
++
++
++class Parser(object):
++    TC_CLASS = TestCase
++    TS_CLASS = TestSuite
++    TR_CLASS = TestResult
++
++    def parse(self, source):
++        xml = ElementTree.parse(source)
++        root = xml.getroot()
++        return self.parse_root(root)
++
++    def parse_root(self, root):
++        ts = self.TS_CLASS()
++        if root.tag == 'testsuites':
++            for subroot in root:
++                self.parse_testsuite(subroot, ts)
++        else:
++            self.parse_testsuite(root, ts)
++
++        tr = ts.run(self.TR_CLASS())
++
++        tr.time = to_timedelta(root.attrib.get('time'))
++
++        # check totals if they are in the root XML element
++        if 'errors' in root.attrib:
++            assert len(tr.errors) == int(root.attrib['errors'])
++        if 'failures' in root.attrib:
++            assert len(tr.failures) == int(root.attrib['failures'])
++        if 'skip' in root.attrib:
++            assert len(tr.skipped) == int(root.attrib['skip'])
++        if 'tests' in root.attrib:
++            assert len(list(ts)) == int(root.attrib['tests'])
++
++        return (ts, tr)
++
++    def parse_testsuite(self, root, ts):
++        assert root.tag == 'testsuite'
++        ts.name = root.attrib.get('name')
++        ts.package = root.attrib.get('package')
++        for el in root:
++            if el.tag == 'testcase':
++                self.parse_testcase(el, ts)
++            if el.tag == 'properties':
++                self.parse_properties(el, ts)
++            if el.tag == 'system-out' and el.text:
++                ts.stdout = el.text.strip()
++            if el.tag == 'system-err' and el.text:
++                ts.stderr = el.text.strip()
++
++    def parse_testcase(self, el, ts):
++        tc_classname = el.attrib.get('classname') or ts.name
++        tc = self.TC_CLASS(tc_classname, el.attrib['name'])
++        tc.seed('success', trace=el.text or None)
++        tc.time = to_timedelta(el.attrib.get('time'))
++        message = None
++        text = None
++        for e in el:
++            # error takes over failure in JUnit 4
++            if e.tag in ('failure', 'error', 'skipped'):
++                tc = self.TC_CLASS(tc_classname, el.attrib['name'])
++                result = e.tag
++                typename = e.attrib.get('type')
++
++                # reuse old if empty
++                message = e.attrib.get('message') or message
++                text = e.text or text
++
++                tc.seed(result, typename, message, text)
++                tc.time = to_timedelta(el.attrib.get('time'))
++            if e.tag == 'system-out' and e.text:
++                tc.stdout = e.text.strip()
++            if e.tag == 'system-err' and e.text:
++                tc.stderr = e.text.strip()
++
++        # add either the original "success" tc or a tc created by elements
++        ts.addTest(tc)
++
++    def parse_properties(self, el, ts):
++        for e in el:
++            if e.tag == 'property':
++                assert e.attrib['name'] not in ts.properties
++                ts.properties[e.attrib['name']] = e.attrib['value']
++
++
++def parse(source):
++    return Parser().parse(source)
+-- 
+1.7.9.5
+

@@ -1,0 +1,140 @@
+From ffa390069412580c2f76c12081f5be2297c1771f Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Tue, 14 Apr 2015 13:46:50 -0700
+Subject: [PATCH 0322/1164] HIVE-10325 : Remove ExprNodeNullEvaluator
+ (Ashutosh Chauhan via Gopal V)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../hive/ql/exec/ExprNodeEvaluatorFactory.java     |   11 +++--
+ .../hive/ql/exec/ExprNodeGenericFuncEvaluator.java |    3 +-
+ .../hadoop/hive/ql/exec/ExprNodeNullEvaluator.java |   47 --------------------
+ .../hadoop/hive/ql/plan/ExprNodeConstantDesc.java  |    1 -
+ 4 files changed, 9 insertions(+), 53 deletions(-)
+ delete mode 100644 ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeNullEvaluator.java
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java
+index ff0ddc8..a149571 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeEvaluatorFactory.java
+@@ -28,6 +28,8 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeFieldDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
++import org.apache.hadoop.io.NullWritable;
+ 
+ /**
+  * ExprNodeEvaluatorFactory.
+@@ -57,7 +59,8 @@ public static ExprNodeEvaluator get(ExprNodeDesc desc) throws HiveException {
+     }
+     // Null node, a constant node with value NULL and no type information
+     if (desc instanceof ExprNodeNullDesc) {
+-      return new ExprNodeNullEvaluator((ExprNodeNullDesc) desc);
++      return new ExprNodeConstantEvaluator(new ExprNodeConstantDesc(TypeInfoFactory
++          .getPrimitiveTypeInfoFromPrimitiveWritable(NullWritable.class), null));
+     }
+ 
+     throw new RuntimeException(
+@@ -114,14 +117,14 @@ private static ExprNodeEvaluator iterate(ExprNodeEvaluator eval, EvaluatorContex
+ 
+   private static class EvaluatorContext {
+ 
+-    private final Map<ExprNodeDesc.ExprNodeDescEqualityWrapper, ExprNodeEvaluator> cached = 
++    private final Map<ExprNodeDesc.ExprNodeDescEqualityWrapper, ExprNodeEvaluator> cached =
+         new HashMap<ExprNodeDesc.ExprNodeDescEqualityWrapper, ExprNodeEvaluator>();
+ 
+     private boolean hasReference;
+ 
+     public ExprNodeEvaluator getEvaluated(ExprNodeEvaluator eval) {
+-      ExprNodeDesc.ExprNodeDescEqualityWrapper key = 
+-          new ExprNodeDesc.ExprNodeDescEqualityWrapper(eval.expr); 
++      ExprNodeDesc.ExprNodeDescEqualityWrapper key =
++          new ExprNodeDesc.ExprNodeDescEqualityWrapper(eval.expr);
+       ExprNodeEvaluator prev = cached.get(key);
+       if (prev == null) {
+         cached.put(key, eval);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeGenericFuncEvaluator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeGenericFuncEvaluator.java
+index b695bef..b09b706 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeGenericFuncEvaluator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeGenericFuncEvaluator.java
+@@ -78,9 +78,10 @@ public void prepare(int version) throws HiveException {
+     }
+ 
+     public boolean needsPrepare() {
+-      return !(eval instanceof ExprNodeConstantEvaluator || eval instanceof ExprNodeNullEvaluator);
++      return !(eval instanceof ExprNodeConstantEvaluator);
+     }
+ 
++    @Override
+     public Object get() throws HiveException {
+       if (!evaluated) {
+         obj = eval.evaluate(rowObject, version);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeNullEvaluator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeNullEvaluator.java
+deleted file mode 100644
+index 3aaf17c..0000000
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ExprNodeNullEvaluator.java
++++ /dev/null
+@@ -1,47 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.hive.ql.exec;
+-
+-import org.apache.hadoop.hive.ql.metadata.HiveException;
+-import org.apache.hadoop.hive.ql.plan.ExprNodeNullDesc;
+-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+-import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+-
+-// This function will not be used currently, since the function expressions
+-// change the void to the first matching argument
+-/**
+- * ExprNodeNullEvaluator.
+- *
+- */
+-public class ExprNodeNullEvaluator extends ExprNodeEvaluator<ExprNodeNullDesc> {
+-
+-  public ExprNodeNullEvaluator(ExprNodeNullDesc expr) {
+-    super(expr);
+-  }
+-
+-  @Override
+-  public ObjectInspector initialize(ObjectInspector rowInspector) throws HiveException {
+-    return outputOI = PrimitiveObjectInspectorFactory.writableVoidObjectInspector;
+-  }
+-
+-  @Override
+-  protected Object _evaluate(Object row, int version) throws HiveException {
+-    return null;
+-  }
+-}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
+index b15df0f..89a175e 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ExprNodeConstantDesc.java
+@@ -84,7 +84,6 @@ public Object getValue() {
+   @Override
+   public ConstantObjectInspector getWritableObjectInspector() {
+     PrimitiveTypeInfo pti = (PrimitiveTypeInfo) getTypeInfo();
+-    PrimitiveCategory pc = pti.getPrimitiveCategory();
+     // Convert from Java to Writable
+     Object writableValue = PrimitiveObjectInspectorFactory
+         .getPrimitiveJavaObjectInspector(pti).getPrimitiveWritableObject(
+-- 
+1.7.9.5
+

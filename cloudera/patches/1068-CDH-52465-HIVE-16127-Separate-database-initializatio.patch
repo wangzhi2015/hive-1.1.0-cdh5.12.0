@@ -1,0 +1,1173 @@
+From 38e2b2329e7749d18c4e96683635385fb6d9c1ca Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Mon, 13 Mar 2017 21:00:54 +0100
+Subject: [PATCH 1068/1164] CDH-52465: HIVE-16127: Separate database
+ initialization from actual query run in
+ TestBeeLineDriver(Peter Vary via Zoltan Haindrich
+ reviewed by Vihang Karajgaonkar, Barna Zsombor
+ Klara)
+
+Signed-off-by: Zoltan Haindrich <kirk@rxd.hu>
+(cherry picked from commit 95796e1727d1799449d9fdf2f10f9db530fa690e)
+
+Change-Id: I0844bf30a6f3284cd48b760f3da385dde8f1a391
+---
+ .../org/apache/hive/beeline/util/QFileClient.java  |  380 --------------------
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../hadoop/hive/cli/control/CoreBeeLineDriver.java |  145 +++++---
+ .../java/org/apache/hive/beeline/qfile/QFile.java  |  273 ++++++++++++++
+ .../hive/beeline/qfile/QFileBeeLineClient.java     |  149 ++++++++
+ .../apache/hive/beeline/qfile/package-info.java    |   22 ++
+ .../beeline/drop_with_concurrency.q.out            |   70 ++++
+ 7 files changed, 603 insertions(+), 439 deletions(-)
+ delete mode 100644 beeline/src/java/org/apache/hive/beeline/util/QFileClient.java
+ create mode 100644 itests/util/src/main/java/org/apache/hive/beeline/qfile/QFile.java
+ create mode 100644 itests/util/src/main/java/org/apache/hive/beeline/qfile/QFileBeeLineClient.java
+ create mode 100644 itests/util/src/main/java/org/apache/hive/beeline/qfile/package-info.java
+ create mode 100644 ql/src/test/results/clientpositive/beeline/drop_with_concurrency.q.out
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java b/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java
+deleted file mode 100644
+index a5dc611..0000000
+--- a/beeline/src/java/org/apache/hive/beeline/util/QFileClient.java
++++ /dev/null
+@@ -1,380 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hive.beeline.util;
+-
+-import java.io.File;
+-import java.io.IOException;
+-import java.io.PrintStream;
+-import java.util.ArrayList;
+-import java.util.LinkedHashMap;
+-import java.util.Map;
+-import java.util.regex.Pattern;
+-
+-import org.apache.commons.io.FileUtils;
+-import org.apache.commons.lang.StringUtils;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.util.Shell;
+-import org.apache.hive.common.util.StreamPrinter;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+-import org.apache.hive.beeline.BeeLine;
+-
+-/**
+- * QTestClient.
+- *
+- */
+-public class QFileClient {
+-  private String username;
+-  private String password;
+-  private String jdbcUrl;
+-  private String jdbcDriver;
+-
+-  private final File hiveRootDirectory;
+-  private File qFileDirectory;
+-  private File outputDirectory;
+-  private File expectedDirectory;
+-  private final File scratchDirectory;
+-  private final File warehouseDirectory;
+-  private final File initScript;
+-  private final File cleanupScript;
+-
+-  private File testDataDirectory;
+-  private File testScriptDirectory;
+-
+-  private String qFileName;
+-  private String testname;
+-
+-  private File qFile;
+-  private File outputFile;
+-  private File expectedFile;
+-
+-  private PrintStream beelineOutputStream;
+-
+-  private BeeLine beeLine;
+-
+-  private RegexFilterSet filterSet;
+-
+-  private boolean hasErrors = false;
+-
+-  private static Log LOG = LogFactory
+-      .getLog(QFileClient.class.getName());
+-
+-
+-  public QFileClient(HiveConf hiveConf, String hiveRootDirectory, String qFileDirectory, String outputDirectory,
+-      String expectedDirectory, String initScript, String cleanupScript) {
+-    this.hiveRootDirectory = new File(hiveRootDirectory);
+-    this.qFileDirectory = new File(qFileDirectory);
+-    this.outputDirectory = new File(outputDirectory);
+-    this.expectedDirectory = new File(expectedDirectory);
+-    this.initScript = new File(initScript);
+-    this.cleanupScript = new File(cleanupScript);
+-    this.scratchDirectory = new File(hiveConf.getVar(ConfVars.SCRATCHDIR));
+-    this.warehouseDirectory = new File(hiveConf.getVar(ConfVars.METASTOREWAREHOUSE));
+-  }
+-
+-
+-  private class RegexFilterSet {
+-    private final Map<Pattern, String> regexFilters = new LinkedHashMap<Pattern, String>();
+-
+-    public RegexFilterSet addFilter(String regex, String replacement) {
+-      regexFilters.put(Pattern.compile(regex), replacement);
+-      return this;
+-    }
+-
+-    public String filter(String input) {
+-      for (Pattern pattern : regexFilters.keySet()) {
+-        input = pattern.matcher(input).replaceAll(regexFilters.get(pattern));
+-      }
+-      return input;
+-    }
+-  }
+-
+-  void initFilterSet() {
+-    // Extract the leading four digits from the unix time value.
+-    // Use this as a prefix in order to increase the selectivity
+-    // of the unix time stamp replacement regex.
+-    String currentTimePrefix = Long.toString(System.currentTimeMillis()).substring(0, 4);
+-
+-    String userName = System.getProperty("user.name");
+-
+-    String timePattern = "(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+-        + "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+-        + "\\d{2} \\d{2}:\\d{2}:\\d{2} \\w+ 20\\d{2}";
+-    // Pattern to remove the timestamp and other infrastructural info from the out file
+-    String logPattern = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2},\\d*\\s+\\S+\\s+\\[" +
+-                            ".*\\]\\s+\\S+:\\s+";
+-    String unixTimePattern = "\\D" + currentTimePrefix + "\\d{6}\\D";
+-    String unixTimeMillisPattern = "\\D" + currentTimePrefix + "\\d{9}\\D";
+-
+-    String operatorPattern = "\"(CONDITION|COPY|DEPENDENCY_COLLECTION|DDL"
+-      + "|EXPLAIN|FETCH|FIL|FS|FUNCTION|GBY|HASHTABLEDUMMY|HASTTABLESINK|JOIN"
+-      + "|LATERALVIEWFORWARD|LIM|LVJ|MAP|MAPJOIN|MAPRED|MAPREDLOCAL|MOVE|OP|RS"
+-      + "|SCR|SEL|STATS|TS|UDTF|UNION)_\\d+\"";
+-
+-    filterSet = new RegexFilterSet()
+-    .addFilter(logPattern,"")
+-    .addFilter("Getting log thread is interrupted, since query is done!\n","")
+-    .addFilter(scratchDirectory.toString() + "[\\w\\-/]+", "!!{hive.exec.scratchdir}!!")
+-    .addFilter(warehouseDirectory.toString(), "!!{hive.metastore.warehouse.dir}!!")
+-    .addFilter(expectedDirectory.toString(), "!!{expectedDirectory}!!")
+-    .addFilter(outputDirectory.toString(), "!!{outputDirectory}!!")
+-    .addFilter(qFileDirectory.toString(), "!!{qFileDirectory}!!")
+-    .addFilter(hiveRootDirectory.toString(), "!!{hive.root}!!")
+-    .addFilter("\\(queryId=[^\\)]*\\)","queryId=(!!{queryId}!!)")
+-    .addFilter("file:/\\w\\S+", "file:/!!ELIDED!!")
+-    .addFilter("pfile:/\\w\\S+", "pfile:/!!ELIDED!!")
+-    .addFilter("hdfs:/\\w\\S+", "hdfs:/!!ELIDED!!")
+-    .addFilter("last_modified_by=\\w+", "last_modified_by=!!ELIDED!!")
+-    .addFilter(timePattern, "!!TIMESTAMP!!")
+-    .addFilter("(\\D)" + currentTimePrefix + "\\d{6}(\\D)", "$1!!UNIXTIME!!$2")
+-    .addFilter("(\\D)" + currentTimePrefix + "\\d{9}(\\D)", "$1!!UNIXTIMEMILLIS!!$2")
+-    .addFilter(userName, "!!{user.name}!!")
+-    .addFilter(operatorPattern, "\"$1_!!ELIDED!!\"")
+-    .addFilter("Time taken: [0-9\\.]* seconds", "Time taken: !!ELIDED!! seconds")
+-    ;
+-  };
+-
+-  public QFileClient setUsername(String username) {
+-    this.username = username;
+-    return this;
+-  }
+-
+-  public QFileClient setPassword(String password) {
+-    this.password = password;
+-    return this;
+-  }
+-
+-  public QFileClient setJdbcUrl(String jdbcUrl) {
+-    this.jdbcUrl = jdbcUrl;
+-    return this;
+-  }
+-
+-  public QFileClient setJdbcDriver(String jdbcDriver) {
+-    this.jdbcDriver = jdbcDriver;
+-    return this;
+-  }
+-
+-  public QFileClient setQFileName(String qFileName) {
+-    this.qFileName = qFileName;
+-    this.qFile = new File(qFileDirectory, qFileName);
+-    this.testname = StringUtils.substringBefore(qFileName, ".");
+-    expectedFile = new File(expectedDirectory, qFileName + ".out");
+-    outputFile = new File(outputDirectory, qFileName + ".out");
+-    return this;
+-  }
+-
+-  public QFileClient setQFileDirectory(String qFileDirectory) {
+-    this.qFileDirectory = new File(qFileDirectory);
+-    return this;
+-  }
+-
+-  public QFileClient setOutputDirectory(String outputDirectory) {
+-    this.outputDirectory = new File(outputDirectory);
+-    return this;
+-  }
+-
+-  public QFileClient setExpectedDirectory(String expectedDirectory) {
+-    this.expectedDirectory = new File(expectedDirectory);
+-    return this;
+-  }
+-
+-  public QFileClient setTestDataDirectory(String testDataDirectory) {
+-    this.testDataDirectory = new File(testDataDirectory);
+-    return this;
+-  }
+-
+-  public QFileClient setTestScriptDirectory(String testScriptDirectory) {
+-    this.testScriptDirectory = new File(testScriptDirectory);
+-    return this;
+-  }
+-
+-  public boolean hasErrors() {
+-    return hasErrors;
+-  }
+-
+-  private void initBeeLine() throws Exception {
+-    beeLine = new BeeLine();
+-    beelineOutputStream = new PrintStream(new File(outputDirectory, qFileName + ".beeline"));
+-    beeLine.setOutputStream(beelineOutputStream);
+-    beeLine.setErrorStream(beelineOutputStream);
+-    beeLine.runCommands(new String[] {
+-        "!set verbose true",
+-        "!set shownestederrs true",
+-        "!set showwarnings true",
+-        "!set showelapsedtime false",
+-        "!set maxwidth -1",
+-        "!connect " + jdbcUrl + " " + username + " " + password + " " + jdbcDriver,
+-    });
+-  }
+-
+-  private void setUp() {
+-    beeLine.runCommands(new String[] {
+-        "USE default;",
+-        "SHOW TABLES;",
+-        "DROP DATABASE IF EXISTS `" + testname + "` CASCADE;",
+-        "CREATE DATABASE `" + testname + "`;",
+-        "USE `" + testname + "`;",
+-        "set test.data.dir=" + testDataDirectory + ";",
+-        "set test.script.dir=" + testScriptDirectory + ";",
+-        "!run " + testScriptDirectory + "/" + initScript,
+-    });
+-  }
+-
+-  private void tearDown() {
+-    beeLine.runCommands(new String[] {
+-        "!set outputformat table",
+-        "USE default;",
+-        "DROP DATABASE IF EXISTS `" + testname + "` CASCADE;",
+-        "!run " + testScriptDirectory + "/" + cleanupScript,
+-    });
+-  }
+-
+-  private void runQFileTest() throws Exception {
+-    hasErrors = false;
+-    beeLine.runCommands(new String[] {
+-        "!set outputformat csv",
+-        "!record " + outputDirectory + "/" + qFileName + ".raw",
+-      });
+-
+-    if (1 != beeLine.runCommands(new String[] { "!run " + qFileDirectory + "/" + qFileName })) {
+-      hasErrors = true;
+-    }
+-    
+-    beeLine.runCommands(new String[] { "!record" });
+-  }
+-
+-
+-  private void filterResults() throws IOException {
+-    initFilterSet();
+-    String rawOutput = FileUtils.readFileToString(new File(outputDirectory, qFileName + ".raw"));
+-    FileUtils.writeStringToFile(outputFile, filterSet.filter(rawOutput));
+-  }
+-
+-  public void cleanup() {
+-    if (beeLine != null) {
+-      beeLine.runCommands(new String[] {
+-          "!quit"
+-      });
+-    }
+-    if (beelineOutputStream != null) {
+-      beelineOutputStream.close();
+-    }
+-    if (hasErrors) {
+-      String oldFileName = outputDirectory + "/" + qFileName + ".raw";
+-      String newFileName = oldFileName + ".error";
+-      try {
+-        FileUtils.moveFile(new File(oldFileName), new File(newFileName));
+-      } catch (IOException e) {
+-        System.out.println("Failed to move '" + oldFileName + "' to '" + newFileName);
+-      }
+-    }
+-  }
+-
+-
+-  public void run() throws Exception {
+-    try {
+-      initBeeLine();
+-      setUp();
+-      runQFileTest();
+-      tearDown();
+-      filterResults();
+-    } finally {
+-      cleanup();
+-    }
+-  }
+-
+-  /**
+-   * Does the test have a file with expected results to compare the log against.
+-   * False probably indicates that this is a new test and the caller should
+-   * copy the log to the expected results directory.
+-   * @return
+-   */
+-  public boolean hasExpectedResults() {
+-    return expectedFile.exists();
+-  }
+-
+-  public boolean compareResults() throws IOException, InterruptedException {
+-    if (!expectedFile.exists()) {
+-      LOG.error("Expected results file does not exist: " + expectedFile);
+-      return false;
+-    }
+-    return executeDiff();
+-  }
+-
+-  private boolean executeDiff() throws IOException, InterruptedException {
+-    ArrayList<String> diffCommandArgs = new ArrayList<String>();
+-    diffCommandArgs.add("diff");
+-
+-    // Text file comparison
+-    diffCommandArgs.add("-a");
+-
+-    if (Shell.WINDOWS) {
+-      // Ignore changes in the amount of white space
+-      diffCommandArgs.add("-b");
+-
+-      // Files created on Windows machines have different line endings
+-      // than files created on Unix/Linux. Windows uses carriage return and line feed
+-      // ("\r\n") as a line ending, whereas Unix uses just line feed ("\n").
+-      // Also StringBuilder.toString(), Stream to String conversions adds extra
+-      // spaces at the end of the line.
+-      diffCommandArgs.add("--strip-trailing-cr"); // Strip trailing carriage return on input
+-      diffCommandArgs.add("-B"); // Ignore changes whose lines are all blank
+-    }
+-
+-    // Add files to compare to the arguments list
+-    diffCommandArgs.add(getQuotedString(expectedFile));
+-    diffCommandArgs.add(getQuotedString(outputFile));
+-
+-    System.out.println("Running: " + org.apache.commons.lang.StringUtils.join(diffCommandArgs,
+-        ' '));
+-    Process executor = Runtime.getRuntime().exec(diffCommandArgs.toArray(
+-        new String[diffCommandArgs.size()]));
+-
+-    StreamPrinter errPrinter = new StreamPrinter(executor.getErrorStream(), null, System.err);
+-    StreamPrinter outPrinter = new StreamPrinter(executor.getInputStream(), null, System.out);
+-
+-    outPrinter.start();
+-    errPrinter.start();
+-
+-    int result = executor.waitFor();
+-
+-    outPrinter.join();
+-    errPrinter.join();
+-
+-    executor.waitFor();
+-
+-    return (result == 0);
+-  }
+-
+-  private static String getQuotedString(File file) {
+-    return Shell.WINDOWS ? String.format("\"%s\"", file.getAbsolutePath()) : file.getAbsolutePath();
+-  }
+-
+-  public void overwriteResults() {
+-    try {
+-      if (expectedFile.exists()) {
+-        FileUtils.forceDelete(expectedFile);
+-      }
+-      FileUtils.copyFileToDirectory(outputFile, expectedDirectory, true);
+-    } catch (IOException e) {
+-      LOG.error("Failed to overwrite results!", e);
+-    }
+-  }
+-}
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index 61d61fe..c70a7cf 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -331,7 +331,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_with_trash.q \
+   encryption_ctas.q
+ 
+-beeline.positive.include=escape_comments.q
++beeline.positive.include=drop_with_concurrency.q,\
++  escape_comments.q
+ 
+ minimr.query.negative.files=cluster_tasklog_retrieval.q,\
+   file_with_header_footer_negative.q,\
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
+index aba1fde..acc02eb 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/cli/control/CoreBeeLineDriver.java
+@@ -17,34 +17,48 @@
+  */
+ package org.apache.hadoop.hive.cli.control;
+ 
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hive.beeline.util.QFileClient;
++import org.apache.hadoop.hive.ql.hooks.PreExecutePrinter;
++import org.apache.hive.beeline.qfile.QFile;
++import org.apache.hive.beeline.qfile.QFile.QFileBuilder;
++import org.apache.hive.beeline.qfile.QFileBeeLineClient;
++import org.apache.hive.beeline.qfile.QFileBeeLineClient.QFileClientBuilder;
+ import org.apache.hive.jdbc.miniHS2.MiniHS2;
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ 
++import java.io.File;
++import java.io.IOException;
+ import java.util.HashMap;
+ 
+ public class CoreBeeLineDriver extends CliAdapter {
+-  private final String hiveRootDirectory = AbstractCliConfig.HIVE_ROOT;
+-  private final String queryDirectory;
+-  private final String logDirectory;
+-  private final String resultsDirectory;
+-  private final String initScript;
+-  private final String cleanupScript;
++  private final File hiveRootDirectory = new File(AbstractCliConfig.HIVE_ROOT);
++  private final File queryDirectory;
++  private final File logDirectory;
++  private final File resultsDirectory;
++  private final File initScript;
++  private final File cleanupScript;
++  private final File testDataDirectory;
++  private final File testScriptDirectory;
+   private boolean overwrite = false;
+   private MiniHS2 miniHS2;
++  private QFileClientBuilder clientBuilder;
++  private QFileBuilder fileBuilder;
++
+ //  private static QTestUtil.QTestSetup miniZKCluster = null;
+ 
+   public CoreBeeLineDriver(AbstractCliConfig testCliConfig) {
+     super(testCliConfig);
+-    queryDirectory = testCliConfig.getQueryDirectory();
+-    logDirectory = testCliConfig.getLogDir();
+-    resultsDirectory = testCliConfig.getResultsDir();
+-    initScript = testCliConfig.getInitScript();
+-    cleanupScript = testCliConfig.getCleanupScript();
++    queryDirectory = new File(testCliConfig.getQueryDirectory());
++    logDirectory = new File(testCliConfig.getLogDir());
++    resultsDirectory = new File(testCliConfig.getResultsDir());
++    testDataDirectory = new File(hiveRootDirectory, "data" + File.separator + "files");
++    testScriptDirectory = new File(hiveRootDirectory, "data" + File.separator + "scripts");
++    initScript = new File(testScriptDirectory, testCliConfig.getInitScript());
++    cleanupScript = new File(testScriptDirectory, testCliConfig.getCleanupScript());
+   }
+ 
+   @Override
+@@ -55,12 +69,6 @@ public void beforeClass() throws Exception {
+       overwrite = true;
+     }
+ 
+-    String disableserver = System.getProperty("test.service.disable.server");
+-    if (null != disableserver && disableserver.equalsIgnoreCase("true")) {
+-      System.err.println("test.service.disable.server=true Skipping HiveServer2 initialization!");
+-      return;
+-    }
+-
+     HiveConf hiveConf = new HiveConf();
+     // We do not need Zookeeper at the moment
+     hiveConf.set(HiveConf.ConfVars.HIVE_LOCK_MANAGER.varname,
+@@ -76,57 +84,77 @@ public void beforeClass() throws Exception {
+     miniHS2 = new MiniHS2.Builder().withConf(hiveConf).cleanupLocalDirOnStartup(true).build();
+ 
+     miniHS2.start(new HashMap<String, String>());
++
++    clientBuilder = new QFileClientBuilder()
++        .setJdbcDriver("org.apache.hive.jdbc.HiveDriver")
++        .setJdbcUrl(miniHS2.getJdbcURL())
++        .setUsername("user")
++        .setPassword("password");
++
++    fileBuilder = new QFileBuilder()
++        .setHiveRootDirectory(hiveRootDirectory)
++        .setLogDirectory(logDirectory)
++        .setQueryDirectory(queryDirectory)
++        .setResultsDirectory(resultsDirectory)
++        .setScratchDirectoryString(hiveConf.getVar(HiveConf.ConfVars.SCRATCHDIR))
++        .setWarehouseDirectoryString(hiveConf.getVar(HiveConf.ConfVars.METASTOREWAREHOUSE));
++
++    runInfraScript(initScript, new File(logDirectory, "init.beeline"),
++        new File(logDirectory, "init.raw"));
+   }
+ 
++  protected void runInfraScript(File script, File beeLineOutput, File log)
++      throws IOException {
++    try (QFileBeeLineClient beeLineClient = clientBuilder.getClient(beeLineOutput)) {
++      beeLineClient.execute(
++          new String[]{
++            "set hive.exec.pre.hooks=" + PreExecutePrinter.class.getName() + ";",
++            "set test.data.dir=" + testDataDirectory + ";",
++            "set test.script.dir=" + testScriptDirectory + ";",
++            "!run " + script,
++          },
++          log);
++    }
++  }
+ 
+   @Override
+   @AfterClass
+   public void shutdown() throws Exception {
++    runInfraScript(cleanupScript, new File(logDirectory, "cleanup.beeline"),
++        new File(logDirectory, "cleanup.raw"));
+     if (miniHS2 != null) {
+       miniHS2.stop();
+     }
+-//    if (miniZKCluster != null) {
+-//      miniZKCluster.tearDown();
+-//    }
++    //    if (miniZKCluster != null) {
++    //      miniZKCluster.tearDown();
++    //    }
+   }
+ 
+-  public void runTest(String qFileName) throws Exception {
+-    QFileClient qClient = new QFileClient(miniHS2.getHiveConf(), hiveRootDirectory,
+-        queryDirectory, logDirectory, resultsDirectory, initScript, cleanupScript)
+-    .setQFileName(qFileName)
+-    .setUsername("user")
+-    .setPassword("password")
+-    .setJdbcUrl(miniHS2.getJdbcURL())
+-    .setJdbcDriver("org.apache.hive.jdbc.HiveDriver")
+-    .setTestDataDirectory(hiveRootDirectory + "/data/files")
+-    .setTestScriptDirectory(hiveRootDirectory + "/data/scripts");
+-
+-    long startTime = System.currentTimeMillis();
+-    System.err.println(">>> STARTED " + qFileName
+-        + " (Thread " + Thread.currentThread().getName() + ")");
+-    try {
+-      qClient.run();
+-    } catch (Exception e) {
+-      System.err.println(">>> FAILED " + qFileName + " with exception:");
+-      e.printStackTrace();
+-      throw e;
+-    }
+-    long elapsedTime = (System.currentTimeMillis() - startTime)/1000;
+-    String time = "(" + elapsedTime + "s)";
+-
+-    if (qClient.compareResults()) {
+-      System.err.println(">>> PASSED " + qFileName + " " + time);
+-    } else {
+-      if (qClient.hasErrors()) {
+-        System.err.println(">>> FAILED " + qFileName + " (ERROR) " + time);
+-        fail();
+-      }
+-      if (overwrite) {
+-        System.err.println(">>> PASSED " + qFileName + " (OVERWRITE) " + time);
+-        qClient.overwriteResults();
++  public void runTest(QFile qFile) throws Exception {
++    try (QFileBeeLineClient beeLineClient = clientBuilder.getClient(qFile.getLogFile())) {
++      long startTime = System.currentTimeMillis();
++      System.err.println(">>> STARTED " + qFile.getName());
++      assertTrue("QFile execution failed, see logs for details", beeLineClient.execute(qFile));
++
++      long endTime = System.currentTimeMillis();
++      System.err.println(">>> EXECUTED " + qFile.getName() + ":" + (endTime - startTime) / 1000
++          + "s");
++
++      qFile.filterOutput();
++      long filterEndTime = System.currentTimeMillis();
++      System.err.println(">>> FILTERED " + qFile.getName() + ":" + (filterEndTime - endTime) / 1000
++          + "s");
++
++      if (!overwrite) {
++        if (qFile.compareResults()) {
++          System.err.println(">>> PASSED " + qFile.getName());
++        } else {
++          System.err.println(">>> FAILED " + qFile.getName());
++          fail("Failed diff");
++        }
+       } else {
+-        System.err.println(">>> FAILED " + qFileName + " (DIFF) " + time);
+-        fail();
++        qFile.overwriteResults();
++        System.err.println(">>> PASSED " + qFile.getName());
+       }
+     }
+   }
+@@ -141,6 +169,7 @@ public void tearDown() {
+ 
+   @Override
+   public void runTest(String name, String name2, String absolutePath) throws Exception {
+-    runTest(name2);
++    QFile qFile = fileBuilder.getQFile(name);
++    runTest(qFile);
+   }
+ }
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/qfile/QFile.java b/itests/util/src/main/java/org/apache/hive/beeline/qfile/QFile.java
+new file mode 100644
+index 0000000..49d6d24
+--- /dev/null
++++ b/itests/util/src/main/java/org/apache/hive/beeline/qfile/QFile.java
+@@ -0,0 +1,273 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.beeline.qfile;
++
++import org.apache.commons.io.FileUtils;
++import org.apache.hadoop.util.Shell;
++import org.apache.hive.common.util.StreamPrinter;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.regex.Pattern;
++
++/**
++ * Class for representing a Query and the connected files. It provides accessors for the specific
++ * input and output files, and provides methods for filtering the output of the runs.
++ */
++public final class QFile {
++  private static final Logger LOG = LoggerFactory.getLogger(QFile.class.getName());
++
++  private String name;
++  private File inputFile;
++  private File rawOutputFile;
++  private File outputFile;
++  private File expcetedOutputFile;
++  private File logFile;
++  private File infraLogFile;
++  private static RegexFilterSet staticFilterSet = getStaticFilterSet();
++  private RegexFilterSet specificFilterSet;
++
++  private QFile() {}
++
++  public String getName() {
++    return name;
++  }
++
++  public File getInputFile() {
++    return inputFile;
++  }
++
++  public File getRawOutputFile() {
++    return rawOutputFile;
++  }
++
++  public File getOutputFile() {
++    return outputFile;
++  }
++
++  public File getExpectedOutputFile() {
++    return expcetedOutputFile;
++  }
++
++  public File getLogFile() {
++    return logFile;
++  }
++
++  public File getInfraLogFile() {
++    return infraLogFile;
++  }
++
++  public void filterOutput() throws IOException {
++    String rawOutput = FileUtils.readFileToString(rawOutputFile);
++    String filteredOutput = staticFilterSet.filter(specificFilterSet.filter(rawOutput));
++    FileUtils.writeStringToFile(outputFile, filteredOutput);
++  }
++
++  public boolean compareResults() throws IOException, InterruptedException {
++    if (!expcetedOutputFile.exists()) {
++      LOG.error("Expected results file does not exist: " + expcetedOutputFile);
++      return false;
++    }
++    return executeDiff();
++  }
++
++  public void overwriteResults() throws IOException {
++    if (expcetedOutputFile.exists()) {
++      FileUtils.forceDelete(expcetedOutputFile);
++    }
++    FileUtils.copyFile(outputFile, expcetedOutputFile);
++  }
++
++  private boolean executeDiff() throws IOException, InterruptedException {
++    List<String> diffCommandArgs = new ArrayList<String>();
++    diffCommandArgs.add("diff");
++
++    // Text file comparison
++    diffCommandArgs.add("-a");
++
++    if (Shell.WINDOWS) {
++      // Ignore changes in the amount of white space
++      diffCommandArgs.add("-b");
++
++      // Files created on Windows machines have different line endings
++      // than files created on Unix/Linux. Windows uses carriage return and line feed
++      // ("\r\n") as a line ending, whereas Unix uses just line feed ("\n").
++      // Also StringBuilder.toString(), Stream to String conversions adds extra
++      // spaces at the end of the line.
++      diffCommandArgs.add("--strip-trailing-cr"); // Strip trailing carriage return on input
++      diffCommandArgs.add("-B"); // Ignore changes whose lines are all blank
++    }
++
++    // Add files to compare to the arguments list
++    diffCommandArgs.add(getQuotedString(expcetedOutputFile));
++    diffCommandArgs.add(getQuotedString(outputFile));
++
++    System.out.println("Running: " + org.apache.commons.lang.StringUtils.join(diffCommandArgs,
++        ' '));
++    Process executor = Runtime.getRuntime().exec(diffCommandArgs.toArray(
++        new String[diffCommandArgs.size()]));
++
++    StreamPrinter errPrinter = new StreamPrinter(executor.getErrorStream(), null, System.err);
++    StreamPrinter outPrinter = new StreamPrinter(executor.getInputStream(), null, System.out);
++
++    outPrinter.start();
++    errPrinter.start();
++
++    int result = executor.waitFor();
++
++    outPrinter.join();
++    errPrinter.join();
++
++    executor.waitFor();
++
++    return (result == 0);
++  }
++
++  private static String getQuotedString(File file) {
++    return Shell.WINDOWS ? String.format("\"%s\"", file.getAbsolutePath()) : file.getAbsolutePath();
++  }
++
++  private static class RegexFilterSet {
++    private final Map<Pattern, String> regexFilters = new LinkedHashMap<Pattern, String>();
++
++    public RegexFilterSet addFilter(String regex, String replacement) {
++      regexFilters.put(Pattern.compile(regex), replacement);
++      return this;
++    }
++
++    public String filter(String input) {
++      for (Pattern pattern : regexFilters.keySet()) {
++        input = pattern.matcher(input).replaceAll(regexFilters.get(pattern));
++      }
++      return input;
++    }
++  }
++
++  // These are the filters which are common for every QTest.
++  // Check specificFilterSet for QTest specific ones.
++  private static RegexFilterSet getStaticFilterSet() {
++    // Extract the leading four digits from the unix time value.
++    // Use this as a prefix in order to increase the selectivity
++    // of the unix time stamp replacement regex.
++    String currentTimePrefix = Long.toString(System.currentTimeMillis()).substring(0, 4);
++
++    String userName = System.getProperty("user.name");
++
++    String timePattern = "(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
++        + "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
++        + "\\d{2} \\d{2}:\\d{2}:\\d{2} \\w+ 20\\d{2}";
++    // Pattern to remove the timestamp and other infrastructural info from the out file
++    String logPattern = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2},\\d*\\s+\\S+\\s+\\[" +
++        ".*\\]\\s+\\S+:\\s+";
++    String operatorPattern = "\"(CONDITION|COPY|DEPENDENCY_COLLECTION|DDL"
++        + "|EXPLAIN|FETCH|FIL|FS|FUNCTION|GBY|HASHTABLEDUMMY|HASTTABLESINK|JOIN"
++        + "|LATERALVIEWFORWARD|LIM|LVJ|MAP|MAPJOIN|MAPRED|MAPREDLOCAL|MOVE|OP|RS"
++        + "|SCR|SEL|STATS|TS|UDTF|UNION)_\\d+\"";
++
++    return new RegexFilterSet()
++        .addFilter(logPattern, "")
++        .addFilter("Getting log thread is interrupted, since query is done!\n", "")
++        .addFilter("going to print operations logs\n", "")
++        .addFilter("printed operations logs\n", "")
++        .addFilter("\\(queryId=[^\\)]*\\)", "queryId=(!!{queryId}!!)")
++        .addFilter("file:/\\w\\S+", "file:/!!ELIDED!!")
++        .addFilter("pfile:/\\w\\S+", "pfile:/!!ELIDED!!")
++        .addFilter("hdfs:/\\w\\S+", "hdfs:/!!ELIDED!!")
++        .addFilter("last_modified_by=\\w+", "last_modified_by=!!ELIDED!!")
++        .addFilter(timePattern, "!!TIMESTAMP!!")
++        .addFilter("(\\D)" + currentTimePrefix + "\\d{6}(\\D)", "$1!!UNIXTIME!!$2")
++        .addFilter("(\\D)" + currentTimePrefix + "\\d{9}(\\D)", "$1!!UNIXTIMEMILLIS!!$2")
++        .addFilter(userName, "!!{user.name}!!")
++        .addFilter(operatorPattern, "\"$1_!!ELIDED!!\"")
++        .addFilter("Time taken: [0-9\\.]* seconds", "Time taken: !!ELIDED!! seconds");
++  }
++
++  /**
++   * Builder to generate QFile objects. After initializing the builder it is possible the
++   * generate the next QFile object using it's name only.
++   */
++  public static class QFileBuilder {
++    private File queryDirectory;
++    private File logDirectory;
++    private File resultsDirectory;
++    private String scratchDirectoryString;
++    private String warehouseDirectoryString;
++    private File hiveRootDirectory;
++
++    public QFileBuilder() {
++    }
++
++    public QFileBuilder setQueryDirectory(File queryDirectory) {
++      this.queryDirectory = queryDirectory;
++      return this;
++    }
++
++    public QFileBuilder setLogDirectory(File logDirectory) {
++      this.logDirectory = logDirectory;
++      return this;
++    }
++
++    public QFileBuilder setResultsDirectory(File resultsDirectory) {
++      this.resultsDirectory = resultsDirectory;
++      return this;
++    }
++
++    public QFileBuilder setScratchDirectoryString(String scratchDirectoryString) {
++      this.scratchDirectoryString = scratchDirectoryString;
++      return this;
++    }
++
++    public QFileBuilder setWarehouseDirectoryString(String warehouseDirectoryString) {
++      this.warehouseDirectoryString = warehouseDirectoryString;
++      return this;
++    }
++
++    public QFileBuilder setHiveRootDirectory(File hiveRootDirectory) {
++      this.hiveRootDirectory = hiveRootDirectory;
++      return this;
++    }
++
++    public QFile getQFile(String name) throws IOException {
++      QFile result = new QFile();
++      result.name = name;
++      result.inputFile = new File(queryDirectory, name + ".q");
++      result.rawOutputFile = new File(logDirectory, name + ".q.out.raw");
++      result.outputFile = new File(logDirectory, name + ".q.out");
++      result.expcetedOutputFile = new File(resultsDirectory, name + ".q.out");
++      result.logFile = new File(logDirectory, name + ".q.beeline");
++      result.infraLogFile = new File(logDirectory, name + ".q.out.infra");
++      // These are the filters which are specific for the given QTest.
++      // Check staticFilterSet for common filters.
++      result.specificFilterSet = new RegexFilterSet()
++          .addFilter(scratchDirectoryString + "[\\w\\-/]+", "!!{hive.exec.scratchdir}!!")
++          .addFilter(warehouseDirectoryString, "!!{hive.metastore.warehouse.dir}!!")
++          .addFilter(resultsDirectory.getAbsolutePath(), "!!{expectedDirectory}!!")
++          .addFilter(logDirectory.getAbsolutePath(), "!!{outputDirectory}!!")
++          .addFilter(queryDirectory.getAbsolutePath(), "!!{qFileDirectory}!!")
++          .addFilter(hiveRootDirectory.getAbsolutePath(), "!!{hive.root}!!");
++      return result;
++    }
++  }
++}
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/qfile/QFileBeeLineClient.java b/itests/util/src/main/java/org/apache/hive/beeline/qfile/QFileBeeLineClient.java
+new file mode 100644
+index 0000000..b6eac89
+--- /dev/null
++++ b/itests/util/src/main/java/org/apache/hive/beeline/qfile/QFileBeeLineClient.java
+@@ -0,0 +1,149 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.beeline.qfile;
++
++import org.apache.hive.beeline.BeeLine;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintStream;
++
++/**
++ * QFile test client using BeeLine. It can be used to submit a list of command strings, or a QFile.
++ */
++public class QFileBeeLineClient implements AutoCloseable {
++  private BeeLine beeLine;
++  private PrintStream beelineOutputStream;
++  private File logFile;
++
++  protected QFileBeeLineClient(String jdbcUrl, String jdbcDriver, String username, String password,
++      File log) throws IOException {
++    logFile = log;
++    beeLine = new BeeLine();
++    beelineOutputStream = new PrintStream(logFile, "UTF-8");
++    beeLine.setOutputStream(beelineOutputStream);
++    beeLine.setErrorStream(beelineOutputStream);
++    beeLine.runCommands(
++        new String[] {
++          "!set verbose true",
++          "!set shownestederrs true",
++          "!set showwarnings true",
++          "!set showelapsedtime false",
++          "!set maxwidth -1",
++          "!connect " + jdbcUrl + " " + username + " " + password + " " + jdbcDriver
++        });
++  }
++
++  public boolean execute(String[] commands, File resultFile) {
++    boolean hasErrors = false;
++    beeLine.runCommands(
++        new String[] {
++          "!set outputformat csv",
++          "!record " + resultFile.getAbsolutePath()
++        });
++
++    if (commands.length != beeLine.runCommands(commands)) {
++      hasErrors = true;
++    }
++
++    beeLine.runCommands(new String[] {"!record"});
++    return !hasErrors;
++  }
++
++  private void beforeExecute(QFile qFile) {
++    assert(execute(
++        new String[] {
++          "USE default;",
++          "SHOW TABLES;",
++          "DROP DATABASE IF EXISTS `" + qFile.getName() + "` CASCADE;",
++          "CREATE DATABASE `" + qFile.getName() + "`;",
++          "USE `" + qFile.getName() + "`;"
++        },
++        qFile.getInfraLogFile()));
++  }
++
++  private void afterExecute(QFile qFile) {
++    assert(execute(
++        new String[] {
++          "USE default;",
++          "DROP DATABASE IF EXISTS `" + qFile.getName() + "` CASCADE;",
++        },
++        qFile.getInfraLogFile()));
++  }
++
++  public boolean execute(QFile qFile) {
++    beforeExecute(qFile);
++    boolean result = execute(
++        new String[] {
++          "!run " + qFile.getInputFile().getAbsolutePath()
++        },
++        qFile.getRawOutputFile());
++    afterExecute(qFile);
++    return result;
++  }
++
++  public void close() {
++    if (beeLine != null) {
++      beeLine.runCommands(new String[] {
++        "!quit"
++      });
++    }
++    if (beelineOutputStream != null) {
++      beelineOutputStream.close();
++    }
++  }
++
++  /**
++   * Builder to generated QFileBeeLineClient objects. The after initializing the builder, it can be
++   * used to create new clients without any parameters.
++   */
++  public static class QFileClientBuilder {
++    private String username;
++    private String password;
++    private String jdbcUrl;
++    private String jdbcDriver;
++
++    public QFileClientBuilder() {
++    }
++
++    public QFileClientBuilder setUsername(String username) {
++      this.username = username;
++      return this;
++    }
++
++    public QFileClientBuilder setPassword(String password) {
++      this.password = password;
++      return this;
++    }
++
++    public QFileClientBuilder setJdbcUrl(String jdbcUrl) {
++      this.jdbcUrl = jdbcUrl;
++      return this;
++    }
++
++    public QFileClientBuilder setJdbcDriver(String jdbcDriver) {
++      this.jdbcDriver = jdbcDriver;
++      return this;
++    }
++
++    public QFileBeeLineClient getClient(File logFile) throws IOException {
++      return new QFileBeeLineClient(jdbcUrl, jdbcDriver, username, password, logFile);
++    }
++  }
++}
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/qfile/package-info.java b/itests/util/src/main/java/org/apache/hive/beeline/qfile/package-info.java
+new file mode 100644
+index 0000000..fcd50ec
+--- /dev/null
++++ b/itests/util/src/main/java/org/apache/hive/beeline/qfile/package-info.java
+@@ -0,0 +1,22 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * Package for the BeeLine specific QTest file classes.
++ */
++package org.apache.hive.beeline.qfile;
+diff --git a/ql/src/test/results/clientpositive/beeline/drop_with_concurrency.q.out b/ql/src/test/results/clientpositive/beeline/drop_with_concurrency.q.out
+new file mode 100644
+index 0000000..2ff5c3a
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/beeline/drop_with_concurrency.q.out
+@@ -0,0 +1,70 @@
++>>>  !run !!{qFileDirectory}!!/drop_with_concurrency.q
++>>>  set hive.lock.numretries=1;
++No rows affected 
++>>>  set hive.lock.sleep.between.retries=1;
++No rows affected 
++>>>  set hive.support.concurrency=true;
++No rows affected 
++>>>  set hive.lock.manager=org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager;
++No rows affected 
++>>>  
++>>>  drop table if exists drop_with_concurrency_1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): drop table if exists drop_with_concurrency_1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): drop table if exists drop_with_concurrency_1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query drop table if exists drop_with_concurrency_1
++No rows affected 
++>>>  create table drop_with_concurrency_1 (c1 int);
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): create table drop_with_concurrency_1 (c1 int)
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): create table drop_with_concurrency_1 (c1 int)
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Output: database:drop_with_concurrency
++ERROR : PREHOOK: Output: drop_with_concurrency@drop_with_concurrency_1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Output: database:drop_with_concurrency
++ERROR : POSTHOOK: Output: drop_with_concurrency@drop_with_concurrency_1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query create table drop_with_concurrency_1 (c1 int)
++No rows affected 
++>>>  drop table drop_with_concurrency_1;
++DEBUG : Acquire a monitor for compiling query
++INFO  : Compiling commandqueryId=(!!{queryId}!!): drop table drop_with_concurrency_1
++DEBUG : Encoding valid txns info 9223372036854775807:
++INFO  : Semantic Analysis Completed
++INFO  : Returning Hive schema: Schema(fieldSchemas:null, properties:null)
++INFO  : Completed compiling commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : Executing commandqueryId=(!!{queryId}!!): drop table drop_with_concurrency_1
++ERROR : PREHOOK: query: 
++ERROR : PREHOOK: type: SWITCHDATABASE
++ERROR : PREHOOK: Input: drop_with_concurrency@drop_with_concurrency_1
++ERROR : PREHOOK: Output: drop_with_concurrency@drop_with_concurrency_1
++INFO  : Starting task [Stage-0:DDL] in serial mode
++ERROR : POSTHOOK: query: 
++ERROR : POSTHOOK: type: SWITCHDATABASE
++ERROR : POSTHOOK: Input: drop_with_concurrency@drop_with_concurrency_1
++ERROR : POSTHOOK: Output: drop_with_concurrency@drop_with_concurrency_1
++INFO  : Completed executing commandqueryId=(!!{queryId}!!); Time taken: !!ELIDED!! seconds
++INFO  : OK
++DEBUG : Shutting down query drop table drop_with_concurrency_1
++No rows affected 
++>>>  !record
+-- 
+1.7.9.5
+

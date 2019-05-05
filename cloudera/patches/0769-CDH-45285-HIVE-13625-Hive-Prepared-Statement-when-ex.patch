@@ -1,0 +1,334 @@
+From 6d534c0e5597542378a153b799eac412ef7af6f4 Mon Sep 17 00:00:00 2001
+From: Zoltan Haindrich <kirk@rxd.hu>
+Date: Tue, 3 May 2016 06:17:00 -0800
+Subject: [PATCH 0769/1164] CDH-45285: HIVE-13625 : Hive Prepared Statement
+ when executed with escape characters in parameter
+ fails (Zoltan Haindrich via Ashutosh Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+(cherry picked from commit db9afe48c2c4caae185ee04ec71d8e4313d0119a)
+
+Change-Id: I329055b2aa4829ba78953faf0b87a27d16b1ead5
+---
+ jdbc/pom.xml                                       |   13 ++
+ .../apache/hive/jdbc/HivePreparedStatement.java    |   85 ++++++------
+ .../hive/jdbc/TestHivePreparedStatement.java       |  138 ++++++++++++++++++++
+ pom.xml                                            |    5 +
+ 4 files changed, 203 insertions(+), 38 deletions(-)
+ create mode 100644 jdbc/src/test/org/apache/hive/jdbc/TestHivePreparedStatement.java
+
+diff --git a/jdbc/pom.xml b/jdbc/pom.xml
+index 04a4bcb..c7f7b12 100644
+--- a/jdbc/pom.xml
++++ b/jdbc/pom.xml
+@@ -103,6 +103,18 @@
+       <artifactId>curator-framework</artifactId>
+       <version>${curator.version}</version>
+     </dependency>
++    <!-- test inter-project -->
++    <dependency>
++      <groupId>junit</groupId>
++      <artifactId>junit</artifactId>
++      <version>${junit.version}</version>
++      <scope>test</scope>
++    </dependency>
++    <dependency>
++      <groupId>org.mockito</groupId>
++      <artifactId>mockito-all</artifactId>
++      <scope>test</scope>
++    </dependency>
+   </dependencies>
+ 
+   <profiles>
+@@ -142,6 +154,7 @@
+ 
+   <build>
+     <sourceDirectory>${basedir}/src/java</sourceDirectory>
++    <testSourceDirectory>${basedir}/src/test</testSourceDirectory>
+    <plugins>
+       <plugin>
+         <groupId>org.apache.maven.plugins</groupId>
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HivePreparedStatement.java b/jdbc/src/java/org/apache/hive/jdbc/HivePreparedStatement.java
+index 8a0671f..63f391a 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HivePreparedStatement.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HivePreparedStatement.java
+@@ -39,8 +39,10 @@
+ import java.sql.Timestamp;
+ import java.sql.Types;
+ import java.text.MessageFormat;
++import java.util.ArrayList;
+ import java.util.Calendar;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Scanner;
+ 
+ import org.apache.hive.service.cli.thrift.TCLIService;
+@@ -126,60 +128,67 @@ public int executeUpdate() throws SQLException {
+    * @param sql
+    * @param parameters
+    * @return updated SQL string
+-   */
+-  private String updateSql(final String sql, HashMap<Integer, String> parameters) {
+-    if (!sql.contains("?")) {
+-      return sql;
+-    }
+-
+-    StringBuffer newSql = new StringBuffer(sql);
+-
+-    int paramLoc = 1;
+-    while (getCharIndexFromSqlByParamLocation(sql, '?', paramLoc) > 0) {
+-      // check the user has set the needs parameters
+-      if (parameters.containsKey(paramLoc)) {
+-        int tt = getCharIndexFromSqlByParamLocation(newSql.toString(), '?', 1);
+-        newSql.deleteCharAt(tt);
+-        newSql.insert(tt, parameters.get(paramLoc));
++   * @throws SQLException 
++   */
++  private String updateSql(final String sql, HashMap<Integer, String> parameters) throws SQLException {
++    List<String>  parts=splitSqlStatement(sql);
++    
++    StringBuilder newSql = new StringBuilder(parts.get(0));
++    for(int i=1;i<parts.size();i++){
++      if(!parameters.containsKey(i)){
++        throw new SQLException("Parameter #"+i+" is unset");
+       }
+-      paramLoc++;
++      newSql.append(parameters.get(i));
++      newSql.append(parts.get(i));
+     }
+-
+     return newSql.toString();
+ 
+   }
+-
++  
+   /**
+-   * Get the index of given char from the SQL string by parameter location
+-   * </br> The -1 will be return, if nothing found
+-   *
++   * Splits the parametered sql statement at parameter boundaries.
++   * 
++   * taking into account ' and \ escaping.
++   * 
++   * output for: 'select 1 from ? where a = ?'
++   *  ['select 1 from ',' where a = ','']
++   * 
+    * @param sql
+-   * @param cchar
+-   * @param paramLoc
+    * @return
+    */
+-  private int getCharIndexFromSqlByParamLocation(final String sql, final char cchar, final int paramLoc) {
+-    int signalCount = 0;
+-    int charIndex = -1;
+-    int num = 0;
++  private List<String> splitSqlStatement(String sql) {
++    List<String> parts=new ArrayList<>();
++    int apCount=0;
++    int off=0;
++    boolean skip=false;
++
+     for (int i = 0; i < sql.length(); i++) {
+       char c = sql.charAt(i);
+-      if (c == '\'' || c == '\\')// record the count of char "'" and char "\"
+-      {
+-        signalCount++;
+-      } else if (c == cchar && signalCount % 2 == 0) {// check if the ? is really the parameter
+-        num++;
+-        if (num == paramLoc) {
+-          charIndex = i;
+-          break;
++      if(skip){
++        skip=false;
++        continue;
++      }
++      switch (c) {
++      case '\'':
++        apCount++;
++        break;
++      case '\\':
++        skip = true;
++        break;
++      case '?':
++        if ((apCount & 1) == 0) {
++          parts.add(sql.substring(off,i));
++          off=i+1;
+         }
++        break;
++      default:
++        break;
+       }
+     }
+-    return charIndex;
++    parts.add(sql.substring(off,sql.length()));
++    return parts;
+   }
+ 
+-
+-
+   /*
+    * (non-Javadoc)
+    *
+diff --git a/jdbc/src/test/org/apache/hive/jdbc/TestHivePreparedStatement.java b/jdbc/src/test/org/apache/hive/jdbc/TestHivePreparedStatement.java
+new file mode 100644
+index 0000000..f9364ed
+--- /dev/null
++++ b/jdbc/src/test/org/apache/hive/jdbc/TestHivePreparedStatement.java
+@@ -0,0 +1,138 @@
++package org.apache.hive.jdbc;
++
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Matchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import java.sql.SQLException;
++
++import org.apache.hive.service.cli.thrift.TCLIService.Iface;
++import org.apache.hive.service.cli.thrift.TExecuteStatementReq;
++import org.apache.hive.service.cli.thrift.TExecuteStatementResp;
++import org.apache.hive.service.cli.thrift.TGetOperationStatusReq;
++import org.apache.hive.service.cli.thrift.TGetOperationStatusResp;
++import org.apache.hive.service.cli.thrift.TOperationHandle;
++import org.apache.hive.service.cli.thrift.TOperationState;
++import org.apache.hive.service.cli.thrift.TSessionHandle;
++import org.apache.hive.service.cli.thrift.TStatus;
++import org.apache.hive.service.cli.thrift.TStatusCode;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++public class TestHivePreparedStatement {
++
++	@Mock
++	private HiveConnection connection;
++	@Mock
++	private Iface client;
++	@Mock
++	private TSessionHandle sessHandle;
++	@Mock
++	TExecuteStatementResp tExecStatementResp;
++	@Mock
++	TGetOperationStatusResp tGetOperationStatusResp;
++	private TStatus tStatus_SUCCESS = new TStatus(TStatusCode.SUCCESS_STATUS);
++	@Mock
++	private TOperationHandle tOperationHandle;
++
++	@Before
++	public void before() throws Exception {
++		MockitoAnnotations.initMocks(this);
++		when(tExecStatementResp.getStatus()).thenReturn(tStatus_SUCCESS);
++		when(tExecStatementResp.getOperationHandle()).thenReturn(tOperationHandle);
++
++		when(tGetOperationStatusResp.getStatus()).thenReturn(tStatus_SUCCESS);
++		when(tGetOperationStatusResp.getOperationState()).thenReturn(TOperationState.FINISHED_STATE);
++		when(tGetOperationStatusResp.isSetOperationState()).thenReturn(true);
++		when(tGetOperationStatusResp.isSetOperationCompleted()).thenReturn(true);
++
++		when(client.GetOperationStatus(any(TGetOperationStatusReq.class))).thenReturn(tGetOperationStatusResp);
++		when(client.ExecuteStatement(any(TExecuteStatementReq.class))).thenReturn(tExecStatementResp);
++	}
++
++	@SuppressWarnings("resource")
++	@Test
++	public void testNonParameterized() throws Exception {
++		String sql = "select 1";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.execute();
++
++		ArgumentCaptor<TExecuteStatementReq> argument = ArgumentCaptor.forClass(TExecuteStatementReq.class);
++		verify(client).ExecuteStatement(argument.capture());
++		assertEquals("select 1", argument.getValue().getStatement());
++	}
++
++	@SuppressWarnings("resource")
++	@Test
++	public void unusedArgument() throws Exception {
++		String sql = "select 1";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.setString(1, "asd");
++		ps.execute();
++	}
++
++	@SuppressWarnings("resource")
++	@Test(expected=SQLException.class)
++	public void unsetArgument() throws Exception {
++		String sql = "select 1 from x where a=?";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.execute();
++	}
++
++	@SuppressWarnings("resource")
++	@Test
++	public void oneArgument() throws Exception {
++		String sql = "select 1 from x where a=?";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.setString(1, "asd");
++		ps.execute();
++		
++		ArgumentCaptor<TExecuteStatementReq> argument = ArgumentCaptor.forClass(TExecuteStatementReq.class);
++		verify(client).ExecuteStatement(argument.capture());
++		assertEquals("select 1 from x where a='asd'", argument.getValue().getStatement());
++	}
++	
++	@SuppressWarnings("resource")
++	@Test
++	public void escapingOfStringArgument() throws Exception {
++		String sql = "select 1 from x where a=?";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.setString(1, "a'\"d");
++		ps.execute();
++		
++		ArgumentCaptor<TExecuteStatementReq> argument = ArgumentCaptor.forClass(TExecuteStatementReq.class);
++		verify(client).ExecuteStatement(argument.capture());
++		assertEquals("select 1 from x where a='a\\'\"d'", argument.getValue().getStatement());
++	}
++	
++	@SuppressWarnings("resource")
++	@Test
++	public void pastingIntoQuery() throws Exception {
++		String sql = "select 1 from x where a='e' || ?";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.setString(1, "v");
++		ps.execute();
++		
++		ArgumentCaptor<TExecuteStatementReq> argument = ArgumentCaptor.forClass(TExecuteStatementReq.class);
++		verify(client).ExecuteStatement(argument.capture());
++		assertEquals("select 1 from x where a='e' || 'v'", argument.getValue().getStatement());
++	}
++	
++	// HIVE-13625
++	@SuppressWarnings("resource")
++	@Test
++	public void pastingIntoEscapedQuery() throws Exception {
++		String sql = "select 1 from x where a='\\044e' || ?";
++		HivePreparedStatement ps = new HivePreparedStatement(connection, client, sessHandle, sql);
++		ps.setString(1, "v");
++		ps.execute();
++		
++		ArgumentCaptor<TExecuteStatementReq> argument = ArgumentCaptor.forClass(TExecuteStatementReq.class);
++		verify(client).ExecuteStatement(argument.capture());
++		assertEquals("select 1 from x where a='\\044e' || 'v'", argument.getValue().getStatement());
++	}
++}
+diff --git a/pom.xml b/pom.xml
+index 8eec5e4..df7f4e7 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -638,6 +638,11 @@
+       <artifactId>slf4j-log4j12</artifactId>
+       <version>${slf4j.version}</version>
+     </dependency>
++    <dependency>
++      <groupId>org.mockito</groupId>
++      <artifactId>mockito-all</artifactId>
++      <scope>test</scope>
++    </dependency>
+   </dependencies>
+ 
+   <build>
+-- 
+1.7.9.5
+

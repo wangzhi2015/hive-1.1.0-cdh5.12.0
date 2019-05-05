@@ -1,0 +1,310 @@
+From 0b4f7324fc436c3ed27a04e9e78c8828d19a6707 Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@hortonworks.com>
+Date: Mon, 4 May 2015 23:11:47 -0700
+Subject: [PATCH 0725/1164] CDH-42810: HIVE-10485: Create md5 UDF (Alex
+ Pivovarov via Jason Dere)
+
+(cherry picked from commit 9803344bff3d8aecafae3e03261b48592a86bfb1)
+
+Change-Id: I5c36aafc5091b09d29a1cdb0e509ea0d2347a337
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    5 +-
+ .../java/org/apache/hadoop/hive/ql/udf/UDFMd5.java |   79 ++++++++++++++++++++
+ .../org/apache/hadoop/hive/ql/udf/TestUDFMd5.java  |   57 ++++++++++++++
+ ql/src/test/queries/clientpositive/udf_md5.q       |   13 ++++
+ .../results/clientpositive/show_functions.q.out    |    2 +
+ ql/src/test/results/clientpositive/udf_md5.q.out   |   61 +++++++++++++++
+ 6 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/UDFMd5.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFMd5.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_md5.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_md5.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index e9fb8f3..2a80f0c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -24,8 +24,8 @@
+ import java.util.Collections;
+ import java.util.EnumMap;
+ import java.util.HashSet;
+-import java.util.LinkedHashSet;
+ import java.util.Iterator;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.TreeSet;
+@@ -65,6 +65,7 @@
+ import org.apache.hadoop.hive.ql.udf.UDFLog;
+ import org.apache.hadoop.hive.ql.udf.UDFLog10;
+ import org.apache.hadoop.hive.ql.udf.UDFLog2;
++import org.apache.hadoop.hive.ql.udf.UDFMd5;
+ import org.apache.hadoop.hive.ql.udf.UDFMinute;
+ import org.apache.hadoop.hive.ql.udf.UDFMonth;
+ import org.apache.hadoop.hive.ql.udf.UDFOPBitAnd;
+@@ -222,7 +223,7 @@
+     system.registerUDF("unhex", UDFUnhex.class, false);
+     system.registerUDF("base64", UDFBase64.class, false);
+     system.registerUDF("unbase64", UDFUnbase64.class, false);
+-    
++    system.registerUDF("md5", UDFMd5.class, false);
+     system.registerUDF("uuid", UDFUUID.class, false);
+ 
+     system.registerGenericUDF("encode", GenericUDFEncode.class);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/UDFMd5.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/UDFMd5.java
+new file mode 100644
+index 0000000..62c16c2
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/UDFMd5.java
+@@ -0,0 +1,79 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf;
++
++import org.apache.commons.codec.digest.DigestUtils;
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDF;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.Text;
++
++/**
++ * UDFMd5.
++ *
++ */
++@Description(name = "md5",
++    value = "_FUNC_(str or bin) - Calculates an MD5 128-bit checksum for the string or binary.",
++    extended = "The value is returned as a string of 32 hex digits, or NULL if the argument was NULL.\n"
++    + "Example:\n"
++    + "  > SELECT _FUNC_('ABC');\n"
++    + "  '902fbdd2b1df0c4f70b4a5d23525e932'\n"
++    + "  > SELECT _FUNC_(binary('ABC'));\n"
++    + "  '902fbdd2b1df0c4f70b4a5d23525e932'")
++public class UDFMd5 extends UDF {
++
++  private final Text result = new Text();
++
++  /**
++   * Convert String to md5
++   */
++  public Text evaluate(Text n) {
++    if (n == null) {
++      return null;
++    }
++
++    String str = n.toString();
++    String md5Hex = DigestUtils.md5Hex(str);
++
++    result.set(md5Hex);
++    return result;
++  }
++
++  /**
++   * Convert bytes to md5
++   */
++  public Text evaluate(BytesWritable b) {
++    if (b == null) {
++      return null;
++    }
++
++    byte[] bytes = copyBytes(b);
++    String md5Hex = DigestUtils.md5Hex(bytes);
++
++    result.set(md5Hex);
++    return result;
++  }
++
++  protected byte[] copyBytes(BytesWritable b) {
++    int size = b.getLength();
++    byte[] result = new byte[size];
++    System.arraycopy(b.getBytes(), 0, result, 0, size);
++    return result;
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFMd5.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFMd5.java
+new file mode 100644
+index 0000000..715e987
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/TestUDFMd5.java
+@@ -0,0 +1,57 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.Text;
++
++public class TestUDFMd5 extends TestCase {
++
++  public void testMD5Str() throws HiveException {
++    UDFMd5 udf = new UDFMd5();
++
++    runAndVerifyStr("ABC", "902fbdd2b1df0c4f70b4a5d23525e932", udf);
++    runAndVerifyStr("", "d41d8cd98f00b204e9800998ecf8427e", udf);
++    // null
++    runAndVerifyStr(null, null, udf);
++  }
++
++  public void testMD5Bin() throws HiveException {
++    UDFMd5 udf = new UDFMd5();
++
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, "902fbdd2b1df0c4f70b4a5d23525e932", udf);
++    runAndVerifyBin(new byte[0], "d41d8cd98f00b204e9800998ecf8427e", udf);
++    // null
++    runAndVerifyBin(null, null, udf);
++  }
++
++  private void runAndVerifyStr(String str, String expResult, UDFMd5 udf) throws HiveException {
++    Text t = str != null ? new Text(str) : null;
++    Text output = (Text) udf.evaluate(t);
++    assertEquals("md5() test ", expResult, output != null ? output.toString() : null);
++  }
++
++  private void runAndVerifyBin(byte[] binV, String expResult, UDFMd5 udf) throws HiveException {
++    BytesWritable binWr = binV != null ? new BytesWritable(binV) : null;
++    Text output = (Text) udf.evaluate(binWr);
++    assertEquals("md5() test ", expResult, output != null ? output.toString() : null);
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_md5.q b/ql/src/test/queries/clientpositive/udf_md5.q
+new file mode 100644
+index 0000000..c22417a
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_md5.q
+@@ -0,0 +1,13 @@
++DESCRIBE FUNCTION md5;
++DESC FUNCTION EXTENDED md5;
++
++explain select md5('ABC');
++
++select
++md5('ABC'),
++md5(''),
++md5(binary('ABC')),
++md5(binary('')),
++md5(cast(null as string)),
++md5(cast(null as binary)),
++md5(null);
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index 9ef5242..538b135 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -121,6 +121,7 @@ map_keys
+ map_values
+ matchpath
+ max
++md5
+ min
+ minute
+ month
+@@ -321,6 +322,7 @@ map_keys
+ map_values
+ matchpath
+ max
++md5
+ min
+ minute
+ month
+diff --git a/ql/src/test/results/clientpositive/udf_md5.q.out b/ql/src/test/results/clientpositive/udf_md5.q.out
+new file mode 100644
+index 0000000..7f8961b
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_md5.q.out
+@@ -0,0 +1,61 @@
++PREHOOK: query: DESCRIBE FUNCTION md5
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION md5
++POSTHOOK: type: DESCFUNCTION
++md5(str or bin) - Calculates an MD5 128-bit checksum for the string or binary.
++PREHOOK: query: DESC FUNCTION EXTENDED md5
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED md5
++POSTHOOK: type: DESCFUNCTION
++md5(str or bin) - Calculates an MD5 128-bit checksum for the string or binary.
++The value is returned as a string of 32 hex digits, or NULL if the argument was NULL.
++Example:
++  > SELECT md5('ABC');
++  '902fbdd2b1df0c4f70b4a5d23525e932'
++  > SELECT md5(binary('ABC'));
++  '902fbdd2b1df0c4f70b4a5d23525e932'
++PREHOOK: query: explain select md5('ABC')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select md5('ABC')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 1 Data size: 1 Basic stats: COMPLETE Column stats: COMPLETE
++          Select Operator
++            expressions: '902fbdd2b1df0c4f70b4a5d23525e932' (type: string)
++            outputColumnNames: _col0
++            Statistics: Num rows: 1 Data size: 116 Basic stats: COMPLETE Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++md5('ABC'),
++md5(''),
++md5(binary('ABC')),
++md5(binary('')),
++md5(cast(null as string)),
++md5(cast(null as binary)),
++md5(null)
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++md5('ABC'),
++md5(''),
++md5(binary('ABC')),
++md5(binary('')),
++md5(cast(null as string)),
++md5(cast(null as binary)),
++md5(null)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++902fbdd2b1df0c4f70b4a5d23525e932	d41d8cd98f00b204e9800998ecf8427e	902fbdd2b1df0c4f70b4a5d23525e932	d41d8cd98f00b204e9800998ecf8427e	NULL	NULL	NULL
+-- 
+1.7.9.5
+

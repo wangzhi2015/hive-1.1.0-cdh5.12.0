@@ -1,0 +1,3869 @@
+From c72c52cfee3de9c754fe50ab0bef1b05e54daffe Mon Sep 17 00:00:00 2001
+From: Navis Ryu <navis@apache.org>
+Date: Fri, 13 Feb 2015 05:55:16 +0000
+Subject: [PATCH 0134/1164] HIVE-2573 : Create per-session function registry
+ (Navis reviewed by Jason Dere and Alexander
+ Pivovarov)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1659461 13f79535-47bb-0310-9956-ffa450edef68
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+	ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+	ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+---
+ .../org/apache/hadoop/hive/common/JavaUtils.java   |    5 +-
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    2 +-
+ .../clientnegative/invalid_row_sequence.q.out      |    2 -
+ .../metastore/DummyRawStoreForJdoConnection.java   |   83 +-
+ .../java/org/apache/hadoop/hive/ql/ErrorMsg.java   |    1 +
+ .../hadoop/hive/ql/exec/CommonFunctionInfo.java    |   25 -
+ .../apache/hadoop/hive/ql/exec/FunctionInfo.java   |  106 +-
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      | 1253 ++++++--------------
+ .../apache/hadoop/hive/ql/exec/FunctionTask.java   |  129 +-
+ .../org/apache/hadoop/hive/ql/exec/Registry.java   |  522 ++++++++
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   15 +-
+ .../hadoop/hive/ql/exec/WindowFunctionInfo.java    |   37 +-
+ .../apache/hadoop/hive/ql/exec/mr/ExecDriver.java  |    1 +
+ .../hive/ql/index/IndexPredicateAnalyzer.java      |    2 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   42 +-
+ .../apache/hadoop/hive/ql/metadata/Partition.java  |   13 +-
+ .../org/apache/hadoop/hive/ql/metadata/Table.java  |   29 +-
+ .../hadoop/hive/ql/optimizer/IndexUtils.java       |   10 +-
+ .../calcite/translator/SqlFunctionConverter.java   |    7 +-
+ .../hive/ql/optimizer/ppr/PartitionPruner.java     |    2 +-
+ .../hive/ql/parse/FunctionSemanticAnalyzer.java    |   16 +-
+ .../org/apache/hadoop/hive/ql/parse/HiveLexer.g    |    1 +
+ .../org/apache/hadoop/hive/ql/parse/HiveParser.g   |    7 +
+ .../hadoop/hive/ql/parse/IdentifiersParser.g       |    2 +-
+ .../apache/hadoop/hive/ql/parse/IndexUpdater.java  |    3 +-
+ .../hive/ql/parse/SemanticAnalyzerFactory.java     |    1 +
+ .../apache/hadoop/hive/ql/parse/WindowingSpec.java |    3 +-
+ .../apache/hadoop/hive/ql/plan/FunctionWork.java   |   13 +
+ .../hadoop/hive/ql/plan/ReloadFunctionDesc.java    |   26 +
+ .../hadoop/hive/ql/session/SessionState.java       |   71 +-
+ .../hive/ql/udf/ptf/WindowingTableFunction.java    |    9 +-
+ .../hive/ql/parse/TestMacroSemanticAnalyzer.java   |    4 +-
+ .../test/queries/clientnegative/drop_native_udf.q  |    2 +-
+ .../clientnegative/alter_table_wrong_regex.q.out   |    4 +-
+ .../create_function_nonexistent_class.q.out        |    2 +-
+ .../create_function_nonudf_class.q.out             |    2 +-
+ .../results/clientnegative/drop_native_udf.q.out   |    5 +-
+ .../clientnegative/udf_nonexistent_resource.q.out  |    3 +-
+ 38 files changed, 1330 insertions(+), 1130 deletions(-)
+ delete mode 100644 ql/src/java/org/apache/hadoop/hive/ql/exec/CommonFunctionInfo.java
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/plan/ReloadFunctionDesc.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java b/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java
+index 9aa917c..f686a34 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java
+@@ -70,9 +70,9 @@ public static ClassLoader getClassLoader() {
+     return classLoader;
+   }
+ 
+-  public static void closeClassLoadersTo(ClassLoader current, ClassLoader stop) {
++  public static boolean closeClassLoadersTo(ClassLoader current, ClassLoader stop) {
+     if (!isValidHierarchy(current, stop)) {
+-      return;
++      return false;
+     }
+     for (; current != null && current != stop; current = current.getParent()) {
+       try {
+@@ -82,6 +82,7 @@ public static void closeClassLoadersTo(ClassLoader current, ClassLoader stop) {
+             Arrays.toString(((URLClassLoader) current).getURLs()), e);
+       }
+     }
++    return true;
+   }
+ 
+   // check before closing loaders, not to close app-classloader, etc. by mistake
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index fc9f0dd..b564e9e 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -334,7 +334,7 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "When hive.exec.mode.local.auto is true, the number of tasks should less than this for local mode."),
+ 
+     DROPIGNORESNONEXISTENT("hive.exec.drop.ignorenonexistent", true,
+-        "Do not report an error if DROP TABLE/VIEW/Index specifies a non-existent table/view/index"),
++        "Do not report an error if DROP TABLE/VIEW/Index/Function specifies a non-existent table/view/index/function"),
+ 
+     HIVEIGNOREMAPJOINHINT("hive.ignore.mapjoin.hint", true, "Ignore the mapjoin hint"),
+ 
+diff --git a/contrib/src/test/results/clientnegative/invalid_row_sequence.q.out b/contrib/src/test/results/clientnegative/invalid_row_sequence.q.out
+index 8f3c0b3..15b96c2 100644
+--- a/contrib/src/test/results/clientnegative/invalid_row_sequence.q.out
++++ b/contrib/src/test/results/clientnegative/invalid_row_sequence.q.out
+@@ -2,12 +2,10 @@ PREHOOK: query: -- Verify that a stateful UDF cannot be used outside of the SELE
+ 
+ drop temporary function row_sequence
+ PREHOOK: type: DROPFUNCTION
+-PREHOOK: Output: row_sequence
+ POSTHOOK: query: -- Verify that a stateful UDF cannot be used outside of the SELECT list
+ 
+ drop temporary function row_sequence
+ POSTHOOK: type: DROPFUNCTION
+-POSTHOOK: Output: row_sequence
+ PREHOOK: query: create temporary function row_sequence as 
+ 'org.apache.hadoop.hive.contrib.udf.UDFRowSequence'
+ PREHOOK: type: CREATEFUNCTION
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
+index 5f28d73..ccf928a 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
+@@ -18,9 +18,9 @@
+ 
+ package org.apache.hadoop.hive.metastore;
+ 
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.SortedSet;
+ 
+ import junit.framework.Assert;
+ 
+@@ -28,7 +28,6 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.AggrStats;
+ import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
+-import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
+ import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.Function;
+@@ -44,12 +43,10 @@
+ import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.PartitionEventType;
+-import org.apache.hadoop.hive.metastore.api.PartitionsStatsRequest;
+ import org.apache.hadoop.hive.metastore.api.PrincipalPrivilegeSet;
+ import org.apache.hadoop.hive.metastore.api.PrincipalType;
+ import org.apache.hadoop.hive.metastore.api.PrivilegeBag;
+ import org.apache.hadoop.hive.metastore.api.Role;
+-import org.apache.hadoop.hive.metastore.api.SetPartitionsStatsRequest;
+ import org.apache.hadoop.hive.metastore.api.Table;
+ import org.apache.hadoop.hive.metastore.api.Type;
+ import org.apache.hadoop.hive.metastore.api.UnknownDBException;
+@@ -145,13 +142,13 @@ public boolean alterDatabase(String dbname, Database db) throws NoSuchObjectExce
+   @Override
+   public List<String> getDatabases(String pattern) throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<String> getAllDatabases() throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -214,7 +211,7 @@ public boolean dropPartition(String dbName, String tableName, List<String> part_
+   public List<Partition> getPartitions(String dbName, String tableName, int max)
+       throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -227,41 +224,41 @@ public void alterTable(String dbname, String name, Table newTable) throws Invali
+   @Override
+   public List<String> getTables(String dbName, String pattern) throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<Table> getTableObjectsByName(String dbname, List<String> tableNames)
+       throws MetaException, UnknownDBException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<String> getAllTables(String dbName) throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<String> listTableNamesByFilter(String dbName, String filter, short max_tables)
+       throws MetaException, UnknownDBException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<String> listPartitionNames(String db_name, String tbl_name, short max_parts)
+       throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<String> listPartitionNamesByFilter(String db_name, String tbl_name, String filter,
+       short max_parts) throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -310,7 +307,7 @@ public boolean dropIndex(String dbName, String origTableName, String indexName)
+   public List<String> listIndexNames(String dbName, String origTableName, short max)
+       throws MetaException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -324,14 +321,14 @@ public void alterIndex(String dbname, String baseTblName, String name, Index new
+   public List<Partition> getPartitionsByFilter(String dbName, String tblName, String filter,
+       short maxParts) throws MetaException, NoSuchObjectException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<Partition> getPartitionsByNames(String dbName, String tblName,
+       List<String> partNames) throws MetaException, NoSuchObjectException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -425,35 +422,35 @@ public PrincipalPrivilegeSet getColumnPrivilegeSet(String dbName, String tableNa
+   public List<MGlobalPrivilege> listPrincipalGlobalGrants(String principalName,
+       PrincipalType principalType) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<MDBPrivilege> listPrincipalDBGrants(String principalName,
+       PrincipalType principalType, String dbName) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<MTablePrivilege> listAllTableGrants(String principalName,
+       PrincipalType principalType, String dbName, String tableName) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<MPartitionPrivilege> listPrincipalPartitionGrants(String principalName,
+       PrincipalType principalType, String dbName, String tableName, String partName) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<MTableColumnPrivilege> listPrincipalTableColumnGrants(String principalName,
+       PrincipalType principalType, String dbName, String tableName, String columnName) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -461,7 +458,7 @@ public PrincipalPrivilegeSet getColumnPrivilegeSet(String dbName, String tableNa
+       PrincipalType principalType, String dbName, String tableName, String partName,
+       String columnName) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -487,18 +484,18 @@ public Role getRole(String roleName) throws NoSuchObjectException {
+   @Override
+   public List<String> listRoleNames() {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<MRoleMap> listRoles(String principalName, PrincipalType principalType) {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<MRoleMap> listRoleMembers(String roleName) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -514,14 +511,14 @@ public Partition getPartitionWithAuth(String dbName, String tblName, List<String
+       String userName, List<String> groupNames) throws MetaException, NoSuchObjectException,
+       InvalidObjectException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<String> listPartitionNamesPs(String db_name, String tbl_name, List<String> part_vals,
+       short max_parts) throws MetaException, NoSuchObjectException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -529,7 +526,7 @@ public Partition getPartitionWithAuth(String dbName, String tblName, List<String
+       List<String> part_vals, short max_parts, String userName, List<String> groupNames)
+       throws MetaException, InvalidObjectException, NoSuchObjectException {
+ 
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -555,7 +552,7 @@ public String getToken(String tokenIdentifier) {
+ 
+   @Override
+   public List<String> getAllTokenIdentifiers() {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -574,67 +571,67 @@ public boolean removeMasterKey(Integer keySeq) {
+ 
+   @Override
+   public String[] getMasterKeys() {
+-    return null;
++    return new String[0];
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPrincipalDBGrantsAll(
+       String principalName, PrincipalType principalType) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPrincipalTableGrantsAll(
+       String principalName, PrincipalType principalType) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPrincipalPartitionGrantsAll(
+       String principalName, PrincipalType principalType) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPrincipalTableColumnGrantsAll(
+       String principalName, PrincipalType principalType) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPrincipalPartitionColumnGrantsAll(
+       String principalName, PrincipalType principalType) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listGlobalGrantsAll() {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listDBGrantsAll(String dbName) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPartitionColumnGrantsAll(String dbName, String tableName, String partitionName, String columnName) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listTableGrantsAll(String dbName, String tableName) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listPartitionGrantsAll(String dbName, String tableName, String partitionName) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+   public List<HiveObjectPrivilege> listTableColumnGrantsAll(String dbName, String tableName, String columnName) {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -689,7 +686,7 @@ public void setMetaStoreSchemaVersion(String version, String comment) throws Met
+   public List<ColumnStatistics> getPartitionColumnStatistics(String dbName,
+       String tblName, List<String> colNames, List<String> partNames)
+       throws MetaException, NoSuchObjectException {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+@@ -738,7 +735,7 @@ public Function getFunction(String dbName, String funcName)
+   @Override
+   public List<String> getFunctions(String dbName, String pattern)
+       throws MetaException {
+-    return null;
++    return Collections.emptyList();
+   }
+ 
+   @Override
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+index a06e858..68b23e7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+@@ -428,6 +428,7 @@
+   ALTER_TABLE_PARTITION_CASCADE_NOT_SUPPORTED(10300,
+       "Alter table partition type {0} does not support cascade", true),
+ 
++  DROP_NATIVE_FUNCTION(10301, "Cannot drop native function"),
+ 
+   //========================== 20000 range starts here ========================//
+   SCRIPT_INIT_ERROR(20000, "Unable to initialize custom script."),
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/CommonFunctionInfo.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/CommonFunctionInfo.java
+deleted file mode 100644
+index 93c15c0..0000000
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/CommonFunctionInfo.java
++++ /dev/null
+@@ -1,25 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hive.ql.exec;
+-
+-/**
+- * Interface for common functionality between FunctionInfo/WindowFunctionInfo
+- */
+-public interface CommonFunctionInfo {
+-  Class<?> getFunctionClass();
+-}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionInfo.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionInfo.java
+index bd00bd4..30ba996 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionInfo.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionInfo.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.hive.ql.exec;
+ 
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFBridge;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFResolver;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+@@ -27,18 +28,28 @@
+ import org.apache.hadoop.hive.ql.udf.ptf.WindowingTableFunction;
+ import org.apache.hive.common.util.AnnotationUtils;
+ 
++import java.util.concurrent.atomic.AtomicBoolean;
++
+ /**
+  * FunctionInfo.
+  *
+  */
+-public class FunctionInfo implements CommonFunctionInfo {
++public class FunctionInfo {
++
++  public static enum FunctionType {
++    BUILTIN, PERSISTENT, TEMPORARY;
++  }
+ 
+-  private final boolean isNative;
++  private final FunctionType functionType;
+ 
+   private final boolean isInternalTableFunction;
+ 
+   private final String displayName;
+ 
++  private final FunctionResource[] resources;
++
++  private String className;
++
+   private GenericUDF genericUDF;
+ 
+   private GenericUDTF genericUDTF;
+@@ -49,38 +60,55 @@
+ 
+   private boolean blockedFunction;
+ 
++  // for persistent function
++  // if the function is dropped, all functions registered to sessions are needed to be reloaded
++  private AtomicBoolean discarded;
++
++  public FunctionInfo(String displayName, String className, FunctionResource... resources) {
++    this.functionType = FunctionType.PERSISTENT;
++    this.displayName = displayName;
++    this.className = className;
++    this.isInternalTableFunction = false;
++    this.resources = resources;
++    this.discarded = new AtomicBoolean(false);  // shared to all session functions
++  }
++
+   public FunctionInfo(boolean isNative, String displayName,
+-      GenericUDF genericUDF) {
+-    this.isNative = isNative;
++      GenericUDF genericUDF, FunctionResource... resources) {
++    this.functionType = isNative ? FunctionType.BUILTIN : FunctionType.TEMPORARY;
+     this.displayName = displayName;
+     this.genericUDF = genericUDF;
+     this.isInternalTableFunction = false;
++    this.resources = resources;
+   }
+ 
+   public FunctionInfo(boolean isNative, String displayName,
+-      GenericUDAFResolver genericUDAFResolver) {
+-    this.isNative = isNative;
++      GenericUDAFResolver genericUDAFResolver, FunctionResource... resources) {
++    this.functionType = isNative ? FunctionType.BUILTIN : FunctionType.TEMPORARY;
+     this.displayName = displayName;
+     this.genericUDAFResolver = genericUDAFResolver;
+     this.isInternalTableFunction = false;
++    this.resources = resources;
+   }
+ 
+   public FunctionInfo(boolean isNative, String displayName,
+-      GenericUDTF genericUDTF) {
+-    this.isNative = isNative;
++      GenericUDTF genericUDTF, FunctionResource... resources) {
++    this.functionType = isNative ? FunctionType.BUILTIN : FunctionType.TEMPORARY;
+     this.displayName = displayName;
+     this.genericUDTF = genericUDTF;
+     this.isInternalTableFunction = false;
++    this.resources = resources;
+   }
+ 
+-  public FunctionInfo(String displayName, Class<? extends TableFunctionResolver> tFnCls)
+-  {
++  public FunctionInfo(boolean isNative, String displayName, Class<? extends TableFunctionResolver> tFnCls,
++      FunctionResource... resources) {
++    this.functionType = isNative ? FunctionType.BUILTIN : FunctionType.TEMPORARY;
+     this.displayName = displayName;
+     this.tableFunctionResolver = tFnCls;
+     PartitionTableFunctionDescription def = AnnotationUtils.getAnnotation(
+         tableFunctionResolver, PartitionTableFunctionDescription.class);
+-    this.isNative = (def == null) ? false : def.isInternal();
+-    this.isInternalTableFunction = isNative;
++    this.isInternalTableFunction = def != null && def.isInternal();
++    this.resources = resources;
+   }
+ 
+   /**
+@@ -154,7 +182,7 @@ public String getDisplayName() {
+    * Native functions cannot be unregistered.
+    */
+   public boolean isNative() {
+-    return isNative;
++    return functionType == FunctionType.BUILTIN || functionType == FunctionType.PERSISTENT;
+   }
+ 
+   /**
+@@ -201,4 +229,56 @@ public void setBlockedFunction(boolean blockedFunction) {
+     this.blockedFunction = blockedFunction;
+   }
+ 
++  public boolean isBuiltIn() {
++    return functionType == FunctionType.BUILTIN;
++  }
++
++  public boolean isPersistent() {
++    return functionType == FunctionType.PERSISTENT;
++  }
++
++  public String getClassName() {
++    return className;
++  }
++
++  public FunctionResource[] getResources() {
++    return resources;
++  }
++
++  public void discarded() {
++    if (discarded != null) {
++      discarded.set(true);
++    }
++  }
++
++  // for persistent function
++  public boolean isDiscarded() {
++    return discarded != null && discarded.get();
++  }
++
++  // for persistent function
++  public void shareStateWith(FunctionInfo function) {
++    if (function != null) {
++      function.discarded = discarded;
++    }
++  }
++
++  public static class FunctionResource {
++    private final SessionState.ResourceType resourceType;
++    private final String resourceURI;
++    public FunctionResource(SessionState.ResourceType resourceType, String resourceURI) {
++      this.resourceType = resourceType;
++      this.resourceURI = resourceURI;
++    }
++    public SessionState.ResourceType getResourceType() {
++      return resourceType;
++    }
++    public String getResourceURI() {
++      return resourceURI;
++    }
++    @Override
++    public String toString() {
++      return resourceType + ":" + resourceURI;
++    }
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 9a3b8c6..909f6ae 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -18,35 +18,23 @@
+ 
+ package org.apache.hadoop.hive.ql.exec;
+ 
+-import java.io.InputStream;
+ import java.lang.reflect.Method;
+-import java.net.URL;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.EnumMap;
+ import java.util.HashSet;
+ import java.util.LinkedHashSet;
+ import java.util.Iterator;
+-import java.util.LinkedHashMap;
+ import java.util.List;
+-import java.util.Map;
+-import java.util.Map.Entry;
+ import java.util.Set;
+ import java.util.TreeSet;
+ import java.util.regex.Pattern;
+ import java.util.regex.PatternSyntaxException;
+ 
+-import javax.xml.parsers.DocumentBuilder;
+-import javax.xml.parsers.DocumentBuilderFactory;
+-
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hive.conf.HiveConf;
+-import org.apache.hadoop.hive.metastore.api.Function;
+-import org.apache.hadoop.hive.metastore.api.MetaException;
+-import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
+-import org.apache.hadoop.hive.ql.exec.FunctionUtils.UDFClassType;
+-import org.apache.hadoop.hive.ql.metadata.Hive;
++import org.apache.hadoop.hive.ql.exec.FunctionInfo.FunctionResource;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.parse.SemanticException;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+@@ -142,30 +130,16 @@
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+-import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hive.common.util.AnnotationUtils;
+-import org.w3c.dom.Document;
+-import org.w3c.dom.Element;
+-import org.w3c.dom.NodeList;
+-
+-import com.google.common.base.Splitter;
+-import com.google.common.collect.Lists;
+-
+ 
+ /**
+  * FunctionRegistry.
+  */
+ public final class FunctionRegistry {
+ 
+-  private static Log LOG = LogFactory.getLog(FunctionRegistry.class);
++  private static final Log LOG = LogFactory.getLog(FunctionRegistry.class);
+ 
+-  /**
+-   * The mapping from expression function names to expression classes.
+-   */
+-  static Map<String, FunctionInfo> mFunctions = Collections.synchronizedMap(new LinkedHashMap<String, FunctionInfo>());
+-
+-  static Set<Class<?>> nativeUdfs = Collections.synchronizedSet(new HashSet<Class<?>>());
+   /*
+    * PTF variables
+    * */
+@@ -182,570 +156,328 @@
+   private static final String NOOP_MAP_TABLE_FUNCTION = "noopwithmap";
+   private static final String NOOP_STREAMING_TABLE_FUNCTION = "noopstreaming";
+   private static final String NOOP_STREAMING_MAP_TABLE_FUNCTION = "noopwithmapstreaming";
++  private static final String MATCH_PATH_TABLE_FUNCTION = "matchpath";
+ 
+-  static Map<String, WindowFunctionInfo> windowFunctions = Collections.synchronizedMap(new LinkedHashMap<String, WindowFunctionInfo>());
++  public static final Set<String> HIVE_OPERATORS = new HashSet<String>();
+ 
+   static {
+-    registerGenericUDF("concat", GenericUDFConcat.class);
+-    registerUDF("substr", UDFSubstr.class, false);
+-    registerUDF("substring", UDFSubstr.class, false);
+-    registerUDF("space", UDFSpace.class, false);
+-    registerUDF("repeat", UDFRepeat.class, false);
+-    registerUDF("ascii", UDFAscii.class, false);
+-    registerGenericUDF("lpad", GenericUDFLpad.class);
+-    registerGenericUDF("rpad", GenericUDFRpad.class);
+-
+-    registerGenericUDF("size", GenericUDFSize.class);
+-
+-    registerGenericUDF("round", GenericUDFRound.class);
+-    registerGenericUDF("floor", GenericUDFFloor.class);
+-    registerUDF("sqrt", UDFSqrt.class, false);
+-    registerGenericUDF("ceil", GenericUDFCeil.class);
+-    registerGenericUDF("ceiling", GenericUDFCeil.class);
+-    registerUDF("rand", UDFRand.class, false);
+-    registerGenericUDF("abs", GenericUDFAbs.class);
+-    registerGenericUDF("pmod", GenericUDFPosMod.class);
+-
+-    registerUDF("ln", UDFLn.class, false);
+-    registerUDF("log2", UDFLog2.class, false);
+-    registerUDF("sin", UDFSin.class, false);
+-    registerUDF("asin", UDFAsin.class, false);
+-    registerUDF("cos", UDFCos.class, false);
+-    registerUDF("acos", UDFAcos.class, false);
+-    registerUDF("log10", UDFLog10.class, false);
+-    registerUDF("log", UDFLog.class, false);
+-    registerUDF("exp", UDFExp.class, false);
+-    registerGenericUDF("power", GenericUDFPower.class);
+-    registerGenericUDF("pow", GenericUDFPower.class);
+-    registerUDF("sign", UDFSign.class, false);
+-    registerUDF("pi", UDFPI.class, false);
+-    registerUDF("degrees", UDFDegrees.class, false);
+-    registerUDF("radians", UDFRadians.class, false);
+-    registerUDF("atan", UDFAtan.class, false);
+-    registerUDF("tan", UDFTan.class, false);
+-    registerUDF("e", UDFE.class, false);
+-
+-    registerUDF("conv", UDFConv.class, false);
+-    registerUDF("bin", UDFBin.class, false);
+-    registerUDF("hex", UDFHex.class, false);
+-    registerUDF("unhex", UDFUnhex.class, false);
+-    registerUDF("base64", UDFBase64.class, false);
+-    registerUDF("unbase64", UDFUnbase64.class, false);
+-
+-    registerGenericUDF("encode", GenericUDFEncode.class);
+-    registerGenericUDF("decode", GenericUDFDecode.class);
+-
+-    registerGenericUDF("upper", GenericUDFUpper.class);
+-    registerGenericUDF("lower", GenericUDFLower.class);
+-    registerGenericUDF("ucase", GenericUDFUpper.class);
+-    registerGenericUDF("lcase", GenericUDFLower.class);
+-    registerGenericUDF("trim", GenericUDFTrim.class);
+-    registerGenericUDF("ltrim", GenericUDFLTrim.class);
+-    registerGenericUDF("rtrim", GenericUDFRTrim.class);
+-    registerUDF("length", UDFLength.class, false);
+-    registerUDF("reverse", UDFReverse.class, false);
+-    registerGenericUDF("field", GenericUDFField.class);
+-    registerUDF("find_in_set", UDFFindInSet.class, false);
+-    registerGenericUDF("initcap", GenericUDFInitCap.class);
+-
+-    registerUDF("like", UDFLike.class, true);
+-    registerUDF("rlike", UDFRegExp.class, true);
+-    registerUDF("regexp", UDFRegExp.class, true);
+-    registerUDF("regexp_replace", UDFRegExpReplace.class, false);
+-    registerUDF("regexp_extract", UDFRegExpExtract.class, false);
+-    registerUDF("parse_url", UDFParseUrl.class, false);
+-    registerGenericUDF("nvl", GenericUDFNvl.class);
+-    registerGenericUDF("split", GenericUDFSplit.class);
+-    registerGenericUDF("str_to_map", GenericUDFStringToMap.class);
+-    registerGenericUDF("translate", GenericUDFTranslate.class);
+-
+-    registerGenericUDF(UNARY_PLUS_FUNC_NAME, GenericUDFOPPositive.class);
+-    registerGenericUDF(UNARY_MINUS_FUNC_NAME, GenericUDFOPNegative.class);
+-
+-    registerUDF("day", UDFDayOfMonth.class, false);
+-    registerUDF("dayofmonth", UDFDayOfMonth.class, false);
+-    registerUDF("month", UDFMonth.class, false);
+-    registerUDF("year", UDFYear.class, false);
+-    registerUDF("hour", UDFHour.class, false);
+-    registerUDF("minute", UDFMinute.class, false);
+-    registerUDF("second", UDFSecond.class, false);
+-    registerUDF("from_unixtime", UDFFromUnixTime.class, false);
+-    registerGenericUDF("to_date", GenericUDFDate.class);
+-    registerUDF("weekofyear", UDFWeekOfYear.class, false);
+-    registerGenericUDF("last_day", GenericUDFLastDay.class);
+-    registerGenericUDF("next_day", GenericUDFNextDay.class);
+-
+-    registerGenericUDF("date_add", GenericUDFDateAdd.class);
+-    registerGenericUDF("date_sub", GenericUDFDateSub.class);
+-    registerGenericUDF("datediff", GenericUDFDateDiff.class);
+-    registerGenericUDF("add_months", GenericUDFAddMonths.class);
+-
+-    registerUDF("get_json_object", UDFJson.class, false);
+-
+-    registerUDF("xpath_string", UDFXPathString.class, false);
+-    registerUDF("xpath_boolean", UDFXPathBoolean.class, false);
+-    registerUDF("xpath_number", UDFXPathDouble.class, false);
+-    registerUDF("xpath_double", UDFXPathDouble.class, false);
+-    registerUDF("xpath_float", UDFXPathFloat.class, false);
+-    registerUDF("xpath_long", UDFXPathLong.class, false);
+-    registerUDF("xpath_int", UDFXPathInteger.class, false);
+-    registerUDF("xpath_short", UDFXPathShort.class, false);
+-    registerGenericUDF("xpath", GenericUDFXPath.class);
+-
+-    registerGenericUDF("+", GenericUDFOPPlus.class);
+-    registerGenericUDF("-", GenericUDFOPMinus.class);
+-    registerGenericUDF("*", GenericUDFOPMultiply.class);
+-    registerGenericUDF("/", GenericUDFOPDivide.class);
+-    registerGenericUDF("%", GenericUDFOPMod.class);
+-    registerUDF("div", UDFOPLongDivide.class, true);
+-
+-    registerUDF("&", UDFOPBitAnd.class, true);
+-    registerUDF("|", UDFOPBitOr.class, true);
+-    registerUDF("^", UDFOPBitXor.class, true);
+-    registerUDF("~", UDFOPBitNot.class, true);
+-
+-    registerGenericUDF("current_database", UDFCurrentDB.class);
+-    registerGenericUDF("current_date", GenericUDFCurrentDate.class);
+-    registerGenericUDF("current_timestamp", GenericUDFCurrentTimestamp.class);
+-    registerGenericUDF("current_user", GenericUDFCurrentUser.class);
+-
+-    registerGenericUDF("isnull", GenericUDFOPNull.class);
+-    registerGenericUDF("isnotnull", GenericUDFOPNotNull.class);
+-
+-    registerGenericUDF("if", GenericUDFIf.class);
+-    registerGenericUDF("in", GenericUDFIn.class);
+-    registerGenericUDF("and", GenericUDFOPAnd.class);
+-    registerGenericUDF("or", GenericUDFOPOr.class);
+-    registerGenericUDF("=", GenericUDFOPEqual.class);
+-    registerGenericUDF("==", GenericUDFOPEqual.class);
+-    registerGenericUDF("<=>", GenericUDFOPEqualNS.class);
+-    registerGenericUDF("!=", GenericUDFOPNotEqual.class);
+-    registerGenericUDF("<>", GenericUDFOPNotEqual.class);
+-    registerGenericUDF("<", GenericUDFOPLessThan.class);
+-    registerGenericUDF("<=", GenericUDFOPEqualOrLessThan.class);
+-    registerGenericUDF(">", GenericUDFOPGreaterThan.class);
+-    registerGenericUDF(">=", GenericUDFOPEqualOrGreaterThan.class);
+-    registerGenericUDF("not", GenericUDFOPNot.class);
+-    registerGenericUDF("!", GenericUDFOPNot.class);
+-    registerGenericUDF("between", GenericUDFBetween.class);
+-
+-    registerGenericUDF("ewah_bitmap_and", GenericUDFEWAHBitmapAnd.class);
+-    registerGenericUDF("ewah_bitmap_or", GenericUDFEWAHBitmapOr.class);
+-    registerGenericUDF("ewah_bitmap_empty", GenericUDFEWAHBitmapEmpty.class);
++    HIVE_OPERATORS.addAll(Arrays.asList(
++        "+", "-", "*", "/", "%", "div", "&", "|", "^", "~",
++        "and", "or", "not", "!",
++        "=", "==", "<=>", "!=", "<>", "<", "<=", ">", ">=",
++        "index"));
++  }
+ 
++  // registry for system functions
++  private static final Registry system = new Registry(true);
++
++  static {
++    system.registerGenericUDF("concat", GenericUDFConcat.class);
++    system.registerUDF("substr", UDFSubstr.class, false);
++    system.registerUDF("substring", UDFSubstr.class, false);
++    system.registerUDF("space", UDFSpace.class, false);
++    system.registerUDF("repeat", UDFRepeat.class, false);
++    system.registerUDF("ascii", UDFAscii.class, false);
++    system.registerGenericUDF("lpad", GenericUDFLpad.class);
++    system.registerGenericUDF("rpad", GenericUDFRpad.class);
++
++    system.registerGenericUDF("size", GenericUDFSize.class);
++
++    system.registerGenericUDF("round", GenericUDFRound.class);
++    system.registerGenericUDF("floor", GenericUDFFloor.class);
++    system.registerUDF("sqrt", UDFSqrt.class, false);
++    system.registerGenericUDF("ceil", GenericUDFCeil.class);
++    system.registerGenericUDF("ceiling", GenericUDFCeil.class);
++    system.registerUDF("rand", UDFRand.class, false);
++    system.registerGenericUDF("abs", GenericUDFAbs.class);
++    system.registerGenericUDF("pmod", GenericUDFPosMod.class);
++
++    system.registerUDF("ln", UDFLn.class, false);
++    system.registerUDF("log2", UDFLog2.class, false);
++    system.registerUDF("sin", UDFSin.class, false);
++    system.registerUDF("asin", UDFAsin.class, false);
++    system.registerUDF("cos", UDFCos.class, false);
++    system.registerUDF("acos", UDFAcos.class, false);
++    system.registerUDF("log10", UDFLog10.class, false);
++    system.registerUDF("log", UDFLog.class, false);
++    system.registerUDF("exp", UDFExp.class, false);
++    system.registerGenericUDF("power", GenericUDFPower.class);
++    system.registerGenericUDF("pow", GenericUDFPower.class);
++    system.registerUDF("sign", UDFSign.class, false);
++    system.registerUDF("pi", UDFPI.class, false);
++    system.registerUDF("degrees", UDFDegrees.class, false);
++    system.registerUDF("radians", UDFRadians.class, false);
++    system.registerUDF("atan", UDFAtan.class, false);
++    system.registerUDF("tan", UDFTan.class, false);
++    system.registerUDF("e", UDFE.class, false);
++
++    system.registerUDF("conv", UDFConv.class, false);
++    system.registerUDF("bin", UDFBin.class, false);
++    system.registerUDF("hex", UDFHex.class, false);
++    system.registerUDF("unhex", UDFUnhex.class, false);
++    system.registerUDF("base64", UDFBase64.class, false);
++    system.registerUDF("unbase64", UDFUnbase64.class, false);
++
++    system.registerGenericUDF("encode", GenericUDFEncode.class);
++    system.registerGenericUDF("decode", GenericUDFDecode.class);
++
++    system.registerGenericUDF("upper", GenericUDFUpper.class);
++    system.registerGenericUDF("lower", GenericUDFLower.class);
++    system.registerGenericUDF("ucase", GenericUDFUpper.class);
++    system.registerGenericUDF("lcase", GenericUDFLower.class);
++    system.registerGenericUDF("trim", GenericUDFTrim.class);
++    system.registerGenericUDF("ltrim", GenericUDFLTrim.class);
++    system.registerGenericUDF("rtrim", GenericUDFRTrim.class);
++    system.registerUDF("length", UDFLength.class, false);
++    system.registerUDF("reverse", UDFReverse.class, false);
++    system.registerGenericUDF("field", GenericUDFField.class);
++    system.registerUDF("find_in_set", UDFFindInSet.class, false);
++    system.registerGenericUDF("initcap", GenericUDFInitCap.class);
++
++    system.registerUDF("like", UDFLike.class, true);
++    system.registerUDF("rlike", UDFRegExp.class, true);
++    system.registerUDF("regexp", UDFRegExp.class, true);
++    system.registerUDF("regexp_replace", UDFRegExpReplace.class, false);
++    system.registerUDF("regexp_extract", UDFRegExpExtract.class, false);
++    system.registerUDF("parse_url", UDFParseUrl.class, false);
++    system.registerGenericUDF("nvl", GenericUDFNvl.class);
++    system.registerGenericUDF("split", GenericUDFSplit.class);
++    system.registerGenericUDF("str_to_map", GenericUDFStringToMap.class);
++    system.registerGenericUDF("translate", GenericUDFTranslate.class);
++
++    system.registerGenericUDF(UNARY_PLUS_FUNC_NAME, GenericUDFOPPositive.class);
++    system.registerGenericUDF(UNARY_MINUS_FUNC_NAME, GenericUDFOPNegative.class);
++
++    system.registerUDF("day", UDFDayOfMonth.class, false);
++    system.registerUDF("dayofmonth", UDFDayOfMonth.class, false);
++    system.registerUDF("month", UDFMonth.class, false);
++    system.registerUDF("year", UDFYear.class, false);
++    system.registerUDF("hour", UDFHour.class, false);
++    system.registerUDF("minute", UDFMinute.class, false);
++    system.registerUDF("second", UDFSecond.class, false);
++    system.registerUDF("from_unixtime", UDFFromUnixTime.class, false);
++    system.registerGenericUDF("to_date", GenericUDFDate.class);
++    system.registerUDF("weekofyear", UDFWeekOfYear.class, false);
++    system.registerGenericUDF("last_day", GenericUDFLastDay.class);
++    system.registerGenericUDF("next_day", GenericUDFNextDay.class);
++
++    system.registerGenericUDF("date_add", GenericUDFDateAdd.class);
++    system.registerGenericUDF("date_sub", GenericUDFDateSub.class);
++    system.registerGenericUDF("datediff", GenericUDFDateDiff.class);
++    system.registerGenericUDF("add_months", GenericUDFAddMonths.class);
++
++    system.registerUDF("get_json_object", UDFJson.class, false);
++
++    system.registerUDF("xpath_string", UDFXPathString.class, false);
++    system.registerUDF("xpath_boolean", UDFXPathBoolean.class, false);
++    system.registerUDF("xpath_number", UDFXPathDouble.class, false);
++    system.registerUDF("xpath_double", UDFXPathDouble.class, false);
++    system.registerUDF("xpath_float", UDFXPathFloat.class, false);
++    system.registerUDF("xpath_long", UDFXPathLong.class, false);
++    system.registerUDF("xpath_int", UDFXPathInteger.class, false);
++    system.registerUDF("xpath_short", UDFXPathShort.class, false);
++    system.registerGenericUDF("xpath", GenericUDFXPath.class);
++
++    system.registerGenericUDF("+", GenericUDFOPPlus.class);
++    system.registerGenericUDF("-", GenericUDFOPMinus.class);
++    system.registerGenericUDF("*", GenericUDFOPMultiply.class);
++    system.registerGenericUDF("/", GenericUDFOPDivide.class);
++    system.registerGenericUDF("%", GenericUDFOPMod.class);
++    system.registerUDF("div", UDFOPLongDivide.class, true);
++
++    system.registerUDF("&", UDFOPBitAnd.class, true);
++    system.registerUDF("|", UDFOPBitOr.class, true);
++    system.registerUDF("^", UDFOPBitXor.class, true);
++    system.registerUDF("~", UDFOPBitNot.class, true);
++
++    system.registerGenericUDF("current_database", UDFCurrentDB.class);
++    system.registerGenericUDF("current_date", GenericUDFCurrentDate.class);
++    system.registerGenericUDF("current_timestamp", GenericUDFCurrentTimestamp.class);
++    system.registerGenericUDF("current_user", GenericUDFCurrentUser.class);
++
++    system.registerGenericUDF("isnull", GenericUDFOPNull.class);
++    system.registerGenericUDF("isnotnull", GenericUDFOPNotNull.class);
++
++    system.registerGenericUDF("if", GenericUDFIf.class);
++    system.registerGenericUDF("in", GenericUDFIn.class);
++    system.registerGenericUDF("and", GenericUDFOPAnd.class);
++    system.registerGenericUDF("or", GenericUDFOPOr.class);
++    system.registerGenericUDF("=", GenericUDFOPEqual.class);
++    system.registerGenericUDF("==", GenericUDFOPEqual.class);
++    system.registerGenericUDF("<=>", GenericUDFOPEqualNS.class);
++    system.registerGenericUDF("!=", GenericUDFOPNotEqual.class);
++    system.registerGenericUDF("<>", GenericUDFOPNotEqual.class);
++    system.registerGenericUDF("<", GenericUDFOPLessThan.class);
++    system.registerGenericUDF("<=", GenericUDFOPEqualOrLessThan.class);
++    system.registerGenericUDF(">", GenericUDFOPGreaterThan.class);
++    system.registerGenericUDF(">=", GenericUDFOPEqualOrGreaterThan.class);
++    system.registerGenericUDF("not", GenericUDFOPNot.class);
++    system.registerGenericUDF("!", GenericUDFOPNot.class);
++    system.registerGenericUDF("between", GenericUDFBetween.class);
++
++    system.registerGenericUDF("ewah_bitmap_and", GenericUDFEWAHBitmapAnd.class);
++    system.registerGenericUDF("ewah_bitmap_or", GenericUDFEWAHBitmapOr.class);
++    system.registerGenericUDF("ewah_bitmap_empty", GenericUDFEWAHBitmapEmpty.class);
+ 
+     // Aliases for Java Class Names
+     // These are used in getImplicitConvertUDFMethod
+-    registerUDF(serdeConstants.BOOLEAN_TYPE_NAME, UDFToBoolean.class, false,
+-        UDFToBoolean.class.getSimpleName());
+-    registerUDF(serdeConstants.TINYINT_TYPE_NAME, UDFToByte.class, false,
+-        UDFToByte.class.getSimpleName());
+-    registerUDF(serdeConstants.SMALLINT_TYPE_NAME, UDFToShort.class, false,
+-        UDFToShort.class.getSimpleName());
+-    registerUDF(serdeConstants.INT_TYPE_NAME, UDFToInteger.class, false,
+-        UDFToInteger.class.getSimpleName());
+-    registerUDF(serdeConstants.BIGINT_TYPE_NAME, UDFToLong.class, false,
+-        UDFToLong.class.getSimpleName());
+-    registerUDF(serdeConstants.FLOAT_TYPE_NAME, UDFToFloat.class, false,
+-        UDFToFloat.class.getSimpleName());
+-    registerUDF(serdeConstants.DOUBLE_TYPE_NAME, UDFToDouble.class, false,
+-        UDFToDouble.class.getSimpleName());
+-    registerUDF(serdeConstants.STRING_TYPE_NAME, UDFToString.class, false,
+-        UDFToString.class.getSimpleName());
+-
+-    registerGenericUDF(serdeConstants.DATE_TYPE_NAME,
+-        GenericUDFToDate.class);
+-    registerGenericUDF(serdeConstants.TIMESTAMP_TYPE_NAME,
+-        GenericUDFTimestamp.class);
+-    registerGenericUDF(serdeConstants.BINARY_TYPE_NAME,
+-        GenericUDFToBinary.class);
+-    registerGenericUDF(serdeConstants.DECIMAL_TYPE_NAME,
+-        GenericUDFToDecimal.class);
+-    registerGenericUDF(serdeConstants.VARCHAR_TYPE_NAME,
+-        GenericUDFToVarchar.class);
+-    registerGenericUDF(serdeConstants.CHAR_TYPE_NAME,
+-        GenericUDFToChar.class);
++    system.registerUDF(serdeConstants.BOOLEAN_TYPE_NAME, UDFToBoolean.class, false, UDFToBoolean.class.getSimpleName());
++    system.registerUDF(serdeConstants.TINYINT_TYPE_NAME, UDFToByte.class, false, UDFToByte.class.getSimpleName());
++    system.registerUDF(serdeConstants.SMALLINT_TYPE_NAME, UDFToShort.class, false, UDFToShort.class.getSimpleName());
++    system.registerUDF(serdeConstants.INT_TYPE_NAME, UDFToInteger.class, false, UDFToInteger.class.getSimpleName());
++    system.registerUDF(serdeConstants.BIGINT_TYPE_NAME, UDFToLong.class, false, UDFToLong.class.getSimpleName());
++    system.registerUDF(serdeConstants.FLOAT_TYPE_NAME, UDFToFloat.class, false, UDFToFloat.class.getSimpleName());
++    system.registerUDF(serdeConstants.DOUBLE_TYPE_NAME, UDFToDouble.class, false, UDFToDouble.class.getSimpleName());
++    system.registerUDF(serdeConstants.STRING_TYPE_NAME, UDFToString.class, false, UDFToString.class.getSimpleName());
++
++    system.registerGenericUDF(serdeConstants.DATE_TYPE_NAME, GenericUDFToDate.class);
++    system.registerGenericUDF(serdeConstants.TIMESTAMP_TYPE_NAME, GenericUDFTimestamp.class);
++    system.registerGenericUDF(serdeConstants.BINARY_TYPE_NAME, GenericUDFToBinary.class);
++    system.registerGenericUDF(serdeConstants.DECIMAL_TYPE_NAME, GenericUDFToDecimal.class);
++    system.registerGenericUDF(serdeConstants.VARCHAR_TYPE_NAME, GenericUDFToVarchar.class);
++    system.registerGenericUDF(serdeConstants.CHAR_TYPE_NAME, GenericUDFToChar.class);
+ 
+     // Aggregate functions
+-    registerGenericUDAF("max", new GenericUDAFMax());
+-    registerGenericUDAF("min", new GenericUDAFMin());
++    system.registerGenericUDAF("max", new GenericUDAFMax());
++    system.registerGenericUDAF("min", new GenericUDAFMin());
+ 
+-    registerGenericUDAF("sum", new GenericUDAFSum());
+-    registerGenericUDAF("count", new GenericUDAFCount());
+-    registerGenericUDAF("avg", new GenericUDAFAverage());
+-    registerGenericUDAF("std", new GenericUDAFStd());
+-    registerGenericUDAF("stddev", new GenericUDAFStd());
+-    registerGenericUDAF("stddev_pop", new GenericUDAFStd());
+-    registerGenericUDAF("stddev_samp", new GenericUDAFStdSample());
+-    registerGenericUDAF("variance", new GenericUDAFVariance());
+-    registerGenericUDAF("var_pop", new GenericUDAFVariance());
+-    registerGenericUDAF("var_samp", new GenericUDAFVarianceSample());
+-    registerGenericUDAF("covar_pop", new GenericUDAFCovariance());
+-    registerGenericUDAF("covar_samp", new GenericUDAFCovarianceSample());
+-    registerGenericUDAF("corr", new GenericUDAFCorrelation());
+-    registerGenericUDAF("histogram_numeric", new GenericUDAFHistogramNumeric());
+-    registerGenericUDAF("percentile_approx", new GenericUDAFPercentileApprox());
+-    registerGenericUDAF("collect_set", new GenericUDAFCollectSet());
+-    registerGenericUDAF("collect_list", new GenericUDAFCollectList());
++    system.registerGenericUDAF("sum", new GenericUDAFSum());
++    system.registerGenericUDAF("count", new GenericUDAFCount());
++    system.registerGenericUDAF("avg", new GenericUDAFAverage());
++    system.registerGenericUDAF("std", new GenericUDAFStd());
++    system.registerGenericUDAF("stddev", new GenericUDAFStd());
++    system.registerGenericUDAF("stddev_pop", new GenericUDAFStd());
++    system.registerGenericUDAF("stddev_samp", new GenericUDAFStdSample());
++    system.registerGenericUDAF("variance", new GenericUDAFVariance());
++    system.registerGenericUDAF("var_pop", new GenericUDAFVariance());
++    system.registerGenericUDAF("var_samp", new GenericUDAFVarianceSample());
++    system.registerGenericUDAF("covar_pop", new GenericUDAFCovariance());
++    system.registerGenericUDAF("covar_samp", new GenericUDAFCovarianceSample());
++    system.registerGenericUDAF("corr", new GenericUDAFCorrelation());
++    system.registerGenericUDAF("histogram_numeric", new GenericUDAFHistogramNumeric());
++    system.registerGenericUDAF("percentile_approx", new GenericUDAFPercentileApprox());
++    system.registerGenericUDAF("collect_set", new GenericUDAFCollectSet());
++    system.registerGenericUDAF("collect_list", new GenericUDAFCollectList());
+ 
+-    registerGenericUDAF("ngrams", new GenericUDAFnGrams());
+-    registerGenericUDAF("context_ngrams", new GenericUDAFContextNGrams());
++    system.registerGenericUDAF("ngrams", new GenericUDAFnGrams());
++    system.registerGenericUDAF("context_ngrams", new GenericUDAFContextNGrams());
+ 
+-    registerGenericUDAF("ewah_bitmap", new GenericUDAFEWAHBitmap());
++    system.registerGenericUDAF("ewah_bitmap", new GenericUDAFEWAHBitmap());
+ 
+-    registerGenericUDAF("compute_stats" , new GenericUDAFComputeStats());
++    system.registerGenericUDAF("compute_stats", new GenericUDAFComputeStats());
+ 
+-    registerUDAF("percentile", UDAFPercentile.class);
++    system.registerUDAF("percentile", UDAFPercentile.class);
+ 
+ 
+     // Generic UDFs
+-    registerGenericUDF("reflect", GenericUDFReflect.class);
+-    registerGenericUDF("reflect2", GenericUDFReflect2.class);
+-    registerGenericUDF("java_method", GenericUDFReflect.class);
+-
+-    registerGenericUDF("array", GenericUDFArray.class);
+-    registerGenericUDF("assert_true", GenericUDFAssertTrue.class);
+-    registerGenericUDF("map", GenericUDFMap.class);
+-    registerGenericUDF("struct", GenericUDFStruct.class);
+-    registerGenericUDF("named_struct", GenericUDFNamedStruct.class);
+-    registerGenericUDF("create_union", GenericUDFUnion.class);
+-
+-    registerGenericUDF("case", GenericUDFCase.class);
+-    registerGenericUDF("when", GenericUDFWhen.class);
+-    registerGenericUDF("hash", GenericUDFHash.class);
+-    registerGenericUDF("coalesce", GenericUDFCoalesce.class);
+-    registerGenericUDF("index", GenericUDFIndex.class);
+-    registerGenericUDF("in_file", GenericUDFInFile.class);
+-    registerGenericUDF("instr", GenericUDFInstr.class);
+-    registerGenericUDF("locate", GenericUDFLocate.class);
+-    registerGenericUDF("elt", GenericUDFElt.class);
+-    registerGenericUDF("concat_ws", GenericUDFConcatWS.class);
+-    registerGenericUDF("sort_array", GenericUDFSortArray.class);
+-    registerGenericUDF("array_contains", GenericUDFArrayContains.class);
+-    registerGenericUDF("sentences", GenericUDFSentences.class);
+-    registerGenericUDF("map_keys", GenericUDFMapKeys.class);
+-    registerGenericUDF("map_values", GenericUDFMapValues.class);
+-    registerGenericUDF("format_number", GenericUDFFormatNumber.class);
+-    registerGenericUDF("printf", GenericUDFPrintf.class);
+-    registerGenericUDF("greatest", GenericUDFGreatest.class);
+-    registerGenericUDF("least", GenericUDFLeast.class);
+-
+-    registerGenericUDF("from_utc_timestamp", GenericUDFFromUtcTimestamp.class);
+-    registerGenericUDF("to_utc_timestamp", GenericUDFToUtcTimestamp.class);
+-
+-    registerGenericUDF("unix_timestamp", GenericUDFUnixTimeStamp.class);
+-    registerGenericUDF("to_unix_timestamp", GenericUDFToUnixTimeStamp.class);
++    system.registerGenericUDF("reflect", GenericUDFReflect.class);
++    system.registerGenericUDF("reflect2", GenericUDFReflect2.class);
++    system.registerGenericUDF("java_method", GenericUDFReflect.class);
++
++    system.registerGenericUDF("array", GenericUDFArray.class);
++    system.registerGenericUDF("assert_true", GenericUDFAssertTrue.class);
++    system.registerGenericUDF("map", GenericUDFMap.class);
++    system.registerGenericUDF("struct", GenericUDFStruct.class);
++    system.registerGenericUDF("named_struct", GenericUDFNamedStruct.class);
++    system.registerGenericUDF("create_union", GenericUDFUnion.class);
++
++    system.registerGenericUDF("case", GenericUDFCase.class);
++    system.registerGenericUDF("when", GenericUDFWhen.class);
++    system.registerGenericUDF("hash", GenericUDFHash.class);
++    system.registerGenericUDF("coalesce", GenericUDFCoalesce.class);
++    system.registerGenericUDF("index", GenericUDFIndex.class);
++    system.registerGenericUDF("in_file", GenericUDFInFile.class);
++    system.registerGenericUDF("instr", GenericUDFInstr.class);
++    system.registerGenericUDF("locate", GenericUDFLocate.class);
++    system.registerGenericUDF("elt", GenericUDFElt.class);
++    system.registerGenericUDF("concat_ws", GenericUDFConcatWS.class);
++    system.registerGenericUDF("sort_array", GenericUDFSortArray.class);
++    system.registerGenericUDF("array_contains", GenericUDFArrayContains.class);
++    system.registerGenericUDF("sentences", GenericUDFSentences.class);
++    system.registerGenericUDF("map_keys", GenericUDFMapKeys.class);
++    system.registerGenericUDF("map_values", GenericUDFMapValues.class);
++    system.registerGenericUDF("format_number", GenericUDFFormatNumber.class);
++    system.registerGenericUDF("printf", GenericUDFPrintf.class);
++    system.registerGenericUDF("greatest", GenericUDFGreatest.class);
++    system.registerGenericUDF("least", GenericUDFLeast.class);
++
++    system.registerGenericUDF("from_utc_timestamp", GenericUDFFromUtcTimestamp.class);
++    system.registerGenericUDF("to_utc_timestamp", GenericUDFToUtcTimestamp.class);
++
++    system.registerGenericUDF("unix_timestamp", GenericUDFUnixTimeStamp.class);
++    system.registerGenericUDF("to_unix_timestamp", GenericUDFToUnixTimeStamp.class);
+ 
+     // Generic UDTF's
+-    registerGenericUDTF("explode", GenericUDTFExplode.class);
+-    registerGenericUDTF("inline", GenericUDTFInline.class);
+-    registerGenericUDTF("json_tuple", GenericUDTFJSONTuple.class);
+-    registerGenericUDTF("parse_url_tuple", GenericUDTFParseUrlTuple.class);
+-    registerGenericUDTF("posexplode", GenericUDTFPosExplode.class);
+-    registerGenericUDTF("stack", GenericUDTFStack.class);
++    system.registerGenericUDTF("explode", GenericUDTFExplode.class);
++    system.registerGenericUDTF("inline", GenericUDTFInline.class);
++    system.registerGenericUDTF("json_tuple", GenericUDTFJSONTuple.class);
++    system.registerGenericUDTF("parse_url_tuple", GenericUDTFParseUrlTuple.class);
++    system.registerGenericUDTF("posexplode", GenericUDTFPosExplode.class);
++    system.registerGenericUDTF("stack", GenericUDTFStack.class);
+ 
+     //PTF declarations
+-    registerGenericUDF(LEAD_FUNC_NAME, GenericUDFLead.class);
+-    registerGenericUDF(LAG_FUNC_NAME, GenericUDFLag.class);
+-
+-    registerWindowFunction("row_number", new GenericUDAFRowNumber());
+-    registerWindowFunction("rank", new GenericUDAFRank());
+-    registerWindowFunction("dense_rank", new GenericUDAFDenseRank());
+-    registerWindowFunction("percent_rank", new GenericUDAFPercentRank());
+-    registerWindowFunction("cume_dist", new GenericUDAFCumeDist());
+-    registerWindowFunction("ntile", new GenericUDAFNTile());
+-    registerWindowFunction("first_value", new GenericUDAFFirstValue());
+-    registerWindowFunction("last_value", new GenericUDAFLastValue());
+-    registerWindowFunction(LEAD_FUNC_NAME, new GenericUDAFLead(), false);
+-    registerWindowFunction(LAG_FUNC_NAME, new GenericUDAFLag(), false);
+-
+-    registerTableFunction(NOOP_TABLE_FUNCTION, NoopResolver.class);
+-    registerTableFunction(NOOP_MAP_TABLE_FUNCTION, NoopWithMapResolver.class);
+-    registerTableFunction(NOOP_STREAMING_TABLE_FUNCTION, NoopStreamingResolver.class);
+-    registerTableFunction(NOOP_STREAMING_MAP_TABLE_FUNCTION, NoopWithMapStreamingResolver.class);
+-    registerTableFunction(WINDOWING_TABLE_FUNCTION,  WindowingTableFunctionResolver.class);
+-    registerTableFunction("matchpath", MatchPathResolver.class);
+-  }
+-
+-  public static void registerTemporaryUDF(String functionName,
+-      Class<? extends UDF> UDFClass, boolean isOperator) {
+-    registerUDF(false, functionName, UDFClass, isOperator);
+-  }
+-
+-  static void registerUDF(String functionName, Class<? extends UDF> UDFClass,
+-      boolean isOperator) {
+-    registerUDF(true, functionName, UDFClass, isOperator);
+-  }
+-
+-  public static void registerUDF(boolean isNative, String functionName,
+-      Class<? extends UDF> UDFClass, boolean isOperator) {
+-    registerUDF(isNative, functionName, UDFClass, isOperator, functionName
+-        .toLowerCase());
+-  }
+-
+-  public static void registerUDF(String functionName,
+-      Class<? extends UDF> UDFClass, boolean isOperator, String displayName) {
+-    registerUDF(true, functionName, UDFClass, isOperator, displayName);
+-  }
+-
+-  public static void registerUDF(boolean isNative, String functionName,
+-      Class<? extends UDF> UDFClass, boolean isOperator, String displayName) {
+-    if (UDF.class.isAssignableFrom(UDFClass)) {
+-      FunctionInfo fI = new FunctionInfo(isNative, displayName,
+-          new GenericUDFBridge(displayName, isOperator, UDFClass.getName()));
+-      mFunctions.put(functionName.toLowerCase(), fI);
+-      registerNativeStatus(fI);
+-    } else {
+-      throw new RuntimeException("Registering UDF Class " + UDFClass
+-          + " which does not extend " + UDF.class);
+-    }
+-  }
+-
+-  public static void registerTemporaryGenericUDF(String functionName,
+-      Class<? extends GenericUDF> genericUDFClass) {
+-    registerGenericUDF(false, functionName, genericUDFClass);
+-  }
+-
+-  static void registerGenericUDF(String functionName,
+-      Class<? extends GenericUDF> genericUDFClass) {
+-    registerGenericUDF(true, functionName, genericUDFClass);
+-  }
+-
+-  public static void registerGenericUDF(boolean isNative, String functionName,
+-      Class<? extends GenericUDF> genericUDFClass) {
+-    if (GenericUDF.class.isAssignableFrom(genericUDFClass)) {
+-      FunctionInfo fI = new FunctionInfo(isNative, functionName,
+-          ReflectionUtils.newInstance(genericUDFClass, null));
+-      mFunctions.put(functionName.toLowerCase(), fI);
+-      registerNativeStatus(fI);
+-    } else {
+-      throw new RuntimeException("Registering GenericUDF Class "
+-          + genericUDFClass + " which does not extend " + GenericUDF.class);
+-    }
+-  }
+-
+-  public static void registerTemporaryGenericUDTF(String functionName,
+-      Class<? extends GenericUDTF> genericUDTFClass) {
+-    registerGenericUDTF(false, functionName, genericUDTFClass);
+-  }
+-
+-  static void registerGenericUDTF(String functionName,
+-      Class<? extends GenericUDTF> genericUDTFClass) {
+-    registerGenericUDTF(true, functionName, genericUDTFClass);
+-  }
+-
+-  public static void registerGenericUDTF(boolean isNative, String functionName,
+-      Class<? extends GenericUDTF> genericUDTFClass) {
+-    if (GenericUDTF.class.isAssignableFrom(genericUDTFClass)) {
+-      FunctionInfo fI = new FunctionInfo(isNative, functionName,
+-          ReflectionUtils.newInstance(genericUDTFClass, null));
+-      mFunctions.put(functionName.toLowerCase(), fI);
+-      registerNativeStatus(fI);
+-    } else {
+-      throw new RuntimeException("Registering GenericUDTF Class "
+-          + genericUDTFClass + " which does not extend " + GenericUDTF.class);
+-    }
+-  }
+-
+-  private static FunctionInfo getFunctionInfoFromMetastore(String functionName) {
+-    FunctionInfo ret = null;
+-
+-    try {
+-      String dbName;
+-      String fName;
+-      if (FunctionUtils.isQualifiedFunctionName(functionName)) {
+-        String[] parts = FunctionUtils.splitQualifiedFunctionName(functionName);
+-        dbName = parts[0];
+-        fName = parts[1];
+-      } else {
+-        // otherwise, qualify using current db
+-        dbName = SessionState.get().getCurrentDatabase().toLowerCase();
+-        fName = functionName;
+-      }
+-
+-      // Try looking up function in the metastore
+-      HiveConf conf = SessionState.get().getConf();
+-      Function func = Hive.get(conf).getFunction(dbName, fName);
+-      if (func != null) {
+-        // Found UDF in metastore - now add it to the function registry
+-        // At this point we should add any relevant jars that would be needed for the UDf.
+-        try {
+-          FunctionTask.addFunctionResources(func.getResourceUris());
+-        } catch (Exception e) {
+-          LOG.error("Unable to load resources for " + dbName + "." + fName + ":" + e.getMessage(), e);
+-          return null;
+-        }
+-
+-        Class<?> udfClass = Class.forName(func.getClassName(), true, Utilities.getSessionSpecifiedClassLoader());
+-        if (registerTemporaryFunction(functionName, udfClass)) {
+-          ret = mFunctions.get(functionName);
+-        } else {
+-          LOG.error(func.getClassName() + " is not a valid UDF class and was not registered.");
+-        }
+-      }
+-    } catch (HiveException e) {
+-      if (!((e.getCause() != null) && (e.getCause() instanceof MetaException)) &&
+-         (e.getCause().getCause() != null) && (e.getCause().getCause() instanceof NoSuchObjectException))  {
+-         LOG.info("Unable to lookup UDF in metastore: " + e);
+-      }
+-    } catch (ClassNotFoundException e) {
+-      // Lookup of UDf class failed
+-      LOG.error("Unable to load UDF class: " + e);
+-    }
+-
+-    return ret;
+-  }
+-
+-  private static <T extends CommonFunctionInfo> T getQualifiedFunctionInfo(
+-      Map<String, T> mFunctions, String functionName) {
+-    T functionInfo =  mFunctions.get(functionName);
+-    if (functionInfo == null) {
+-      // Try looking up in metastore.
+-      FunctionInfo fi = getFunctionInfoFromMetastore(functionName);
+-      if (fi != null) {
+-        // metastore lookup resulted in function getting added to mFunctions, try again
+-        functionInfo = mFunctions.get(functionName);
+-      }
+-    }
+-
+-    // HIVE-6672: In HiveServer2 the JARs for this UDF may have been loaded by a different thread,
+-    // and the current thread may not be able to resolve the UDF. Test for this condition
+-    // and if necessary load the JARs in this thread.
+-    if (functionInfo != null) {
+-      loadFunctionResourcesIfNecessary(functionName, functionInfo);
+-    }
+-
+-    return functionInfo;
+-  }
+-
+-  private static void checkFunctionClass(CommonFunctionInfo cfi) throws ClassNotFoundException {
+-    // This call will fail for non-generic UDFs using GenericUDFBridge
+-    Class<?> udfClass = cfi.getFunctionClass();
+-    // Even if we have a reference to the class (which will be the case for GenericUDFs),
+-    // the classloader may not be able to resolve the class, which would mean reflection-based
+-    // methods would fail such as for plan deserialization. Make sure this works too.
+-    Class.forName(udfClass.getName(), true, Utilities.getSessionSpecifiedClassLoader());
+-  }
+-
+-  private static void loadFunctionResourcesIfNecessary(String functionName, CommonFunctionInfo cfi) {
+-    try {
+-      // Check if the necessary JARs have been loaded for this function.
+-      checkFunctionClass(cfi);
+-    } catch (Exception e) {
+-      // Unable to resolve the UDF with the classloader.
+-      // Look up the function in the metastore and load any resources.
+-      LOG.debug("Attempting to reload resources for " + functionName);
+-      try {
+-        String[] parts = FunctionUtils.getQualifiedFunctionNameParts(functionName);
+-        HiveConf conf = SessionState.get().getConf();
+-        Function func = Hive.get(conf).getFunction(parts[0], parts[1]);
+-        if (func != null) {
+-          FunctionTask.addFunctionResources(func.getResourceUris());
+-          // Check again now that we've loaded the resources in this thread.
+-          checkFunctionClass(cfi);
+-        } else {
+-          // Couldn't find the function .. just rethrow the original error
+-          LOG.error("Unable to reload resources for " + functionName);
+-          throw e;
+-        }
+-      } catch (Exception err) {
+-        throw new RuntimeException(err);
+-      }
+-    }
+-  }
+-
+-  public static String getNormalizedFunctionName(String fn) {
++    system.registerGenericUDF(LEAD_FUNC_NAME, GenericUDFLead.class);
++    system.registerGenericUDF(LAG_FUNC_NAME, GenericUDFLag.class);
++
++    system.registerGenericUDAF("row_number", new GenericUDAFRowNumber());
++    system.registerGenericUDAF("rank", new GenericUDAFRank());
++    system.registerGenericUDAF("dense_rank", new GenericUDAFDenseRank());
++    system.registerGenericUDAF("percent_rank", new GenericUDAFPercentRank());
++    system.registerGenericUDAF("cume_dist", new GenericUDAFCumeDist());
++    system.registerGenericUDAF("ntile", new GenericUDAFNTile());
++    system.registerGenericUDAF("first_value", new GenericUDAFFirstValue());
++    system.registerGenericUDAF("last_value", new GenericUDAFLastValue());
++    system.registerWindowFunction(LEAD_FUNC_NAME, new GenericUDAFLead());
++    system.registerWindowFunction(LAG_FUNC_NAME, new GenericUDAFLag());
++
++    system.registerTableFunction(NOOP_TABLE_FUNCTION, NoopResolver.class);
++    system.registerTableFunction(NOOP_MAP_TABLE_FUNCTION, NoopWithMapResolver.class);
++    system.registerTableFunction(NOOP_STREAMING_TABLE_FUNCTION, NoopStreamingResolver.class);
++    system.registerTableFunction(NOOP_STREAMING_MAP_TABLE_FUNCTION, NoopWithMapStreamingResolver.class);
++    system.registerTableFunction(WINDOWING_TABLE_FUNCTION, WindowingTableFunctionResolver.class);
++    system.registerTableFunction(MATCH_PATH_TABLE_FUNCTION, MatchPathResolver.class);
++  }
++
++  public static String getNormalizedFunctionName(String fn) throws SemanticException {
+     // Does the same thing as getFunctionInfo, except for getting the function info.
+     fn = fn.toLowerCase();
+-    return (FunctionUtils.isQualifiedFunctionName(fn) || mFunctions.get(fn) != null) ? fn
++    return (FunctionUtils.isQualifiedFunctionName(fn) || getFunctionInfo(fn) != null) ? fn
+         : FunctionUtils.qualifyFunctionName(
+             fn, SessionState.get().getCurrentDatabase().toLowerCase());
+   }
+ 
+-  private static <T extends CommonFunctionInfo> T getFunctionInfo(
+-      Map<String, T> mFunctions, String functionName) {
+-    functionName = functionName.toLowerCase();
+-    T functionInfo = null;
+-    if (FunctionUtils.isQualifiedFunctionName(functionName)) {
+-      functionInfo = getQualifiedFunctionInfo(mFunctions, functionName);
+-    } else {
+-      // First try without qualifiers - would resolve builtin/temp functions.
+-      // Otherwise try qualifying with current db name.
+-      functionInfo =  mFunctions.get(functionName);
+-      if (functionInfo == null && !FunctionUtils.isQualifiedFunctionName(functionName)) {
+-        String qualifiedName = FunctionUtils.qualifyFunctionName(functionName,
+-            SessionState.get().getCurrentDatabase().toLowerCase());
+-        functionInfo = getQualifiedFunctionInfo(mFunctions, qualifiedName);
+-      }
+-    }
+-    return functionInfo;
+-  }
+-
+   public static FunctionInfo getFunctionInfo(String functionName) throws SemanticException {
+-    FunctionInfo functionInfo = getFunctionInfo(mFunctions, functionName);
+-    if (functionInfo != null && functionInfo.isBlockedFunction()) {
+-      throw new SemanticException ("UDF " + functionName + " is not allowed");
+-    }
+-    return functionInfo;
++    FunctionInfo info = getTemporaryFunctionInfo(functionName);
++    return info != null ? info : system.getFunctionInfo(functionName);
+   }
+ 
+-  /**
+-   * Returns a set of registered function names. This is used for the CLI
+-   * command "SHOW FUNCTIONS;"
+-   *
+-   * @return set of strings contains function names
+-   */
+-  public static Set<String> getFunctionNames() {
+-    return getFunctionNames(true);
++  public static FunctionInfo getTemporaryFunctionInfo(String functionName) throws SemanticException {
++    Registry registry = SessionState.getRegistry();
++    return registry == null ? null : registry.getFunctionInfo(functionName);
+   }
+ 
+-  private static Set<String> getFunctionNames(boolean searchMetastore) {
+-    Set<String> functionNames = mFunctions.keySet();
+-    if (searchMetastore) {
+-      functionNames = new HashSet<String>(functionNames);
+-      try {
+-        Hive db = getHive();
+-        List<String> dbNames = db.getAllDatabases();
+-
+-        for (String dbName : dbNames) {
+-          List<String> funcNames = db.getFunctions(dbName, "*");
+-          for (String funcName : funcNames) {
+-            functionNames.add(FunctionUtils.qualifyFunctionName(funcName, dbName));
+-          }
+-        }
+-      } catch (Exception e) {
+-        LOG.error(e);
+-        // Continue on, we can still return the functions we've gotten to this point.
+-      }
+-    }
+-    return functionNames;
++  public static WindowFunctionInfo getWindowFunctionInfo(String functionName)
++      throws SemanticException {
++    Registry registry = SessionState.getRegistry();
++    WindowFunctionInfo info =
++        registry == null ? null : registry.getWindowFunctionInfo(functionName);
++    return info != null ? info : system.getWindowFunctionInfo(functionName);
+   }
+ 
+-  public static Hive getHive() throws HiveException {
+-    return Hive.get(SessionState.get().getConf());
++  public static Set<String> getFunctionNames() {
++    Set<String> names = new TreeSet<String>();
++    names.addAll(system.getCurrentFunctionNames());
++    if (SessionState.getRegistry() != null) {
++      names.addAll(SessionState.getRegistry().getCurrentFunctionNames());
++    }
++    return names;
+   }
+ 
+-  /**
+-   * Returns a set of registered function names. This is used for the CLI
+-   * command "SHOW FUNCTIONS 'regular expression';" Returns an empty set when
+-   * the regular expression is not valid.
+-   *
+-   * @param funcPatternStr
+-   *          regular expression of the interested function names
+-   * @return set of strings contains function names
+-   */
+   public static Set<String> getFunctionNames(String funcPatternStr) {
+     Set<String> funcNames = new TreeSet<String>();
+-    Pattern funcPattern = null;
+-    try {
+-      funcPattern = Pattern.compile(funcPatternStr);
+-    } catch (PatternSyntaxException e) {
+-      return funcNames;
+-    }
+-    for (String funcName : mFunctions.keySet()) {
+-      if (funcPattern.matcher(funcName).matches()) {
+-        funcNames.add(funcName);
+-      }
++    funcNames.addAll(system.getFunctionNames(funcPatternStr));
++    if (SessionState.getRegistry() != null) {
++      funcNames.addAll(SessionState.getRegistry().getFunctionNames(funcPatternStr));
+     }
+     return funcNames;
+   }
+@@ -760,7 +492,7 @@ public static Hive getHive() throws HiveException {
+    */
+   public static Set<String> getFunctionNamesByLikePattern(String funcPatternStr) {
+     Set<String> funcNames = new TreeSet<String>();
+-    Set<String> allFuncs = getFunctionNames(true);
++    Set<String> allFuncs = getFunctionNames();
+     String[] subpatterns = funcPatternStr.trim().split("\\|");
+     for (String subpattern : subpatterns) {
+       subpattern = "(?i)" + subpattern.replaceAll("\\*", ".*");
+@@ -781,35 +513,19 @@ public static Hive getHive() throws HiveException {
+   /**
+    * Returns the set of synonyms of the supplied function.
+    *
+-   * @param funcName
+-   *          the name of the function
++   * @param funcName the name of the function
+    * @return Set of synonyms for funcName
+    */
+-  public static Set<String> getFunctionSynonyms(String funcName) {
+-    // Must be deterministic order map for consistent q-test output across Java versions - see HIVE-9161
+-    Set<String> synonyms = new LinkedHashSet<String>();
+-
+-    FunctionInfo funcInfo;
+-    try {
+-      funcInfo = getFunctionInfo(funcName);
+-    } catch (SemanticException e) {
+-      LOG.warn("Failed to load " + funcName);
+-      funcInfo = null;
+-    }
++  public static Set<String> getFunctionSynonyms(String funcName) throws SemanticException {
++    FunctionInfo funcInfo = getFunctionInfo(funcName);
+     if (null == funcInfo) {
+-      return synonyms;
++      return Collections.emptySet();
+     }
+-
+-    Class<?> funcClass = funcInfo.getFunctionClass();
+-    for (String name : mFunctions.keySet()) {
+-      if (name.equals(funcName)) {
+-        continue;
+-      }
+-      if (mFunctions.get(name).getFunctionClass().equals(funcClass)) {
+-        synonyms.add(name);
+-      }
++    Set<String> synonyms = new LinkedHashSet<String>();
++    system.getFunctionSynonyms(funcName, funcInfo, synonyms);
++    if (SessionState.getRegistry() != null) {
++      SessionState.getRegistry().getFunctionSynonyms(funcName, funcInfo, synonyms);
+     }
+-
+     return synonyms;
+   }
+ 
+@@ -1154,7 +870,6 @@ public static GenericUDAFEvaluator getGenericUDAFEvaluator(String name,
+       return null;
+     }
+ 
+-    GenericUDAFEvaluator udafEvaluator = null;
+     ObjectInspector args[] = new ObjectInspector[argumentOIs.size()];
+     // Can't use toArray here because Java is dumb when it comes to
+     // generics + arrays.
+@@ -1165,6 +880,8 @@ public static GenericUDAFEvaluator getGenericUDAFEvaluator(String name,
+     GenericUDAFParameterInfo paramInfo =
+         new SimpleGenericUDAFParameterInfo(
+             args, isDistinct, isAllColumns);
++    
++    GenericUDAFEvaluator udafEvaluator;
+     if (udafResolver instanceof GenericUDAFResolver2) {
+       udafEvaluator =
+           ((GenericUDAFResolver2) udafResolver).getEvaluator(paramInfo);
+@@ -1178,20 +895,11 @@ public static GenericUDAFEvaluator getGenericUDAFEvaluator(String name,
+   public static GenericUDAFEvaluator getGenericWindowingEvaluator(String name,
+       List<ObjectInspector> argumentOIs, boolean isDistinct,
+       boolean isAllColumns) throws SemanticException {
+-
+-    WindowFunctionInfo finfo = windowFunctions.get(name.toLowerCase());
+-    if (finfo == null) { return null;}
+-    if ( !name.toLowerCase().equals(LEAD_FUNC_NAME) &&
+-    !name.toLowerCase().equals(LAG_FUNC_NAME) ) {
+-    return getGenericUDAFEvaluator(name, argumentOIs, isDistinct, isAllColumns);
+-    }
+-
+-    // this must be lead/lag UDAF
+-    ObjectInspector args[] = new ObjectInspector[argumentOIs.size()];
+-    GenericUDAFResolver udafResolver = finfo.getfInfo().getGenericUDAFResolver();
+-    GenericUDAFParameterInfo paramInfo = new SimpleGenericUDAFParameterInfo(
+-    argumentOIs.toArray(args), isDistinct, isAllColumns);
+-    return ((GenericUDAFResolver2) udafResolver).getEvaluator(paramInfo);
++    Registry registry = SessionState.getRegistry();
++    GenericUDAFEvaluator evaluator = registry == null ? null :
++        registry.getGenericWindowingEvaluator(name, argumentOIs, isDistinct, isAllColumns);
++    return evaluator != null ? evaluator :
++        system.getGenericWindowingEvaluator(name, argumentOIs, isDistinct, isAllColumns);
+   }
+ 
+   /**
+@@ -1215,62 +923,8 @@ public static GenericUDAFEvaluator getGenericWindowingEvaluator(String name,
+     return getMethodInternal(udfClass, mlist, exact, argumentClasses);
+   }
+ 
+-  public static void registerTemporaryGenericUDAF(String functionName,
+-      GenericUDAFResolver genericUDAFResolver) {
+-    registerGenericUDAF(false, functionName, genericUDAFResolver);
+-  }
+-
+-  static void registerGenericUDAF(String functionName,
+-      GenericUDAFResolver genericUDAFResolver) {
+-    registerGenericUDAF(true, functionName, genericUDAFResolver);
+-  }
+-
+-  public static void registerGenericUDAF(boolean isNative, String functionName,
+-      GenericUDAFResolver genericUDAFResolver) {
+-    FunctionInfo fi = new FunctionInfo(isNative, functionName.toLowerCase(), genericUDAFResolver);
+-    mFunctions.put(functionName.toLowerCase(), fi);
+-
+-    // All aggregate functions should also be usable as window functions
+-    addFunctionInfoToWindowFunctions(functionName, fi);
+-
+-    registerNativeStatus(fi);
+-  }
+-
+-  public static void registerTemporaryUDAF(String functionName,
+-      Class<? extends UDAF> udafClass) {
+-    registerUDAF(false, functionName, udafClass);
+-  }
+-
+-  static void registerUDAF(String functionName, Class<? extends UDAF> udafClass) {
+-    registerUDAF(true, functionName, udafClass);
+-  }
+-
+-  public static void registerUDAF(boolean isNative, String functionName,
+-      Class<? extends UDAF> udafClass) {
+-    FunctionInfo fi = new FunctionInfo(isNative,
+-        functionName.toLowerCase(), new GenericUDAFBridge(
+-        ReflectionUtils.newInstance(udafClass, null)));
+-    mFunctions.put(functionName.toLowerCase(), fi);
+-
+-    // All aggregate functions should also be usable as window functions
+-    addFunctionInfoToWindowFunctions(functionName, fi);
+-
+-    registerNativeStatus(fi);
+-  }
+-
+-  public static void unregisterTemporaryUDF(String functionName) throws HiveException {
+-    FunctionInfo fi = mFunctions.get(functionName.toLowerCase());
+-    if (fi != null) {
+-      if (!fi.isNative()) {
+-        mFunctions.remove(functionName.toLowerCase());
+-      } else {
+-        throw new HiveException("Function " + functionName
+-            + " is hive native, it can't be dropped");
+-      }
+-    }
+-  }
+-
+-  public static GenericUDAFResolver getGenericUDAFResolver(String functionName) throws SemanticException {
++  public static GenericUDAFResolver getGenericUDAFResolver(String functionName)
++      throws SemanticException {
+     if (LOG.isDebugEnabled()) {
+       LOG.debug("Looking up GenericUDAF: " + functionName);
+     }
+@@ -1570,7 +1224,11 @@ public static Method getMethodInternal(Class<?> udfClass, List<Method> mlist, bo
+    * @throws SemanticException
+    */
+   public static GenericUDF getGenericUDFForIndex() {
+-    return FunctionRegistry.getFunctionInfo(mFunctions, "index").getGenericUDF();
++    try {
++      return FunctionRegistry.getFunctionInfo("index").getGenericUDF();
++    } catch (SemanticException e) {
++      throw new RuntimeException("hive operator -- never be thrown", e);
++    }
+   }
+ 
+   /**
+@@ -1578,7 +1236,11 @@ public static GenericUDF getGenericUDFForIndex() {
+    * @throws SemanticException
+    */
+   public static GenericUDF getGenericUDFForAnd() {
+-    return FunctionRegistry.getFunctionInfo(mFunctions, "and").getGenericUDF();
++    try {
++      return FunctionRegistry.getFunctionInfo("and").getGenericUDF();
++    } catch (SemanticException e) {
++      throw new RuntimeException("hive operator -- never be thrown", e);
++    }
+   }
+ 
+   /**
+@@ -1589,7 +1251,7 @@ public static GenericUDF cloneGenericUDF(GenericUDF genericUDF) {
+       return null;
+     }
+ 
+-    GenericUDF clonedUDF = null;
++    GenericUDF clonedUDF;
+     if (genericUDF instanceof GenericUDFBridge) {
+       GenericUDFBridge bridge = (GenericUDFBridge) genericUDF;
+       clonedUDF = new GenericUDFBridge(bridge.getUdfName(), bridge.isOperator(),
+@@ -1599,8 +1261,7 @@ public static GenericUDF cloneGenericUDF(GenericUDF genericUDF) {
+       clonedUDF = new GenericUDFMacro(bridge.getMacroName(), bridge.getBody(),
+           bridge.getColNames(), bridge.getColTypes());
+     } else {
+-      clonedUDF = ReflectionUtils
+-          .newInstance(genericUDF.getClass(), null);
++      clonedUDF = ReflectionUtils.newInstance(genericUDF.getClass(), null);
+     }
+ 
+     if (clonedUDF != null) {
+@@ -1638,32 +1299,23 @@ public static GenericUDTF cloneGenericUDTF(GenericUDTF genericUDTF) {
+     if (null == genericUDTF) {
+       return null;
+     }
+-    return ReflectionUtils.newInstance(genericUDTF.getClass(),
+-        null);
++    return ReflectionUtils.newInstance(genericUDTF.getClass(), null);
+   }
+ 
+   /**
+    * Get the UDF class from an exprNodeDesc. Returns null if the exprNodeDesc
+    * does not contain a UDF class.
+    */
+-  private static Class<? extends GenericUDF> getGenericUDFClassFromExprDesc(ExprNodeDesc desc) {
++  private static Class getUDFClassFromExprDesc(ExprNodeDesc desc) {
+     if (!(desc instanceof ExprNodeGenericFuncDesc)) {
+       return null;
+     }
+     ExprNodeGenericFuncDesc genericFuncDesc = (ExprNodeGenericFuncDesc) desc;
+-    return genericFuncDesc.getGenericUDF().getClass();
+-  }
+-
+-  /**
+-   * Get the UDF class from an exprNodeDesc. Returns null if the exprNodeDesc
+-   * does not contain a UDF class.
+-   */
+-  private static Class<? extends GenericUDF> getUDFClassFromExprDesc(ExprNodeDesc desc) {
+-    if (!(desc instanceof ExprNodeGenericFuncDesc)) {
+-      return null;
++    GenericUDF genericUDF = genericFuncDesc.getGenericUDF();
++    if (genericUDF instanceof GenericUDFBridge) {
++      return ((GenericUDFBridge) genericUDF).getUdfClass();
+     }
+-    ExprNodeGenericFuncDesc genericFuncDesc = (ExprNodeGenericFuncDesc) desc;
+-    return genericFuncDesc.getGenericUDF().getClass();
++    return genericUDF.getClass();
+   }
+ 
+   /**
+@@ -1725,7 +1377,7 @@ public static boolean isStateful(GenericUDF genericUDF) {
+    * Returns whether the exprNodeDesc is a node of "and", "or", "not".
+    */
+   public static boolean isOpAndOrNot(ExprNodeDesc desc) {
+-    Class<? extends GenericUDF> genericUdfClass = getGenericUDFClassFromExprDesc(desc);
++    Class genericUdfClass = getUDFClassFromExprDesc(desc);
+     return GenericUDFOPAnd.class == genericUdfClass
+         || GenericUDFOPOr.class == genericUdfClass
+         || GenericUDFOPNot.class == genericUdfClass;
+@@ -1735,29 +1387,28 @@ public static boolean isOpAndOrNot(ExprNodeDesc desc) {
+    * Returns whether the exprNodeDesc is a node of "and".
+    */
+   public static boolean isOpAnd(ExprNodeDesc desc) {
+-    return GenericUDFOPAnd.class == getGenericUDFClassFromExprDesc(desc);
++    return GenericUDFOPAnd.class == getUDFClassFromExprDesc(desc);
+   }
+ 
+   /**
+    * Returns whether the exprNodeDesc is a node of "or".
+    */
+   public static boolean isOpOr(ExprNodeDesc desc) {
+-    return GenericUDFOPOr.class == getGenericUDFClassFromExprDesc(desc);
++    return GenericUDFOPOr.class == getUDFClassFromExprDesc(desc);
+   }
+ 
+   /**
+    * Returns whether the exprNodeDesc is a node of "not".
+    */
+   public static boolean isOpNot(ExprNodeDesc desc) {
+-    return GenericUDFOPNot.class == getGenericUDFClassFromExprDesc(desc);
++    return GenericUDFOPNot.class == getUDFClassFromExprDesc(desc);
+   }
+ 
+   /**
+    * Returns whether the exprNodeDesc is a node of "positive".
+    */
+   public static boolean isOpPositive(ExprNodeDesc desc) {
+-    Class<? extends GenericUDF> udfClass = getUDFClassFromExprDesc(desc);
+-    return GenericUDFOPPositive.class == udfClass;
++    return GenericUDFOPPositive.class == getUDFClassFromExprDesc(desc);
+   }
+ 
+   /**
+@@ -1801,103 +1452,41 @@ public static boolean isOpPreserveInputName(ExprNodeDesc desc) {
+    * @return true if udfClass's type was recognized (so registration
+    * succeeded); false otherwise
+    */
+-  public static boolean registerTemporaryFunction(
+-    String functionName, Class<?> udfClass) {
+-
+-    UDFClassType udfClassType = FunctionUtils.getUDFClassType(udfClass);
+-    switch (udfClassType) {
+-    case UDF:
+-      FunctionRegistry.registerTemporaryUDF(
+-        functionName, (Class<? extends UDF>) udfClass, false);
+-      break;
+-    case GENERIC_UDF:
+-      FunctionRegistry.registerTemporaryGenericUDF(
+-        functionName, (Class<? extends GenericUDF>) udfClass);
+-      break;
+-    case GENERIC_UDTF:
+-      FunctionRegistry.registerTemporaryGenericUDTF(
+-        functionName, (Class<? extends GenericUDTF>) udfClass);
+-      break;
+-    case UDAF:
+-      FunctionRegistry.registerTemporaryUDAF(
+-        functionName, (Class<? extends UDAF>) udfClass);
+-      break;
+-    case GENERIC_UDAF_RESOLVER:
+-      FunctionRegistry.registerTemporaryGenericUDAF(
+-        functionName, (GenericUDAFResolver)
+-        ReflectionUtils.newInstance(udfClass, null));
+-      break;
+-    case TABLE_FUNCTION_RESOLVER:
+-      FunctionRegistry.registerTableFunction(
+-        functionName, (Class<? extends TableFunctionResolver>)udfClass);
+-      break;
+-    default:
+-      return false;
+-    }
+-    return true;
++  public static FunctionInfo registerTemporaryUDF(
++      String functionName, Class<?> udfClass, FunctionResource... resources) {
++    return SessionState.getRegistryForWrite().registerFunction(
++        functionName, udfClass, resources);
++  }
+ 
++  public static void unregisterTemporaryUDF(String functionName) throws HiveException {
++    if (SessionState.getRegistry() != null) {
++      SessionState.getRegistry().unregisterFunction(functionName);
++    }
+   }
+ 
+   /**
+-   * Registers thae appropriate kind of temporary function based on a class's
++   * Registers the appropriate kind of temporary function based on a class's
+    * type.
+    *
+    * @param macroName name under which to register the macro
+    *
+    * @param body the expression which the macro evaluates to
+-   *
+-   * @param colNames the names of the arguments to the macro
+-   *
+-   * @param colTypes the types of the arguments to the macro
++   *@param colNames the names of the arguments to the macro
++   *@param colTypes the types of the arguments to the macro
+    */
+   public static void registerTemporaryMacro(
+-    String macroName, ExprNodeDesc body,
+-    List<String> colNames, List<TypeInfo> colTypes) {
+-
+-    FunctionInfo fI = new FunctionInfo(false, macroName,
+-        new GenericUDFMacro(macroName, body, colNames, colTypes));
+-    mFunctions.put(macroName.toLowerCase(), fI);
+-    registerNativeStatus(fI);
++    String macroName, ExprNodeDesc body, List<String> colNames, List<TypeInfo> colTypes) {
++    SessionState.getRegistryForWrite().registerMacro(macroName, body, colNames, colTypes);
+   }
+ 
+-  /**
+-   * Registers Hive functions from a plugin jar, using metadata from
+-   * the jar's META-INF/class-info.xml.
+-   *
+-   * @param jarLocation URL for reading jar file
+-   *
+-   * @param classLoader classloader to use for loading function classes
+-   */
+-  public static void registerFunctionsFromPluginJar(
+-    URL jarLocation,
+-    ClassLoader classLoader) throws Exception {
++  public static FunctionInfo registerPermanentFunction(String functionName,
++      String className, boolean registerToSession, FunctionResource[] resources) {
++    return system.registerPermanentFunction(functionName, className, registerToSession, resources);
++  }
+ 
+-    URL url = new URL("jar:" + jarLocation + "!/META-INF/class-info.xml");
+-    InputStream inputStream = null;
+-    try {
+-      inputStream = url.openStream();
+-      DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+-      DocumentBuilder docBuilder = dbf.newDocumentBuilder();
+-      Document doc = docBuilder.parse(inputStream);
+-      Element root = doc.getDocumentElement();
+-      if (!root.getTagName().equals("ClassList")) {
+-        return;
+-      }
+-      NodeList children = root.getElementsByTagName("Class");
+-      for (int i = 0; i < children.getLength(); ++i) {
+-        Element child = (Element) children.item(i);
+-        String javaName = child.getAttribute("javaname");
+-        String sqlName = child.getAttribute("sqlname");
+-        Class<?> udfClass = Class.forName(javaName, true, classLoader);
+-        boolean registered = registerTemporaryFunction(sqlName, udfClass);
+-        if (!registered) {
+-          throw new RuntimeException(
+-            "Class " + udfClass + " is not a Hive function implementation");
+-        }
+-      }
+-    } finally {
+-      IOUtils.closeStream(inputStream);
+-    }
++  public static void unregisterPermanentFunction(String functionName) throws HiveException {
++    system.unregisterFunction(functionName);
++    unregisterTemporaryUDF(functionName);
+   }
+ 
+   private FunctionRegistry() {
+@@ -1907,42 +1496,6 @@ private FunctionRegistry() {
+ 
+   //---------PTF functions------------
+ 
+-  public static void registerWindowFunction(String name, GenericUDAFResolver wFn)
+-  {
+-    registerWindowFunction(name, wFn, true);
+-  }
+-
+-  /**
+-   * Typically a WindowFunction is the same as a UDAF. The only exceptions are Lead & Lag UDAFs. These
+-   * are not registered as regular UDAFs because
+-   * - we plan to support Lead & Lag as UDFs (usable only within argument expressions
+-   *   of UDAFs when windowing is involved). Since mFunctions holds both UDFs and UDAFs we cannot
+-   *   add both FunctionInfos to mFunctions.
+-   * We choose to only register UDFs in mFunctions. The implication of this is that Lead/Lag UDAFs
+-   * are only usable when windowing is involved.
+-   *
+-   * @param name
+-   * @param wFn
+-   * @param registerAsUDAF
+-   */
+-  public static void registerWindowFunction(String name, GenericUDAFResolver wFn, boolean registerAsUDAF)
+-  {
+-    FunctionInfo fInfo = null;
+-    if (registerAsUDAF) {
+-      // Just register the function normally, will also get added to window functions.
+-      registerGenericUDAF(true, name, wFn);
+-    }
+-    else {
+-      name = name.toLowerCase();
+-      fInfo = new FunctionInfo(true, name, wFn);
+-      addFunctionInfoToWindowFunctions(name, fInfo);
+-    }
+-  }
+-
+-  public static WindowFunctionInfo getWindowFunctionInfo(String functionName) {
+-    return getFunctionInfo(windowFunctions, functionName);
+-  }
+-
+   /**
+    * Both UDF and UDAF functions can imply order for analytical functions
+    *
+@@ -1955,13 +1508,11 @@ public static WindowFunctionInfo getWindowFunctionInfo(String functionName) {
+   public static boolean impliesOrder(String functionName) throws SemanticException {
+ 
+     FunctionInfo info = getFunctionInfo(functionName);
+-    if (info != null) {
+-      if (info.isGenericUDF()) {
+-        UDFType type =
+-            AnnotationUtils.getAnnotation(info.getGenericUDF().getClass(), UDFType.class);
+-        if (type != null) {
+-          return type.impliesOrder();
+-        }
++    if (info != null && info.isGenericUDF()) {
++      UDFType type =
++          AnnotationUtils.getAnnotation(info.getGenericUDF().getClass(), UDFType.class);
++      if (type != null) {
++        return type.impliesOrder();
+       }
+     }
+     WindowFunctionInfo windowInfo = getWindowFunctionInfo(functionName);
+@@ -1971,30 +1522,23 @@ public static boolean impliesOrder(String functionName) throws SemanticException
+     return false;
+   }
+ 
+-  static private void addFunctionInfoToWindowFunctions(String functionName,
+-      FunctionInfo functionInfo) {
+-    // Assumes that the caller has already verified that functionInfo is for an aggregate function
+-    WindowFunctionInfo wInfo = new WindowFunctionInfo(functionInfo);
+-    windowFunctions.put(functionName.toLowerCase(), wInfo);
+-  }
+-
+-  public static boolean isTableFunction(String name) throws SemanticException
+-  {
+-    FunctionInfo tFInfo = getFunctionInfo(name);
++  public static boolean isTableFunction(String functionName)
++      throws SemanticException {
++    FunctionInfo tFInfo = getFunctionInfo(functionName);
+     return tFInfo != null && !tFInfo.isInternalTableFunction() && tFInfo.isTableFunction();
+   }
+ 
+-  public static TableFunctionResolver getTableFunctionResolver(String name) throws SemanticException
+-  {
+-    FunctionInfo tfInfo = getFunctionInfo(name);
+-    if(tfInfo.isTableFunction()) {
++  public static TableFunctionResolver getTableFunctionResolver(String functionName)
++      throws SemanticException {
++    FunctionInfo tfInfo = getFunctionInfo(functionName);
++    if (tfInfo != null && tfInfo.isTableFunction()) {
+       return (TableFunctionResolver) ReflectionUtils.newInstance(tfInfo.getFunctionClass(), null);
+     }
+     return null;
+   }
+ 
+-  public static TableFunctionResolver getWindowingTableFunction() throws SemanticException
+-  {
++  public static TableFunctionResolver getWindowingTableFunction()
++      throws SemanticException {
+     return getTableFunctionResolver(WINDOWING_TABLE_FUNCTION);
+   }
+ 
+@@ -2006,13 +1550,6 @@ public static boolean isNoopFunction(String fnName) {
+         fnName.equals(NOOP_STREAMING_TABLE_FUNCTION);
+   }
+ 
+-  public static void registerTableFunction(String name, Class<? extends TableFunctionResolver> tFnCls)
+-  {
+-    FunctionInfo tInfo = new FunctionInfo(name, tFnCls);
+-    mFunctions.put(name.toLowerCase(), tInfo);
+-    registerNativeStatus(tInfo);
+-  }
+-
+   /**
+    * Use this to check if function is ranking function
+    *
+@@ -2038,21 +1575,14 @@ public static boolean isRankingFunction(String name) throws SemanticException {
+ 
+   /**
+    * @param fnExpr Function expression.
+-   * @return True iff the fnExpr represents a hive built-in function.
++   * @return True iff the fnExpr represents a hive built-in function (native, non-permanent)
+    */
+-  public static boolean isNativeFuncExpr(ExprNodeGenericFuncDesc fnExpr) {
+-    Class<?> udfClass = getUDFClassFromExprDesc(fnExpr);
+-    if (udfClass == null) {
+-      udfClass = getGenericUDFClassFromExprDesc(fnExpr);
++  public static boolean isBuiltInFuncExpr(ExprNodeGenericFuncDesc fnExpr) {
++    Class<?> udfClass = FunctionRegistry.getUDFClassFromExprDesc(fnExpr);
++    if (udfClass != null) {
++      return system.isBuiltInFunc(udfClass);
+     }
+-    return nativeUdfs.contains(udfClass);
+-  }
+-
+-  private static void registerNativeStatus(FunctionInfo fi) {
+-    if (!fi.isNative()) {
+-      return;
+-    }
+-    nativeUdfs.add(fi.getFunctionClass());
++    return false;
+   }
+ 
+   /**
+@@ -2062,49 +1592,6 @@ private static void registerNativeStatus(FunctionInfo fi) {
+    */
+   public static void setupPermissionsForBuiltinUDFs(String whiteListStr,
+       String blackListStr) {
+-    List<String> whiteList = Lists.newArrayList(
+-        Splitter.on(",").trimResults().omitEmptyStrings().split(whiteListStr));
+-    List<String> blackList = Lists.newArrayList(
+-        Splitter.on(",").trimResults().omitEmptyStrings().split(blackListStr));
+-
+-    for ( Entry<String, FunctionInfo> funcEntry : mFunctions.entrySet()) {
+-      funcEntry.getValue().setBlockedFunction(
+-          isUdfBlocked(funcEntry.getKey(), whiteList, blackList));
+-    }
+-  }
+-
+-  /**
+-   * Check if the function belongs to whitelist or blacklist
+-   * @param functionName
+-   * @param whiteList
+-   * @param blackList
+-   * @return true if the given udf is to be blocked
+-   */
+-  private static boolean isUdfBlocked(String functionName,
+-      List<String> whiteList, List<String> blackList) {
+-    boolean inWhiteList = false;
+-    boolean inBlackList = false;
+-
+-    if (whiteList.isEmpty()) {
+-      // if whitelist is empty, all udfs are allowed
+-      inWhiteList = true;
+-    } else {
+-      for (String allowedFunction : whiteList) {
+-        if (functionName.equalsIgnoreCase(allowedFunction)) {
+-          inWhiteList = true;
+-          break;
+-        }
+-      }
+-    }
+-
+-    for (String blockedFunction : blackList) {
+-      if (functionName.equalsIgnoreCase(blockedFunction)) {
+-        inBlackList = true;
+-        break;
+-      }
+-    }
+-
+-    // blacklist setting takes presendence on whitelist
+-    return !inWhiteList || inBlackList;
++    system.setupPermissionsForUDFs(whiteListStr, blackListStr);
+   }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java
+index 569c125..a5722bf 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java
+@@ -23,18 +23,19 @@
+ import java.io.IOException;
+ import java.util.List;
+ 
++import com.google.common.collect.HashMultimap;
++import com.google.common.collect.Multimap;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.Function;
+ import org.apache.hadoop.hive.metastore.api.PrincipalType;
+ import org.apache.hadoop.hive.metastore.api.ResourceType;
+ import org.apache.hadoop.hive.metastore.api.ResourceUri;
++import org.apache.hadoop.hive.ql.exec.FunctionInfo.FunctionResource;
+ import org.apache.hadoop.hive.ql.DriverContext;
+ import org.apache.hadoop.hive.ql.QueryPlan;
+-import org.apache.hadoop.hive.ql.exec.FunctionUtils.UDFClassType;
+ import org.apache.hadoop.hive.ql.metadata.Hive;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.CreateFunctionDesc;
+@@ -98,6 +99,16 @@ public int execute(DriverContext driverContext) {
+       }
+     }
+ 
++    if (work.getReloadFunctionDesc() != null) {
++      try {
++        Hive.reloadFunctions();
++      } catch (Exception e) {
++        setException(e);
++        LOG.error(stringifyException(e));
++        return 1;
++      }
++    }
++
+     CreateMacroDesc createMacroDesc = work.getCreateMacroDesc();
+     if (createMacroDesc != null) {
+       return createMacro(createMacroDesc);
+@@ -110,6 +121,7 @@ public int execute(DriverContext driverContext) {
+     return 0;
+   }
+ 
++  // todo authorization
+   private int createPermanentFunction(Hive db, CreateFunctionDesc createFunctionDesc)
+       throws HiveException, IOException {
+     String[] qualifiedNameParts = FunctionUtils.getQualifiedFunctionNameParts(
+@@ -118,64 +130,45 @@ private int createPermanentFunction(Hive db, CreateFunctionDesc createFunctionDe
+     String funcName = qualifiedNameParts[1];
+     String registeredName = FunctionUtils.qualifyFunctionName(funcName, dbName);
+     String className = createFunctionDesc.getClassName();
+-    boolean addedToRegistry = false;
+-
+-    try {
+-      // For permanent functions, check for any resources from local filesystem.
+-      checkLocalFunctionResources(db, createFunctionDesc.getResources());
+ 
+-      // Add any required resources
+-      addFunctionResources(createFunctionDesc.getResources());
++    List<ResourceUri> resources = createFunctionDesc.getResources();
+ 
+-      // UDF class should exist
+-      Class<?> udfClass = getUdfClass(createFunctionDesc);
+-      if (FunctionUtils.getUDFClassType(udfClass) == UDFClassType.UNKNOWN) {
+-        console.printError("FAILED: Class " + createFunctionDesc.getClassName()
+-            + " does not implement UDF, GenericUDF, or UDAF");
+-        return 1;
+-      }
+-
+-      // TODO: There should be a registerPermanentFunction()
+-      addedToRegistry = FunctionRegistry.registerTemporaryFunction(registeredName, udfClass);
+-      if (!addedToRegistry) {
+-        console.printError("Failed to register " + registeredName
+-            + " using class " + createFunctionDesc.getClassName());
+-        return 1;
+-      }
++    // For permanent functions, check for any resources from local filesystem.
++    checkLocalFunctionResources(db, createFunctionDesc.getResources());
+ 
+-      // Add to metastore
+-      Function func = new Function(
+-          funcName,
+-          dbName,
+-          className,
+-          SessionState.get().getUserName(),
+-          PrincipalType.USER,
+-          (int) (System.currentTimeMillis() / 1000),
+-          org.apache.hadoop.hive.metastore.api.FunctionType.JAVA,
+-          createFunctionDesc.getResources()
+-          );
+-      db.createFunction(func);
+-      return 0;
+-    } catch (ClassNotFoundException e) {
+-      console.printError("FAILED: Class " + createFunctionDesc.getClassName() + " not found");
+-      LOG.info("create function: " + StringUtils.stringifyException(e));
+-      if (addedToRegistry) {
+-        FunctionRegistry.unregisterTemporaryUDF(registeredName);
+-      }
++    FunctionInfo registered = FunctionRegistry.registerPermanentFunction(
++        registeredName, className, true, toFunctionResource(resources));
++    if (registered == null) {
++      console.printError("Failed to register " + registeredName
++          + " using class " + createFunctionDesc.getClassName());
+       return 1;
+     }
++
++    // Add to metastore
++    Function func = new Function(
++        funcName,
++        dbName,
++        className,
++        SessionState.get().getUserName(),
++        PrincipalType.USER,
++        (int) (System.currentTimeMillis() / 1000),
++        org.apache.hadoop.hive.metastore.api.FunctionType.JAVA,
++        resources
++    );
++    db.createFunction(func);
++    return 0;
+   }
+ 
+   private int createTemporaryFunction(CreateFunctionDesc createFunctionDesc) {
+     try {
+       // Add any required resources
+-      addFunctionResources(createFunctionDesc.getResources());
++      FunctionResource[] resources = toFunctionResource(createFunctionDesc.getResources());
++      addFunctionResources(resources);
+ 
+       Class<?> udfClass = getUdfClass(createFunctionDesc);
+-      boolean registered = FunctionRegistry.registerTemporaryFunction(
+-        createFunctionDesc.getFunctionName(),
+-        udfClass);
+-      if (registered) {
++      FunctionInfo registered = FunctionRegistry.registerTemporaryUDF(
++          createFunctionDesc.getFunctionName(), udfClass, resources);
++      if (registered != null) {
+         return 0;
+       }
+       console.printError("FAILED: Class " + createFunctionDesc.getClassName()
+@@ -198,14 +191,14 @@ private int createMacro(CreateMacroDesc createMacroDesc) {
+       createMacroDesc.getMacroName(),
+       createMacroDesc.getBody(),
+       createMacroDesc.getColNames(),
+-      createMacroDesc.getColTypes());
++      createMacroDesc.getColTypes()
++    );
+     return 0;
+   }
+ 
+   private int dropMacro(DropMacroDesc dropMacroDesc) {
+     try {
+-      FunctionRegistry.unregisterTemporaryUDF(dropMacroDesc
+-          .getMacroName());
++      FunctionRegistry.unregisterTemporaryUDF(dropMacroDesc.getMacroName());
+       return 0;
+     } catch (HiveException e) {
+       LOG.info("drop macro: " + StringUtils.stringifyException(e));
+@@ -213,6 +206,7 @@ private int dropMacro(DropMacroDesc dropMacroDesc) {
+     }
+   }
+ 
++  // todo authorization
+   private int dropPermanentFunction(Hive db, DropFunctionDesc dropFunctionDesc) {
+     try {
+       String[] qualifiedNameParts = FunctionUtils.getQualifiedFunctionNameParts(
+@@ -221,8 +215,7 @@ private int dropPermanentFunction(Hive db, DropFunctionDesc dropFunctionDesc) {
+       String funcName = qualifiedNameParts[1];
+ 
+       String registeredName = FunctionUtils.qualifyFunctionName(funcName, dbName);
+-      // TODO: there should be a unregisterPermanentUDF()
+-      FunctionRegistry.unregisterTemporaryUDF(registeredName);
++      FunctionRegistry.unregisterPermanentFunction(registeredName);
+       db.dropFunction(dbName, funcName);
+ 
+       return 0;
+@@ -235,8 +228,7 @@ private int dropPermanentFunction(Hive db, DropFunctionDesc dropFunctionDesc) {
+ 
+   private int dropTemporaryFunction(DropFunctionDesc dropFunctionDesc) {
+     try {
+-      FunctionRegistry.unregisterTemporaryUDF(dropFunctionDesc
+-          .getFunctionName());
++      FunctionRegistry.unregisterTemporaryUDF(dropFunctionDesc.getFunctionName());
+       return 0;
+     } catch (HiveException e) {
+       LOG.info("drop function: " + StringUtils.stringifyException(e));
+@@ -275,6 +267,19 @@ private void checkLocalFunctionResources(Hive db, List<ResourceUri> resources)
+     }
+   }
+ 
++  public static FunctionResource[] toFunctionResource(List<ResourceUri> resources)
++      throws HiveException {
++    if (resources == null) {
++      return null;
++    }
++    FunctionResource[] converted = new FunctionResource[resources.size()];
++    for (int i = 0; i < converted.length; i++) {
++      ResourceUri resource = resources.get(i);
++      SessionState.ResourceType type = getResourceType(resource.getResourceType());
++      converted[i] = new FunctionResource(type, resource.getUri());
++    }
++    return converted;
++  }
+ 
+   private static SessionState.ResourceType getResourceType(ResourceType rt) throws HiveException {
+     switch (rt) {
+@@ -289,14 +294,14 @@ private void checkLocalFunctionResources(Hive db, List<ResourceUri> resources)
+     }
+   }
+ 
+-  public static void addFunctionResources(List<ResourceUri> resources) throws HiveException {
++  public static void addFunctionResources(FunctionResource[] resources) throws HiveException {
+     if (resources != null) {
+-      for (ResourceUri res : resources) {
+-        String addedResource =
+-            SessionState.get().add_resource(getResourceType(res.getResourceType()), res.getUri());
+-        if (addedResource == null) {
+-          throw new HiveException("Unable to load " + res.getResourceType() + " " + res.getUri());
+-        }
++      Multimap<SessionState.ResourceType, String> mappings = HashMultimap.create();
++      for (FunctionResource res : resources) {
++        mappings.put(res.getResourceType(), res.getResourceURI());
++      }
++      for (SessionState.ResourceType type : mappings.keys()) {
++        SessionState.get().add_resources(type, mappings.get(type));
+       }
+     }
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java
+new file mode 100644
+index 0000000..2ba91d0
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Registry.java
+@@ -0,0 +1,522 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.exec;
++
++import com.google.common.base.Splitter;
++import com.google.common.collect.Sets;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.ql.exec.FunctionInfo.FunctionResource;
++import org.apache.hadoop.hive.ql.ErrorMsg;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.parse.SemanticException;
++import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFBridge;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFEvaluator;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFParameterInfo;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFResolver;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFResolver2;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDFBridge;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDFMacro;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDTF;
++import org.apache.hadoop.hive.ql.udf.generic.SimpleGenericUDAFParameterInfo;
++import org.apache.hadoop.hive.ql.udf.ptf.TableFunctionResolver;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
++import org.apache.hadoop.util.ReflectionUtils;
++
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.regex.Pattern;
++import java.util.regex.PatternSyntaxException;
++
++// Extracted from FunctionRegistry
++public class Registry {
++
++  private static final Log LOG = LogFactory.getLog(FunctionRegistry.class);
++
++  // prefix for window functions, to discern LEAD/LAG UDFs from window functions with the same name
++  private static final String WINDOW_FUNC_PREFIX = "@_";
++
++  /**
++   * The mapping from expression function names to expression classes.
++   */
++  private final Map<String, FunctionInfo> mFunctions = new LinkedHashMap<String, FunctionInfo>();
++  private final Set<Class<?>> builtIns = Collections.synchronizedSet(new HashSet<Class<?>>());
++
++  private final boolean isNative;
++
++  Registry(boolean isNative) {
++    this.isNative = isNative;
++  }
++
++  public Registry() {
++    this(false);
++  }
++
++  /**
++   * Registers the appropriate kind of temporary function based on a class's
++   * type.
++   *
++   * @param functionName name under which to register function
++   * @param udfClass     class implementing UD[A|T]F
++   * @return true if udfClass's type was recognized (so registration
++   *         succeeded); false otherwise
++   */
++  @SuppressWarnings("unchecked")
++  public FunctionInfo registerFunction(
++      String functionName, Class<?> udfClass, FunctionResource... resources) {
++
++    FunctionUtils.UDFClassType udfClassType = FunctionUtils.getUDFClassType(udfClass);
++    switch (udfClassType) {
++      case UDF:
++        return registerUDF(
++            functionName, (Class<? extends UDF>) udfClass, false, resources);
++      case GENERIC_UDF:
++        return registerGenericUDF(
++            functionName, (Class<? extends GenericUDF>) udfClass, resources);
++      case GENERIC_UDTF:
++        return registerGenericUDTF(
++            functionName, (Class<? extends GenericUDTF>) udfClass, resources);
++      case UDAF:
++        return registerUDAF(
++            functionName, (Class<? extends UDAF>) udfClass, resources);
++      case GENERIC_UDAF_RESOLVER:
++        return registerGenericUDAF(
++            functionName, (GenericUDAFResolver)
++            ReflectionUtils.newInstance(udfClass, null), resources);
++      case TABLE_FUNCTION_RESOLVER:
++        // native or not would be decided by annotation. need to evaluate that first
++        return registerTableFunction(functionName,
++            (Class<? extends TableFunctionResolver>) udfClass, resources);
++    }
++    return null;
++
++  }
++
++  public FunctionInfo registerUDF(String functionName,
++      Class<? extends UDF> UDFClass, boolean isOperator, FunctionResource... resources) {
++    return registerUDF(functionName, UDFClass, isOperator, functionName.toLowerCase(), resources);
++  }
++
++  public FunctionInfo registerUDF(String functionName,
++      Class<? extends UDF> UDFClass, boolean isOperator, String displayName,
++      FunctionResource... resources) {
++    validateClass(UDFClass, UDF.class);
++    FunctionInfo fI = new FunctionInfo(isNative, displayName,
++        new GenericUDFBridge(displayName, isOperator, UDFClass.getName()), resources);
++    addFunction(functionName, fI);
++    return fI;
++  }
++
++  public FunctionInfo registerGenericUDF(String functionName,
++      Class<? extends GenericUDF> genericUDFClass, FunctionResource... resources) {
++    validateClass(genericUDFClass, GenericUDF.class);
++    FunctionInfo fI = new FunctionInfo(isNative, functionName,
++        ReflectionUtils.newInstance(genericUDFClass, null), resources);
++    addFunction(functionName, fI);
++    return fI;
++  }
++
++  public FunctionInfo registerGenericUDTF(String functionName,
++      Class<? extends GenericUDTF> genericUDTFClass, FunctionResource... resources) {
++    validateClass(genericUDTFClass, GenericUDTF.class);
++    FunctionInfo fI = new FunctionInfo(isNative, functionName,
++        ReflectionUtils.newInstance(genericUDTFClass, null), resources);
++    addFunction(functionName, fI);
++    return fI;
++  }
++
++  public FunctionInfo registerGenericUDAF(String functionName,
++      GenericUDAFResolver genericUDAFResolver, FunctionResource... resources) {
++    FunctionInfo function =
++        new WindowFunctionInfo(isNative, functionName, genericUDAFResolver, resources);
++    addFunction(functionName, function);
++    addFunction(WINDOW_FUNC_PREFIX + functionName, function);
++    return function;
++  }
++
++  public FunctionInfo registerUDAF(String functionName,
++      Class<? extends UDAF> udafClass, FunctionResource... resources) {
++    validateClass(udafClass, UDAF.class);
++    FunctionInfo function = new WindowFunctionInfo(isNative, functionName,
++        new GenericUDAFBridge(ReflectionUtils.newInstance(udafClass, null)), resources);
++    addFunction(functionName, function);
++    addFunction(WINDOW_FUNC_PREFIX + functionName, function);
++    return function;
++  }
++
++  public FunctionInfo registerTableFunction(String functionName,
++      Class<? extends TableFunctionResolver> tFnCls, FunctionResource... resources) {
++    validateClass(tFnCls, TableFunctionResolver.class);
++    FunctionInfo function = new FunctionInfo(isNative, functionName, tFnCls, resources);
++    addFunction(functionName, function);
++    return function;
++  }
++
++  public FunctionInfo registerMacro(String macroName, ExprNodeDesc body,
++      List<String> colNames, List<TypeInfo> colTypes) {
++    return registerMacro(macroName, body, colNames, colTypes, null);
++  }
++
++  public FunctionInfo registerMacro(String macroName, ExprNodeDesc body,
++      List<String> colNames, List<TypeInfo> colTypes, FunctionResource... resources) {
++    GenericUDFMacro macro = new GenericUDFMacro(macroName, body, colNames, colTypes);
++    FunctionInfo fI = new FunctionInfo(isNative, macroName, macro, resources);
++    addFunction(macroName, fI);
++    return fI;
++  }
++
++  public FunctionInfo registerPermanentFunction(String functionName,
++      String className, boolean registerToSession, FunctionResource... resources) {
++    FunctionInfo function = new FunctionInfo(functionName, className, resources);
++    // register to session first for backward compatibility
++    if (registerToSession) {
++      String qualifiedName = FunctionUtils.qualifyFunctionName(
++          functionName, SessionState.get().getCurrentDatabase().toLowerCase());
++      if (registerToSessionRegistry(qualifiedName, function) != null) {
++        addFunction(functionName, function);
++        return function;
++      }
++    }
++    addFunction(functionName, function);
++    return null;
++  }
++
++  /**
++   * Typically a WindowFunction is the same as a UDAF. The only exceptions are Lead & Lag UDAFs. These
++   * are not registered as regular UDAFs because
++   * - we plan to support Lead & Lag as UDFs (usable only within argument expressions
++   *   of UDAFs when windowing is involved). Since mFunctions holds both UDFs and UDAFs we cannot
++   *   add both FunctionInfos to mFunctions.
++   *
++   * @param name
++   * @param wFn
++   */
++  void registerWindowFunction(String name, GenericUDAFResolver wFn) {
++    addFunction(WINDOW_FUNC_PREFIX + name, new WindowFunctionInfo(isNative, name, wFn, null));
++  }
++
++  private void validateClass(Class input, Class expected) {
++    if (!expected.isAssignableFrom(input)) {
++      throw new RuntimeException("Registering UDF Class " + input
++          + " which does not extend " + expected);
++    }
++  }
++
++  /**
++   * Looks up the function name in the registry. If enabled, will attempt to search the metastore
++   * for the function.
++   * @param functionName
++   * @return
++   */
++  public synchronized FunctionInfo getFunctionInfo(String functionName) throws SemanticException {
++    functionName = functionName.toLowerCase();
++    if (FunctionUtils.isQualifiedFunctionName(functionName)) {
++      return getQualifiedFunctionInfo(functionName);
++    }
++    // First try without qualifiers - would resolve builtin/temp functions.
++    // Otherwise try qualifying with current db name.
++    FunctionInfo functionInfo = mFunctions.get(functionName);
++    if (functionInfo != null && functionInfo.isBlockedFunction()) {
++      throw new SemanticException ("UDF " + functionName + " is not allowed");
++    }
++    if (functionInfo == null) {
++      String qualifiedName = FunctionUtils.qualifyFunctionName(
++          functionName, SessionState.get().getCurrentDatabase().toLowerCase());
++      functionInfo = getQualifiedFunctionInfo(qualifiedName);
++    }
++    return functionInfo;
++  }
++
++  public WindowFunctionInfo getWindowFunctionInfo(String functionName) throws SemanticException {
++    FunctionInfo info = getFunctionInfo(WINDOW_FUNC_PREFIX + functionName);
++    if (info instanceof WindowFunctionInfo) {
++      return (WindowFunctionInfo) info;
++    }
++    return null;
++  }
++
++  /**
++   * @param udfClass Function class.
++   * @return True iff the fnExpr represents a hive built-in function.
++   */
++  public boolean isBuiltInFunc(Class<?> udfClass) {
++    return udfClass != null && builtIns.contains(udfClass);
++  }
++
++  public synchronized Set<String> getCurrentFunctionNames() {
++    return getFunctionNames((Pattern)null);
++  }
++
++  public synchronized Set<String> getFunctionNames(String funcPatternStr) {
++    try {
++      return getFunctionNames(Pattern.compile(funcPatternStr));
++    } catch (PatternSyntaxException e) {
++      return Collections.emptySet();
++    }
++  }
++
++  /**
++   * Returns a set of registered function names. This is used for the CLI
++   * command "SHOW FUNCTIONS 'regular expression';" Returns an empty set when
++   * the regular expression is not valid.
++   *
++   * @param funcPattern regular expression of the interested function names
++   * @return set of strings contains function names
++   */
++  public synchronized Set<String> getFunctionNames(Pattern funcPattern) {
++    Set<String> funcNames = new TreeSet<String>();
++    for (String funcName : mFunctions.keySet()) {
++      if (funcName.contains(WINDOW_FUNC_PREFIX)) {
++        continue;
++      }
++      if (funcPattern == null || funcPattern.matcher(funcName).matches()) {
++        funcNames.add(funcName);
++      }
++    }
++    return funcNames;
++  }
++
++  /**
++   * Adds to the set of synonyms of the supplied function.
++   * @param funcName
++   * @param funcInfo
++   * @param synonyms
++   */
++  public synchronized void getFunctionSynonyms(
++      String funcName, FunctionInfo funcInfo, Set<String> synonyms) throws SemanticException {
++    Class<?> funcClass = funcInfo.getFunctionClass();
++    for (Map.Entry<String, FunctionInfo> entry : mFunctions.entrySet()) {
++      String name = entry.getKey();
++      if (name.contains(WINDOW_FUNC_PREFIX) || name.equals(funcName)) {
++        continue;
++      }
++      FunctionInfo function = entry.getValue();
++      if (function.getFunctionClass() == funcClass) {
++        synonyms.add(name);
++      }
++    }
++  }
++
++  /**
++   * Get the GenericUDAF evaluator for the name and argumentClasses.
++   *
++   * @param name         the name of the UDAF
++   * @param argumentOIs
++   * @param isDistinct
++   * @param isAllColumns
++   * @return The UDAF evaluator
++   */
++  @SuppressWarnings("deprecation")
++  public GenericUDAFEvaluator getGenericUDAFEvaluator(String name,
++      List<ObjectInspector> argumentOIs, boolean isDistinct,
++      boolean isAllColumns) throws SemanticException {
++
++    GenericUDAFResolver udafResolver = getGenericUDAFResolver(name);
++    if (udafResolver == null) {
++      return null;
++    }
++
++    GenericUDAFEvaluator udafEvaluator;
++    ObjectInspector args[] = new ObjectInspector[argumentOIs.size()];
++    // Can't use toArray here because Java is dumb when it comes to
++    // generics + arrays.
++    for (int ii = 0; ii < argumentOIs.size(); ++ii) {
++      args[ii] = argumentOIs.get(ii);
++    }
++
++    GenericUDAFParameterInfo paramInfo =
++        new SimpleGenericUDAFParameterInfo(
++            args, isDistinct, isAllColumns);
++    if (udafResolver instanceof GenericUDAFResolver2) {
++      udafEvaluator =
++          ((GenericUDAFResolver2) udafResolver).getEvaluator(paramInfo);
++    } else {
++      udafEvaluator = udafResolver.getEvaluator(paramInfo.getParameters());
++    }
++    return udafEvaluator;
++  }
++
++  public GenericUDAFEvaluator getGenericWindowingEvaluator(String functionName,
++      List<ObjectInspector> argumentOIs, boolean isDistinct, boolean isAllColumns)
++      throws SemanticException {
++    functionName = functionName.toLowerCase();
++    WindowFunctionInfo info = getWindowFunctionInfo(functionName);
++    if (info == null) {
++      return null;
++    }
++    if (!functionName.equals(FunctionRegistry.LEAD_FUNC_NAME) &&
++        !functionName.equals(FunctionRegistry.LAG_FUNC_NAME)) {
++      return getGenericUDAFEvaluator(functionName, argumentOIs, isDistinct, isAllColumns);
++    }
++
++    // this must be lead/lag UDAF
++    ObjectInspector args[] = new ObjectInspector[argumentOIs.size()];
++    GenericUDAFResolver udafResolver = info.getGenericUDAFResolver();
++    GenericUDAFParameterInfo paramInfo = new SimpleGenericUDAFParameterInfo(
++        argumentOIs.toArray(args), isDistinct, isAllColumns);
++    return ((GenericUDAFResolver2) udafResolver).getEvaluator(paramInfo);
++  }
++
++  private synchronized void addFunction(String functionName, FunctionInfo function) {
++    if (isNative ^ function.isNative()) {
++      throw new RuntimeException("Function " + functionName + " is not for this registry");
++    }
++    functionName = functionName.toLowerCase();
++    FunctionInfo prev = mFunctions.get(functionName);
++    if (prev != null) {
++      if (isBuiltInFunc(prev.getFunctionClass())) {
++        throw new RuntimeException("Function " + functionName + " is hive builtin function, " +
++            "which cannot be overriden.");
++      }
++      prev.discarded();
++    }
++    mFunctions.put(functionName, function);
++    if (function.isBuiltIn()) {
++      builtIns.add(function.getFunctionClass());
++    }
++  }
++
++  public synchronized void unregisterFunction(String functionName) throws HiveException {
++    functionName = functionName.toLowerCase();
++    FunctionInfo fi = mFunctions.get(functionName);
++    if (fi != null) {
++      if (fi.isBuiltIn()) {
++        throw new HiveException(ErrorMsg.DROP_NATIVE_FUNCTION.getMsg(functionName));
++      }
++      mFunctions.remove(functionName);
++      fi.discarded();
++    }
++  }
++
++  public GenericUDAFResolver getGenericUDAFResolver(String functionName) throws SemanticException {
++    FunctionInfo info = getFunctionInfo(functionName);
++    if (info != null) {
++      return info.getGenericUDAFResolver();
++    }
++    return null;
++  }
++
++  private FunctionInfo getQualifiedFunctionInfo(String qualifiedName) throws SemanticException {
++    FunctionInfo info = mFunctions.get(qualifiedName);
++    if (info != null && info.isBlockedFunction()) {
++      throw new SemanticException ("UDF " + qualifiedName + " is not allowed");
++    }
++    if (!isNative && info != null && info.isDiscarded()) {
++      // the persistent function is discarded. try reload
++      mFunctions.remove(qualifiedName);
++      return null;
++    }
++    // HIVE-6672: In HiveServer2 the JARs for this UDF may have been loaded by a different thread,
++    // and the current thread may not be able to resolve the UDF. Test for this condition
++    // and if necessary load the JARs in this thread.
++    if (isNative && info != null && info.isPersistent()) {
++      return registerToSessionRegistry(qualifiedName, info);
++    }
++    return info;
++  }
++
++  // should be called after session registry is checked
++  private FunctionInfo registerToSessionRegistry(String qualifiedName, FunctionInfo function) {
++    FunctionInfo ret = null;
++
++    ClassLoader prev = Utilities.getSessionSpecifiedClassLoader();
++    try {
++      // Found UDF in metastore - now add it to the function registry
++      // At this point we should add any relevant jars that would be needed for the UDf.
++      FunctionResource[] resources = function.getResources();
++      try {
++        FunctionTask.addFunctionResources(resources);
++      } catch (Exception e) {
++        LOG.error("Unable to load resources for " + qualifiedName + ":" + e, e);
++        return null;
++      }
++
++      ClassLoader loader = Utilities.getSessionSpecifiedClassLoader();
++      Class<?> udfClass = Class.forName(function.getClassName(), true, loader);
++
++      ret = FunctionRegistry.registerTemporaryUDF(qualifiedName, udfClass, resources);
++      if (ret == null) {
++        LOG.error(function.getClassName() + " is not a valid UDF class and was not registered.");
++      }
++    } catch (ClassNotFoundException e) {
++      // Lookup of UDf class failed
++      LOG.error("Unable to load UDF class: " + e);
++      Utilities.restoreSessionSpecifiedClassLoader(prev);
++    }
++    function.shareStateWith(ret);
++    return ret;
++  }
++
++  private void checkFunctionClass(FunctionInfo cfi) throws ClassNotFoundException {
++    // This call will fail for non-generic UDFs using GenericUDFBridge
++    Class<?> udfClass = cfi.getFunctionClass();
++    // Even if we have a reference to the class (which will be the case for GenericUDFs),
++    // the classloader may not be able to resolve the class, which would mean reflection-based
++    // methods would fail such as for plan deserialization. Make sure this works too.
++    Class.forName(udfClass.getName(), true, Utilities.getSessionSpecifiedClassLoader());
++  }
++
++  public synchronized void clear() {
++    if (isNative) {
++      throw new IllegalStateException("System function registry cannot be cleared");
++    }
++    mFunctions.clear();
++    builtIns.clear();
++  }
++
++  /**
++   * Setup blocked flag for all builtin UDFs as per udf whitelist and blacklist
++   * @param whiteListStr
++   * @param blackListStr
++   */
++  public void setupPermissionsForUDFs(String whiteListStr, String blackListStr) {
++    Set<String> whiteList = Sets.newHashSet(
++        Splitter.on(",").trimResults().omitEmptyStrings().split(whiteListStr.toLowerCase()));
++    Set<String> blackList = Sets.newHashSet(
++        Splitter.on(",").trimResults().omitEmptyStrings().split(blackListStr.toLowerCase()));
++    blackList.removeAll(FunctionRegistry.HIVE_OPERATORS);
++
++    for (Map.Entry<String, FunctionInfo> funcEntry : mFunctions.entrySet()) {
++      funcEntry.getValue().setBlockedFunction(
++          isUdfBlocked(funcEntry.getKey(), whiteList, blackList));
++    }
++  }
++
++  /**
++   * Check if the function belongs to whitelist or blacklist
++   * @param functionName
++   * @param whiteList
++   * @param blackList
++   * @return true if the given udf is to be blocked
++   */
++  boolean isUdfBlocked(String functionName, Set<String> whiteList, Set<String> blackList) {
++    functionName = functionName.toLowerCase();
++    return blackList.contains(functionName) ||
++        (!whiteList.isEmpty() && !whiteList.contains(functionName));
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 0013f18..d5bebdb 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -2126,8 +2126,8 @@ public static ClassLoader getSessionSpecifiedClassLoader() {
+     }
+     ClassLoader sessionCL = state.getConf().getClassLoader();
+     if (sessionCL != null) {
+-      if (LOG.isDebugEnabled()) {
+-        LOG.debug("Use session specified class loader");
++      if (LOG.isTraceEnabled()) {
++        LOG.trace("Use session specified class loader");  //it's normal case
+       }
+       return sessionCL;
+     }
+@@ -2137,6 +2137,17 @@ public static ClassLoader getSessionSpecifiedClassLoader() {
+     return JavaUtils.getClassLoader();
+   }
+ 
++  public static void restoreSessionSpecifiedClassLoader(ClassLoader prev) {
++    SessionState state = SessionState.get();
++    if (state != null && state.getConf() != null) {
++      ClassLoader current = state.getConf().getClassLoader();
++      if (current != prev && JavaUtils.closeClassLoadersTo(current, prev)) {
++        Thread.currentThread().setContextClassLoader(prev);
++        state.getConf().setClassLoader(prev);
++      }
++    }
++  }
++
+   /**
+    * Create a URL from a string representing a path to a local file.
+    * The path string can be just a path, or can start with file:/, file:///
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/WindowFunctionInfo.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/WindowFunctionInfo.java
+index efecb05..a16d9e5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/WindowFunctionInfo.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/WindowFunctionInfo.java
+@@ -22,23 +22,20 @@
+ import org.apache.hive.common.util.AnnotationUtils;
+ 
+ @SuppressWarnings("deprecation")
+-public class WindowFunctionInfo implements CommonFunctionInfo {
+-  boolean supportsWindow = true;
+-  boolean pivotResult = false;
+-  boolean impliesOrder = false;
+-  FunctionInfo fInfo;
+-
+-  WindowFunctionInfo(FunctionInfo fInfo) {
+-    assert fInfo.isGenericUDAF();
+-    this.fInfo = fInfo;
+-    Class<? extends GenericUDAFResolver> wfnCls = fInfo.getGenericUDAFResolver().getClass();
++public class WindowFunctionInfo extends FunctionInfo {
++
++  private final boolean supportsWindow;
++  private final boolean pivotResult;
++  private final boolean impliesOrder;
++
++  public WindowFunctionInfo(boolean isNative, String functionName,
++      GenericUDAFResolver resolver, FunctionResource[] resources) {
++    super(isNative, functionName, resolver, resources);
+     WindowFunctionDescription def =
+-          AnnotationUtils.getAnnotation(wfnCls, WindowFunctionDescription.class);
+-    if ( def != null) {
+-      supportsWindow = def.supportsWindow();
+-      pivotResult = def.pivotResult();
+-      impliesOrder = def.impliesOrder();
+-    }
++        AnnotationUtils.getAnnotation(resolver.getClass(), WindowFunctionDescription.class);
++    supportsWindow = def == null ? true : def.supportsWindow();
++    pivotResult = def == null ? false : def.pivotResult();
++    impliesOrder = def == null ? false : def.impliesOrder();
+   }
+ 
+   public boolean isSupportsWindow() {
+@@ -52,12 +49,4 @@ public boolean isPivotResult() {
+   public boolean isImpliesOrder() {
+     return impliesOrder;
+   }
+-  public FunctionInfo getfInfo() {
+-    return fInfo;
+-  }
+-
+-  @Override
+-  public Class<?> getFunctionClass() {
+-    return getfInfo().getFunctionClass();
+-  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+index 88116c4..d0693ef 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+@@ -395,6 +395,7 @@ public int execute(DriverContext driverContext) {
+       if (pwd != null) {
+         HiveConf.setVar(job, HiveConf.ConfVars.METASTOREPWD, "HIVE");
+       }
++      LOG.error(job.get("mapreduce.framework.name"));
+       JobClient jc = new JobClient(job);
+       // make this client wait if job tracker is not behaving well.
+       Throttle.checkJobTracker(job, LOG);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/index/IndexPredicateAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/index/IndexPredicateAnalyzer.java
+index a29601c..6702d43 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/index/IndexPredicateAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/index/IndexPredicateAnalyzer.java
+@@ -204,7 +204,7 @@ private ExprNodeDesc getColumnExpr(ExprNodeDesc expr) {
+   private ExprNodeDesc analyzeExpr(
+     ExprNodeGenericFuncDesc expr,
+     List<IndexSearchCondition> searchConditions,
+-    Object... nodeOutputs) {
++    Object... nodeOutputs) throws SemanticException {
+ 
+     if (FunctionRegistry.isOpAnd(expr)) {
+       assert(nodeOutputs.length == 2);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index b974558..0eb8a2d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -29,7 +29,6 @@
+ 
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+-import java.net.URI;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -49,8 +48,6 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.fs.PathFilter;
+-import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.HiveStatsUtils;
+ import org.apache.hadoop.hive.common.ObjectPair;
+@@ -98,6 +95,8 @@
+ import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
++import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
++import org.apache.hadoop.hive.ql.exec.FunctionTask;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.index.HiveIndexHandler;
+ import org.apache.hadoop.hive.ql.io.AcidUtils;
+@@ -153,6 +152,31 @@ public synchronized void remove() {
+     }
+   };
+ 
++  // register all permanent functions. need improvement
++  static {
++    try {
++      reloadFunctions();
++    } catch (Exception e) {
++      LOG.warn("Failed to access metastore. This class should not accessed in runtime.",e);
++    }
++  }
++
++  public static void reloadFunctions() throws HiveException {
++    Hive db = Hive.get();
++    for (String dbName : db.getAllDatabases()) {
++      for (String functionName : db.getFunctions(dbName, "*")) {
++        Function function = db.getFunction(dbName, functionName);
++        try {
++          FunctionRegistry.registerPermanentFunction(functionName, function.getClassName(), false,
++              FunctionTask.toFunctionResource(function.getResourceUris()));
++        } catch (Exception e) {
++          LOG.warn("Failed to register persistent function " +
++              functionName + ":" + function.getClassName() + ". Ignore and continue.");
++        }
++      }
++    }
++  }
++
+   public static Hive get(Configuration c, Class<?> clazz) throws HiveException {
+     return get(c instanceof HiveConf ? (HiveConf)c : new HiveConf(c, clazz));
+   }
+@@ -1583,10 +1607,18 @@ public void loadTable(Path loadPath, String tableName, boolean replace,
+       boolean holdDDLTime, boolean isSrcLocal, boolean isSkewedStoreAsSubdir, boolean isAcid)
+       throws HiveException {
+     Table tbl = getTable(tableName);
++    HiveConf sessionConf = SessionState.getSessionConf();
+     if (replace) {
+-      tbl.replaceFiles(loadPath, isSrcLocal);
++      Path tableDest = tbl.getPath();
++      replaceFiles(tableDest, loadPath, tableDest, tableDest, sessionConf, isSrcLocal);
+     } else {
+-      tbl.copyFiles(loadPath, isSrcLocal, isAcid);
++      FileSystem fs;
++      try {
++        fs = tbl.getDataLocation().getFileSystem(sessionConf);
++        copyFiles(sessionConf, loadPath, tbl.getPath(), fs, isSrcLocal, isAcid);
++      } catch (IOException e) {
++        throw new HiveException("addFiles: filesystem error in check phase", e);
++      }
+       tbl.getParameters().put(StatsSetupConst.STATS_GENERATED_VIA_STATS_TASK, "true");
+     }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java
+index f8007e1..08ff2e9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java
+@@ -43,6 +43,7 @@
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
+ import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.serde2.Deserializer;
+ import org.apache.hadoop.mapred.InputFormat;
+ import org.apache.hadoop.mapred.OutputFormat;
+@@ -246,10 +247,8 @@ public Path getDataLocation() {
+   final public Deserializer getDeserializer() {
+     if (deserializer == null) {
+       try {
+-        deserializer = MetaStoreUtils.getDeserializer(Hive.get().getConf(),
++        deserializer = MetaStoreUtils.getDeserializer(SessionState.getSessionConf(),
+             tPartition, table.getTTable());
+-      } catch (HiveException e) {
+-        throw new RuntimeException(e);
+       } catch (MetaException e) {
+         throw new RuntimeException(e);
+       }
+@@ -367,7 +366,7 @@ public void setBucketCount(int newBucketNum) {
+     try {
+       // Previously, this got the filesystem of the Table, which could be
+       // different from the filesystem of the partition.
+-      FileSystem fs = getDataLocation().getFileSystem(Hive.get().getConf());
++      FileSystem fs = getDataLocation().getFileSystem(SessionState.getSessionConf());
+       String pathPattern = getDataLocation().toString();
+       if (getBucketCount() > 0) {
+         pathPattern = pathPattern + "/*";
+@@ -495,11 +494,11 @@ public void setTPartition(
+   public List<FieldSchema> getCols() {
+ 
+     try {
+-      if (Table.hasMetastoreBasedSchema(Hive.get().getConf(), tPartition.getSd())) {
++      if (Table.hasMetastoreBasedSchema(SessionState.getSessionConf(), tPartition.getSd())) {
+         return tPartition.getSd().getCols();
+       }
+-      return Hive.getFieldsFromDeserializer(table.getTableName(), getDeserializer());
+-    } catch (HiveException e) {
++      return MetaStoreUtils.getFieldsFromDeserializer(table.getTableName(), getDeserializer());
++    } catch (Exception e) {
+       LOG.error("Unable to get cols from serde: " +
+           tPartition.getSd().getSerdeInfo().getSerializationLib(), e);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+index a996adf..8668be7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+@@ -18,8 +18,8 @@
+ 
+ package org.apache.hadoop.hive.ql.metadata;
+ 
+-import java.io.IOException;
+ import java.io.Serializable;
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -41,7 +41,6 @@
+ import org.apache.hadoop.hive.metastore.ProtectMode;
+ import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+-import org.apache.hadoop.hive.metastore.api.Index;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.api.Order;
+ import org.apache.hadoop.hive.metastore.api.SerDeInfo;
+@@ -259,7 +258,7 @@ final public Deserializer getDeserializer() {
+   }
+ 
+   final public Class<? extends Deserializer> getDeserializerClass() throws Exception {
+-    return MetaStoreUtils.getDeserializerClass(Hive.get().getConf(), tTable);
++    return MetaStoreUtils.getDeserializerClass(SessionState.getSessionConf(), tTable);
+   }
+ 
+   final public Deserializer getDeserializer(boolean skipConfError) {
+@@ -271,11 +270,9 @@ final public Deserializer getDeserializer(boolean skipConfError) {
+ 
+   final public Deserializer getDeserializerFromMetaStore(boolean skipConfError) {
+     try {
+-      return MetaStoreUtils.getDeserializer(Hive.get().getConf(), tTable, skipConfError);
++      return MetaStoreUtils.getDeserializer(SessionState.getSessionConf(), tTable, skipConfError);
+     } catch (MetaException e) {
+       throw new RuntimeException(e);
+-    } catch (HiveException e) {
+-      throw new RuntimeException(e);
+     }
+   }
+ 
+@@ -285,7 +282,7 @@ public HiveStorageHandler getStorageHandler() {
+     }
+     try {
+       storageHandler = HiveUtils.getStorageHandler(
+-        Hive.get().getConf(),
++          SessionState.getSessionConf(),
+         getProperty(
+           org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE));
+     } catch (Exception e) {
+@@ -589,12 +586,12 @@ private boolean isField(String col) {
+ 
+     String serializationLib = getSerializationLib();
+     try {
+-      if (hasMetastoreBasedSchema(Hive.get().getConf(), serializationLib)) {
++      if (hasMetastoreBasedSchema(SessionState.getSessionConf(), serializationLib)) {
+         return tTable.getSd().getCols();
+       } else {
+-        return Hive.getFieldsFromDeserializer(getTableName(), getDeserializer());
++        return MetaStoreUtils.getFieldsFromDeserializer(getTableName(), getDeserializer());
+       }
+-    } catch (HiveException e) {
++    } catch (Exception e) {
+       LOG.error("Unable to get field from serde: " + serializationLib, e);
+     }
+     return new ArrayList<FieldSchema>();
+@@ -931,22 +928,12 @@ public static String getCompleteName(String dbName, String tabName) {
+     return dbName + "@" + tabName;
+   }
+ 
+-  /**
+-   * @return List containing Indexes names if there are indexes on this table
+-   * @throws HiveException
+-   **/
+-  public List<Index> getAllIndexes(short max) throws HiveException {
+-    Hive hive = Hive.get();
+-    return hive.getIndexes(getTTable().getDbName(), getTTable().getTableName(), max);
+-  }
+-
+   @SuppressWarnings("nls")
+   public FileStatus[] getSortedPaths() {
+     try {
+       // Previously, this got the filesystem of the Table, which could be
+       // different from the filesystem of the partition.
+-      FileSystem fs = FileSystem.get(getPath().toUri(), Hive.get()
+-          .getConf());
++      FileSystem fs = FileSystem.get(getPath().toUri(), SessionState.getSessionConf());
+       String pathPattern = getPath().toString();
+       if (getNumBuckets() > 0) {
+         pathPattern = pathPattern + "/*";
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/IndexUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/IndexUtils.java
+index 2729ceb..92cae67 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/IndexUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/IndexUtils.java
+@@ -190,7 +190,7 @@ private static boolean isIndexTableFresh(Hive hive, List<Index> indexes, Table s
+ 
+     List<Index> indexesOnTable;
+     try {
+-      indexesOnTable = baseTableMetaData.getAllIndexes((short) -1); // get all indexes
++      indexesOnTable = getAllIndexes(baseTableMetaData, (short) -1); // get all indexes
+     } catch (HiveException e) {
+       throw new SemanticException("Error accessing metastore", e);
+     }
+@@ -204,6 +204,14 @@ private static boolean isIndexTableFresh(Hive hive, List<Index> indexes, Table s
+     return matchingIndexes;
+   }
+ 
++  /**
++   * @return List containing Indexes names if there are indexes on this table
++   * @throws HiveException
++   **/
++  public static List<Index> getAllIndexes(Table table, short max) throws HiveException {
++    Hive hive = Hive.get();
++    return hive.getIndexes(table.getTTable().getDbName(), table.getTTable().getTableName(), max);
++  }
+ 
+   public static Task<?> createRootTask(HiveConf builderConf, Set<ReadEntity> inputs,
+       Set<WriteEntity> outputs, StringBuilder command,
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/SqlFunctionConverter.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/SqlFunctionConverter.java
+index c8c5369..5c0616e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/SqlFunctionConverter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/calcite/translator/SqlFunctionConverter.java
+@@ -64,7 +64,7 @@
+ import com.google.common.collect.Maps;
+ 
+ public class SqlFunctionConverter {
+-  private static final Log                 LOG = LogFactory.getLog(SqlFunctionConverter.class);
++  private static final Log LOG = LogFactory.getLog(SqlFunctionConverter.class);
+ 
+   static final Map<String, SqlOperator>    hiveToCalcite;
+   static final Map<SqlOperator, HiveToken> calciteToHiveToken;
+@@ -79,7 +79,7 @@
+ 
+   public static SqlOperator getCalciteOperator(String funcTextName, GenericUDF hiveUDF,
+       ImmutableList<RelDataType> calciteArgTypes, RelDataType retType)
+-      throws CalciteSemanticException {
++      throws SemanticException {
+     // handle overloaded methods first
+     if (hiveUDF instanceof GenericUDFOPNegative) {
+       return SqlStdOperatorTable.UNARY_MINUS;
+@@ -182,7 +182,8 @@ private static FunctionInfo handleCastForParameterizedType(TypeInfo ti, Function
+     } catch (UDFArgumentException e) {
+       throw new RuntimeException(e);
+     }
+-    return new FunctionInfo(fi.isNative(), fi.getDisplayName(), (GenericUDF) udf);
++    return new FunctionInfo(
++        fi.isNative(), fi.getDisplayName(), (GenericUDF) udf, fi.getResources());
+   }
+ 
+   // TODO: 1) handle Agg Func Name translation 2) is it correct to add func
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java
+index 1708e1b..9c6a252 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java
+@@ -342,7 +342,7 @@ static private boolean hasUserFunctions(ExprNodeDesc expr) {
+     if (!(expr instanceof ExprNodeGenericFuncDesc)) {
+       return false;
+     }
+-    if (!FunctionRegistry.isNativeFuncExpr((ExprNodeGenericFuncDesc)expr)) {
++    if (!FunctionRegistry.isBuiltInFuncExpr((ExprNodeGenericFuncDesc) expr)) {
+       return true;
+     }
+     for (ExprNodeDesc child : expr.getChildren()) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/FunctionSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/FunctionSemanticAnalyzer.java
+index 1ef6d1b..418b4ad 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/FunctionSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/FunctionSemanticAnalyzer.java
+@@ -28,6 +28,7 @@
+ import org.apache.hadoop.hive.metastore.api.ResourceType;
+ import org.apache.hadoop.hive.metastore.api.ResourceUri;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
++import org.apache.hadoop.hive.ql.exec.FunctionInfo;
+ import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
+ import org.apache.hadoop.hive.ql.exec.FunctionUtils;
+ import org.apache.hadoop.hive.ql.exec.TaskFactory;
+@@ -35,6 +36,7 @@
+ import org.apache.hadoop.hive.ql.hooks.WriteEntity;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.CreateFunctionDesc;
++import org.apache.hadoop.hive.ql.plan.ReloadFunctionDesc;
+ import org.apache.hadoop.hive.ql.plan.DropFunctionDesc;
+ import org.apache.hadoop.hive.ql.plan.FunctionWork;
+ import org.apache.hadoop.hive.ql.plan.PlanUtils;
+@@ -53,11 +55,12 @@ public FunctionSemanticAnalyzer(HiveConf conf) throws SemanticException {
+ 
+   @Override
+   public void analyzeInternal(ASTNode ast) throws SemanticException {
+-    if (ast.getToken().getType() == HiveParser.TOK_CREATEFUNCTION) {
++    if (ast.getType() == HiveParser.TOK_CREATEFUNCTION) {
+       analyzeCreateFunction(ast);
+-    }
+-    if (ast.getToken().getType() == HiveParser.TOK_DROPFUNCTION) {
+-        analyzeDropFunction(ast);
++    } else if (ast.getType() == HiveParser.TOK_DROPFUNCTION) {
++      analyzeDropFunction(ast);
++    } else if (ast.getType() == HiveParser.TOK_RELOADFUNCTION) {
++      rootTasks.add(TaskFactory.get(new FunctionWork(new ReloadFunctionDesc()), conf));
+     }
+ 
+     LOG.info("analyze done");
+@@ -93,13 +96,16 @@ private void analyzeDropFunction(ASTNode ast) throws SemanticException {
+     boolean throwException =
+       !ifExists && !HiveConf.getBoolVar(conf, ConfVars.DROPIGNORESNONEXISTENT);
+ 
+-    if (FunctionRegistry.getFunctionInfo(functionName) == null) {
++    FunctionInfo info = FunctionRegistry.getFunctionInfo(functionName);
++    if (info == null) {
+       if (throwException) {
+         throw new SemanticException(ErrorMsg.INVALID_FUNCTION.getMsg(functionName));
+       } else {
+         // Fail silently
+         return;
+       }
++    } else if (info.isBuiltIn()) {
++      throw new SemanticException(ErrorMsg.DROP_NATIVE_FUNCTION.getMsg(functionName));
+     }
+ 
+     boolean isTemporaryFunction = (ast.getFirstChildWithType(HiveParser.TOK_TEMPORARY) != null);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
+index 20c73cd..90b84ac 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
+@@ -297,6 +297,7 @@ KW_REWRITE : 'REWRITE';
+ KW_AUTHORIZATION: 'AUTHORIZATION';
+ KW_CONF: 'CONF';
+ KW_VALUES: 'VALUES';
++KW_RELOAD: 'RELOAD';
+ 
+ // Operators
+ // NOTE: if you add a new function/operator, add it to sysFuncNames so that describe function _FUNC_ will work.
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g
+index 9c7603c..ae5b23a 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g
+@@ -215,6 +215,7 @@ TOK_STRINGLITERALSEQUENCE;
+ TOK_CHARSETLITERAL;
+ TOK_CREATEFUNCTION;
+ TOK_DROPFUNCTION;
++TOK_RELOADFUNCTION;
+ TOK_CREATEMACRO;
+ TOK_DROPMACRO;
+ TOK_TEMPORARY;
+@@ -699,6 +700,7 @@ ddlStatement
+     | createIndexStatement
+     | dropIndexStatement
+     | dropFunctionStatement
++    | reloadFunctionStatement
+     | dropMacroStatement
+     | analyzeStatement
+     | lockStatement
+@@ -1622,6 +1624,11 @@ dropFunctionStatement
+     ->                  ^(TOK_DROPFUNCTION functionIdentifier ifExists?)
+     ;
+ 
++reloadFunctionStatement
++@init { pushMsg("reload function statement", state); }
++@after { popMsg(state); }
++    : KW_RELOAD KW_FUNCTION -> ^(TOK_RELOADFUNCTION);
++
+ createMacroStatement
+ @init { pushMsg("create macro statement", state); }
+ @after { popMsg(state); }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+index bbb8eb3..ec79837 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+@@ -572,5 +572,5 @@ principalIdentifier
+ 
+ nonReserved
+     :
+-    KW_TRUE | KW_FALSE | KW_LIKE | KW_EXISTS | KW_ASC | KW_DESC | KW_ORDER | KW_GROUP | KW_BY | KW_AS | KW_INSERT | KW_OVERWRITE | KW_OUTER | KW_LEFT | KW_RIGHT | KW_FULL | KW_PARTITION | KW_PARTITIONS | KW_TABLE | KW_TABLES | KW_COLUMNS | KW_INDEX | KW_INDEXES | KW_REBUILD | KW_FUNCTIONS | KW_SHOW | KW_MSCK | KW_REPAIR | KW_DIRECTORY | KW_LOCAL | KW_USING | KW_CLUSTER | KW_DISTRIBUTE | KW_SORT | KW_UNION | KW_LOAD | KW_EXPORT | KW_IMPORT | KW_DATA | KW_INPATH | KW_IS | KW_NULL | KW_CREATE | KW_EXTERNAL | KW_ALTER | KW_CHANGE | KW_FIRST | KW_AFTER | KW_DESCRIBE | KW_DROP | KW_RENAME | KW_IGNORE | KW_PROTECTION | KW_TO | KW_COMMENT | KW_BOOLEAN | KW_TINYINT | KW_SMALLINT | KW_INT | KW_BIGINT | KW_FLOAT | KW_DOUBLE | KW_DATE | KW_DATETIME | KW_TIMESTAMP | KW_DECIMAL | KW_STRING | KW_ARRAY | KW_STRUCT | KW_UNIONTYPE | KW_PARTITIONED | KW_CLUSTERED | KW_SORTED | KW_INTO | KW_BUCKETS | KW_ROW | KW_ROWS | KW_FORMAT | KW_DELIMITED | KW_FIELDS | KW_TERMINATED | KW_ESCAPED | KW_COLLECTION | KW_ITEMS | KW_KEYS | KW_KEY_TYPE | KW_LINES | KW_STORED | KW_FILEFORMAT | KW_INPUTFORMAT | KW_OUTPUTFORMAT | KW_INPUTDRIVER | KW_OUTPUTDRIVER | KW_OFFLINE | KW_ENABLE | KW_DISABLE | KW_READONLY | KW_NO_DROP | KW_LOCATION | KW_BUCKET | KW_OUT | KW_OF | KW_PERCENT | KW_ADD | KW_REPLACE | KW_RLIKE | KW_REGEXP | KW_TEMPORARY | KW_EXPLAIN | KW_FORMATTED | KW_PRETTY | KW_DEPENDENCY | KW_LOGICAL | KW_SERDE | KW_WITH | KW_DEFERRED | KW_SERDEPROPERTIES | KW_DBPROPERTIES | KW_LIMIT | KW_SET | KW_UNSET | KW_TBLPROPERTIES | KW_IDXPROPERTIES | KW_VALUE_TYPE | KW_ELEM_TYPE | KW_MAPJOIN | KW_STREAMTABLE | KW_HOLD_DDLTIME | KW_CLUSTERSTATUS | KW_UTC | KW_UTCTIMESTAMP | KW_LONG | KW_DELETE | KW_PLUS | KW_MINUS | KW_FETCH | KW_INTERSECT | KW_VIEW | KW_IN | KW_DATABASES | KW_MATERIALIZED | KW_SCHEMA | KW_SCHEMAS | KW_GRANT | KW_REVOKE | KW_SSL | KW_UNDO | KW_LOCK | KW_LOCKS | KW_UNLOCK | KW_SHARED | KW_EXCLUSIVE | KW_PROCEDURE | KW_UNSIGNED | KW_WHILE | KW_READ | KW_READS | KW_PURGE | KW_RANGE | KW_ANALYZE | KW_BEFORE | KW_BETWEEN | KW_BOTH | KW_BINARY | KW_CONTINUE | KW_CURSOR | KW_TRIGGER | KW_RECORDREADER | KW_RECORDWRITER | KW_SEMI | KW_LATERAL | KW_TOUCH | KW_ARCHIVE | KW_UNARCHIVE | KW_COMPUTE | KW_STATISTICS | KW_USE | KW_OPTION | KW_CONCATENATE | KW_SHOW_DATABASE | KW_UPDATE | KW_RESTRICT | KW_CASCADE | KW_SKEWED | KW_ROLLUP | KW_CUBE | KW_DIRECTORIES | KW_FOR | KW_GROUPING | KW_SETS | KW_TRUNCATE | KW_NOSCAN | KW_USER | KW_ROLE | KW_ROLES | KW_INNER | KW_DEFINED | KW_ADMIN | KW_JAR | KW_FILE | KW_OWNER | KW_PRINCIPALS | KW_ALL | KW_DEFAULT | KW_NONE | KW_COMPACT | KW_COMPACTIONS | KW_TRANSACTIONS | KW_REWRITE | KW_AUTHORIZATION | KW_VALUES | KW_URI | KW_SERVER
++    KW_TRUE | KW_FALSE | KW_LIKE | KW_EXISTS | KW_ASC | KW_DESC | KW_ORDER | KW_GROUP | KW_BY | KW_AS | KW_INSERT | KW_OVERWRITE | KW_OUTER | KW_LEFT | KW_RIGHT | KW_FULL | KW_PARTITION | KW_PARTITIONS | KW_TABLE | KW_TABLES | KW_COLUMNS | KW_INDEX | KW_INDEXES | KW_REBUILD | KW_FUNCTIONS | KW_SHOW | KW_MSCK | KW_REPAIR | KW_DIRECTORY | KW_LOCAL | KW_USING | KW_CLUSTER | KW_DISTRIBUTE | KW_SORT | KW_UNION | KW_LOAD | KW_EXPORT | KW_IMPORT | KW_DATA | KW_INPATH | KW_IS | KW_NULL | KW_CREATE | KW_EXTERNAL | KW_ALTER | KW_CHANGE | KW_FIRST | KW_AFTER | KW_DESCRIBE | KW_DROP | KW_RENAME | KW_IGNORE | KW_PROTECTION | KW_TO | KW_COMMENT | KW_BOOLEAN | KW_TINYINT | KW_SMALLINT | KW_INT | KW_BIGINT | KW_FLOAT | KW_DOUBLE | KW_DATE | KW_DATETIME | KW_TIMESTAMP | KW_DECIMAL | KW_STRING | KW_ARRAY | KW_STRUCT | KW_UNIONTYPE | KW_PARTITIONED | KW_CLUSTERED | KW_SORTED | KW_INTO | KW_BUCKETS | KW_ROW | KW_ROWS | KW_FORMAT | KW_DELIMITED | KW_FIELDS | KW_TERMINATED | KW_ESCAPED | KW_COLLECTION | KW_ITEMS | KW_KEYS | KW_KEY_TYPE | KW_LINES | KW_STORED | KW_FILEFORMAT | KW_INPUTFORMAT | KW_OUTPUTFORMAT | KW_INPUTDRIVER | KW_OUTPUTDRIVER | KW_OFFLINE | KW_ENABLE | KW_DISABLE | KW_READONLY | KW_NO_DROP | KW_LOCATION | KW_BUCKET | KW_OUT | KW_OF | KW_PERCENT | KW_ADD | KW_REPLACE | KW_RLIKE | KW_REGEXP | KW_TEMPORARY | KW_EXPLAIN | KW_FORMATTED | KW_PRETTY | KW_DEPENDENCY | KW_LOGICAL | KW_SERDE | KW_WITH | KW_DEFERRED | KW_SERDEPROPERTIES | KW_DBPROPERTIES | KW_LIMIT | KW_SET | KW_UNSET | KW_TBLPROPERTIES | KW_IDXPROPERTIES | KW_VALUE_TYPE | KW_ELEM_TYPE | KW_MAPJOIN | KW_STREAMTABLE | KW_HOLD_DDLTIME | KW_CLUSTERSTATUS | KW_UTC | KW_UTCTIMESTAMP | KW_LONG | KW_DELETE | KW_PLUS | KW_MINUS | KW_FETCH | KW_INTERSECT | KW_VIEW | KW_IN | KW_DATABASES | KW_MATERIALIZED | KW_SCHEMA | KW_SCHEMAS | KW_GRANT | KW_REVOKE | KW_SSL | KW_UNDO | KW_LOCK | KW_LOCKS | KW_UNLOCK | KW_SHARED | KW_EXCLUSIVE | KW_PROCEDURE | KW_UNSIGNED | KW_WHILE | KW_READ | KW_READS | KW_PURGE | KW_RANGE | KW_ANALYZE | KW_BEFORE | KW_BETWEEN | KW_BOTH | KW_BINARY | KW_CONTINUE | KW_CURSOR | KW_TRIGGER | KW_RECORDREADER | KW_RECORDWRITER | KW_SEMI | KW_LATERAL | KW_TOUCH | KW_ARCHIVE | KW_UNARCHIVE | KW_COMPUTE | KW_STATISTICS | KW_USE | KW_OPTION | KW_CONCATENATE | KW_SHOW_DATABASE | KW_UPDATE | KW_RESTRICT | KW_CASCADE | KW_SKEWED | KW_ROLLUP | KW_CUBE | KW_DIRECTORIES | KW_FOR | KW_GROUPING | KW_SETS | KW_TRUNCATE | KW_NOSCAN | KW_USER | KW_ROLE | KW_ROLES | KW_INNER | KW_DEFINED | KW_ADMIN | KW_JAR | KW_FILE | KW_OWNER | KW_PRINCIPALS | KW_ALL | KW_DEFAULT | KW_NONE | KW_COMPACT | KW_COMPACTIONS | KW_TRANSACTIONS | KW_REWRITE | KW_AUTHORIZATION | KW_VALUES | KW_URI | KW_SERVER | KW_RELOAD
+     ;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/IndexUpdater.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/IndexUpdater.java
+index 2b239ab..f323b05 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/IndexUpdater.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/IndexUpdater.java
+@@ -30,6 +30,7 @@
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.metadata.Partition;
+ import org.apache.hadoop.hive.ql.metadata.Table;
++import org.apache.hadoop.hive.ql.optimizer.IndexUtils;
+ import org.apache.hadoop.hive.ql.plan.LoadTableDesc;
+ import org.apache.hadoop.hive.ql.plan.TableDesc;
+ 
+@@ -69,7 +70,7 @@ public IndexUpdater(LoadTableDesc loadTableWork, Set<ReadEntity> inputs,
+     for (LoadTableDesc ltd : loadTableWork) {
+       TableDesc td = ltd.getTable();
+       Table srcTable = hive.getTable(td.getTableName());
+-      List<Index> tblIndexes = srcTable.getAllIndexes((short)-1);
++      List<Index> tblIndexes = IndexUtils.getAllIndexes(srcTable, (short)-1);
+       Map<String, String> partSpec = ltd.getPartitionSpec();
+       if (partSpec == null || partSpec.size() == 0) {
+         //unpartitioned table, update whole index
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzerFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzerFactory.java
+index 9397b7d..97d02ea 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzerFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzerFactory.java
+@@ -260,6 +260,7 @@ public static BaseSemanticAnalyzer get(HiveConf conf, ASTNode tree)
+ 
+       case HiveParser.TOK_CREATEFUNCTION:
+       case HiveParser.TOK_DROPFUNCTION:
++      case HiveParser.TOK_RELOADFUNCTION:
+         return new FunctionSemanticAnalyzer(conf);
+ 
+       case HiveParser.TOK_ANALYZE:
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java
+index 28afc6b..4fbb8b7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java
+@@ -216,7 +216,8 @@ private void applyContantPartition(WindowSpec wdwSpec) {
+    * - A Window Specification with no Order and no Window Frame is interpreted as:
+          ROW BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    */
+-  private void effectiveWindowFrame(WindowFunctionSpec wFn, WindowSpec wdwSpec) {
++  private void effectiveWindowFrame(WindowFunctionSpec wFn, WindowSpec wdwSpec)
++      throws SemanticException {
+ 
+     WindowFunctionInfo wFnInfo = FunctionRegistry.getWindowFunctionInfo(wFn.getName());
+     boolean supportsWindowing = wFnInfo == null ? true : wFnInfo.isSupportsWindow();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/FunctionWork.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/FunctionWork.java
+index f968bc1..c1e73f3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/FunctionWork.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/FunctionWork.java
+@@ -28,6 +28,7 @@
+   private static final long serialVersionUID = 1L;
+   private CreateFunctionDesc createFunctionDesc;
+   private DropFunctionDesc dropFunctionDesc;
++  private ReloadFunctionDesc reloadFunctionDesc;
+   private CreateMacroDesc createMacroDesc;
+   private DropMacroDesc dropMacroDesc;
+ 
+@@ -45,6 +46,10 @@ public FunctionWork(DropFunctionDesc dropFunctionDesc) {
+     this.dropFunctionDesc = dropFunctionDesc;
+   }
+ 
++  public FunctionWork(ReloadFunctionDesc reloadFunctionDesc) {
++    this.reloadFunctionDesc = reloadFunctionDesc;
++  }
++
+   public FunctionWork(CreateMacroDesc createMacroDesc) {
+     this.createMacroDesc = createMacroDesc;
+   }
+@@ -69,6 +74,14 @@ public void setDropFunctionDesc(DropFunctionDesc dropFunctionDesc) {
+     this.dropFunctionDesc = dropFunctionDesc;
+   }
+ 
++  public ReloadFunctionDesc getReloadFunctionDesc() {
++    return reloadFunctionDesc;
++  }
++
++  public void setReloadFunctionDesc(ReloadFunctionDesc reloadFunctionDesc) {
++    this.reloadFunctionDesc = reloadFunctionDesc;
++  }
++
+   public CreateMacroDesc getCreateMacroDesc() {
+     return createMacroDesc;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ReloadFunctionDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ReloadFunctionDesc.java
+new file mode 100644
+index 0000000..4cfd48d
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ReloadFunctionDesc.java
+@@ -0,0 +1,26 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.plan;
++
++import java.io.Serializable;
++
++@Explain(displayName = "Reload Function")
++public class ReloadFunctionDesc implements Serializable {
++  private static final long serialVersionUID = 1L;
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index d81b44c..d4e5562 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -26,7 +26,16 @@
+ import java.net.URI;
+ import java.net.URLClassLoader;
+ import java.sql.Timestamp;
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
+ 
+ import org.apache.commons.io.FileUtils;
+ import org.apache.commons.lang.StringUtils;
+@@ -42,6 +51,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
+ import org.apache.hadoop.hive.ql.MapRedStats;
++import org.apache.hadoop.hive.ql.exec.Registry;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.exec.spark.session.SparkSession;
+ import org.apache.hadoop.hive.ql.exec.spark.session.SparkSessionManagerImpl;
+@@ -252,6 +262,8 @@
+    */
+   private final Set<String> preReloadableAuxJars = new HashSet<String>();
+ 
++  private final Registry registry = new Registry();
++
+   /**
+    * CURRENT_TIMESTAMP value for query
+    */
+@@ -407,11 +419,33 @@ public boolean isAutoCommit() {
+     return hdfsEncryptionShim;
+   }
+ 
++  // SessionState is not available in runtime and Hive.get().getConf() is not safe to call 
++  private static class SessionStates {
++    private SessionState state;
++    private HiveConf conf;
++    private void attach(SessionState state) {
++      this.state = state;
++      attach(state.getConf());
++    }
++    private void attach(HiveConf conf) {
++      this.conf = conf;
++      ClassLoader classLoader = conf.getClassLoader();
++      if (classLoader != null) {
++        Thread.currentThread().setContextClassLoader(classLoader);
++      }
++    }
++  }
++  
+   /**
+    * Singleton Session object per thread.
+    *
+    **/
+-  private static ThreadLocal<SessionState> tss = new ThreadLocal<SessionState>();
++  private static ThreadLocal<SessionStates> tss = new ThreadLocal<SessionStates>() {
++    @Override
++    protected SessionStates initialValue() {
++      return new SessionStates();
++    }
++  };
+ 
+   /**
+    * start a new session and set it to current session.
+@@ -425,8 +459,7 @@ public static SessionState start(HiveConf conf) {
+    * Sets the given session state in the thread local var for sessions.
+    */
+   public static void setCurrentSessionState(SessionState startSs) {
+-    tss.set(startSs);
+-    Thread.currentThread().setContextClassLoader(startSs.getConf().getClassLoader());
++    tss.get().attach(startSs);
+   }
+ 
+   public static void detachSession() {
+@@ -752,11 +785,32 @@ private static File createTempFile(HiveConf conf) throws IOException {
+    * get the current session.
+    */
+   public static SessionState get() {
+-    return tss.get();
++    return tss.get().state;
++  }
++
++  public static HiveConf getSessionConf() {
++    SessionStates state = tss.get();
++    if (state.conf == null) {
++      state.attach(new HiveConf());
++    }
++    return state.conf;
++  }
++
++  public static Registry getRegistry() {
++    SessionState session = get();
++    return session != null ? session.registry : null;
++  }
++
++  public static Registry getRegistryForWrite() {
++    Registry registry = getRegistry();
++    if (registry == null) {
++      throw new RuntimeException("Function registery for session is not initialized");
++    }
++    return registry;
+   }
+ 
+   /**
+-   * get hiveHitsory object which does structured logging.
++   * get hiveHistory object which does structured logging.
+    *
+    * @return The hive history object
+    */
+@@ -1051,13 +1105,13 @@ public String add_resource(ResourceType t, String value, boolean convertToUnix)
+     return added.get(0);
+   }
+ 
+-  public List<String> add_resources(ResourceType t, List<String> values)
++  public List<String> add_resources(ResourceType t, Collection<String> values)
+       throws RuntimeException {
+     // By default don't convert to unix
+     return add_resources(t, values, false);
+   }
+ 
+-  public List<String> add_resources(ResourceType t, List<String> values, boolean convertToUnix)
++  public List<String> add_resources(ResourceType t, Collection<String> values, boolean convertToUnix)
+       throws RuntimeException {
+     Set<String> resourceMap = getResourceMap(t);
+ 
+@@ -1271,6 +1325,7 @@ public void setCurrentDatabase(String currentDatabase) {
+   }
+ 
+   public void close() throws IOException {
++    registry.clear();;
+     if (txnMgr != null) txnMgr.closeTxnManager();
+     JavaUtils.closeClassLoadersTo(conf.getClassLoader(), parentLoader);
+     File resourceDir =
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
+index 903a9b0..cebaf45 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
+@@ -69,8 +69,7 @@
+   public void execute(PTFPartitionIterator<Object> pItr, PTFPartition outP) throws HiveException {
+     ArrayList<List<?>> oColumns = new ArrayList<List<?>>();
+     PTFPartition iPart = pItr.getPartition();
+-    StructObjectInspector inputOI;
+-    inputOI = (StructObjectInspector) iPart.getOutputOI();
++    StructObjectInspector inputOI = iPart.getOutputOI();
+ 
+     WindowTableFunctionDef wTFnDef = (WindowTableFunctionDef) getTableDef();
+     Order order = wTFnDef.getOrder().getExpressions().get(0).getOrder();
+@@ -145,7 +144,8 @@ private boolean processWindow(WindowFunctionDef wFn) {
+     return true;
+   }
+ 
+-  private boolean streamingPossible(Configuration cfg, WindowFunctionDef wFnDef) {
++  private boolean streamingPossible(Configuration cfg, WindowFunctionDef wFnDef)
++      throws HiveException {
+     WindowFrameDef wdwFrame = wFnDef.getWindowFrame();
+     WindowFunctionInfo wFnInfo = FunctionRegistry.getWindowFunctionInfo(wFnDef
+         .getName());
+@@ -202,7 +202,7 @@ private boolean streamingPossible(Configuration cfg, WindowFunctionDef wFnDef) {
+    * So no Unbounded Preceding or Following.
+    */
+   @SuppressWarnings("resource")
+-  private int[] setCanAcceptInputAsStream(Configuration cfg) {
++  private int[] setCanAcceptInputAsStream(Configuration cfg) throws HiveException {
+ 
+     canAcceptInputAsStream = false;
+ 
+@@ -514,7 +514,6 @@ public boolean canIterateOutput() {
+       i++;
+     }
+ 
+-    i=0;
+     for(i=0; i < iPart.getOutputOI().getAllStructFieldRefs().size(); i++) {
+       output.add(null);
+     }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/parse/TestMacroSemanticAnalyzer.java b/ql/src/test/org/apache/hadoop/hive/ql/parse/TestMacroSemanticAnalyzer.java
+index 46f8052..9d7166c 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/parse/TestMacroSemanticAnalyzer.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/parse/TestMacroSemanticAnalyzer.java
+@@ -66,12 +66,12 @@ public void testDropMacroDoesNotExist() throws Exception {
+   @Test
+   public void testDropMacroExistsDoNotIgnoreErrors() throws Exception {
+     conf.setBoolVar(ConfVars.DROPIGNORESNONEXISTENT, false);
+-    FunctionRegistry.registerGenericUDF(false, "SOME_MACRO", GenericUDFMacro.class);
++    FunctionRegistry.registerTemporaryUDF("SOME_MACRO", GenericUDFMacro.class);
+     analyze(parse("DROP TEMPORARY MACRO SOME_MACRO"));
+   }
+   @Test
+   public void testDropMacro() throws Exception {
+-    FunctionRegistry.registerGenericUDF(false, "SOME_MACRO", GenericUDFMacro.class);
++    FunctionRegistry.registerTemporaryUDF("SOME_MACRO", GenericUDFMacro.class);
+     analyze(parse("DROP TEMPORARY MACRO SOME_MACRO"));
+   }
+   @Test(expected = SemanticException.class)
+diff --git a/ql/src/test/queries/clientnegative/drop_native_udf.q b/ql/src/test/queries/clientnegative/drop_native_udf.q
+index ae047bb..4188cf2 100644
+--- a/ql/src/test/queries/clientnegative/drop_native_udf.q
++++ b/ql/src/test/queries/clientnegative/drop_native_udf.q
+@@ -1 +1 @@
+-DROP TEMPORARY FUNCTION max;
++DROP FUNCTION max;
+diff --git a/ql/src/test/results/clientnegative/alter_table_wrong_regex.q.out b/ql/src/test/results/clientnegative/alter_table_wrong_regex.q.out
+index 9bb6470..667c7d5 100644
+--- a/ql/src/test/results/clientnegative/alter_table_wrong_regex.q.out
++++ b/ql/src/test/results/clientnegative/alter_table_wrong_regex.q.out
+@@ -18,6 +18,4 @@ PREHOOK: query: alter table aa set serdeproperties ("input.regex" = "[^\\](.*)",
+ PREHOOK: type: ALTERTABLE_SERDEPROPERTIES
+ PREHOOK: Input: default@aa
+ PREHOOK: Output: default@aa
+-FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Unclosed character class near index 7
+-[^\](.*)
+-       ^
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. at least one column must be specified for the table
+diff --git a/ql/src/test/results/clientnegative/create_function_nonexistent_class.q.out b/ql/src/test/results/clientnegative/create_function_nonexistent_class.q.out
+index c7405ed..77467f6 100644
+--- a/ql/src/test/results/clientnegative/create_function_nonexistent_class.q.out
++++ b/ql/src/test/results/clientnegative/create_function_nonexistent_class.q.out
+@@ -2,5 +2,5 @@ PREHOOK: query: create function default.badfunc as 'my.nonexistent.class'
+ PREHOOK: type: CREATEFUNCTION
+ PREHOOK: Output: database:default
+ PREHOOK: Output: default.badfunc
+-FAILED: Class my.nonexistent.class not found
++Failed to register default.badfunc using class my.nonexistent.class
+ FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.FunctionTask
+diff --git a/ql/src/test/results/clientnegative/create_function_nonudf_class.q.out b/ql/src/test/results/clientnegative/create_function_nonudf_class.q.out
+index d0dd50a..6d5427e 100644
+--- a/ql/src/test/results/clientnegative/create_function_nonudf_class.q.out
++++ b/ql/src/test/results/clientnegative/create_function_nonudf_class.q.out
+@@ -2,5 +2,5 @@ PREHOOK: query: create function default.badfunc as 'java.lang.String'
+ PREHOOK: type: CREATEFUNCTION
+ PREHOOK: Output: database:default
+ PREHOOK: Output: default.badfunc
+-FAILED: Class java.lang.String does not implement UDF, GenericUDF, or UDAF
++Failed to register default.badfunc using class java.lang.String
+ FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.FunctionTask
+diff --git a/ql/src/test/results/clientnegative/drop_native_udf.q.out b/ql/src/test/results/clientnegative/drop_native_udf.q.out
+index 9f0eaa5..adb06b9 100644
+--- a/ql/src/test/results/clientnegative/drop_native_udf.q.out
++++ b/ql/src/test/results/clientnegative/drop_native_udf.q.out
+@@ -1,4 +1 @@
+-PREHOOK: query: DROP TEMPORARY FUNCTION max
+-PREHOOK: type: DROPFUNCTION
+-PREHOOK: Output: max
+-FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.FunctionTask
++FAILED: SemanticException [Error 10301]: Cannot drop native function max
+diff --git a/ql/src/test/results/clientnegative/udf_nonexistent_resource.q.out b/ql/src/test/results/clientnegative/udf_nonexistent_resource.q.out
+index ec981ee..4751761 100644
+--- a/ql/src/test/results/clientnegative/udf_nonexistent_resource.q.out
++++ b/ql/src/test/results/clientnegative/udf_nonexistent_resource.q.out
+@@ -4,4 +4,5 @@ PREHOOK: Output: database:default
+ PREHOOK: Output: default.lookup
+ #### A masked pattern was here ####
+ nonexistent_file.txt does not exist
+-FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.FunctionTask. nonexistent_file.txt does not exist
++Failed to register default.lookup using class org.apache.hadoop.hive.ql.udf.UDFFileLookup
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.FunctionTask
+-- 
+1.7.9.5
+

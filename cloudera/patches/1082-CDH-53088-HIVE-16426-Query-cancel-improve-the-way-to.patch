@@ -1,0 +1,168 @@
+From f5ade1ccfe5a29bb392fab195f6f74f333bf755b Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Thu, 13 Apr 2017 16:25:24 -0400
+Subject: [PATCH 1082/1164] CDH-53088: HIVE-16426: Query cancel: improve the
+ way to handle files. (Yongzhi Chen, reviewed by
+ Aihua Xu and Chaoyu Tang)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+	ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+	ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+
+Change-Id: Ib13ee24198d3619d70bdf41e6f457d993b4200b8
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   23 ++++++++++++++++++++
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   10 +++++++++
+ .../hadoop/hive/ql/io/CombineHiveInputFormat.java  |    6 +++++
+ .../hive/service/cli/operation/SQLOperation.java   |    4 +++-
+ 4 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 0a43ab5..48ffda7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -184,6 +184,25 @@
+     // resource releases
+     public final ReentrantLock stateLock = new ReentrantLock();
+     public DriverState driverState = DriverState.INITIALIZED;
++    private static ThreadLocal<LockedDriverState> lds = new ThreadLocal<LockedDriverState>() {
++      @Override
++      protected LockedDriverState initialValue() {
++        return new LockedDriverState();
++      }
++    };
++
++    public static void setLockedDriverState(LockedDriverState lDrv) {
++      lds.set(lDrv);
++    }
++
++    public static LockedDriverState getLockedDriverState() {
++      return lds.get();
++    }
++
++    public static void removeLockedDriverState() {
++      if (lds != null)
++        lds.remove();
++    }
+   }
+ 
+   private boolean checkConcurrency() {
+@@ -440,6 +459,8 @@ public int compile(String command, boolean resetTaskIds, boolean deferClose) {
+     }
+     saveSession(queryState);
+ 
++    LockedDriverState.setLockedDriverState(lDrvState);
++
+     String queryId = conf.getVar(HiveConf.ConfVars.HIVEQUERYID);
+ 
+     //save some info for webUI for use after plan is freed
+@@ -1344,6 +1365,7 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+     if (!validateConfVariables()) {
+       return createProcessorResponse(12);
+     }
++    LockedDriverState.setLockedDriverState(lDrvState);
+ 
+     lDrvState.stateLock.lock();
+     try {
+@@ -2178,6 +2200,7 @@ public int close() {
+       lDrvState.driverState = DriverState.CLOSED;
+     } finally {
+       lDrvState.stateLock.unlock();
++      LockedDriverState.removeLockedDriverState();
+     }
+     if (SessionState.get() != null) {
+       SessionState.get().getLineageState().clear();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 4c8c3ac..5684142 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -112,6 +112,8 @@
+ import org.apache.hadoop.hive.metastore.api.Order;
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+ import org.apache.hadoop.hive.ql.Context;
++import org.apache.hadoop.hive.ql.Driver.DriverState;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+ import org.apache.hadoop.hive.ql.QueryPlan;
+ import org.apache.hadoop.hive.ql.exec.FileSinkOperator.RecordWriter;
+@@ -3399,6 +3401,7 @@ public static double getHighestSamplePercentage (MapWork work) {
+ 
+     Set<Path> pathsProcessed = new HashSet<Path>();
+     List<Path> pathsToAdd = new LinkedList<Path>();
++    LockedDriverState lDrvStat = LockedDriverState.getLockedDriverState();
+     // AliasToWork contains all the aliases
+     for (String alias : work.getAliasToWork().keySet()) {
+       LOG.info("Processing alias " + alias);
+@@ -3407,6 +3410,9 @@ public static double getHighestSamplePercentage (MapWork work) {
+       boolean isEmptyTable = true;
+       // Note: this copies the list because createDummyFileForEmptyPartition may modify the map.
+       for (String fileString : new LinkedList<String>(work.getPathToAliases().keySet())) {
++        if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT)
++          throw new IOException("Operation is Canceled. "); 
++
+         List<String> aliases = work.getPathToAliases().get(fileString);
+         if (aliases.contains(alias)) {
+           if (fileString != null) {
+@@ -3453,6 +3459,8 @@ public static double getHighestSamplePercentage (MapWork work) {
+     List<Path> finalPathsToAdd = new LinkedList<>();
+     List<Future<Path>> futures = new LinkedList<>();
+     for (final Path path : pathsToAdd) {
++      if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT)
++        throw new IOException("Operation is Canceled. ");
+       if (pool == null) {
+         finalPathsToAdd.add(new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy).call());
+       } else {
+@@ -3462,6 +3470,8 @@ public static double getHighestSamplePercentage (MapWork work) {
+ 
+     if (pool != null) {
+       for (Future<Path> future : futures) {
++        if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT)
++          throw new IOException("Operation is Canceled. ");
+         finalPathsToAdd.add(future.get());
+       }
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+index 9776cb1..b295808 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+@@ -46,6 +46,8 @@
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.Driver.DriverState;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.exec.Operator;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
+@@ -355,8 +357,12 @@ public int hashCode() {
+     Map<CombinePathInputFormat, CombineFilter> poolMap =
+       new HashMap<CombinePathInputFormat, CombineFilter>();
+     Set<Path> poolSet = new HashSet<Path>();
++    LockedDriverState lDrvStat = LockedDriverState.getLockedDriverState();
+ 
+     for (Path path : paths) {
++      if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT)
++        throw new IOException("Operation is Canceled. ");
++
+       PartitionDesc part = HiveFileFormatUtils.getPartitionDescFromPathRecursively(
+           pathToPartitionInfo, path, IOPrepareCache.get().allocatePartitionDescMap());
+       TableDesc tableDesc = part.getTableDesc();
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index 274443c..1855291 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -374,7 +374,9 @@ private void registerCurrentOperationLog() {
+   private synchronized void cleanup(OperationState state) throws HiveSQLException {
+     setState(state);
+ 
+-    if (shouldRunAsync()) {
++    //Need shut down background thread gracefully, driver.close will inform background thread
++    //a cancel request is sent.
++    if (shouldRunAsync() && state != OperationState.CANCELED && state != OperationState.TIMEDOUT) {
+       Future<?> backgroundHandle = getBackgroundHandle();
+       if (backgroundHandle != null) {
+         boolean success = backgroundHandle.cancel(true);
+-- 
+1.7.9.5
+

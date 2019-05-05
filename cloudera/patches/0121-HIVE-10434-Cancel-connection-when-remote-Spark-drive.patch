@@ -1,0 +1,65 @@
+From 20caad1d6e7bc8c6e6fbc6f9dfad73b7d7d812fe Mon Sep 17 00:00:00 2001
+From: Chao Sun <sunchao@apache.org>
+Date: Fri, 24 Apr 2015 15:16:36 -0700
+Subject: [PATCH 0121/1164] HIVE-10434 - Cancel connection when remote Spark
+ driver process has failed [Spark Branch] (Chao,
+ reviewed by Marcelo)
+
+---
+ .../apache/hive/spark/client/SparkClientImpl.java  |    3 ++-
+ .../apache/hive/spark/client/rpc/RpcServer.java    |   18 ++++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+index 71e432d..1bcd221 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+@@ -180,7 +180,7 @@ void cancel(String jobId) {
+     protocol.cancel(jobId);
+   }
+ 
+-  private Thread startDriver(RpcServer rpcServer, final String clientId, final String secret)
++  private Thread startDriver(final RpcServer rpcServer, final String clientId, final String secret)
+       throws IOException {
+     Runnable runnable;
+     final String serverAddress = rpcServer.getAddress();
+@@ -424,6 +424,7 @@ public void run() {
+           try {
+             int exitCode = child.waitFor();
+             if (exitCode != 0) {
++              rpcServer.cancelClient(clientId, "Child process exited before connecting back");
+               LOG.warn("Child process exited with code {}.", exitCode);
+             }
+           } catch (InterruptedException ie) {
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/rpc/RpcServer.java b/spark-client/src/main/java/org/apache/hive/spark/client/rpc/RpcServer.java
+index 32d4c46..68ee627 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/rpc/RpcServer.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/rpc/RpcServer.java
+@@ -164,6 +164,24 @@ public void operationComplete(Promise<Rpc> p) {
+   }
+ 
+   /**
++   * Tells the RPC server to cancel the connection from an existing pending client
++   * @param clientId The identifier for the client
++   * @param msg The error message about why the connection should be canceled
++   */
++  public void cancelClient(final String clientId, final String msg) {
++    final ClientInfo cinfo = pendingClients.remove(clientId);
++    if (cinfo == null) {
++      // Nothing to be done here.
++      return;
++    }
++    cinfo.timeoutFuture.cancel(true);
++    if (!cinfo.promise.isDone()) {
++      cinfo.promise.setFailure(new RuntimeException(
++          String.format("Cancel client '%s'. Error: " + msg, clientId)));
++    }
++  }
++
++  /**
+    * Creates a secret for identifying a client connection.
+    */
+   public String createSecret() {
+-- 
+1.7.9.5
+

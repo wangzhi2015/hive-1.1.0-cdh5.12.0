@@ -1,0 +1,135 @@
+From 44c5a2153088fccfa02a0099af0e3343769cdbee Mon Sep 17 00:00:00 2001
+From: xzhang <xzhang@xzdt>
+Date: Thu, 30 Jul 2015 12:48:31 -0700
+Subject: [PATCH 0221/1164] HIVE-11363: Prewarm Hive on Spark containers
+ [Spark Branch] (reviewed by Chao)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    5 ++
+ .../hive/ql/exec/spark/HiveSparkClientFactory.java |    5 +-
+ .../hive/ql/exec/spark/RemoteHiveSparkClient.java  |   51 ++++++++++++++++++--
+ 3 files changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index c1d2e40..3781796 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2073,6 +2073,11 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+       "Channel logging level for remote Spark driver.  One of {DEBUG, ERROR, INFO, TRACE, WARN}."),
+     SPARK_RPC_SASL_MECHANISM("hive.spark.client.rpc.sasl.mechanisms", "DIGEST-MD5",
+       "Name of the SASL mechanism to use for authentication."),
++    SPARK_PREWARM_CONTAINERS("hive.spark.prewarm.containers", false, "Whether to prewarn containers for Spark." +
++      "If enabled, Hive will spend no more than 60 seconds to wait for the containers to come up " +
++      "before any query can be executed."),
++    SPARK_PREWARM_NUM_CONTAINERS("hive.spark.prewarm.num.containers", 10, "The minimum number of containers to be prewarmed for Spark." +
++      "Applicable only if hive.spark.prewarm.containers is set to true."),
+     SPARK_ENABLED("hive.enable.spark.execution.engine", false, "Whether Spark is allowed as an execution engine");
+ 
+     public final String varname;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
+index 21398d8..efd9f39 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
+@@ -35,7 +35,6 @@
+ import org.apache.hadoop.io.BytesWritable;
+ import org.apache.hive.spark.client.rpc.RpcConfiguration;
+ import org.apache.spark.SparkConf;
+-import org.apache.spark.SparkException;
+ 
+ import com.google.common.base.Joiner;
+ import com.google.common.base.Splitter;
+@@ -51,9 +50,7 @@
+   private static final String SPARK_DEFAULT_SERIALIZER = "org.apache.spark.serializer.KryoSerializer";
+   private static final String SPARK_DEFAULT_REFERENCE_TRACKING = "false";
+ 
+-  public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf)
+-    throws IOException, SparkException {
+-
++  public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Exception {
+     Map<String, String> sparkConf = initiateSparkConf(hiveconf);
+     // Submit spark job through local spark context while spark master is local mode, otherwise submit
+     // spark job through remote spark context.
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+index 8b15099..d77dea8 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+@@ -39,6 +39,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.ql.Context;
+ import org.apache.hadoop.hive.ql.DriverContext;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+@@ -59,7 +60,6 @@
+ import org.apache.hive.spark.client.SparkClientUtilities;
+ import org.apache.hive.spark.counter.SparkCounters;
+ import org.apache.spark.SparkConf;
+-import org.apache.spark.SparkException;
+ import org.apache.spark.api.java.JavaFutureAction;
+ import org.apache.spark.api.java.JavaPairRDD;
+ 
+@@ -85,11 +85,56 @@
+ 
+   private final transient long sparkClientTimtout;
+ 
+-  RemoteHiveSparkClient(HiveConf hiveConf, Map<String, String> conf) throws IOException, SparkException {
++  RemoteHiveSparkClient(HiveConf hiveConf, Map<String, String> conf) throws Exception {
+     this.hiveConf = hiveConf;
++    sparkClientTimtout = hiveConf.getTimeVar(HiveConf.ConfVars.SPARK_CLIENT_FUTURE_TIMEOUT,
++        TimeUnit.SECONDS);
+     sparkConf = HiveSparkClientFactory.generateSparkConf(conf);
+     remoteClient = SparkClientFactory.createClient(conf, hiveConf);
+-    sparkClientTimtout = hiveConf.getTimeVar(HiveConf.ConfVars.SPARK_CLIENT_FUTURE_TIMEOUT, TimeUnit.SECONDS);
++
++    if (HiveConf.getBoolVar(hiveConf, ConfVars.SPARK_PREWARM_CONTAINERS) &&
++        hiveConf.get("spark.master").startsWith("yarn-")) {
++      int minExecutors = getExecutorsToWarm();
++      if (minExecutors <= 0) {
++        return;
++      }
++
++      LOG.info("Prewarm Spark executors. The minimum number of executors to warm is " + minExecutors);
++
++      // Spend at most 60s to wait for executors to come up.
++      int curExecutors = 0;
++      long ts = System.currentTimeMillis();
++      do {
++        curExecutors = getExecutorCount();
++        if (curExecutors >= minExecutors) {
++          LOG.info("Finished prewarming Spark executors. The current number of executors is " + curExecutors);
++          return;
++        }
++        Thread.sleep(1000); // sleep 1 second
++      } while (System.currentTimeMillis() - ts < 60000);
++
++      LOG.info("Timeout (60s) occurred while prewarming executors. The current number of executors is " + curExecutors);
++    }
++  }
++
++  /**
++   * Please note that the method is very tied with Spark documentation 1.4.1 regarding
++   * dynamic allocation, such as default values.
++   * @return
++   */
++  private int getExecutorsToWarm() {
++    int minExecutors =
++        HiveConf.getIntVar(hiveConf, HiveConf.ConfVars.SPARK_PREWARM_NUM_CONTAINERS);
++    boolean dynamicAllocation = hiveConf.getBoolean("spark.dynamicAllocation.enabled", false);
++    if (dynamicAllocation) {
++      int min = sparkConf.getInt("spark.dynamicAllocation.minExecutors", 0);
++      int initExecutors = sparkConf.getInt("spark.dynamicAllocation.initialExecutors", min);
++      minExecutors = Math.min(minExecutors, initExecutors);
++    } else {
++      int execInstances = sparkConf.getInt("spark.executor.instances", 2);
++      minExecutors = Math.min(minExecutors, execInstances);
++    }
++    return minExecutors;
+   }
+ 
+   @Override
+-- 
+1.7.9.5
+

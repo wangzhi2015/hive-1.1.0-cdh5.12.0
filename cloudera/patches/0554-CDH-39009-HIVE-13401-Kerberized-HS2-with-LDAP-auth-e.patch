@@ -1,0 +1,382 @@
+From 5dca0fb30ee4b2d1950a56930c3a09746d76ec8b Mon Sep 17 00:00:00 2001
+From: ctang <ctang@cloudera.com>
+Date: Tue, 5 Apr 2016 10:00:11 -0400
+Subject: [PATCH 0554/1164] CDH-39009: HIVE-13401: Kerberized HS2 with LDAP
+ auth enabled fails kerberos/delegation token
+ authentication (Chaoyu Tang, reviewed by Szehon
+ Ho)
+
+Change-Id: I57f8e4dd8461995eba761e1a8a9b7b1f10122ad0
+---
+ .../java/org/apache/hive/minikdc/MiniHiveKdc.java  |   31 ++++--
+ .../minikdc/TestJdbcNonKrbSASLWithMiniKdc.java     |  103 ++++++++++++++++++++
+ .../apache/hive/minikdc/TestJdbcWithMiniKdc.java   |   12 +--
+ .../java/org/apache/hive/jdbc/miniHS2/MiniHS2.java |   14 ++-
+ .../apache/hive/service/auth/HiveAuthFactory.java  |   17 ++--
+ .../hive/service/cli/thrift/ThriftCLIService.java  |   15 +--
+ 6 files changed, 155 insertions(+), 37 deletions(-)
+ create mode 100644 itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcNonKrbSASLWithMiniKdc.java
+
+diff --git a/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/MiniHiveKdc.java b/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/MiniHiveKdc.java
+index dedbf35..e191663 100644
+--- a/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/MiniHiveKdc.java
++++ b/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/MiniHiveKdc.java
+@@ -50,6 +50,7 @@
+   public static String HIVE_TEST_USER_1 = "user1";
+   public static String HIVE_TEST_USER_2 = "user2";
+   public static String HIVE_TEST_SUPER_USER = "superuser";
++  public static String AUTHENTICATION_TYPE = "KERBEROS";
+ 
+   private final MiniKdc miniKdc;
+   private final File workDir;
+@@ -170,14 +171,26 @@ public String getDefaultUserPrincipal() {
+    * @throws Exception
+    */
+   public static MiniHS2 getMiniHS2WithKerb(MiniHiveKdc miniHiveKdc, HiveConf hiveConf) throws Exception {
+-    String hivePrincipal =
+-        miniHiveKdc.getFullyQualifiedServicePrincipal(MiniHiveKdc.HIVE_SERVICE_PRINCIPAL);
+-    String hiveKeytab = miniHiveKdc.getKeyTabFile(
+-        miniHiveKdc.getServicePrincipalForUser(MiniHiveKdc.HIVE_SERVICE_PRINCIPAL));
+-
+-    return new MiniHS2.Builder().withConf(hiveConf).
+-        withMiniKdc(hivePrincipal, hiveKeytab).build();
++    return getMiniHS2WithKerb(miniHiveKdc, hiveConf, AUTHENTICATION_TYPE);
+   }
+ 
+-
+-}
++  /**
++  * Create a MiniHS2 with the hive service principal and keytab in MiniHiveKdc
++  * @param miniHiveKdc
++  * @param hiveConf
++  * @param authType
++  * @return new MiniHS2 instance
++  * @throws Exception
++  */
++  public static MiniHS2 getMiniHS2WithKerb(MiniHiveKdc miniHiveKdc, HiveConf hiveConf,
++    String authType) throws Exception {
++	String hivePrincipal =
++		miniHiveKdc.getFullyQualifiedServicePrincipal(MiniHiveKdc.HIVE_SERVICE_PRINCIPAL);
++	String hiveKeytab = miniHiveKdc.getKeyTabFile(
++		miniHiveKdc.getServicePrincipalForUser(MiniHiveKdc.HIVE_SERVICE_PRINCIPAL));
++
++	return new MiniHS2.Builder().withConf(hiveConf).withMiniKdc(hivePrincipal, hiveKeytab).
++		withAuthenticationType(authType).build();
++  }
++ }
++ 
+diff --git a/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcNonKrbSASLWithMiniKdc.java b/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcNonKrbSASLWithMiniKdc.java
+new file mode 100644
+index 0000000..9b8622b
+--- /dev/null
++++ b/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcNonKrbSASLWithMiniKdc.java
+@@ -0,0 +1,103 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.minikdc;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++import java.sql.DriverManager;
++import java.sql.SQLException;
++
++import javax.security.sasl.AuthenticationException;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
++import org.apache.hive.jdbc.miniHS2.MiniHS2;
++import org.apache.hive.service.auth.PasswdAuthenticationProvider;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class TestJdbcNonKrbSASLWithMiniKdc extends TestJdbcWithMiniKdc{
++
++  public static class CustomAuthenticator implements PasswdAuthenticationProvider {
++    @Override
++    public void Authenticate(String user, String password) throws AuthenticationException {
++      if (!("nonkrbuser".equals(user) && "mypwd".equals(password))) {
++        throw new AuthenticationException("Authentication failed");
++      }
++    }
++  }
++
++  @BeforeClass
++  public static void beforeTest() throws Exception {
++    Class.forName(MiniHS2.getJdbcDriverName());
++    confOverlay.put(ConfVars.HIVE_SERVER2_SESSION_HOOK.varname,
++        SessionHookTest.class.getName());
++    confOverlay.put(ConfVars.HIVE_SERVER2_CUSTOM_AUTHENTICATION_CLASS.varname,
++        CustomAuthenticator.class.getName());
++    HiveConf hiveConf = new HiveConf();
++    miniHiveKdc = MiniHiveKdc.getMiniHiveKdc(hiveConf);
++    miniHS2 = MiniHiveKdc.getMiniHS2WithKerb(miniHiveKdc, hiveConf, "CUSTOM");
++    miniHS2.start(confOverlay);
++  }
++
++  /***
++   * Test a nonkrb user could login the kerberized HS2 with authentication type SASL NONE
++   * @throws Exception
++   */
++  @Test
++  public void testNonKrbSASLAuth() throws Exception {
++    hs2Conn = DriverManager.getConnection(miniHS2.getBaseJdbcURL() + "default;user=nonkrbuser;password=mypwd");
++    verifyProperty(SESSION_USER_NAME, "nonkrbuser");
++    hs2Conn.close();
++  }
++
++  /***
++   * Negative test, verify that connection to secure HS2 fails if it is noSasl
++   * @throws Exception
++   */
++  @Test
++  public void testNoSaslConnectionNeg() throws Exception {
++    try {
++      String url = miniHS2.getBaseJdbcURL() + "default;auth=noSasl";
++      hs2Conn = DriverManager.getConnection(url);
++      fail("noSasl connection should fail");
++    } catch (SQLException e) {
++      // expected error
++      assertEquals("08S01", e.getSQLState().trim());
++    }
++  }
++
++  /***
++   * Negative test, verify that NonKrb connection to secure HS2 fails if it is
++   * user/pwd do not match.
++   * @throws Exception
++   */
++  @Test
++  public void testNoKrbConnectionNeg() throws Exception {
++    try {
++      String url = miniHS2.getBaseJdbcURL() + "default;user=wronguser;pwd=mypwd";
++      hs2Conn = DriverManager.getConnection(url);
++      fail("noSasl connection should fail");
++    } catch (SQLException e) {
++      // expected error
++      assertEquals("08S01", e.getSQLState().trim());
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcWithMiniKdc.java b/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcWithMiniKdc.java
+index 954a452..5121ac4 100644
+--- a/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcWithMiniKdc.java
++++ b/itests/hive-minikdc/src/test/java/org/apache/hive/minikdc/TestJdbcWithMiniKdc.java
+@@ -59,10 +59,10 @@ public void run(HiveSessionHookContext sessionHookContext) throws HiveSQLExcepti
+     }
+   }
+ 
+-  private static MiniHS2 miniHS2 = null;
+-  private static MiniHiveKdc miniHiveKdc = null;
+-  private static Map<String, String> confOverlay = new HashMap<String, String>();
+-  private Connection hs2Conn;
++  protected static MiniHS2 miniHS2 = null;
++  protected static MiniHiveKdc miniHiveKdc = null;
++  protected static Map<String, String> confOverlay = new HashMap<String, String>();
++  protected Connection hs2Conn;
+ 
+   @BeforeClass
+   public static void beforeTest() throws Exception {
+@@ -219,7 +219,7 @@ public void testNegativeProxyAuth() throws Exception {
+    * @param expectedValue
+    * @throws Exception
+    */
+-  private void verifyProperty(String propertyName, String expectedValue) throws Exception {
++  protected void verifyProperty(String propertyName, String expectedValue) throws Exception {
+     Statement stmt = hs2Conn .createStatement();
+     ResultSet res = stmt.executeQuery("set " + propertyName);
+     assertTrue(res.next());
+@@ -229,7 +229,7 @@ private void verifyProperty(String propertyName, String expectedValue) throws Ex
+   }
+ 
+   // Store the given token in the UGI
+-  private void storeToken(String tokenStr, UserGroupInformation ugi)
++  protected void storeToken(String tokenStr, UserGroupInformation ugi)
+       throws Exception {
+     Utils.setTokenStr(ugi,
+         tokenStr, HiveAuthFactory.HS2_CLIENT_TOKEN);
+diff --git a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+index 32b971c..8f0c667 100644
+--- a/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
++++ b/itests/hive-unit/src/main/java/org/apache/hive/jdbc/miniHS2/MiniHS2.java
+@@ -73,6 +73,7 @@
+     private String serverKeytab;
+     private boolean isHTTPTransMode = false;
+     private boolean isMetastoreRemote;
++    private String authType = "KERBEROS";
+ 
+     public Builder() {
+     }
+@@ -89,6 +90,11 @@ public Builder withMiniKdc(String serverPrincipal, String serverKeytab) {
+       return this;
+     }
+ 
++    public Builder withAuthenticationType(String authType) {
++      this.authType = authType;
++      return this;
++    }
++
+     public Builder withRemoteMetastore() {
+       this.isMetastoreRemote = true;
+       return this;
+@@ -119,7 +125,7 @@ public MiniHS2 build() throws Exception {
+         hiveConf.setVar(ConfVars.HIVE_SERVER2_TRANSPORT_MODE, HS2_BINARY_MODE);
+       }
+       return new MiniHS2(hiveConf, useMiniMR, useMiniKdc, serverPrincipal, serverKeytab,
+-          isMetastoreRemote);
++          isMetastoreRemote, authType);
+     }
+   }
+ 
+@@ -156,7 +162,7 @@ public boolean isUseMiniKdc() {
+   }
+ 
+   private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+-      String serverPrincipal, String serverKeytab, boolean isMetastoreRemote) throws Exception {
++      String serverPrincipal, String serverKeytab, boolean isMetastoreRemote, String authType) throws Exception {
+     super(hiveConf, "localhost", MetaStoreUtils.findFreePort(), MetaStoreUtils.findFreePort());
+     this.useMiniMR = useMiniMR;
+     this.useMiniKdc = useMiniKdc;
+@@ -181,7 +187,7 @@ private MiniHS2(HiveConf hiveConf, boolean useMiniMR, boolean useMiniKdc,
+     if (useMiniKdc) {
+       hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL, serverPrincipal);
+       hiveConf.setVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB, serverKeytab);
+-      hiveConf.setVar(ConfVars.HIVE_SERVER2_AUTHENTICATION, "KERBEROS");
++      hiveConf.setVar(ConfVars.HIVE_SERVER2_AUTHENTICATION, authType);
+     }
+     String metaStoreURL =  "jdbc:derby:" + baseDir.getAbsolutePath() + File.separator + "test_metastore-" +
+         hs2Counter.incrementAndGet() + ";create=true";
+@@ -217,7 +223,7 @@ public MiniHS2(HiveConf hiveConf) throws Exception {
+   }
+ 
+   public MiniHS2(HiveConf hiveConf, boolean useMiniMR) throws Exception {
+-    this(hiveConf, useMiniMR, false, null, null, false);
++    this(hiveConf, useMiniMR, false, null, null, false, "KERBEROS");
+   }
+ 
+   public void start(Map<String, String> confOverlay) throws Exception {
+diff --git a/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java b/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
+index 74748de..424a350 100644
+--- a/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
++++ b/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
+@@ -102,7 +102,7 @@ public HiveAuthFactory(HiveConf conf) throws TTransportException {
+     transportMode = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_TRANSPORT_MODE);
+     authTypeStr = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_AUTHENTICATION);
+ 
+-    // ShimLoader.getHadoopShims().isSecurityEnabled() will only check that·
++    // ShimLoader.getHadoopShims().isSecurityEnabled() will only check that
+     // hadoopAuth is not simple, it does not guarantee it is kerberos
+     hadoopAuth = conf.get(HADOOP_SECURITY_AUTHENTICATION, "simple");
+ 
+@@ -115,8 +115,8 @@ public HiveAuthFactory(HiveConf conf) throws TTransportException {
+       if (authTypeStr == null) {
+         authTypeStr = AuthTypes.NONE.getAuthName();
+       }
+-      if (hadoopAuth.equalsIgnoreCase("kerberos") && !authTypeStr.equalsIgnoreCase(
+-          AuthTypes.NOSASL.getAuthName())) {
++
++      if (isSASLWithKerberizedHadoop()) {
+         saslServer = ShimLoader.getHadoopThriftAuthBridge()
+           .createServer(conf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB),
+                         conf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL));
+@@ -125,7 +125,6 @@ public HiveAuthFactory(HiveConf conf) throws TTransportException {
+           // rawStore is only necessary for DBTokenStore
+           HMSHandler baseHandler = null;
+           String tokenStoreClass = conf.getVar(HiveConf.ConfVars.METASTORE_CLUSTER_DELEGATION_TOKEN_STORE_CLS);
+-
+           if (tokenStoreClass.equals(DBTokenStore.class.getName())) {
+             baseHandler = new HiveMetaStore.HMSHandler("new db based metaserver", conf, true);
+           }
+@@ -154,8 +153,7 @@ public TTransportFactory getAuthTransFactory() throws LoginException {
+     TTransportFactory transportFactory;
+     TSaslServerTransport.Factory serverTransportFactory;
+ 
+-    if (hadoopAuth.equalsIgnoreCase("kerberos") && !authTypeStr.equalsIgnoreCase(
+-          AuthTypes.NOSASL.getAuthName())) {
++    if (isSASLWithKerberizedHadoop()) {
+       try {
+         serverTransportFactory = saslServer.createSaslServerTransportFactory(
+             getSaslProperties());
+@@ -199,7 +197,7 @@ public TTransportFactory getAuthTransFactory() throws LoginException {
+    * @throws LoginException
+    */
+   public TProcessorFactory getAuthProcFactory(ThriftCLIService service) throws LoginException {
+-    if (authTypeStr.equalsIgnoreCase(AuthTypes.KERBEROS.getAuthName())) {
++    if (isSASLWithKerberizedHadoop()) {
+       return KerberosSaslHelper.getKerberosProcessorFactory(saslServer, service);
+     } else {
+       return PlainSaslHelper.getPlainProcessorFactory(service);
+@@ -218,6 +216,11 @@ public String getIpAddress() {
+     }
+   }
+ 
++  public boolean isSASLWithKerberizedHadoop() {
++    return "kerberos".equalsIgnoreCase(hadoopAuth)
++        && !authTypeStr.equalsIgnoreCase(AuthTypes.NOSASL.getAuthName());
++  }
++
+   // Perform kerberos login using the hadoop shim API if the configuration is available
+   public static void loginFromKeytab(HiveConf hiveConf) throws IOException {
+     String principal = hiveConf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL);
+diff --git a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+index 926f18f..a2083c6 100644
+--- a/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
++++ b/service/src/java/org/apache/hive/service/cli/thrift/ThriftCLIService.java
+@@ -342,11 +342,10 @@ private String getIpAddress() {
+       clientIpAddress = SessionManager.getIpAddress();
+     }
+     else {
+-      // Kerberos
+-      if (isKerberosAuthMode()) {
++      if (hiveAuthFactory != null && hiveAuthFactory.isSASLWithKerberizedHadoop()) {
+         clientIpAddress = hiveAuthFactory.getIpAddress();
+       }
+-      // Except kerberos, NOSASL
++      // NOSASL
+       else {
+         clientIpAddress = TSetIpAddressProcessor.getUserIpAddress();
+       }
+@@ -367,11 +366,10 @@ private String getIpAddress() {
+    */
+   private String getUserName(TOpenSessionReq req) throws HiveSQLException {
+     String userName = null;
+-    // Kerberos
+-    if (isKerberosAuthMode()) {
++    if (hiveAuthFactory != null && hiveAuthFactory.isSASLWithKerberizedHadoop()) {
+       userName = hiveAuthFactory.getRemoteUser();
+     }
+-    // Except kerberos, NOSASL
++    // NOSASL
+     if (userName == null) {
+       userName = TSetIpAddressProcessor.getUserName();
+     }
+@@ -752,9 +750,4 @@ private String getProxyUser(String realUser, Map<String, String> sessionConf,
+     LOG.debug("Verified proxy user: " + proxyUser);
+     return proxyUser;
+   }
+-
+-  private boolean isKerberosAuthMode() {
+-    return cliService.getHiveConf().getVar(ConfVars.HIVE_SERVER2_AUTHENTICATION)
+-        .equalsIgnoreCase(HiveAuthFactory.AuthTypes.KERBEROS.toString());
+-  }
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,285 @@
+From de31a37a6dd65365beb066d4101494285c3cbd91 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Thu, 21 Jan 2016 14:07:19 -0800
+Subject: [PATCH 0930/1164] CDH-49161: HIVE-12897: Improve dynamic partition
+ loading (Ashutosh Chauhan via Prasanth J)
+
+(cherry picked from commit fe81a3760a87f3d8e9aa32dd51cfbb948e4f793a)
+
+Change-Id: Iae99751bb7412aeb279306d1da1f238874bd2094
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    3 ++-
+ .../hadoop/hive/metastore/MetaStoreUtils.java      |    2 +-
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |    7 +++++--
+ .../hadoop/hive/ql/exec/FileSinkOperator.java      |    8 ++++++++
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   19 ++++---------------
+ .../index/RewriteParseContextGenerator.java        |    4 ++--
+ .../ql/parse/ExplainSQRewriteSemanticAnalyzer.java |    2 --
+ .../hive/ql/parse/ExplainSemanticAnalyzer.java     |    2 +-
+ .../hadoop/hive/ql/plan/DynamicPartitionCtx.java   |   20 +++++++++++++++++++-
+ .../dynamic_partitions_with_whitelist.q.out        |    4 ++--
+ 10 files changed, 44 insertions(+), 27 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index cc20eb9..e69817d 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -180,7 +180,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+   public static final HiveConf.ConfVars[] metaConfVars = {
+       HiveConf.ConfVars.METASTORE_TRY_DIRECT_SQL,
+       HiveConf.ConfVars.METASTORE_TRY_DIRECT_SQL_DDL,
+-      HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT
++      HiveConf.ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT,
++      HiveConf.ConfVars.METASTORE_PARTITION_NAME_WHITELIST_PATTERN
+   };
+ 
+   static {
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+index f58e6b1..5ff0d82 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+@@ -1611,7 +1611,7 @@ public static boolean compareFieldColumns(List<FieldSchema> schema1, List<FieldS
+   }
+ 
+ 
+-  private static String getPartitionValWithInvalidCharacter(List<String> partVals,
++  public static String getPartitionValWithInvalidCharacter(List<String> partVals,
+       Pattern partitionValidationPattern) {
+     if (partitionValidationPattern == null) {
+       return null;
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index 5fc621d..d312f66 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -303,7 +303,7 @@ public Object getValue() {
+ 
+       String partitionValidationRegex =
+           hiveConf.get(HiveConf.ConfVars.METASTORE_PARTITION_NAME_WHITELIST_PATTERN.name());
+-      if (partitionValidationRegex != null && partitionValidationRegex.equals("")) {
++      if (partitionValidationRegex != null && !partitionValidationRegex.isEmpty()) {
+         partitionValidationPattern = Pattern.compile(partitionValidationRegex);
+       } else {
+         partitionValidationPattern = null;
+@@ -774,7 +774,7 @@ public boolean dropDatabase(String dbname) throws NoSuchObjectException, MetaExc
+ 
+     String queryStr = "select name from org.apache.hadoop.hive.metastore.model.MDatabase";
+     Query query = null;
+-    
++
+     openTransaction();
+     try {
+       query = pm.newQuery(queryStr);
+@@ -1069,14 +1069,17 @@ public Table getTable(String dbName, String tableName) throws MetaException {
+     return tbls;
+   }
+ 
++  @Override
+   public int getDatabaseCount() throws MetaException {
+     return getObjectCount("name", MDatabase.class.getName());
+   }
+ 
++  @Override
+   public int getPartitionCount() throws MetaException {
+     return getObjectCount("partitionName", MPartition.class.getName());
+   }
+ 
++  @Override
+   public int getTableCount() throws MetaException {
+     return getObjectCount("tableName", MTable.class.getName());
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+index 0236b2c..4340cb1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FileSinkOperator.java
+@@ -38,6 +38,7 @@
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.StatsSetupConst;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+ import org.apache.hadoop.hive.ql.io.AcidUtils;
+ import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
+@@ -654,6 +655,13 @@ public void processOp(Object row, int tag) throws HiveException {
+           }
+         }
+ 
++        String invalidPartitionVal;
++        if((invalidPartitionVal = MetaStoreUtils.getPartitionValWithInvalidCharacter(dpVals, dpCtx.getWhiteListPattern()))!=null) {
++          throw new HiveFatalException("Partition value '" + invalidPartitionVal +
++              "' contains a character not matched by whitelist pattern '" +
++              dpCtx.getWhiteListPattern().toString() + "'.  " + "(configure with " +
++              HiveConf.ConfVars.METASTORE_PARTITION_NAME_WHITELIST_PATTERN.varname + ")");
++        }
+         fpaths = getDynOutPaths(dpVals, lbDirName);
+ 
+         // use SubStructObjectInspector to serialize the non-partitioning columns in the input row
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index cacd781..bc9672c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -1410,6 +1410,7 @@ public void loadPartition(Path loadPath, String tableName,
+    * @param isSrcLocal
+    *          If the source directory is LOCAL
+    * @param isAcid true if this is an ACID operation
++   * @throws JSONException
+    */
+   public Partition loadPartition(Path loadPath, Table tbl,
+       Map<String, String> partSpec, boolean replace, boolean holdDDLTime,
+@@ -1600,6 +1601,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
+    * @param isAcid true if this is an ACID operation
+    * @return partition map details (PartitionSpec and Partition)
+    * @throws HiveException
++   * @throws JSONException
+    */
+   public Map<Map<String, String>, Partition> loadDynamicPartitions(Path loadPath,
+       String tableName, Map<String, String> partSpec, boolean replace,
+@@ -1612,23 +1614,10 @@ private void constructOneLBLocationMap(FileStatus fSta,
+           LinkedHashMap<Map<String, String>, Partition>();
+ 
+       FileSystem fs = loadPath.getFileSystem(conf);
+-      FileStatus[] leafStatus = HiveStatsUtils.getFileStatusRecurse(loadPath, numDP+1, fs);
++      FileStatus[] leafStatus = HiveStatsUtils.getFileStatusRecurse(loadPath, numDP, fs);
+       // Check for empty partitions
+       for (FileStatus s : leafStatus) {
+-        // Check if the hadoop version supports sub-directories for tables/partitions
+-        if (s.isDir() &&
+-          !conf.getBoolVar(HiveConf.ConfVars.HIVE_HADOOP_SUPPORTS_SUBDIRECTORIES)) {
+-          // No leaves in this directory
+-          LOG.info("NOT moving empty directory: " + s.getPath());
+-        } else {
+-          try {
+-            validatePartitionNameCharacters(
+-                Warehouse.getPartValuesFromPartName(s.getPath().getParent().toString()));
+-          } catch (MetaException e) {
+-            throw new HiveException(e);
+-          }
+-          validPartitions.add(s.getPath().getParent());
+-        }
++        validPartitions.add(s.getPath());
+       }
+ 
+       if (validPartitions.size() == 0) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/index/RewriteParseContextGenerator.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/index/RewriteParseContextGenerator.java
+index 3097385..d9e82b7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/index/RewriteParseContextGenerator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/index/RewriteParseContextGenerator.java
+@@ -107,9 +107,9 @@ private static void doSemanticAnalysis(SemanticAnalyzer sem,
+       ASTNode ast, Context ctx) throws SemanticException {
+     QB qb = new QB(null, null, false);
+     ASTNode child = ast;
+-    ParseContext subPCtx = ((SemanticAnalyzer) sem).getParseContext();
++    ParseContext subPCtx = sem.getParseContext();
+     subPCtx.setContext(ctx);
+-    ((SemanticAnalyzer) sem).initParseCtx(subPCtx);
++    sem.initParseCtx(subPCtx);
+ 
+     LOG.info("Starting Sub-query Semantic Analysis");
+     sem.doPhase1(child, qb, sem.initPhase1Ctx(), null);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSQRewriteSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSQRewriteSemanticAnalyzer.java
+index 2c2339a..6f0f3a6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSQRewriteSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSQRewriteSemanticAnalyzer.java
+@@ -17,13 +17,11 @@
+  */
+  package org.apache.hadoop.hive.ql.parse;
+ 
+-import java.io.Serializable;
+ import java.util.List;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.ql.exec.ExplainSQRewriteTask;
+-import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.exec.TaskFactory;
+ import org.apache.hadoop.hive.ql.plan.ExplainSQRewriteWork;
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSemanticAnalyzer.java
+index 38b6d96..5480853 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ExplainSemanticAnalyzer.java
+@@ -79,7 +79,7 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+     if (tasks == null) {
+       tasks = Collections.emptyList();
+     }
+-    
++
+     FetchTask fetchTask = sem.getFetchTask();
+     if (fetchTask != null) {
+       // Initialize fetch work such that operator tree will be constructed.
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/DynamicPartitionCtx.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/DynamicPartitionCtx.java
+index 24db7d0..6c2a50e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/DynamicPartitionCtx.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/DynamicPartitionCtx.java
+@@ -23,11 +23,16 @@
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
++import java.util.regex.Pattern;
+ 
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+ import org.apache.hadoop.hive.ql.exec.ColumnInfo;
++import org.apache.hadoop.hive.ql.metadata.Hive;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.metadata.Table;
++import org.apache.hadoop.hive.ql.parse.SemanticException;
+ 
+ public class DynamicPartitionCtx implements Serializable {
+ 
+@@ -49,12 +54,13 @@
+   private List<String> dpNames; // dp column names
+   private String defaultPartName; // default partition name in case of null or empty value
+   private int maxPartsPerNode;    // maximum dynamic partitions created per mapper/reducer
++  private Pattern whiteListPattern;
+ 
+   public DynamicPartitionCtx() {
+   }
+ 
+   public DynamicPartitionCtx(Table tbl, Map<String, String> partSpec, String defaultPartName,
+-      int maxParts) {
++      int maxParts) throws SemanticException {
+     this.partSpec = partSpec;
+     this.spNames = new ArrayList<String>();
+     this.dpNames = new ArrayList<String>();
+@@ -77,6 +83,13 @@ public DynamicPartitionCtx(Table tbl, Map<String, String> partSpec, String defau
+     } else {
+       this.spPath = null;
+     }
++    String confVal;
++    try {
++      confVal = Hive.get().getMetaConf(ConfVars.METASTORE_PARTITION_NAME_WHITELIST_PATTERN.varname);
++    } catch (HiveException e) {
++      throw new SemanticException(e);
++    }
++    this.whiteListPattern = confVal == null || confVal.isEmpty() ? null : Pattern.compile(confVal);
+   }
+ 
+   public DynamicPartitionCtx(DynamicPartitionCtx dp) {
+@@ -91,6 +104,11 @@ public DynamicPartitionCtx(DynamicPartitionCtx dp) {
+     this.dpNames = dp.dpNames;
+     this.defaultPartName = dp.defaultPartName;
+     this.maxPartsPerNode = dp.maxPartsPerNode;
++    this.whiteListPattern = dp.whiteListPattern;
++  }
++
++  public Pattern getWhiteListPattern() {
++    return whiteListPattern;
+   }
+ 
+   public void mapInputToDP(List<ColumnInfo> fs) {
+diff --git a/ql/src/test/results/clientnegative/dynamic_partitions_with_whitelist.q.out b/ql/src/test/results/clientnegative/dynamic_partitions_with_whitelist.q.out
+index f069ae8..654d892 100644
+--- a/ql/src/test/results/clientnegative/dynamic_partitions_with_whitelist.q.out
++++ b/ql/src/test/results/clientnegative/dynamic_partitions_with_whitelist.q.out
+@@ -32,5 +32,5 @@ PREHOOK: type: QUERY
+ PREHOOK: Input: default@source_table
+ PREHOOK: Input: default@source_table@ds=2008-04-08/hr=11
+ PREHOOK: Output: default@dest_table
+-Failed with exception MetaException(message:Partition value 'val_129' contains a character not matched by whitelist pattern '[^9]*'.  (configure with hive.metastore.partition.name.whitelist.pattern))
+-FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.MoveTask
++#### A masked pattern was here ####
++FAILED: Execution Error, return code 2 from org.apache.hadoop.hive.ql.exec.mr.MapRedTask
+-- 
+1.7.9.5
+

@@ -1,0 +1,300 @@
+From e7417b3c8593d2ba4e7094a8d46dc73e678823fa Mon Sep 17 00:00:00 2001
+From: Sahil Takiar <takiar.sahil@gmail.com>
+Date: Tue, 30 May 2017 13:43:32 -0500
+Subject: [PATCH 1157/1164] CDH-53684: HIVE-16665: Race condition in
+ Utilities.GetInputPathsCallable -->
+ createDummyFileForEmptyPartition (Sahil Takiar,
+ reviewed by Sergio Pena, Vihang Karajgaonkar)
+
+(cherry picked from commit 824b9c80b443dc4e2b9ad35214a23ac756e75234)
+(cherry picked from commit 7a518581f9e9baad517f3483c32a1cecfd4c948f)
+
+Change-Id: Ibef87fb486561f46d1d7cd61653958ffc11ee6af
+---
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   54 ++++----
+ .../apache/hadoop/hive/ql/exec/TestUtilities.java  |  146 +++++++++++++++++++-
+ 2 files changed, 174 insertions(+), 26 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index c228270..8abcb0c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -3490,22 +3490,30 @@ public static double getHighestSamplePercentage (MapWork work) {
+     }
+ 
+     List<Path> finalPathsToAdd = new LinkedList<>();
+-    List<Future<Path>> futures = new LinkedList<>();
++    Map<GetInputPathsCallable, Future<Path>> getPathsCallableToFuture = new LinkedHashMap<>();
+     for (final Path path : pathsToAdd) {
+-      if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT)
++      if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT) {
+         throw new IOException("Operation is Canceled. ");
++      }
+       if (pool == null) {
+-        finalPathsToAdd.add(new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy).call());
++        Path newPath = new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy).call();
++        updatePathForMapWork(newPath, work, path);
++        finalPathsToAdd.add(newPath);
+       } else {
+-        futures.add(pool.submit(new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy)));
++        GetInputPathsCallable callable = new GetInputPathsCallable(path, job, work, hiveScratchDir, ctx, skipDummy);
++        getPathsCallableToFuture.put(callable, pool.submit(callable));
+       }
+     }
+ 
+     if (pool != null) {
+-      for (Future<Path> future : futures) {
+-        if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT)
++      for (Map.Entry<GetInputPathsCallable, Future<Path>> future : getPathsCallableToFuture.entrySet()) {
++        if (lDrvStat != null && lDrvStat.driverState == DriverState.INTERRUPT) {
+           throw new IOException("Operation is Canceled. ");
+-        finalPathsToAdd.add(future.get());
++        }
++
++        Path newPath = future.getValue().get();
++        updatePathForMapWork(newPath, work, future.getKey().path);
++        finalPathsToAdd.add(newPath);
+       }
+     }
+ 
+@@ -3534,7 +3542,8 @@ private GetInputPathsCallable(Path path, JobConf job, MapWork work, Path hiveScr
+     @Override
+     public Path call() throws Exception {
+       if (!this.skipDummy && isEmptyPath(this.job, this.path, this.ctx)) {
+-        return createDummyFileForEmptyPartition(this.path, this.job, this.work, this.hiveScratchDir);
++        return createDummyFileForEmptyPartition(this.path, this.job, this.work.getPathToPartitionInfo().get(this.path),
++                this.hiveScratchDir);
+       }
+       return this.path;
+     }
+@@ -3572,14 +3581,12 @@ private static Path createEmptyFile(Path hiveScratchDir,
+   }
+ 
+   @SuppressWarnings("rawtypes")
+-  private static Path createDummyFileForEmptyPartition(Path path, JobConf job, MapWork work,
+-      Path hiveScratchDir)
+-          throws Exception {
++  private static Path createDummyFileForEmptyPartition(Path path, JobConf job, PartitionDesc partDesc,
++                                                       Path hiveScratchDir) throws Exception {
+ 
+     String strPath = path.toString();
+ 
+     // The input file does not exist, replace it by a empty file
+-    PartitionDesc partDesc = work.getPathToPartitionInfo().get(strPath);
+     if (partDesc.getTableDesc().isNonNative()) {
+       // if this isn't a hive table we can't create an empty file for it.
+       return path;
+@@ -3597,22 +3604,19 @@ private static Path createDummyFileForEmptyPartition(Path path, JobConf job, Map
+     if (LOG.isInfoEnabled()) {
+       LOG.info("Changed input file " + strPath + " to empty file " + newPath);
+     }
++    return newPath;
++  }
+ 
++  private static void updatePathForMapWork(Path newPath, MapWork work, Path path) {
+     // update the work
+-    String strNewPath = newPath.toString().intern();
+-
+-    LinkedHashMap<String, ArrayList<String>> pathToAliases = work.getPathToAliases();
+-    pathToAliases.put(strNewPath, pathToAliases.get(strPath));
+-    pathToAliases.remove(strPath);
+-
+-    work.setPathToAliases(pathToAliases);
+-
+-    LinkedHashMap<String, PartitionDesc> pathToPartitionInfo = work.getPathToPartitionInfo();
+-    pathToPartitionInfo.put(strNewPath, pathToPartitionInfo.get(strPath));
+-    pathToPartitionInfo.remove(strPath);
+-    work.setPathToPartitionInfo(pathToPartitionInfo);
++    if (!newPath.equals(path)) {
++      PartitionDesc partDesc = work.getPathToPartitionInfo().get(path);
++      work.getPathToAliases().put(newPath.toString(), work.getPathToAliases().get(path));
++      work.getPathToAliases().remove(path);
+ 
+-    return newPath;
++      work.getPathToPartitionInfo().remove(path);
++      work.getPathToPartitionInfo().put(newPath.toString(), partDesc);
++    }
+   }
+ 
+   @SuppressWarnings("rawtypes")
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+index e322544..2bc48b4 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+@@ -21,6 +21,10 @@
+ import static org.apache.hadoop.hive.ql.exec.Utilities.getFileExtension;
+ import static org.apache.hadoop.hive.ql.exec.Utilities.DEPRECATED_MAPRED_DFSCLIENT_PARALLELISM_MAX;
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.mock;
+@@ -32,6 +36,7 @@
+ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Properties;
+ import java.util.UUID;
+ import java.util.concurrent.ExecutorService;
+@@ -272,6 +277,145 @@ private Path setupTempDirWithSingleOutputFile(Configuration hconf) throws IOExce
+   }
+ 
+   /**
++   * Check that calling {@link Utilities#getInputPaths(JobConf, MapWork, Path, Context, boolean)}
++   * can process two different tables that both have empty partitions.
++   */
++  @Test
++  public void testGetInputPathsWithEmptyPartitions() throws Exception {
++    String alias1Name = "alias1";
++    String alias2Name = "alias2";
++
++    MapWork mapWork1 = new MapWork();
++    MapWork mapWork2 = new MapWork();
++    JobConf jobConf = new JobConf();
++    Configuration conf = new Configuration();
++
++    Path nonExistentPath1 = new Path(UUID.randomUUID().toString());
++    Path nonExistentPath2 = new Path(UUID.randomUUID().toString());
++
++    PartitionDesc mockPartitionDesc = mock(PartitionDesc.class);
++    TableDesc mockTableDesc = mock(TableDesc.class);
++
++    when(mockTableDesc.isNonNative()).thenReturn(false);
++    when(mockTableDesc.getProperties()).thenReturn(new Properties());
++
++    when(mockPartitionDesc.getProperties()).thenReturn(new Properties());
++    when(mockPartitionDesc.getTableDesc()).thenReturn(mockTableDesc);
++    doReturn(HiveSequenceFileOutputFormat.class).when(
++            mockPartitionDesc).getOutputFileFormatClass();
++
++    mapWork1.setPathToAliases(new LinkedHashMap<>(
++            ImmutableMap.of(nonExistentPath1.toString(), Lists.newArrayList(alias1Name))));
++    mapWork1.setAliasToWork(new LinkedHashMap<>(
++            ImmutableMap.<String, Operator<? extends OperatorDesc>>of(alias1Name,
++                    (Operator<? extends OperatorDesc>) mock(Operator.class))));
++    mapWork1.setPathToPartitionInfo(new LinkedHashMap<>(
++            ImmutableMap.of(nonExistentPath1.toString(), mockPartitionDesc)));
++
++    mapWork2.setPathToAliases(new LinkedHashMap<>(
++            ImmutableMap.of(nonExistentPath2.toString(), Lists.newArrayList(alias2Name))));
++    mapWork2.setAliasToWork(new LinkedHashMap<>(
++            ImmutableMap.<String, Operator<? extends OperatorDesc>>of(alias2Name,
++                    (Operator<? extends OperatorDesc>) mock(Operator.class))));
++    mapWork2.setPathToPartitionInfo(new LinkedHashMap<>(
++            ImmutableMap.of(nonExistentPath2.toString(), mockPartitionDesc)));
++
++    List<Path> inputPaths = new ArrayList<>();
++    try {
++      Path scratchDir = new Path(HiveConf.getVar(jobConf, HiveConf.ConfVars.LOCALSCRATCHDIR));
++
++      List<Path> inputPaths1 = Utilities.getInputPaths(jobConf, mapWork1, scratchDir,
++              mock(Context.class), false);
++      inputPaths.addAll(inputPaths1);
++      assertEquals(inputPaths1.size(), 1);
++      assertNotEquals(inputPaths1.get(0), nonExistentPath1);
++      assertTrue(inputPaths1.get(0).getFileSystem(conf).exists(inputPaths1.get(0)));
++      assertFalse(nonExistentPath1.getFileSystem(conf).exists(nonExistentPath1));
++
++      List<Path> inputPaths2 = Utilities.getInputPaths(jobConf, mapWork2, scratchDir,
++              mock(Context.class), false);
++      inputPaths.addAll(inputPaths2);
++      assertEquals(inputPaths2.size(), 1);
++      assertNotEquals(inputPaths2.get(0), nonExistentPath2);
++      assertTrue(inputPaths2.get(0).getFileSystem(conf).exists(inputPaths2.get(0)));
++      assertFalse(nonExistentPath2.getFileSystem(conf).exists(nonExistentPath2));
++    } finally {
++      File file;
++      for (Path path : inputPaths) {
++        file = new File(path.toString());
++        if (file.exists()) {
++          file.delete();
++        }
++      }
++    }
++  }
++
++  /**
++   * Check that calling {@link Utilities#getInputPaths(JobConf, MapWork, Path, Context, boolean)}
++   * can process two different tables that both have empty partitions when using multiple threads.
++   * Some extra logic is placed at the end of the test to validate no race conditions put the
++   * {@link MapWork} object in an invalid state.
++   */
++  @Test
++  public void testGetInputPathsWithMultipleThreadsAndEmptyPartitions() throws Exception {
++    int numPartitions = 15;
++    JobConf jobConf = new JobConf();
++    jobConf.setInt(HiveConf.ConfVars.HIVE_EXEC_INPUT_LISTING_MAX_THREADS.varname,
++            Runtime.getRuntime().availableProcessors() * 2);
++    MapWork mapWork = new MapWork();
++    Path testTablePath = new Path("testTable");
++    Path[] testPartitionsPaths = new Path[numPartitions];
++
++    PartitionDesc mockPartitionDesc = mock(PartitionDesc.class);
++    TableDesc mockTableDesc = mock(TableDesc.class);
++
++    when(mockTableDesc.isNonNative()).thenReturn(false);
++    when(mockTableDesc.getProperties()).thenReturn(new Properties());
++    when(mockPartitionDesc.getProperties()).thenReturn(new Properties());
++    when(mockPartitionDesc.getTableDesc()).thenReturn(mockTableDesc);
++    doReturn(HiveSequenceFileOutputFormat.class).when(
++            mockPartitionDesc).getOutputFileFormatClass();
++
++
++    for (int i = 0; i < numPartitions; i++) {
++      String testPartitionName = "p=" + i;
++      testPartitionsPaths[i] = new Path(testTablePath, "p=" + i);
++      mapWork.getPathToAliases().put(testPartitionsPaths[i].toString(), Lists.newArrayList(testPartitionName));
++      mapWork.getAliasToWork().put(testPartitionName, (Operator<?>) mock(Operator.class));
++      mapWork.getPathToPartitionInfo().put(testPartitionsPaths[i].toString(), mockPartitionDesc);
++
++    }
++
++    FileSystem fs = FileSystem.getLocal(jobConf);
++
++    try {
++      fs.mkdirs(testTablePath);
++      List<Path> inputPaths = Utilities.getInputPaths(jobConf, mapWork,
++              new Path(HiveConf.getVar(jobConf, HiveConf.ConfVars.LOCALSCRATCHDIR)), mock(Context.class), false);
++      assertEquals(inputPaths.size(), numPartitions);
++
++      for (int i = 0; i < numPartitions; i++) {
++        assertNotEquals(inputPaths.get(i), testPartitionsPaths[i]);
++      }
++
++      assertEquals(mapWork.getPathToAliases().size(), numPartitions);
++      assertEquals(mapWork.getPathToPartitionInfo().size(), numPartitions);
++      assertEquals(mapWork.getAliasToWork().size(), numPartitions);
++
++      for (Map.Entry<String, ArrayList<String>> entry : mapWork.getPathToAliases().entrySet()) {
++        assertNotNull(entry.getKey());
++        assertNotNull(entry.getValue());
++        assertEquals(entry.getValue().size(), 1);
++        assertTrue(new Path(entry.getKey()).getFileSystem(new Configuration()).exists(new Path(entry.getKey())));
++      }
++    } finally {
++      if (fs.exists(testTablePath)) {
++        fs.delete(testTablePath, true);
++      }
++    }
++  }
++
++  /**
+    * Check that calling {@link Utilities#getMaxExecutorsForInputListing(Configuration, int)}
+    * returns the maximum number of executors to use based on the number of input locations.
+    */
+@@ -384,7 +528,7 @@ private void runTestGetInputPaths(JobConf jobConf, int numOfPartitions) throws E
+     Path testTablePath = new Path(testTableName);
+     Path[] testPartitionsPaths = new Path[numOfPartitions];
+     for (int i=0; i<numOfPartitions; i++) {
+-      String testPartitionName = "p=" + 1;
++      String testPartitionName = "p=" + i;
+       testPartitionsPaths[i] = new Path(testTablePath, "p=" + i);
+ 
+       pathToAliasTable.put(testPartitionsPaths[i].toString(), Lists.newArrayList(testPartitionName));
+-- 
+1.7.9.5
+

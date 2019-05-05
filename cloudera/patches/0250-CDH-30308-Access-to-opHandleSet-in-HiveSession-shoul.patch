@@ -1,0 +1,207 @@
+From 7d0b2c72c4224eb9c651b8c1a0b9f05928bee9e9 Mon Sep 17 00:00:00 2001
+From: Mohit Sabharwal <mohit@cloudera.com>
+Date: Wed, 2 Sep 2015 21:11:25 -0700
+Subject: [PATCH 0250/1164] CDH-30308 : Access to opHandleSet in HiveSession
+ should be synchronized (portion of HIVE-4239)
+
+---
+ .../hive/service/cli/session/HiveSessionImpl.java  |   61 ++++++++++++++------
+ .../cli/session/HiveSessionImplwithUGI.java        |    3 +-
+ 2 files changed, 46 insertions(+), 18 deletions(-)
+
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+index 3e17b36..f29a8dd 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+@@ -23,6 +23,7 @@
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStreamReader;
++import java.util.ArrayList;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -76,17 +77,26 @@
+  *
+  */
+ public class HiveSessionImpl implements HiveSession {
++  private static final String FETCH_WORK_SERDE_CLASS =
++      "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe";
++  private static final Log LOG = LogFactory.getLog(HiveSessionImpl.class);
++
++  // Shared between threads (including SessionState!)
+   private final SessionHandle sessionHandle;
+   private String username;
+   private final String password;
+-  private HiveConf hiveConf;
++  private final HiveConf hiveConf;
++  // TODO: some SessionState internals are not thread safe. The compile-time internals are synced
++  //       via session-scope or global compile lock. The run-time internals work by magic!
++  //       They probably work because races are relatively unlikely and few tools run parallel
++  //       queries from the same session.
++  //       1) OperationState should be refactored out of SessionState, and made thread-local.
++  //       2) Some parts of session state, like mrStats and vars, need proper synchronization.
+   private SessionState sessionState;
+   private String ipAddress;
+-  private static final String FETCH_WORK_SERDE_CLASS =
+-      "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe";
+-  private static final Log LOG = LogFactory.getLog(HiveSessionImpl.class);
+   private SessionManager sessionManager;
+   private OperationManager operationManager;
++  // Synchronized by locking on itself.
+   private final Set<OperationHandle> opHandleSet = new HashSet<OperationHandle>();
+   private boolean isOperationLogEnabled;
+   private File sessionLogDir;
+@@ -398,7 +408,7 @@ private OperationHandle executeStatementInternal(String statement, Map<String, S
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       // Refering to SQLOperation.java,there is no chance that a HiveSQLException throws and the asyn
+@@ -421,7 +431,7 @@ public OperationHandle getTypeInfo()
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -441,7 +451,7 @@ public OperationHandle getCatalogs()
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -462,7 +472,7 @@ public OperationHandle getSchemas(String catalogName, String schemaName)
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -484,7 +494,7 @@ public OperationHandle getTables(String catalogName, String schemaName, String t
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -504,7 +514,7 @@ public OperationHandle getTableTypes()
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -529,7 +539,7 @@ public OperationHandle getColumns(String catalogName, String schemaName,
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -539,6 +549,12 @@ public OperationHandle getColumns(String catalogName, String schemaName,
+     }
+   }
+ 
++  private void addOpHandle(OperationHandle opHandle) {
++    synchronized (opHandleSet) {
++      opHandleSet.add(opHandle);
++    }
++  }
++
+   @Override
+   public OperationHandle getFunctions(String catalogName, String schemaName, String functionName)
+       throws HiveSQLException {
+@@ -550,7 +566,7 @@ public OperationHandle getFunctions(String catalogName, String schemaName, Strin
+     OperationHandle opHandle = operation.getHandle();
+     try {
+       operation.run();
+-      opHandleSet.add(opHandle);
++      addOpHandle(opHandle);
+       return opHandle;
+     } catch (HiveSQLException e) {
+       operationManager.closeOperation(opHandle);
+@@ -565,10 +581,14 @@ public void close() throws HiveSQLException {
+     try {
+       acquire(true);
+       // Iterate through the opHandles and close their operations
+-      for (OperationHandle opHandle : opHandleSet) {
++      List<OperationHandle> ops = null;
++      synchronized (opHandleSet) {
++        ops = new ArrayList<>(opHandleSet);
++        opHandleSet.clear();
++      }
++      for (OperationHandle opHandle : ops) {
+         operationManager.closeOperation(opHandle);
+       }
+-      opHandleSet.clear();
+       // Cleanup session log directory.
+       cleanupSessionLogDir();
+       HiveHistory hiveHist = sessionState.getHiveHistory();
+@@ -635,7 +655,10 @@ public long getLastAccessTime() {
+ 
+   @Override
+   public void closeExpiredOperations() {
+-    OperationHandle[] handles = opHandleSet.toArray(new OperationHandle[opHandleSet.size()]);
++    OperationHandle[] handles;
++    synchronized (opHandleSet) {
++      handles = opHandleSet.toArray(new OperationHandle[opHandleSet.size()]);
++    }
+     if (handles.length > 0) {
+       List<Operation> operations = operationManager.removeExpiredOperations(handles);
+       if (!operations.isEmpty()) {
+@@ -653,7 +676,9 @@ private void closeTimedOutOperations(List<Operation> operations) {
+     acquire(false);
+     try {
+       for (Operation operation : operations) {
+-        opHandleSet.remove(operation.getHandle());
++        synchronized (opHandleSet) {
++          opHandleSet.remove(operation.getHandle());
++        }
+         try {
+           operation.close();
+         } catch (Exception e) {
+@@ -680,7 +705,9 @@ public void closeOperation(OperationHandle opHandle) throws HiveSQLException {
+     acquire(true);
+     try {
+       operationManager.closeOperation(opHandle);
+-      opHandleSet.remove(opHandle);
++      synchronized (opHandleSet) {
++        opHandleSet.remove(opHandle);
++      }
+     } finally {
+       release(true);
+     }
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java
+index 345ee4c..025516e 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java
+@@ -37,7 +37,8 @@
+ /**
+  *
+  * HiveSessionImplwithUGI.
+- * HiveSession with connecting user's UGI and delegation token if required
++ * HiveSession with connecting user's UGI and delegation token if required.
++ * Note: this object may be shared between threads in HS2.
+  */
+ public class HiveSessionImplwithUGI extends HiveSessionImpl {
+   public static final String HS2TOKEN = "HiveServer2ImpersonationToken";
+-- 
+1.7.9.5
+

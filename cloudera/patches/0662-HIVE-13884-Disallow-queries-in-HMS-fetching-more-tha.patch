@@ -1,0 +1,430 @@
+From 8c7c4fc4bfdc7147a87d4ed6978731d89a38cdfa Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Sat, 2 Jul 2016 11:24:47 -0500
+Subject: [PATCH 0662/1164] HIVE-13884: Disallow queries in HMS fetching more
+ than a configured number of partitions (Sergio
+ Pena, reviewed by Szehon Ho, Mohit Sabharwal,
+ Brock Noland, Reuben Kuhnert, Sergey Shelukhin)
+
+Change-Id: Iad46bc08a451b3e5c424a0b7ab1dfc9f9e195887
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    7 +-
+ .../hadoop/hive/metastore/TestHiveMetaStore.java   |   45 +++++++++++
+ .../hive/metastore/TestRemoteHiveMetaStore.java    |    2 +-
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   56 ++++++++++++-
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |    2 +-
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |   84 +++++++++++++++++---
+ .../org/apache/hadoop/hive/metastore/RawStore.java |    2 +
+ .../metastore/DummyRawStoreControlledCommit.java   |    6 ++
+ .../metastore/DummyRawStoreForJdoConnection.java   |    6 ++
+ 9 files changed, 193 insertions(+), 17 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index dc4a4ec..b9d081d 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -572,6 +572,9 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "not blocked.\n" +
+         "\n" +
+         "See HIVE-4409 for more details."),
++    METASTORE_LIMIT_PARTITION_REQUEST("hive.metastore.limit.partition.request", -1,
++        "This limits the number of partitions that can be requested from the metastore for a given table.\n" +
++            "The default value \"-1\" means no limit."),
+ 
+     NEWTABLEDEFAULTPARA("hive.table.parameters.default", "",
+         "Default property values for newly created tables"),
+@@ -1004,9 +1007,11 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "Insert queries are not restricted by this limit."),
+     HIVELIMITPUSHDOWNMEMORYUSAGE("hive.limit.pushdown.memory.usage", -1f,
+         "The max memory to be used for hash in RS operator for top K selection."),
++
++    @Deprecated
+     HIVELIMITTABLESCANPARTITION("hive.limit.query.max.table.partition", -1,
+         "This controls how many partitions can be scanned for each partitioned table.\n" +
+-        "The default value \"-1\" means no limit."),
++        "The default value \"-1\" means no limit. (DEPRECATED: Please use " + ConfVars.METASTORE_LIMIT_PARTITION_REQUEST + " in the metastore instead.)"),
+ 
+     HIVEHASHTABLEKEYCOUNTADJUSTMENT("hive.hashtable.key.count.adjustment", 1.0f,
+         "Adjustment to mapjoin hashtable size derived from table and column statistics; the estimate" +
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
+index f25004b..423623a 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
+@@ -90,6 +90,8 @@
+   private static final String TEST_DB1_NAME = "testdb1";
+   private static final String TEST_DB2_NAME = "testdb2";
+ 
++  private static final int DEFAULT_LIMIT_PARTITION_REQUEST = 100;
++
+   @Override
+   protected void setUp() throws Exception {
+     hiveConf = new HiveConf(this.getClass());
+@@ -103,6 +105,7 @@ protected void setUp() throws Exception {
+     hiveConf.set("hive.key4", "0");
+ 
+     hiveConf.setIntVar(ConfVars.METASTORE_BATCH_RETRIEVE_MAX, 2);
++    hiveConf.setIntVar(ConfVars.METASTORE_LIMIT_PARTITION_REQUEST, DEFAULT_LIMIT_PARTITION_REQUEST);
+   }
+ 
+   public void testNameMethods() {
+@@ -554,7 +557,49 @@ public void testListPartitions() throws Throwable {
+ 
+   }
+ 
++  public void testListPartitionsWihtLimitEnabled() throws Throwable {
++    // create a table with multiple partitions
++    String dbName = "compdb";
++    String tblName = "comptbl";
++    String typeName = "Person";
+ 
++    cleanUp(dbName, tblName, typeName);
++
++    // Create too many partitions, just enough to validate over limit requests
++    List<List<String>> values = new ArrayList<List<String>>();
++    for (int i=0; i<DEFAULT_LIMIT_PARTITION_REQUEST + 1; i++) {
++      values.add(makeVals("2008-07-01 14:13:12", Integer.toString(i)));
++    }
++
++    createMultiPartitionTableSchema(dbName, tblName, typeName, values);
++
++    List<Partition> partitions;
++    short maxParts;
++
++    // Requesting more partitions than allowed should throw an exception
++    try {
++      maxParts = -1;
++      partitions = client.listPartitions(dbName, tblName, maxParts);
++      fail("should have thrown MetaException about partition limit");
++    } catch (MetaException e) {
++      assertTrue(true);
++    }
++
++    // Requesting more partitions than allowed should throw an exception
++    try {
++      maxParts = DEFAULT_LIMIT_PARTITION_REQUEST + 1;
++      partitions = client.listPartitions(dbName, tblName, maxParts);
++      fail("should have thrown MetaException about partition limit");
++    } catch (MetaException e) {
++      assertTrue(true);
++    }
++
++    // Requesting less partitions than allowed should work
++    maxParts = DEFAULT_LIMIT_PARTITION_REQUEST / 2;
++    partitions = client.listPartitions(dbName, tblName, maxParts);
++    assertNotNull("should have returned partitions", partitions);
++    assertEquals(" should have returned 50 partitions", maxParts, partitions.size());
++  }
+ 
+   public void testListPartitionNames() throws Throwable {
+     // create a table with multiple partitions
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestRemoteHiveMetaStore.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestRemoteHiveMetaStore.java
+index 491d093..6da5165 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestRemoteHiveMetaStore.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestRemoteHiveMetaStore.java
+@@ -42,7 +42,7 @@ protected void setUp() throws Exception {
+ 
+     int port = MetaStoreUtils.findFreePort();
+     System.out.println("Starting MetaStore Server on port " + port);
+-    MetaStoreUtils.startMetaStore(port, ShimLoader.getHadoopThriftAuthBridge());
++    MetaStoreUtils.startMetaStore(port, ShimLoader.getHadoopThriftAuthBridge(), hiveConf);
+     isServerStarted = true;
+ 
+     // This is default case with setugi off for both client and server
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index e608779..9df094e 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -285,6 +285,9 @@ protected DateFormat initialValue() {
+   private static HadoopThriftAuthBridge.Server saslServer;
+   private static boolean useSasl;
+ 
++  public static final String NO_FILTER_STRING = "";
++  public static final int UNLIMITED_MAX_PARTITIONS = -1;
++
+   private static final class ChainedTTransportFactory extends TTransportFactory {
+     private final TTransportFactory parentTransFactory;
+     private final TTransportFactory childTransFactory;
+@@ -3067,6 +3070,7 @@ public Partition get_partition_with_auth(final String db_name,
+       List<Partition> ret = null;
+       Exception ex = null;
+       try {
++        checkLimitNumberOfPartitionsByFilter(db_name, tbl_name, NO_FILTER_STRING, max_parts);
+         ret = getMS().getPartitions(db_name, tbl_name, max_parts);
+       } catch (Exception e) {
+         ex = e;
+@@ -3094,6 +3098,7 @@ public Partition get_partition_with_auth(final String db_name,
+       List<Partition> ret = null;
+       Exception ex = null;
+       try {
++        checkLimitNumberOfPartitionsByFilter(dbName, tblName, NO_FILTER_STRING, maxParts);
+         ret = getMS().getPartitionsWithAuth(dbName, tblName, maxParts,
+             userName, groupNames);
+       } catch (InvalidObjectException e) {
+@@ -3109,6 +3114,35 @@ public Partition get_partition_with_auth(final String db_name,
+ 
+     }
+ 
++    private void checkLimitNumberOfPartitionsByFilter(String dbName, String tblName, String filterString, int maxParts) throws TException {
++      if (isPartitionLimitEnabled()) {
++        checkLimitNumberOfPartitions(tblName, get_num_partitions_by_filter(dbName, tblName, filterString), maxParts);
++      }
++    }
++
++    private void checkLimitNumberOfPartitionsByExpr(String dbName, String tblName, byte[] filterExpr, int maxParts) throws TException {
++      if (isPartitionLimitEnabled()) {
++        checkLimitNumberOfPartitions(tblName, get_num_partitions_by_expr(dbName, tblName, filterExpr), maxParts);
++      }
++    }
++
++    private boolean isPartitionLimitEnabled() {
++      int partitionLimit = HiveConf.getIntVar(hiveConf, HiveConf.ConfVars.METASTORE_LIMIT_PARTITION_REQUEST);
++      return partitionLimit > -1;
++    }
++
++    private void checkLimitNumberOfPartitions(String tblName, int numPartitions, int maxToFetch) throws MetaException {
++      if (isPartitionLimitEnabled()) {
++        int partitionLimit = HiveConf.getIntVar(hiveConf, HiveConf.ConfVars.METASTORE_LIMIT_PARTITION_REQUEST);
++        int partitionRequest = (maxToFetch < 0) ? numPartitions : maxToFetch;
++        if (partitionRequest > partitionLimit) {
++          String configName = ConfVars.METASTORE_LIMIT_PARTITION_REQUEST.varname;
++          throw new MetaException(String.format("Number of partitions scanned (=%d) on table '%s' exceeds limit" +
++              " (=%d). This is controlled on the metastore server by %s.", partitionRequest, tblName, partitionLimit, configName));
++        }
++      }
++    }
++
+     @Override
+     public List<PartitionSpec> get_partitions_pspec(final String db_name, final String tbl_name, final int max_parts)
+       throws NoSuchObjectException, MetaException  {
+@@ -4578,6 +4612,7 @@ public boolean delete_table_column_statistics(String dbName, String tableName, S
+       List<Partition> ret = null;
+       Exception ex = null;
+       try {
++        checkLimitNumberOfPartitionsByFilter(dbName, tblName, filter, maxParts);
+         ret = getMS().getPartitionsByFilter(dbName, tblName, filter, maxParts);
+       } catch (Exception e) {
+         ex = e;
+@@ -4628,6 +4663,7 @@ public PartitionsByExprResult get_partitions_by_expr(
+       PartitionsByExprResult ret = null;
+       Exception ex = null;
+       try {
++        checkLimitNumberOfPartitionsByExpr(dbName, tblName, req.getExpr(), UNLIMITED_MAX_PARTITIONS);
+         List<Partition> partitions = new LinkedList<Partition>();
+         boolean hasUnknownPartitions = getMS().getPartitionsByExpr(dbName, tblName,
+             req.getExpr(), req.getDefaultPartitionName(), req.getMaxParts(), partitions);
+@@ -4657,7 +4693,7 @@ private void rethrowException(Exception e)
+     
+     public int get_num_partitions_by_filter(final String dbName,
+                                             final String tblName, final String filter)
+-            throws MetaException, NoSuchObjectException, TException {
++            throws TException {
+       startTableFunction("get_num_partitions_by_filter", dbName, tblName);
+ 
+       int ret = -1;
+@@ -4673,6 +4709,24 @@ public int get_num_partitions_by_filter(final String dbName,
+       return ret;
+     }
+ 
++    public int get_num_partitions_by_expr(final String dbName,
++                                            final String tblName, final byte[] expr)
++        throws TException {
++      startTableFunction("get_num_partitions_by_expr", dbName, tblName);
++
++      int ret = -1;
++      Exception ex = null;
++      try {
++        ret = getMS().getNumPartitionsByExpr(dbName, tblName, expr);
++      } catch (Exception e) {
++        ex = e;
++        rethrowException(e);
++      } finally {
++        endFunction("get_num_partitions_by_expr", ret != -1, ex, tblName);
++      }
++      return ret;
++    }
++
+     @Override
+     public List<Partition> get_partitions_by_names(final String dbName,
+         final String tblName, final List<String> partNames)
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index e8aa7d8..fb4ee61 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -827,7 +827,7 @@ public int getNumPartitionsViaSqlFilter(SqlFilterForPushdown filter) throws Meta
+       + "  inner join \"DBS\" on \"TBLS\".\"DB_ID\" = \"DBS\".\"DB_ID\" "
+       + "     and \"DBS\".\"NAME\" = ? "
+       + join(filter.joins, ' ')
+-      + (filter.filter == null ? "" : (" where " + filter.filter));
++      + (filter.filter == null || filter.filter.trim().isEmpty() ? "" : (" where " + filter.filter));
+ 
+     Object[] params = new Object[filter.params.size() + 2];
+     params[0] = tblName;
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index 6f01912..7a6a1d6 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -2447,7 +2447,23 @@ private boolean getPartitionNamesPrunedByExprNoTxn(Table table, byte[] expr,
+ 
+   private Integer getNumPartitionsViaOrmFilter(Table table, ExpressionTree tree, boolean isValidatedFilter)
+     throws MetaException {
+-    return getPartitionsViaOrmFilter(table, tree, (short) -1, isValidatedFilter).size();
++    Map<String, Object> params = new HashMap<String, Object>();
++    String jdoFilter = makeQueryFilterString(table.getDbName(), table, tree, params, isValidatedFilter);
++    if (jdoFilter == null) {
++      assert !isValidatedFilter;
++      return null;
++    }
++
++    Query query = pm.newQuery(
++        "select count(partitionName) from org.apache.hadoop.hive.metastore.model.MPartition"
++    );
++    query.setFilter(jdoFilter);
++    String parameterDeclaration = makeParameterDeclarationStringObj(params);
++    query.declareParameters(parameterDeclaration);
++    Long result = (Long) query.executeWithMap(params);
++    query.closeAll();
++
++    return result.intValue();
+   }
+ 
+   /**
+@@ -2730,35 +2746,77 @@ protected String describeResult() {
+   @Override
+   public int getNumPartitionsByFilter(String dbName, String tblName,
+                                       String filter) throws MetaException, NoSuchObjectException {
+-    return getNumPartitionsByFilterInternal(dbName, tblName, filter,
+-      true, true);
+-  }
++    final ExpressionTree exprTree = (filter != null && !filter.isEmpty())
++        ? PartFilterExprUtil.getFilterParser(filter).tree : ExpressionTree.EMPTY_TREE;
+ 
+-  protected int getNumPartitionsByFilterInternal(String dbName, String tblName,
+-                                                 String filter, boolean allowSql, boolean allowJdo)
+-    throws MetaException, NoSuchObjectException {
+-    final ExpressionTree tree = (filter != null && !filter.isEmpty())
+-      ? PartFilterExprUtil.getFilterParser(filter).tree : ExpressionTree.EMPTY_TREE;
+-    return new GetHelper<Integer>(dbName, tblName, allowSql, allowJdo) {
++    return new GetHelper<Integer>(dbName, tblName, true, true) {
+       private SqlFilterForPushdown filter = new SqlFilterForPushdown();
++
+       @Override
+       protected String describeResult() {
+         return "Partition count";
+       }
+ 
+       protected boolean canUseDirectSql(GetHelper<Integer> ctx) throws MetaException {
+-        return directSql.generateSqlFilterForPushdown(ctx.getTable(), tree, filter);
++        return directSql.generateSqlFilterForPushdown(ctx.getTable(), exprTree, filter);
+       };
+ 
+       @Override
+       protected Integer getSqlResult(GetHelper<Integer> ctx) throws MetaException {
+         return directSql.getNumPartitionsViaSqlFilter(filter);
+       }
++      @Override
++      protected Integer getJdoResult(
++          GetHelper<Integer> ctx) throws MetaException, NoSuchObjectException {
++        return getNumPartitionsViaOrmFilter(ctx.getTable(), exprTree, true);
++      }
++    }.run(true);
++  }
++
++  @Override
++  public int getNumPartitionsByExpr(String dbName, String tblName,
++                                             byte[] expr) throws MetaException, NoSuchObjectException {
++    final ExpressionTree exprTree = PartFilterExprUtil.makeExpressionTree(expressionProxy, expr);
++    final byte[] tempExpr = expr; // Need to be final to pass it to an inner class
++
++
++    return new GetHelper<Integer>(dbName, tblName, true, true) {
++      private SqlFilterForPushdown filter = new SqlFilterForPushdown();
++
++      @Override
++      protected String describeResult() {
++        return "Partition count";
++      }
++
++      protected boolean canUseDirectSql(GetHelper<Integer> ctx) throws MetaException {
++        return directSql.generateSqlFilterForPushdown(ctx.getTable(), exprTree, filter);
++      };
+ 
+       @Override
++      protected Integer getSqlResult(GetHelper<Integer> ctx) throws MetaException {
++        return directSql.getNumPartitionsViaSqlFilter(filter);
++      }
++      @Override
+       protected Integer getJdoResult(
+-        GetHelper<Integer> ctx) throws MetaException, NoSuchObjectException {
+-        return getNumPartitionsViaOrmFilter(ctx.getTable(), tree, true);
++          GetHelper<Integer> ctx) throws MetaException, NoSuchObjectException {
++        Integer numPartitions = null;
++
++        if (exprTree != null) {
++          try {
++            numPartitions = getNumPartitionsViaOrmFilter(ctx.getTable(), exprTree, true);
++          } catch (MetaException e) {
++            numPartitions = null;
++          }
++        }
++
++        // if numPartitions could not be obtained from ORM filters, then get number partitions names, and count them
++        if (numPartitions == null) {
++          List<String> filteredPartNames = new ArrayList<String>();
++          getPartitionNamesPrunedByExprNoTxn(ctx.getTable(), tempExpr, "", (short) -1, filteredPartNames);
++          numPartitions = filteredPartNames.size();
++        }
++
++        return numPartitions;
+       }
+     }.run(true);
+   }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java
+index 2fcd122..67dd122 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java
+@@ -233,6 +233,8 @@ public abstract boolean getPartitionsByExpr(String dbName, String tblName,
+   public abstract int getNumPartitionsByFilter(String dbName, String tblName, String filter)
+     throws MetaException, NoSuchObjectException;
+ 
++  public abstract int getNumPartitionsByExpr(String dbName, String tblName, byte[] expr) throws MetaException, NoSuchObjectException;
++
+   public abstract List<Partition> getPartitionsByNames(
+       String dbName, String tblName, List<String> partNames)
+       throws MetaException, NoSuchObjectException;
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java
+index 07f840d..b7315f7 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java
+@@ -324,6 +324,12 @@ public int getNumPartitionsByFilter(String dbName, String tblName,
+   }
+ 
+   @Override
++  public int getNumPartitionsByExpr(String dbName, String tblName,
++                                      byte[] expr) throws MetaException, NoSuchObjectException {
++    return objectStore.getNumPartitionsByExpr(dbName, tblName, expr);
++  }
++
++  @Override
+   public List<Partition> getPartitionsByNames(String dbName, String tblName,
+       List<String> partNames) throws MetaException, NoSuchObjectException {
+     return objectStore.getPartitionsByNames(dbName, tblName, partNames);
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
+index 70e27e3..899fe7b 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
+@@ -351,6 +351,12 @@ public int getNumPartitionsByFilter(String dbName, String tblName, String filter
+   }
+ 
+   @Override
++  public int getNumPartitionsByExpr(String dbName, String tblName, byte[] expr)
++      throws MetaException, NoSuchObjectException {
++    return -1;
++  }
++
++  @Override
+   public Table markPartitionForEvent(String dbName, String tblName, Map<String, String> partVals,
+       PartitionEventType evtType) throws MetaException, UnknownTableException,
+       InvalidPartitionException, UnknownPartitionException {
+-- 
+1.7.9.5
+

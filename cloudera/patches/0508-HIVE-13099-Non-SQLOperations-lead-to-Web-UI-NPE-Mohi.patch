@@ -1,0 +1,86 @@
+From e669f90a1368d4dc4152ff02cc203695b51399ef Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Mon, 22 Feb 2016 08:18:45 -0800
+Subject: [PATCH 0508/1164] HIVE-13099: Non-SQLOperations lead to Web UI NPE
+ (Mohit via Jimmy)
+
+(cherry picked from commit ac9c5991b5bf8184319657315638af73b22b1c02)
+
+Change-Id: Ifb6c0b02004ec2da11cf4acd64079ff2e2f6ec8f
+---
+ .../service/cli/operation/OperationManager.java    |   47 +++++++++++---------
+ 1 file changed, 27 insertions(+), 20 deletions(-)
+
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+index 81ce9ca..4c9a0c7 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/OperationManager.java
+@@ -176,22 +176,6 @@ private Operation getOperationInternal(OperationHandle operationHandle) {
+     return handleToOperation.get(operationHandle);
+   }
+ 
+-  private Operation removeTimedOutOperation(OperationHandle operationHandle) {
+-    Operation operation = handleToOperation.get(operationHandle);
+-    if (operation != null && operation.isTimedOut(System.currentTimeMillis())) {
+-      handleToOperation.remove(operationHandle, operation);
+-      synchronized (webuiLock) {
+-        String opKey = operationHandle.getHandleIdentifier().toString();
+-        SQLOperationDisplay display = liveSqlOperations.remove(opKey);
+-        if (historicSqlOperations != null) {
+-          historicSqlOperations.put(opKey, display);
+-        }
+-      }
+-      return operation;
+-    }
+-    return null;
+-  }
+-
+   private void addOperation(Operation operation) {
+     handleToOperation.put(operation.getHandle(), operation);
+     if (operation instanceof SQLOperation) {
+@@ -203,15 +187,38 @@ private void addOperation(Operation operation) {
+   }
+ 
+   private Operation removeOperation(OperationHandle opHandle) {
+-    Operation result = handleToOperation.remove(opHandle);
++    Operation operation = handleToOperation.remove(opHandle);
++    if (operation instanceof SQLOperation) {
++      removeSaveSqlOperationDisplay(opHandle);
++    }
++    return operation;
++  }
++
++  private Operation removeTimedOutOperation(OperationHandle operationHandle) {
++    Operation operation = handleToOperation.get(operationHandle);
++    if (operation != null && operation.isTimedOut(System.currentTimeMillis())) {
++      handleToOperation.remove(operationHandle, operation);
++      if (operation instanceof SQLOperation) {
++        removeSaveSqlOperationDisplay(operationHandle);
++      }
++      return operation;
++    }
++    return null;
++  }
++
++  private void removeSaveSqlOperationDisplay(OperationHandle operationHandle) {
+     synchronized (webuiLock) {
+-      String opKey = opHandle.getHandleIdentifier().toString();
++      String opKey = operationHandle.getHandleIdentifier().toString();
++      // remove from list of live operations
+       SQLOperationDisplay display = liveSqlOperations.remove(opKey);
+-      if (historicSqlOperations != null) {
++      if (display == null) {
++        LOG.debug("Unexpected display object value of null for operation " +
++            opKey);
++      } else if (historicSqlOperations != null) {
++        // add to list of saved historic operations
+         historicSqlOperations.put(opKey, display);
+       }
+     }
+-    return result;
+   }
+ 
+   public OperationStatus getOperationStatus(OperationHandle opHandle)
+-- 
+1.7.9.5
+

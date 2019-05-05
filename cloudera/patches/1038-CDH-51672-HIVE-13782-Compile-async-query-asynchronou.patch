@@ -1,0 +1,63 @@
+From 02f07176922ec6540b52fedf0070ae35ce1e8696 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Wed, 18 May 2016 15:05:03 -0700
+Subject: [PATCH 1038/1164] CDH-51672: HIVE-13782: Compile async query
+ asynchronously (Jimmy Xiang, reviewed by Xuefu
+ Zhang, Lefty Leverenz)
+
+Conflicts:
+	service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+
+Change-Id: I976fc0950eafe217a32fdd6c1245f5fbf5a9e5f9
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    2 ++
+ .../hive/service/cli/operation/SQLOperation.java   |   13 +++++++++++--
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index c06598a..f02cbee 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1821,6 +1821,8 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         new TimeValidator(TimeUnit.SECONDS),
+         "Time that an idle HiveServer2 async thread (from the thread pool) will wait for a new task\n" +
+         "to arrive before terminating"),
++    HIVE_SERVER2_ASYNC_EXEC_ASYNC_COMPILE("hive.server2.async.exec.async.compile", false,
++        "Whether to enable compiling async query asynchronously. If enabled, it is unknown if the query will have any resultset before compilation completed."),
+     HIVE_SERVER2_LONG_POLLING_TIMEOUT("hive.server2.long.polling.timeout", "5000ms",
+         new TimeValidator(TimeUnit.MILLISECONDS),
+         "Time that HiveServer2 will wait before responding to asynchronous calls that use long polling"),
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index abe0b9e..be9ad53 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -264,8 +264,14 @@ public void runInternal() throws HiveSQLException {
+     setState(OperationState.PENDING);
+     final HiveConf opConfig = getConfigForOperation();
+ 
+-    prepare(opConfig);
+-    if (!shouldRunAsync()) {
++    boolean runAsync = shouldRunAsync();
++    final boolean asyncPrepare = runAsync
++      && HiveConf.getBoolVar(opConfig,
++        HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_ASYNC_COMPILE);
++    if (!asyncPrepare) {
++      prepare(opConfig);
++    }
++    if (!runAsync) {
+       runQuery(opConfig);
+     } else {
+       // We'll pass ThreadLocals in the background thread from the foreground (handler) thread
+@@ -290,6 +296,9 @@ public Object run() throws HiveSQLException {
+               registerCurrentOperationLog();
+               registerLoggingContext();
+               try {
++                if (asyncPrepare) {
++                  prepare(opConfig);
++                }
+                 runQuery(opConfig);
+               } catch (HiveSQLException e) {
+                 setOperationException(e);
+-- 
+1.7.9.5
+

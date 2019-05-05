@@ -1,0 +1,227 @@
+From b5cc6a20cd355fddfc15dfa84b1ffb3442dfa2b2 Mon Sep 17 00:00:00 2001
+From: ctang <ctang@cloudera.com>
+Date: Mon, 28 Dec 2015 22:59:26 -0500
+Subject: [PATCH 0440/1164] CDH-35804: Backport HIVE-12713 Miscellaneous
+ improvements in driver compile and execute
+ logging (from Hive-1.3.0)
+
+Change-Id: Idb002a4e7e110a6daf5819f0d866d09da8330c91
+---
+ .../apache/hive/beeline/TestBeeLineWithArgs.java   |    2 +-
+ .../java/org/apache/hive/jdbc/TestJdbcDriver2.java |    6 ++---
+ .../cli/operation/TestOperationLoggingAPI.java     |    7 ++---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   27 +++++++++++++-------
+ .../apache/hadoop/hive/ql/parse/ParseDriver.java   |   14 ++++++----
+ .../hive/service/cli/operation/SQLOperation.java   |    3 +--
+ 6 files changed, 36 insertions(+), 23 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+index 0465ef3..90727a7 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+@@ -674,7 +674,7 @@ public void testQueryProgressHidden() throws Throwable {
+     final String SCRIPT_TEXT = "set hive.support.concurrency = false;\n" +
+         "!set silent true\n" +
+         "select count(*) from " + tableName + ";\n";
+-    final String EXPECTED_PATTERN = "Parsing command";
++    final String EXPECTED_PATTERN = "Executing command";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, false, getBaseArgs(miniHS2.getBaseJdbcURL()));
+   }
+ 
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+index 609cce8..67569fa 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+@@ -2352,11 +2352,11 @@ public void testNonAsciiReturnValues() throws Exception {
+   public void testGetQueryLog() throws Exception {
+     // Prepare
+     String[] expectedLogs = {
+-        "Parsing command",
+-        "Parse Completed",
++        "Compiling command",
++        "Completed compiling command",
+         "Starting Semantic Analysis",
+         "Semantic Analysis Completed",
+-        "Starting command"
++        "Executing command"
+     };
+     String sql = "select count(*) from " + tableName;
+ 
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/operation/TestOperationLoggingAPI.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/operation/TestOperationLoggingAPI.java
+index 217d50a..f8eefa9 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/operation/TestOperationLoggingAPI.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/operation/TestOperationLoggingAPI.java
+@@ -55,14 +55,15 @@
+   private final String sql = "select * from " + tableName;
+   private final String sqlCntStar = "select count(*) from " + tableName;
+   private final String[] expectedLogs = {
+-    "Parsing command",
+-    "Parse Completed",
+     "Starting Semantic Analysis"
+   };
+   private final String[] expectedLogsExecution = {
++    "Compiling command",
++    "Completed compiling command",
+     "Total jobs",
+     "Semantic Analysis Completed",
+-    "Starting command",
++    "Executing command",
++    "Completed executing command",
+     "Number of reduce tasks determined at compile time",
+     "number of splits",
+     "Submitting tokens for job",
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index a712d3c..4cd0475 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -363,6 +363,16 @@ public int compile(String command, boolean resetTaskIds) {
+     PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.COMPILE);
+ 
++    command = new VariableSubstitution().substitute(conf,command);
++    String queryStr = command;
++
++    try {
++      // command should be redacted to avoid to logging sensitive data
++      queryStr = HookUtils.redactLogString(conf, command);
++    } catch (Exception e) {
++      LOG.warn("WARNING! Query command could not be redacted." + e);
++    }
++
+     //holder for parent command type/string when executing reentrant queries
+     QueryState queryState = new QueryState();
+ 
+@@ -383,10 +393,11 @@ public int compile(String command, boolean resetTaskIds) {
+       conf.setVar(HiveConf.ConfVars.HIVEQUERYID, queryId);
+     }
+ 
++    LOG.info("Compiling command(queryId=" + queryId + "): " + queryStr);
++
+     SessionState.get().setupQueryCurrentTimestamp();
+ 
+     try {
+-      command = new VariableSubstitution().substitute(conf,command);
+       ctx = new Context(conf);
+       ctx.setTryCount(getTryCount());
+       ctx.setCmd(command);
+@@ -440,10 +451,6 @@ public int compile(String command, boolean resetTaskIds) {
+       sem.validate();
+       perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.ANALYZE);
+ 
+-      // Command should be redacted before passing it to the QueryPlan in order
+-      // to avoid returning sensitive data
+-      String queryStr = HookUtils.redactLogString(conf, command);
+-
+       // get the output schema
+       schema = getSchema(sem, conf);
+ 
+@@ -507,8 +514,9 @@ public int compile(String command, boolean resetTaskIds) {
+           + org.apache.hadoop.util.StringUtils.stringifyException(e));
+       return error.getErrorCode();
+     } finally {
+-      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.COMPILE);
++      double duration = perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.COMPILE)/1000.00;
+       restoreSession(queryState);
++      LOG.info("Completed compiling command(queryId=" + queryId + "); Time taken: " + duration + " seconds");
+     }
+   }
+ 
+@@ -1144,6 +1152,7 @@ public CommandProcessorResponse compileAndRespond(String command) {
+ 
+   private int compileInternal(String command) {
+     int ret;
++    LOG.debug("Acquire a monitor for compiling query");
+     synchronized (compileMonitor) {
+       ret = compile(command);
+     }
+@@ -1351,8 +1360,7 @@ public int execute() throws CommandNeedRetryException {
+     maxthreads = HiveConf.getIntVar(conf, HiveConf.ConfVars.EXECPARALLETHREADNUMBER);
+ 
+     try {
+-      LOG.info("Starting command(queryId=" + queryId + "): " + queryStr);
+-
++      LOG.info("Executing command(queryId=" + queryId + "): " + queryStr);
+       plan.setStarted();
+ 
+       if (SessionState.get() != null) {
+@@ -1580,7 +1588,7 @@ public int execute() throws CommandNeedRetryException {
+       if (noName) {
+         conf.setVar(HiveConf.ConfVars.HADOOPJOBNAME, "");
+       }
+-      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.DRIVER_EXECUTE);
++      double duration = perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.DRIVER_EXECUTE)/1000.00;
+ 
+       Map<String, MapRedStats> stats = SessionState.get().getMapRedStats();
+       if (stats != null && !stats.isEmpty()) {
+@@ -1592,6 +1600,7 @@ public int execute() throws CommandNeedRetryException {
+         }
+         console.printInfo("Total MapReduce CPU Time Spent: " + Utilities.formatMsecToStr(totalCpu));
+       }
++      LOG.info("Completed executing command(queryId=" + queryId + "); Time taken: " + duration + " seconds");
+     }
+     plan.setDone();
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseDriver.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseDriver.java
+index a24cad9..1f74d08 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseDriver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ParseDriver.java
+@@ -180,9 +180,11 @@ public ASTNode parse(String command, Context ctx)
+    *
+    * @return parsed AST
+    */
+-  public ASTNode parse(String command, Context ctx, boolean setTokenRewriteStream) 
++  public ASTNode parse(String command, Context ctx, boolean setTokenRewriteStream)
+       throws ParseException {
+-    LOG.info("Parsing command: " + command);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Parsing command: " + command);
++    }
+ 
+     HiveLexerX lexer = new HiveLexerX(new ANTLRNoCaseStringStream(command));
+     TokenRewriteStream tokens = new TokenRewriteStream(lexer);
+@@ -203,7 +205,7 @@ public ASTNode parse(String command, Context ctx, boolean setTokenRewriteStream)
+     }
+ 
+     if (lexer.getErrors().size() == 0 && parser.errors.size() == 0) {
+-      LOG.info("Parse Completed");
++      LOG.debug("Parse Completed");
+     } else if (lexer.getErrors().size() != 0) {
+       throw new ParseException(lexer.getErrors());
+     } else {
+@@ -227,7 +229,9 @@ public ASTNode parse(String command, Context ctx, boolean setTokenRewriteStream)
+    * translation process.
+    */
+   public ASTNode parseSelect(String command, Context ctx) throws ParseException {
+-    LOG.info("Parsing command: " + command);
++    if (LOG.isDebugEnabled()) {
++      LOG.debug("Parsing command: " + command);
++    }
+ 
+     HiveLexerX lexer = new HiveLexerX(new ANTLRNoCaseStringStream(command));
+     TokenRewriteStream tokens = new TokenRewriteStream(lexer);
+@@ -245,7 +249,7 @@ public ASTNode parseSelect(String command, Context ctx) throws ParseException {
+     }
+ 
+     if (lexer.getErrors().size() == 0 && parser.errors.size() == 0) {
+-      LOG.info("Parse Completed");
++      LOG.debug("Parse Completed");
+     } else if (lexer.getErrors().size() != 0) {
+       throw new ParseException(lexer.getErrors());
+     } else {
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index 8e95a31..501bb1a 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -114,8 +114,7 @@ public void prepare(HiveConf sqlOperationConf) throws HiveSQLException {
+       // For now, we disable the test attempts.
+       driver.setTryCount(Integer.MAX_VALUE);
+ 
+-      String subStatement = new VariableSubstitution().substitute(sqlOperationConf, statement);
+-      response = driver.compileAndRespond(subStatement);
++      response = driver.compileAndRespond(statement);
+       if (0 != response.getResponseCode()) {
+         throw toSQLException("Error while compiling statement", response);
+       }
+-- 
+1.7.9.5
+

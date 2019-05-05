@@ -1,0 +1,139 @@
+From d9e64b85ec0bf2eceebaa2c3656be9d61741e23b Mon Sep 17 00:00:00 2001
+From: Brock Noland <brock@apache.org>
+Date: Mon, 23 Feb 2015 02:44:47 +0000
+Subject: [PATCH 0050/1164] HIVE-9671 - Support Impersonation [Spark Branch]
+ (Brock via Xuefu)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/branches/spark@1661599 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit fd0f638a8d481a9a98b34d3dd08236d6d591812f)
+---
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |    8 +++++---
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |   15 ++++++++++++++-
+ .../org/apache/hive/spark/client/RemoteDriver.java |    8 ++++++--
+ .../apache/hive/spark/client/SparkClientImpl.java  |   11 +++++++++++
+ 4 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index 8017ade..f60d7d0 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -920,13 +920,15 @@ public void setSparkSession(SparkSession sparkSession) {
+             long endTime = System.currentTimeMillis() + 240000;
+             while (sparkSession.getMemoryAndCores().getSecond() <= 1) {
+               if (System.currentTimeMillis() >= endTime) {
+-                LOG.error("Timed out waiting for Spark cluster to init");
+-                break;
++                String msg = "Timed out waiting for Spark cluster to init";
++                throw new IllegalStateException(msg);
+               }
+               Thread.sleep(100);
+             }
+           } catch (Exception e) {
+-            LOG.error(e);
++            String msg = "Error trying to obtain executor info: " + e;
++            LOG.error(msg, e);
++            throw new IllegalStateException(msg, e);
+           }
+         }
+       }
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index 8ccf8e3..1237066 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -429,6 +429,18 @@ public void setupConfiguration(Configuration conf) {
+     }
+   }
+ 
++  private void configureImpersonation(Configuration conf) {
++    String user;
++    try {
++      user = Utils.getUGI().getShortUserName();
++    } catch (Exception e) {
++      String msg = "Cannot obtain username: " + e;
++      throw new IllegalStateException(msg, e);
++    }
++    conf.set("hadoop.proxyuser." + user + ".groups", "*");
++    conf.set("hadoop.proxyuser." + user + ".hosts", "*");
++  }
++
+   /**
+    * Returns a shim to wrap MiniSparkOnYARNCluster
+    */
+@@ -448,10 +460,10 @@ public MiniMrShim getMiniSparkCluster(Configuration conf, int numberOfTaskTracke
+ 
+     public MiniSparkShim(Configuration conf, int numberOfTaskTrackers,
+       String nameNode, int numDir) throws IOException {
+-
+       mr = new MiniSparkOnYARNCluster("sparkOnYarn");
+       conf.set("fs.defaultFS", nameNode);
+       conf.set("yarn.resourcemanager.scheduler.class", "org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler");
++      configureImpersonation(conf);
+       mr.init(conf);
+       mr.start();
+       this.conf = mr.getConfig();
+@@ -506,6 +518,7 @@ public void setupConfiguration(Configuration conf) {
+       int numDataNodes,
+       boolean format,
+       String[] racks) throws IOException {
++    configureImpersonation(conf);
+     MiniDFSCluster miniDFSCluster = new MiniDFSCluster(conf, numDataNodes, format, racks);
+ 
+     // Need to set the client's KeyProvider to the NN's for JKS,
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/RemoteDriver.java b/spark-client/src/main/java/org/apache/hive/spark/client/RemoteDriver.java
+index c2ac0c2..4e15902 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/RemoteDriver.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/RemoteDriver.java
+@@ -166,7 +166,7 @@ public void rpcClosed(Rpc rpc) {
+         jcLock.notifyAll();
+       }
+     } catch (Exception e) {
+-      LOG.error("Failed to start SparkContext.", e);
++      LOG.error("Failed to start SparkContext: " + e, e);
+       shutdown(e);
+       synchronized (jcLock) {
+         jcLock.notifyAll();
+@@ -203,7 +203,11 @@ private void submit(JobWrapper<?> job) {
+ 
+   private synchronized void shutdown(Throwable error) {
+     if (running) {
+-      LOG.info("Shutting down remote driver.");
++      if (error == null) {
++        LOG.info("Shutting down remote driver.");
++      } else {
++        LOG.error("Shutting down remote driver due to error: " + error, error);
++      }
+       running = false;
+       for (JobWrapper<?> job : activeJobs.values()) {
+         cancelJob(job);
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+index 9f9a1c1..ba08106 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+@@ -47,6 +47,7 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hive.spark.client.rpc.Rpc;
+ import org.apache.hive.spark.client.rpc.RpcConfiguration;
+ import org.apache.hive.spark.client.rpc.RpcServer;
+@@ -350,6 +351,16 @@ public void run() {
+         }
+       }
+ 
++      if (hiveConf.getBoolVar(HiveConf.ConfVars.HIVE_SERVER2_ENABLE_DOAS)) {
++        argv.add("--proxy-user");
++        try {
++          argv.add(Utils.getUGI().getShortUserName());
++        } catch (Exception e) {
++          String msg = "Cannot obtain username: " + e;
++          throw new IllegalStateException(msg, e);
++        }
++      }
++
+       argv.add("--properties-file");
+       argv.add(properties.getAbsolutePath());
+       argv.add("--class");
+-- 
+1.7.9.5
+

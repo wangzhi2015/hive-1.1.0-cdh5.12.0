@@ -1,0 +1,613 @@
+From 2eeea08edc303484c0dc0afb536d0fc82361ef35 Mon Sep 17 00:00:00 2001
+From: Jason Dere <jdere@apache.org>
+Date: Fri, 17 Apr 2015 17:59:16 +0000
+Subject: [PATCH 0818/1164] CDH-41489 HIVE-10276: Implement
+ date_format(timestamp, fmt) UDF (Alex Pivovarov
+ via Jason Dere)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1674370 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 9529a68ef3cfa7d773eef923da897dac8e523c70)
+
+Change-Id: I0eb18275348b26176b4c1f3bfc4e9052c27a4dce
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    1 +
+ .../hive/ql/udf/generic/GenericUDFDateFormat.java  |  125 ++++++++++++++
+ .../ql/udf/generic/TestGenericUDFDateFormat.java   |  173 ++++++++++++++++++++
+ .../test/queries/clientpositive/udf_date_format.q  |   60 +++++++
+ .../results/clientpositive/show_functions.q.out    |    2 +
+ .../results/clientpositive/udf_date_format.q.out   |  172 +++++++++++++++++++
+ 6 files changed, 533 insertions(+)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateFormat.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFDateFormat.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_date_format.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_date_format.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 050c155..9d081f3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -270,6 +270,7 @@
+     system.registerGenericUDF("last_day", GenericUDFLastDay.class);
+     system.registerGenericUDF("next_day", GenericUDFNextDay.class);
+     system.registerGenericUDF("trunc", GenericUDFTrunc.class);
++    system.registerGenericUDF("date_format", GenericUDFDateFormat.class);
+ 
+     system.registerGenericUDF("date_add", GenericUDFDateAdd.class);
+     system.registerGenericUDF("date_sub", GenericUDFDateSub.class);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateFormat.java
+new file mode 100644
+index 0000000..b709e95
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFDateFormat.java
+@@ -0,0 +1,125 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.DATE_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
++import java.text.SimpleDateFormat;
++import java.util.Date;
++
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.io.Text;
++
++/**
++ * GenericUDFDateFormat.
++ *
++ * converts a date/timestamp/string to a value of string in the format specified
++ * by the java date format
++ *
++ */
++@Description(name = "date_format", value = "_FUNC_(date/timestamp/string, fmt) - converts a date/timestamp/string "
++    + "to a value of string in the format specified by the date format fmt.",
++    extended = "Supported formats are SimpleDateFormat formats - "
++    + "https://docs.oracle.com/javase/7/docs/api/java/text/SimpleDateFormat.html. "
++    + "Second argument fmt should be constant.\n"
++    + "Example: > SELECT _FUNC_('2015-04-08', 'y');\n '2015'")
++public class GenericUDFDateFormat extends GenericUDF {
++  private transient Converter[] tsConverters = new Converter[2];
++  private transient PrimitiveCategory[] tsInputTypes = new PrimitiveCategory[2];
++  private transient Converter[] dtConverters = new Converter[2];
++  private transient PrimitiveCategory[] dtInputTypes = new PrimitiveCategory[2];
++  private final Text output = new Text();
++  private transient SimpleDateFormat formatter;
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    checkArgsSize(arguments, 2, 2);
++
++    checkArgPrimitive(arguments, 0);
++    checkArgPrimitive(arguments, 1);
++
++    // the function should support both short date and full timestamp format
++    // time part of the timestamp should not be skipped
++    checkArgGroups(arguments, 0, tsInputTypes, STRING_GROUP, DATE_GROUP);
++    checkArgGroups(arguments, 0, dtInputTypes, STRING_GROUP, DATE_GROUP);
++
++    checkArgGroups(arguments, 1, tsInputTypes, STRING_GROUP);
++
++    obtainTimestampConverter(arguments, 0, tsInputTypes, tsConverters);
++    obtainDateConverter(arguments, 0, dtInputTypes, dtConverters);
++
++    if (arguments[1] instanceof ConstantObjectInspector) {
++      String fmtStr = getConstantStringValue(arguments, 1);
++      if (fmtStr != null) {
++        try {
++          formatter = new SimpleDateFormat(fmtStr);
++        } catch (IllegalArgumentException e) {
++          // ignore
++        }
++      }
++    } else {
++      throw new UDFArgumentTypeException(1, getFuncName() + " only takes constant as "
++          + getArgOrder(1) + " argument");
++    }
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    return outputOI;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    if (formatter == null) {
++      return null;
++    }
++    // the function should support both short date and full timestamp format
++    // time part of the timestamp should not be skipped
++    Date date = getTimestampValue(arguments, 0, tsConverters);
++    if (date == null) {
++      date = getDateValue(arguments, 0, dtInputTypes, dtConverters);
++      if (date == null) {
++        return null;
++      }
++    }
++
++    String res = formatter.format(date);
++    if (res == null) {
++      return null;
++    }
++    output.set(res);
++    return output;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "date_format";
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFDateFormat.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFDateFormat.java
+new file mode 100644
+index 0000000..db53a49
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFDateFormat.java
+@@ -0,0 +1,173 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import java.sql.Date;
++import java.sql.Timestamp;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
++import org.apache.hadoop.hive.serde2.io.TimestampWritable;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
++import org.apache.hadoop.io.Text;
++
++public class TestGenericUDFDateFormat extends TestCase {
++
++  public void testDateFormatStr() throws HiveException {
++    GenericUDFDateFormat udf = new GenericUDFDateFormat();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    Text fmtText = new Text("EEEE");
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.stringTypeInfo, fmtText);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    // date str
++    runAndVerifyStr("2015-04-05", fmtText, "Sunday", udf);
++    runAndVerifyStr("2015-04-06", fmtText, "Monday", udf);
++    runAndVerifyStr("2015-04-07", fmtText, "Tuesday", udf);
++    runAndVerifyStr("2015-04-08", fmtText, "Wednesday", udf);
++    runAndVerifyStr("2015-04-09", fmtText, "Thursday", udf);
++    runAndVerifyStr("2015-04-10", fmtText, "Friday", udf);
++    runAndVerifyStr("2015-04-11", fmtText, "Saturday", udf);
++    runAndVerifyStr("2015-04-12", fmtText, "Sunday", udf);
++    // wrong date str
++    runAndVerifyStr("2016-02-30", fmtText, "Tuesday", udf);
++    runAndVerifyStr("2014-01-32", fmtText, "Saturday", udf);
++    runAndVerifyStr("01/14/2014", fmtText, null, udf);
++    runAndVerifyStr(null, fmtText, null, udf);
++
++    // ts str
++    runAndVerifyStr("2015-04-05 10:30:45", fmtText, "Sunday", udf);
++    runAndVerifyStr("2015-04-06 10:30:45", fmtText, "Monday", udf);
++    runAndVerifyStr("2015-04-07 10:30:45", fmtText, "Tuesday", udf);
++    runAndVerifyStr("2015-04-08 10:30:45", fmtText, "Wednesday", udf);
++    runAndVerifyStr("2015-04-09 10:30", fmtText, "Thursday", udf);
++    runAndVerifyStr("2015-04-10 10:30:45.123", fmtText, "Friday", udf);
++    runAndVerifyStr("2015-04-11T10:30:45", fmtText, "Saturday", udf);
++    runAndVerifyStr("2015-04-12 10", fmtText, "Sunday", udf);
++    // wrong ts str
++    runAndVerifyStr("2016-02-30 10:30:45", fmtText, "Tuesday", udf);
++    runAndVerifyStr("2014-01-32 10:30:45", fmtText, "Saturday", udf);
++    runAndVerifyStr("01/14/2014 10:30:45", fmtText, null, udf);
++    runAndVerifyStr("2016-02-28T10:30:45", fmtText, "Sunday", udf);
++  }
++
++  public void testDateFormatDate() throws HiveException {
++    GenericUDFDateFormat udf = new GenericUDFDateFormat();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableDateObjectInspector;
++    Text fmtText = new Text("EEEE");
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.stringTypeInfo, fmtText);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyDate("2015-04-05", fmtText, "Sunday", udf);
++    runAndVerifyDate("2015-04-06", fmtText, "Monday", udf);
++    runAndVerifyDate("2015-04-07", fmtText, "Tuesday", udf);
++    runAndVerifyDate("2015-04-08", fmtText, "Wednesday", udf);
++    runAndVerifyDate("2015-04-09", fmtText, "Thursday", udf);
++    runAndVerifyDate("2015-04-10", fmtText, "Friday", udf);
++    runAndVerifyDate("2015-04-11", fmtText, "Saturday", udf);
++    runAndVerifyDate("2015-04-12", fmtText, "Sunday", udf);
++  }
++
++  public void testDateFormatTs() throws HiveException {
++    GenericUDFDateFormat udf = new GenericUDFDateFormat();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableTimestampObjectInspector;
++    Text fmtText = new Text("EEEE");
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.stringTypeInfo, fmtText);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyTs("2015-04-08 10:30:45", fmtText, "Wednesday", udf);
++    runAndVerifyTs("2015-04-05 10:30:45", fmtText, "Sunday", udf);
++    runAndVerifyTs("2015-04-06 10:30:45", fmtText, "Monday", udf);
++    runAndVerifyTs("2015-04-07 10:30:45", fmtText, "Tuesday", udf);
++    runAndVerifyTs("2015-04-08 10:30:45", fmtText, "Wednesday", udf);
++    runAndVerifyTs("2015-04-09 10:30:45", fmtText, "Thursday", udf);
++    runAndVerifyTs("2015-04-10 10:30:45.123", fmtText, "Friday", udf);
++    runAndVerifyTs("2015-04-11 10:30:45.123456789", fmtText, "Saturday", udf);
++    runAndVerifyTs("2015-04-12 10:30:45", fmtText, "Sunday", udf);
++  }
++
++  public void testNullFmt() throws HiveException {
++    GenericUDFDateFormat udf = new GenericUDFDateFormat();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    Text fmtText = null;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.stringTypeInfo, fmtText);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr("2015-04-05", fmtText, null, udf);
++  }
++
++  public void testWrongFmt() throws HiveException {
++    GenericUDFDateFormat udf = new GenericUDFDateFormat();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    Text fmtText = new Text("Q");
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.stringTypeInfo, fmtText);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr("2015-04-05", fmtText, null, udf);
++  }
++
++  private void runAndVerifyStr(String str, Text fmtText, String expResult, GenericUDF udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(str != null ? new Text(str) : null);
++    DeferredObject valueObj1 = new DeferredJavaObject(fmtText);
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("date_format() test ", expResult, output != null ? output.toString() : null);
++  }
++
++  private void runAndVerifyDate(String str, Text fmtText, String expResult, GenericUDF udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(str != null ? new DateWritable(
++        Date.valueOf(str)) : null);
++    DeferredObject valueObj1 = new DeferredJavaObject(fmtText);
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("date_format() test ", expResult, output != null ? output.toString() : null);
++  }
++
++  private void runAndVerifyTs(String str, Text fmtText, String expResult, GenericUDF udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(str != null ? new TimestampWritable(
++        Timestamp.valueOf(str)) : null);
++    DeferredObject valueObj1 = new DeferredJavaObject(fmtText);
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("date_format() test ", expResult, output != null ? output.toString() : null);
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_date_format.q b/ql/src/test/queries/clientpositive/udf_date_format.q
+new file mode 100644
+index 0000000..fd8906f
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_date_format.q
+@@ -0,0 +1,60 @@
++DESCRIBE FUNCTION date_format;
++DESC FUNCTION EXTENDED date_format;
++
++explain select date_format('2015-04-08', 'EEEE');
++
++--string date
++select
++date_format('2015-04-08', 'E'),
++date_format('2015-04-08', 'G'),
++date_format('2015-04-08', 'y'),
++date_format('2015-04-08', 'Y'),
++date_format('2015-04-08', 'MMM'),
++date_format('2015-04-08', 'w'),
++date_format('2015-04-08', 'W'),
++date_format('2015-04-08', 'D'),
++date_format('2015-04-08', 'd'),
++date_format(cast(null as string), 'dd'),
++date_format('01/29/2014', 'dd');
++
++--string timestamp
++select
++date_format('2015-04-08 10:30:45', 'HH'),
++date_format('2015-04-08 10:30:45', 'mm'),
++date_format('2015-04-08 10:30:45', 'ss'),
++date_format('2015-04-08 21:30:45', 'hh a'),
++date_format('2015-04-08 10:30', 'dd'),
++date_format('2015-04-08 10:30:45.123', 'S'),
++date_format('2015-04-08T10:30:45', 'dd'),
++date_format('2015-04-08 10', 'dd'),
++date_format(cast(null as string), 'dd'),
++date_format('04/08/2015 10:30:45', 'dd');
++
++--date
++select
++date_format(cast('2015-04-08' as date), 'EEEE'),
++date_format(cast('2015-04-08' as date), 'G'),
++date_format(cast('2015-04-08' as date), 'yyyy'),
++date_format(cast('2015-04-08' as date), 'YY'),
++date_format(cast('2015-04-08' as date), 'MMM'),
++date_format(cast('2015-04-08' as date), 'w'),
++date_format(cast('2015-04-08' as date), 'W'),
++date_format(cast('2015-04-08' as date), 'D'),
++date_format(cast('2015-04-08' as date), 'd'),
++date_format(cast(null as date), 'dd');
++
++--timestamp
++select
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'HH'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'mm'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'ss'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'hh a'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'dd'),
++date_format(cast('2015-04-08 10:30:45.123' as timestamp), 'SSS'),
++date_format(cast('2015-04-08 10:30:45.123456789' as timestamp), 'SSS'),
++date_format(cast(null as timestamp), 'HH');
++
++-- wrong fmt
++select
++date_format('2015-04-08', ''),
++date_format('2015-04-08', 'Q');
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index 868c80d..c2aa95c 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -57,6 +57,7 @@ current_date
+ current_timestamp
+ current_user
+ date_add
++date_format
+ date_sub
+ datediff
+ day
+@@ -299,6 +300,7 @@ POSTHOOK: query: SHOW FUNCTIONS '.*date.*'
+ POSTHOOK: type: SHOWFUNCTIONS
+ current_date
+ date_add
++date_format
+ date_sub
+ datediff
+ to_date
+diff --git a/ql/src/test/results/clientpositive/udf_date_format.q.out b/ql/src/test/results/clientpositive/udf_date_format.q.out
+new file mode 100644
+index 0000000..acca21e
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_date_format.q.out
+@@ -0,0 +1,172 @@
++PREHOOK: query: DESCRIBE FUNCTION date_format
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION date_format
++POSTHOOK: type: DESCFUNCTION
++date_format(date/timestamp/string, fmt) - converts a date/timestamp/string to a value of string in the format specified by the date format fmt.
++PREHOOK: query: DESC FUNCTION EXTENDED date_format
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED date_format
++POSTHOOK: type: DESCFUNCTION
++date_format(date/timestamp/string, fmt) - converts a date/timestamp/string to a value of string in the format specified by the date format fmt.
++Supported formats are SimpleDateFormat formats - https://docs.oracle.com/javase/7/docs/api/java/text/SimpleDateFormat.html. Second argument fmt should be constant.
++Example: > SELECT date_format('2015-04-08', 'y');
++ '2015'
++PREHOOK: query: explain select date_format('2015-04-08', 'EEEE')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select date_format('2015-04-08', 'EEEE')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 'Wednesday' (type: string)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: --string date
++select
++date_format('2015-04-08', 'E'),
++date_format('2015-04-08', 'G'),
++date_format('2015-04-08', 'y'),
++date_format('2015-04-08', 'Y'),
++date_format('2015-04-08', 'MMM'),
++date_format('2015-04-08', 'w'),
++date_format('2015-04-08', 'W'),
++date_format('2015-04-08', 'D'),
++date_format('2015-04-08', 'd'),
++date_format(cast(null as string), 'dd'),
++date_format('01/29/2014', 'dd')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --string date
++select
++date_format('2015-04-08', 'E'),
++date_format('2015-04-08', 'G'),
++date_format('2015-04-08', 'y'),
++date_format('2015-04-08', 'Y'),
++date_format('2015-04-08', 'MMM'),
++date_format('2015-04-08', 'w'),
++date_format('2015-04-08', 'W'),
++date_format('2015-04-08', 'D'),
++date_format('2015-04-08', 'd'),
++date_format(cast(null as string), 'dd'),
++date_format('01/29/2014', 'dd')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++Wed	AD	2015	2015	Apr	15	2	98	8	NULL	NULL
++PREHOOK: query: --string timestamp
++select
++date_format('2015-04-08 10:30:45', 'HH'),
++date_format('2015-04-08 10:30:45', 'mm'),
++date_format('2015-04-08 10:30:45', 'ss'),
++date_format('2015-04-08 21:30:45', 'hh a'),
++date_format('2015-04-08 10:30', 'dd'),
++date_format('2015-04-08 10:30:45.123', 'S'),
++date_format('2015-04-08T10:30:45', 'dd'),
++date_format('2015-04-08 10', 'dd'),
++date_format(cast(null as string), 'dd'),
++date_format('04/08/2015 10:30:45', 'dd')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --string timestamp
++select
++date_format('2015-04-08 10:30:45', 'HH'),
++date_format('2015-04-08 10:30:45', 'mm'),
++date_format('2015-04-08 10:30:45', 'ss'),
++date_format('2015-04-08 21:30:45', 'hh a'),
++date_format('2015-04-08 10:30', 'dd'),
++date_format('2015-04-08 10:30:45.123', 'S'),
++date_format('2015-04-08T10:30:45', 'dd'),
++date_format('2015-04-08 10', 'dd'),
++date_format(cast(null as string), 'dd'),
++date_format('04/08/2015 10:30:45', 'dd')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++10	30	45	09 PM	08	123	08	08	NULL	NULL
++PREHOOK: query: --date
++select
++date_format(cast('2015-04-08' as date), 'EEEE'),
++date_format(cast('2015-04-08' as date), 'G'),
++date_format(cast('2015-04-08' as date), 'yyyy'),
++date_format(cast('2015-04-08' as date), 'YY'),
++date_format(cast('2015-04-08' as date), 'MMM'),
++date_format(cast('2015-04-08' as date), 'w'),
++date_format(cast('2015-04-08' as date), 'W'),
++date_format(cast('2015-04-08' as date), 'D'),
++date_format(cast('2015-04-08' as date), 'd'),
++date_format(cast(null as date), 'dd')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --date
++select
++date_format(cast('2015-04-08' as date), 'EEEE'),
++date_format(cast('2015-04-08' as date), 'G'),
++date_format(cast('2015-04-08' as date), 'yyyy'),
++date_format(cast('2015-04-08' as date), 'YY'),
++date_format(cast('2015-04-08' as date), 'MMM'),
++date_format(cast('2015-04-08' as date), 'w'),
++date_format(cast('2015-04-08' as date), 'W'),
++date_format(cast('2015-04-08' as date), 'D'),
++date_format(cast('2015-04-08' as date), 'd'),
++date_format(cast(null as date), 'dd')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++Wednesday	AD	2015	15	Apr	15	2	98	8	NULL
++PREHOOK: query: --timestamp
++select
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'HH'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'mm'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'ss'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'hh a'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'dd'),
++date_format(cast('2015-04-08 10:30:45.123' as timestamp), 'SSS'),
++date_format(cast('2015-04-08 10:30:45.123456789' as timestamp), 'SSS'),
++date_format(cast(null as timestamp), 'HH')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --timestamp
++select
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'HH'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'mm'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'ss'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'hh a'),
++date_format(cast('2015-04-08 10:30:45' as timestamp), 'dd'),
++date_format(cast('2015-04-08 10:30:45.123' as timestamp), 'SSS'),
++date_format(cast('2015-04-08 10:30:45.123456789' as timestamp), 'SSS'),
++date_format(cast(null as timestamp), 'HH')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++10	30	45	10 AM	08	123	123	NULL
++PREHOOK: query: -- wrong fmt
++select
++date_format('2015-04-08', ''),
++date_format('2015-04-08', 'Q')
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: -- wrong fmt
++select
++date_format('2015-04-08', ''),
++date_format('2015-04-08', 'Q')
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++	NULL
+-- 
+1.7.9.5
+

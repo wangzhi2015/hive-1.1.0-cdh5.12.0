@@ -1,0 +1,627 @@
+From 3244e7568954553e2cf3437f981921cff339f974 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Tue, 10 Jan 2017 21:48:34 -0500
+Subject: [PATCH 0938/1164] CDH-49295: HIVE-15572: Improve the response time
+ for query canceling when it happens during
+ acquiring locks (Yongzhi Chen, reviewed by Chaoyu
+ Tang)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+	ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+	ql/src/java/org/apache/hadoop/hive/ql/lockmgr/EmbeddedLockManager.java
+	ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManager.java
+	ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManagerImpl.java
+	ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
+
+Change-Id: Ia6df4a89e789715b9341465efca6da65eb0f80da
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |  114 ++++++++++----------
+ .../java/org/apache/hadoop/hive/ql/ErrorMsg.java   |    1 +
+ .../hadoop/hive/ql/lockmgr/DbLockManager.java      |    3 +-
+ .../hadoop/hive/ql/lockmgr/DummyTxnManager.java    |    9 +-
+ .../hive/ql/lockmgr/EmbeddedLockManager.java       |    3 +-
+ .../hadoop/hive/ql/lockmgr/HiveLockManager.java    |    3 +-
+ .../hadoop/hive/ql/lockmgr/HiveTxnManager.java     |   15 +++
+ .../hadoop/hive/ql/lockmgr/HiveTxnManagerImpl.java |    8 ++
+ .../zookeeper/ZooKeeperHiveLockManager.java        |   29 +++--
+ .../hive/ql/lockmgr/TestDummyTxnManager.java       |   24 ++++-
+ 10 files changed, 138 insertions(+), 71 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 1dbcb0f..515a053 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -159,13 +159,9 @@
+ 
+   // For WebUI.  Kept alive after queryPlan is freed.
+   private final QueryDisplay queryDisplay = new QueryDisplay();
++  private LockedDriverState lDrvState = new LockedDriverState();
+ 
+-  // a lock is used for synchronizing the state transition and its associated
+-  // resource releases
+-  private final ReentrantLock stateLock = new ReentrantLock();
+-  private DriverState driverState = DriverState.INITIALIZED;
+-
+-  private enum DriverState {
++  public enum DriverState {
+     INITIALIZED,
+     COMPILING,
+     COMPILED,
+@@ -182,6 +178,13 @@
+     ERROR
+   }
+ 
++  public static class LockedDriverState {
++    // a lock is used for synchronizing the state transition and its associated
++    // resource releases
++    public final ReentrantLock stateLock = new ReentrantLock();
++    public DriverState driverState = DriverState.INITIALIZED;
++  }
++
+   private boolean checkConcurrency() {
+     boolean supportConcurrency = conf.getBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY);
+     if (!supportConcurrency) {
+@@ -397,11 +400,11 @@ public int compile(String command, boolean resetTaskIds) {
+   public int compile(String command, boolean resetTaskIds, boolean deferClose) {
+     PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.COMPILE);
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+-      driverState = DriverState.COMPILING;
++      lDrvState.driverState = DriverState.COMPILING;
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+ 
+     command = new VariableSubstitution(new HiveVariableSource() {
+@@ -592,15 +595,15 @@ public int compile(String command, boolean resetTaskIds, boolean deferClose) {
+       if (isInterrupted && !deferClose) {
+         closeInProcess(true);
+       }
+-      stateLock.lock();
++      lDrvState.stateLock.lock();
+       try {
+         if (isInterrupted) {
+-          driverState = deferClose ? DriverState.EXECUTING : DriverState.ERROR;
++          lDrvState.driverState = deferClose ? DriverState.EXECUTING : DriverState.ERROR;
+         } else {
+-          driverState = compileError ? DriverState.ERROR : DriverState.COMPILED;
++          lDrvState.driverState = compileError ? DriverState.ERROR : DriverState.COMPILED;
+         }
+       } finally {
+-        stateLock.unlock();
++        lDrvState.stateLock.unlock();
+       }
+ 
+       if (isInterrupted) {
+@@ -619,16 +622,16 @@ private int handleInterruption(String msg) {
+   }
+ 
+   private boolean isInterrupted() {
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+-      if (driverState == DriverState.INTERRUPT) {
++      if (lDrvState.driverState == DriverState.INTERRUPT) {
+         Thread.currentThread().interrupt();
+         return true;
+       } else {
+         return false;
+       }
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+   }
+ 
+@@ -1121,8 +1124,7 @@ private int acquireLocksAndOpenTxn() {
+         // our list of valid transactions.  We don't have a way to do that right now.
+       }
+ 
+-      txnMgr.acquireLocks(plan, ctx, userFromUGI);
+-
++      txnMgr.acquireLocks(plan, ctx, userFromUGI, lDrvState);
+       return 0;
+     } catch (Exception e) {
+       errorMessage = "FAILED: Error in acquiring locks: " + e.getMessage();
+@@ -1342,21 +1344,21 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+       return createProcessorResponse(12);
+     }
+ 
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+       if (alreadyCompiled) {
+-        if (driverState == DriverState.COMPILED) {
+-          driverState = DriverState.EXECUTING;
++        if (lDrvState.driverState == DriverState.COMPILED) {
++          lDrvState.driverState = DriverState.EXECUTING;
+         } else {
+           errorMessage = "FAILED: Precompiled query has been cancelled or closed.";
+           console.printError(errorMessage);
+           return createProcessorResponse(12);
+         }
+       } else {
+-        driverState = DriverState.COMPILING;
++        lDrvState.driverState = DriverState.COMPILING;
+       }
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+ 
+     // a flag that helps to set the correct driver state in finally block by tracking if
+@@ -1467,15 +1469,15 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+         // only release the related resources ctx, driverContext as normal
+         releaseResources();
+       }
+-      stateLock.lock();
++      lDrvState.stateLock.lock();
+       try {
+-        if (driverState == DriverState.INTERRUPT) {
+-          driverState = DriverState.ERROR;
++        if (lDrvState.driverState == DriverState.INTERRUPT) {
++          lDrvState.driverState = DriverState.ERROR;
+         } else {
+-          driverState = isFinishedWithError ? DriverState.ERROR : DriverState.EXECUTED;
++          lDrvState.driverState = isFinishedWithError ? DriverState.ERROR : DriverState.EXECUTED;
+         }
+       } finally {
+-        stateLock.unlock();
++        lDrvState.stateLock.unlock();
+       }
+     }
+   }
+@@ -1575,22 +1577,22 @@ public int execute(boolean deferClose) throws CommandNeedRetryException {
+     // hide sensitive information during query redaction.
+     String queryStr = HiveConf.getVar(conf, HiveConf.ConfVars.HIVEQUERYSTRING);
+ 
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+       // if query is not in compiled state, or executing state which is carried over from
+       // a combined compile/execute in runInternal, throws the error
+-      if (driverState != DriverState.COMPILED &&
+-          driverState != DriverState.EXECUTING) {
++      if (lDrvState.driverState != DriverState.COMPILED &&
++          lDrvState.driverState != DriverState.EXECUTING) {
+         SQLState = "HY008";
+         errorMessage = "FAILED: query " + queryStr + " has " +
+-            (driverState == DriverState.INTERRUPT ? "been cancelled" : "not been compiled.");
++            (lDrvState.driverState == DriverState.INTERRUPT ? "been cancelled" : "not been compiled.");
+         console.printError(errorMessage);
+         return 1000;
+       } else {
+-        driverState = DriverState.EXECUTING;
++        lDrvState.driverState = DriverState.EXECUTING;
+       }
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+ 
+     maxthreads = HiveConf.getIntVar(conf, HiveConf.ConfVars.EXECPARALLETHREADNUMBER);
+@@ -1865,17 +1867,17 @@ public int execute(boolean deferClose) throws CommandNeedRetryException {
+       if (isInterrupted && !deferClose) {
+         closeInProcess(true);
+       }
+-      stateLock.lock();
++      lDrvState.stateLock.lock();
+       try {
+         if (isInterrupted) {
+           if (!deferClose) {
+-            driverState = DriverState.ERROR;
++            lDrvState.driverState = DriverState.ERROR;
+           }
+         } else {
+-          driverState = executionError ? DriverState.ERROR : DriverState.EXECUTED;
++          lDrvState.driverState = executionError ? DriverState.ERROR : DriverState.EXECUTED;
+         }
+       } finally {
+-        stateLock.unlock();
++        lDrvState.stateLock.unlock();
+       }
+       if (isInterrupted) {
+         LOG.info("Executing command(queryId=" + queryId + ") has been interrupted after " + duration + " seconds");
+@@ -1893,7 +1895,7 @@ public int execute(boolean deferClose) throws CommandNeedRetryException {
+ 
+   private void releasePlan(QueryPlan plan) {
+     // Plan maybe null if Driver.close is called in another thread for the same Driver object
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+       if (plan != null) {
+         plan.setDone();
+@@ -1907,7 +1909,7 @@ private void releasePlan(QueryPlan plan) {
+         }
+       }
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+   }
+ 
+@@ -1984,7 +1986,7 @@ public boolean isFetchingTable() {
+ 
+   @SuppressWarnings("unchecked")
+   public boolean getResults(List res) throws IOException, CommandNeedRetryException {
+-    if (driverState == DriverState.DESTROYED || driverState == DriverState.CLOSED) {
++    if (lDrvState.driverState == DriverState.DESTROYED || lDrvState.driverState == DriverState.CLOSED) {
+       throw new IOException("FAILED: query has been cancelled, closed, or destroyed.");
+     }
+ 
+@@ -2040,7 +2042,7 @@ public boolean getResults(List res) throws IOException, CommandNeedRetryExceptio
+   }
+ 
+   public void resetFetch() throws IOException {
+-    if (driverState == DriverState.DESTROYED || driverState == DriverState.CLOSED) {
++    if (lDrvState.driverState == DriverState.DESTROYED || lDrvState.driverState == DriverState.CLOSED) {
+       throw new IOException("FAILED: driver has been cancelled, closed or destroyed.");
+     }
+     if (isFetchingTable()) {
+@@ -2068,7 +2070,7 @@ public void setTryCount(int tryCount) {
+   // DriverContext could be released in the query and close processes at same
+   // time, which needs to be thread protected.
+   private void releaseDriverContext() {
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+       if (driverCxt != null) {
+         driverCxt.shutdown();
+@@ -2077,7 +2079,7 @@ private void releaseDriverContext() {
+     } catch (Exception e) {
+       LOG.debug("Exception while shutting down the task runner", e);
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+   }
+ 
+@@ -2159,22 +2161,22 @@ private int closeInProcess(boolean destroyed) {
+ 
+   // is called to stop the query if it is running, clean query results, and release resources.
+   public int close() {
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+       releaseDriverContext();
+-      if (driverState == DriverState.COMPILING ||
+-          driverState == DriverState.EXECUTING ||
+-          driverState == DriverState.INTERRUPT) {
+-        driverState = DriverState.INTERRUPT;
++      if (lDrvState.driverState == DriverState.COMPILING ||
++          lDrvState.driverState == DriverState.EXECUTING ||
++          lDrvState.driverState == DriverState.INTERRUPT) {
++        lDrvState.driverState = DriverState.INTERRUPT;
+         return 0;
+       }
+       releasePlan();
+       releaseFetchTask();
+       releaseResStream();
+       releaseContext();
+-      driverState = DriverState.CLOSED;
++      lDrvState.driverState = DriverState.CLOSED;
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+     if (SessionState.get() != null) {
+       SessionState.get().getLineageState().clear();
+@@ -2185,18 +2187,18 @@ public int close() {
+   // is usually called after close() to commit or rollback a query and end the driver life cycle.
+   // do not understand why it is needed and wonder if it could be combined with close.
+   public void destroy() {
+-    stateLock.lock();
++    lDrvState.stateLock.lock();
+     try {
+       // in the cancel case where the driver state is INTERRUPTED, destroy will be deferred to
+       // the query process
+-      if (driverState == DriverState.DESTROYED ||
+-          driverState == DriverState.INTERRUPT) {
++      if (lDrvState.driverState == DriverState.DESTROYED ||
++          lDrvState.driverState == DriverState.INTERRUPT) {
+         return;
+       } else {
+-        driverState = DriverState.DESTROYED;
++        lDrvState.driverState = DriverState.DESTROYED;
+       }
+     } finally {
+-      stateLock.unlock();
++      lDrvState.stateLock.unlock();
+     }
+     if (!hiveLocks.isEmpty()) {
+       try {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+index 8b34513..a8f0687 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+@@ -432,6 +432,7 @@
+   COMPILE_LOCK_TIMED_OUT(10308, "Attempt to acquire compile lock timed out.", true),
+   UPDATE_CANNOT_UPDATE_BUCKET_VALUE(10302, "Updating values of bucketing columns is not supported.  Column {0}.", true),
+   IMPORT_INTO_STRICT_REPL_TABLE(10303,"Non-repl import disallowed against table that is a destination of replication."),
++  LOCK_ACQUIRE_CANCELLED(10330, "Query was cancelled while acquiring locks on the underlying objects. "),
+   //========================== 20000 range starts here ========================//
+   SCRIPT_INIT_ERROR(20000, "Unable to initialize custom script."),
+   SCRIPT_IO_ERROR(20001, "An error occurred while reading or writing to your custom script. "
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DbLockManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DbLockManager.java
+index 1ecdeca..8ebef20 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DbLockManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DbLockManager.java
+@@ -26,6 +26,7 @@
+ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.api.*;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+ import org.apache.thrift.TException;
+ 
+@@ -67,7 +68,7 @@ public HiveLock lock(HiveLockObject key, HiveLockMode mode,
+   }
+ 
+   @Override
+-  public List<HiveLock> lock(List<HiveLockObj> objs, boolean keepAlive) throws
++  public List<HiveLock> lock(List<HiveLockObj> objs, boolean keepAlive, LockedDriverState lDrvState) throws
+       LockException {
+     throw new UnsupportedOperationException();
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java
+index 21ab8ee..3a0f911 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/DummyTxnManager.java
+@@ -24,6 +24,8 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.ql.Context;
++import org.apache.hadoop.hive.ql.Driver.DriverState;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+ import org.apache.hadoop.hive.ql.QueryPlan;
+ import org.apache.hadoop.hive.ql.hooks.ReadEntity;
+@@ -97,6 +99,11 @@ public HiveLockManager getLockManager() throws LockException {
+ 
+   @Override
+   public void acquireLocks(QueryPlan plan, Context ctx, String username) throws LockException {
++    acquireLocks(plan,ctx,username,null);
++  }
++
++  @Override
++  public void acquireLocks(QueryPlan plan, Context ctx, String username, LockedDriverState lDrvState) throws LockException {
+     // Make sure we've built the lock manager
+     getLockManager();
+ 
+@@ -158,7 +165,7 @@ else if (output.getTyp() == WriteEntity.Type.DUMMYPARTITION) {
+     }
+ 
+     dedupLockObjects(lockObjects);
+-    List<HiveLock> hiveLocks = lockMgr.lock(lockObjects, false);
++    List<HiveLock> hiveLocks = lockMgr.lock(lockObjects, false, lDrvState);
+ 
+     if (hiveLocks == null) {
+       throw new LockException(ErrorMsg.LOCK_CANNOT_BE_ACQUIRED.getMsg());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/EmbeddedLockManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/EmbeddedLockManager.java
+index 7d7e7c0..7bd3df6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/EmbeddedLockManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/EmbeddedLockManager.java
+@@ -21,6 +21,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.lockmgr.HiveLockObject.HiveLockObjectData;
+ import org.apache.hadoop.hive.ql.metadata.*;
+ 
+@@ -56,7 +57,7 @@ public HiveLock lock(HiveLockObject key, HiveLockMode mode, boolean keepAlive)
+     return lock(key, mode, numRetriesForLock, sleepTime);
+   }
+ 
+-  public List<HiveLock> lock(List<HiveLockObj> objs, boolean keepAlive) throws LockException {
++  public List<HiveLock> lock(List<HiveLockObj> objs, boolean keepAlive, LockedDriverState lDrvState) throws LockException {
+     return lock(objs, numRetriesForLock, sleepTime);
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockManager.java
+index b2eb997..2f22d74 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockManager.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hive.ql.lockmgr;
+ 
+ import java.util.List;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ 
+ /**
+  * Manager for locks in Hive.  Users should not instantiate a lock manager
+@@ -37,7 +38,7 @@
+   public HiveLock lock(HiveLockObject key, HiveLockMode mode,
+       boolean keepAlive) throws LockException;
+   public List<HiveLock> lock(List<HiveLockObj> objs,
+-      boolean keepAlive) throws LockException;
++      boolean keepAlive, LockedDriverState lDrvState) throws LockException;
+   public void unlock(HiveLock hiveLock) throws LockException;
+   public void releaseLocks(List<HiveLock> hiveLocks);
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManager.java
+index 2dd0c7d..690b828 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManager.java
+@@ -20,6 +20,7 @@
+ import org.apache.hadoop.hive.common.ValidTxnList;
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+ import org.apache.hadoop.hive.ql.Context;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.QueryPlan;
+ 
+ /**
+@@ -60,6 +61,20 @@
+   void acquireLocks(QueryPlan plan, Context ctx, String username) throws LockException;
+ 
+   /**
++   * Acquire all of the locks needed by a query.  If used with a query that
++   * requires transactions, this should be called after {@link #openTxn(String)}.
++   * A list of acquired locks will be stored in the
++   * {@link org.apache.hadoop.hive.ql.Context} object and can be retrieved
++   * via {@link org.apache.hadoop.hive.ql.Context#getHiveLocks}.
++   * @param plan query plan
++   * @param ctx Context for this query
++   * @param username name of the user for this query
++   * @param lDrvState the state to inform if the query cancelled or not
++   * @throws LockException if there is an error getting the locks
++   */
++   void acquireLocks(QueryPlan plan, Context ctx, String username, LockedDriverState lDrvState) throws LockException;
++
++  /**
+    * Commit the current transaction.  This will release all locks obtained in
+    * {@link #acquireLocks(org.apache.hadoop.hive.ql.QueryPlan,
+    * org.apache.hadoop.hive.ql.Context, java.lang.String)}.
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManagerImpl.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManagerImpl.java
+index eccb8d1..6533f83 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManagerImpl.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveTxnManagerImpl.java
+@@ -18,6 +18,9 @@
+ package org.apache.hadoop.hive.ql.lockmgr;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.Context;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
++import org.apache.hadoop.hive.ql.QueryPlan;
+ 
+ /**
+  * An implementation HiveTxnManager that includes internal methods that all
+@@ -40,6 +43,11 @@ public void closeTxnManager() {
+   }
+ 
+   @Override
++  public void acquireLocks(QueryPlan plan, Context ctx, String username, LockedDriverState lDrvState) throws LockException {
++    acquireLocks(plan, ctx, username);
++  }
++
++  @Override
+   protected void finalize() throws Throwable {
+     destruct();
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java
+index bb2c390..79de81c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/zookeeper/ZooKeeperHiveLockManager.java
+@@ -26,6 +26,8 @@
+ import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.Driver.DriverState;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+ import org.apache.hadoop.hive.ql.lockmgr.*;
+ import org.apache.hadoop.hive.ql.lockmgr.HiveLockObject.HiveLockObjectData;
+@@ -144,7 +146,7 @@ private static String getLastObjectName(String parent, HiveLockObject key) {
+    * could not be acquired.
+    **/
+   public List<HiveLock> lock(List<HiveLockObj> lockObjects,
+-      boolean keepAlive) throws LockException
++      boolean keepAlive, LockedDriverState lDrvState) throws LockException
+   {
+     // Sort the objects first. You are guaranteed that if a partition is being locked,
+     // the table has already been locked
+@@ -182,16 +184,29 @@ public int compare(HiveLockObj o1, HiveLockObj o2) {
+       }
+ 
+       HiveLock lock = null;
+-      try {
+-        lock = lock(lockObject.getObj(), lockObject.getMode(), keepAlive, true);
+-      } catch (LockException e) {
+-        console.printError("Error in acquireLocks..." );
+-        LOG.error("Error in acquireLocks...", e);
+-        lock = null;
++      boolean isInterrupted = false;
++      if (lDrvState != null) {
++        lDrvState.stateLock.lock();
++        if (lDrvState.driverState == DriverState.INTERRUPT) {
++          isInterrupted = true;
++        }
++        lDrvState.stateLock.unlock();
++      }
++      if (!isInterrupted) {
++        try {
++          lock = lock(lockObject.getObj(), lockObject.getMode(), keepAlive, true);
++        } catch (LockException e) {
++          console.printError("Error in acquireLocks..." );
++          LOG.error("Error in acquireLocks...", e);
++          lock = null;
++        }
+       }
+ 
+       if (lock == null) {
+         releaseLocks(hiveLocks);
++        if (isInterrupted) {
++          throw new LockException(ErrorMsg.LOCK_ACQUIRE_CANCELLED.getMsg());
++        }
+         return null;
+       }
+ 
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
+index 19f82ad..0d96619 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/lockmgr/TestDummyTxnManager.java
+@@ -26,6 +26,9 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.ql.Context;
++import org.apache.hadoop.hive.ql.ErrorMsg;
++import org.apache.hadoop.hive.ql.Driver.DriverState;
++import org.apache.hadoop.hive.ql.Driver.LockedDriverState;
+ import org.apache.hadoop.hive.ql.QueryPlan;
+ import org.apache.hadoop.hive.ql.hooks.ReadEntity;
+ import org.apache.hadoop.hive.ql.hooks.WriteEntity;
+@@ -95,8 +98,12 @@ public void testSingleReadTable() throws Exception {
+     List<HiveLock> expectedLocks = new ArrayList<HiveLock>();
+     expectedLocks.add(new ZooKeeperHiveLock("default", new HiveLockObject(), HiveLockMode.SHARED));
+     expectedLocks.add(new ZooKeeperHiveLock("default.table1", new HiveLockObject(), HiveLockMode.SHARED));
+-
+-    when(mockLockManager.lock(anyListOf(HiveLockObj.class), eq(false))).thenReturn(expectedLocks);
++    LockedDriverState lDrvState = new LockedDriverState();
++    LockedDriverState lDrvInp = new LockedDriverState();
++    lDrvInp.driverState = DriverState.INTERRUPT;
++    LockException lEx = new LockException(ErrorMsg.LOCK_ACQUIRE_CANCELLED.getMsg());
++    when(mockLockManager.lock(anyListOf(HiveLockObj.class), eq(false), eq(lDrvState))).thenReturn(expectedLocks);
++    when(mockLockManager.lock(anyListOf(HiveLockObj.class), eq(false), eq(lDrvInp))).thenThrow(lEx);
+     doNothing().when(mockLockManager).setContext(any(HiveLockManagerCtx.class));
+     doNothing().when(mockLockManager).close();
+     ArgumentCaptor<List> lockObjsCaptor = ArgumentCaptor.forClass(List.class);
+@@ -105,7 +112,7 @@ public void testSingleReadTable() throws Exception {
+     when(mockQueryPlan.getOutputs()).thenReturn(new HashSet<WriteEntity>());
+ 
+     // Execute
+-    txnMgr.acquireLocks(mockQueryPlan, ctx, "fred");
++    txnMgr.acquireLocks(mockQueryPlan, ctx, "fred", lDrvState);
+ 
+     // Verify
+     Assert.assertEquals("db1", SessionState.get().getCurrentDatabase());
+@@ -116,13 +123,22 @@ public void testSingleReadTable() throws Exception {
+     Assert.assertEquals(expectedLocks.get(1).getHiveLockMode(), resultLocks.get(1).getHiveLockMode());
+     Assert.assertEquals(expectedLocks.get(0).getHiveLockObject().getName(), resultLocks.get(0).getHiveLockObject().getName());
+ 
+-    verify(mockLockManager).lock((List<HiveLockObj>)lockObjsCaptor.capture(), eq(false));
++    verify(mockLockManager).lock((List<HiveLockObj>)lockObjsCaptor.capture(), eq(false), eq(lDrvState));
+     List<HiveLockObj> lockObjs = (List<HiveLockObj>)lockObjsCaptor.getValue();
+     Assert.assertEquals(2, lockObjs.size());
+     Assert.assertEquals("default", lockObjs.get(0).getName());
+     Assert.assertEquals(HiveLockMode.SHARED, lockObjs.get(0).mode);
+     Assert.assertEquals("default/table1", lockObjs.get(1).getName());
+     Assert.assertEquals(HiveLockMode.SHARED, lockObjs.get(1).mode);
++
++    // Execute
++    try {
++      txnMgr.acquireLocks(mockQueryPlan, ctx, "fred", lDrvInp);
++      Assert.fail();
++    } catch(LockException le) {
++      Assert.assertEquals(le.getMessage(), ErrorMsg.LOCK_ACQUIRE_CANCELLED.getMsg());
++    }
++
+   }
+ 
+   @Test
+-- 
+1.7.9.5
+

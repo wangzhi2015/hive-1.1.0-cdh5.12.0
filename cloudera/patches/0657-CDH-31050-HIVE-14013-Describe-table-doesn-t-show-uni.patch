@@ -1,0 +1,391 @@
+From 15806f72ad01c8165703410378a2e39b30a64fa8 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Tue, 14 Jun 2016 16:37:54 -0400
+Subject: [PATCH 0657/1164] CDH-31050: HIVE-14013: Describe table doesn't show
+ unicode properly (Reviewed by Yongzhi Chen)
+
+Change-Id: I25ceabca997bb9e32aaae67fa20cc04db9635046
+---
+ common/pom.xml                                     |    7 +-
+ .../apache/hive/common/util/HiveStringUtils.java   |   25 ++-
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    9 +-
+ .../metadata/formatting/MetaDataFormatUtils.java   |   22 ++-
+ .../test/queries/clientpositive/unicode_comments.q |   17 ++
+ .../results/clientpositive/unicode_comments.q.out  |  166 ++++++++++++++++++++
+ 6 files changed, 237 insertions(+), 9 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/unicode_comments.q
+ create mode 100644 ql/src/test/results/clientpositive/unicode_comments.q.out
+
+diff --git a/common/pom.xml b/common/pom.xml
+index 7b4b275..d07a309 100644
+--- a/common/pom.xml
++++ b/common/pom.xml
+@@ -51,11 +51,16 @@
+       <version>${commons-lang.version}</version>
+     </dependency>
+     <dependency>
++      <groupId>org.apache.commons</groupId>
++      <artifactId>commons-lang3</artifactId>
++      <version>${commons-lang3.version}</version>
++    </dependency>
++    <dependency>
+       <groupId>commons-logging</groupId>
+       <artifactId>commons-logging</artifactId>
+       <version>${commons-logging.version}</version>
+    </dependency>
+-   <dependency>
++    <dependency>
+       <groupId>org.eclipse.jetty.aggregate</groupId>
+       <artifactId>jetty-all</artifactId>
+       <version>${jetty.version}</version>
+diff --git a/common/src/java/org/apache/hive/common/util/HiveStringUtils.java b/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
+index 4bac077..991d6ec 100644
+--- a/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
++++ b/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
+@@ -41,11 +41,15 @@
+ 
+ import com.google.common.collect.Interner;
+ import com.google.common.collect.Interners;
++
++import org.apache.commons.lang3.text.translate.CharSequenceTranslator;
++import org.apache.commons.lang3.text.translate.EntityArrays;
++import org.apache.commons.lang3.text.translate.LookupTranslator;
++
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
+ import org.apache.hadoop.hive.common.classification.InterfaceStability;
+ import org.apache.hadoop.io.Text;
+-import org.apache.hadoop.util.StringUtils;
+ 
+ /**
+  * HiveStringUtils
+@@ -64,6 +68,14 @@
+ 
+   private static final DecimalFormat decimalFormat;
+ 
++  private static final CharSequenceTranslator ESCAPE_JAVA =
++      new LookupTranslator(
++        new String[][] {
++          {"\"", "\\\""},
++          {"\\", "\\\\"},
++      }).with(
++        new LookupTranslator(EntityArrays.JAVA_CTRL_CHARS_ESCAPE()));
++
+   /**
+    * Maintain a String pool to reduce memory.
+    */
+@@ -601,6 +613,17 @@ public static String escapeString(String str, char escapeChar,
+   }
+ 
+   /**
++   * Escape non-unicode characters. StringEscapeUtil.escapeJava() will escape
++   * unicode characters as well but in some cases it's not desired.
++   *
++   * @param str Original string
++   * @return Escaped string
++   */
++  public static String escapeJava(String str) {
++    return ESCAPE_JAVA.translate(str);
++}
++
++  /**
+    * Unescape commas in the string using the default escape char
+    * @param str a string
+    * @return an unescaped string
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index b04be9a..d2855e8 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -31,6 +31,7 @@
+ import java.io.Writer;
+ import java.net.URI;
+ import java.net.URISyntaxException;
++import java.nio.charset.StandardCharsets;
+ import java.sql.SQLException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -1900,7 +1901,7 @@ private int showCreateTable(Hive db, ShowCreateTableDesc showCreateTbl) throws H
+ 
+       if (tbl.isView()) {
+         String createTab_stmt = "CREATE VIEW `" + tableName + "` AS " + tbl.getViewExpandedText();
+-        outStream.writeBytes(createTab_stmt.toString());
++        outStream.write(createTab_stmt.getBytes(StandardCharsets.UTF_8));
+         outStream.close();
+         outStream = null;
+         return 0;
+@@ -2061,7 +2062,7 @@ else if (sortCol.getOrder() == BaseSemanticAnalyzer.HIVE_COLUMN_ORDER_DESC) {
+       }
+       createTab_stmt.add(TBL_PROPERTIES, tbl_properties);
+ 
+-      outStream.writeBytes(createTab_stmt.render());
++      outStream.write(createTab_stmt.render().getBytes(StandardCharsets.UTF_8));
+       outStream.close();
+       outStream = null;
+     } catch (FileNotFoundException e) {
+@@ -2121,14 +2122,14 @@ private int showIndexes(Hive db, ShowIndexesDesc showIndexes) throws HiveExcepti
+ 
+       if (showIndexes.isFormatted()) {
+         // column headers
+-        outStream.writeBytes(MetaDataFormatUtils.getIndexColumnsHeader());
++        outStream.write(MetaDataFormatUtils.getIndexColumnsHeader().getBytes(StandardCharsets.UTF_8));
+         outStream.write(terminator);
+         outStream.write(terminator);
+       }
+ 
+       for (Index index : indexes)
+       {
+-        outStream.writeBytes(MetaDataFormatUtils.getAllColumnsInformation(index));
++        outStream.write(MetaDataFormatUtils.getAllColumnsInformation(index).getBytes(StandardCharsets.UTF_8));
+       }
+ 
+       outStream.close();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/formatting/MetaDataFormatUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/formatting/MetaDataFormatUtils.java
+index 534f90b..fa49566 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/formatting/MetaDataFormatUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/formatting/MetaDataFormatUtils.java
+@@ -52,7 +52,7 @@
+ import org.apache.hadoop.hive.ql.plan.DescTableDesc;
+ import org.apache.hadoop.hive.ql.plan.PlanUtils;
+ import org.apache.hadoop.hive.ql.plan.ShowIndexesDesc;
+-
++import org.apache.hive.common.util.HiveStringUtils;
+ 
+ /**
+  * This class provides methods to format table and index information.
+@@ -356,7 +356,7 @@ private static void getTableMetaDataInformation(StringBuilder tableInfo, Table
+ 
+     if (tbl.getParameters().size() > 0) {
+       tableInfo.append("Table Parameters:").append(LINE_DELIM);
+-      displayAllParameters(tbl.getParameters(), tableInfo);
++      displayAllParameters(tbl.getParameters(), tableInfo, false);
+     }
+   }
+ 
+@@ -377,12 +377,28 @@ private static void getPartitionMetaDataInformation(StringBuilder tableInfo, Par
+     }
+   }
+ 
++  /**
++   * Display key, value pairs of the parameters. The characters will be escaped
++   * including unicode.
++   */
+   private static void displayAllParameters(Map<String, String> params, StringBuilder tableInfo) {
++    displayAllParameters(params, tableInfo, true);
++  }
++
++  /**
++   * Display key, value pairs of the parameters. The characters will be escaped
++   * including unicode if escapeUnicode is true; otherwise the characters other
++   * than unicode will be escaped.
++   */
++
++  private static void displayAllParameters(Map<String, String> params, StringBuilder tableInfo, boolean escapeUnicode) {
+     List<String> keys = new ArrayList<String>(params.keySet());
+     Collections.sort(keys);
+     for (String key : keys) {
+       tableInfo.append(FIELD_DELIM); // Ensures all params are indented.
+-      formatOutput(key, StringEscapeUtils.escapeJava(params.get(key)), tableInfo);
++      formatOutput(key,
++          escapeUnicode ? StringEscapeUtils.escapeJava(params.get(key)) : HiveStringUtils.escapeJava(params.get(key)),
++          tableInfo);
+     }
+   }
+ 
+diff --git a/ql/src/test/queries/clientpositive/unicode_comments.q b/ql/src/test/queries/clientpositive/unicode_comments.q
+new file mode 100644
+index 0000000..4d958e4
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/unicode_comments.q
+@@ -0,0 +1,17 @@
++create database unicode_comments_db comment '数据库';
++use unicode_comments_db;
++create table unicode_comments_tbl1
++(col1 string comment '第一列') comment '表格'
++partitioned by (p1 string comment '分割');
++create view unicode_comments_view1 (col1 comment '第一列') comment '视图'
++as select col1 from unicode_comments_tbl1;
++create index index2 on table unicode_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment '索引';
++
++describe database extended unicode_comments_db;
++show create table unicode_comments_tbl1;
++describe formatted unicode_comments_tbl1;
++show create table unicode_comments_view1;
++describe formatted unicode_comments_view1;
++show formatted index on unicode_comments_tbl1;
++
++drop database unicode_comments_db cascade;
+diff --git a/ql/src/test/results/clientpositive/unicode_comments.q.out b/ql/src/test/results/clientpositive/unicode_comments.q.out
+new file mode 100644
+index 0000000..d8b8d8d
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/unicode_comments.q.out
+@@ -0,0 +1,166 @@
++PREHOOK: query: create database unicode_comments_db comment '数据库'
++PREHOOK: type: CREATEDATABASE
++PREHOOK: Output: database:unicode_comments_db
++POSTHOOK: query: create database unicode_comments_db comment '数据库'
++POSTHOOK: type: CREATEDATABASE
++POSTHOOK: Output: database:unicode_comments_db
++PREHOOK: query: use unicode_comments_db
++PREHOOK: type: SWITCHDATABASE
++PREHOOK: Input: database:unicode_comments_db
++POSTHOOK: query: use unicode_comments_db
++POSTHOOK: type: SWITCHDATABASE
++POSTHOOK: Input: database:unicode_comments_db
++PREHOOK: query: create table unicode_comments_tbl1
++(col1 string comment '第一列') comment '表格'
++partitioned by (p1 string comment '分割')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:unicode_comments_db
++PREHOOK: Output: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: query: create table unicode_comments_tbl1
++(col1 string comment '第一列') comment '表格'
++partitioned by (p1 string comment '分割')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:unicode_comments_db
++POSTHOOK: Output: unicode_comments_db@unicode_comments_tbl1
++PREHOOK: query: create view unicode_comments_view1 (col1 comment '第一列') comment '视图'
++as select col1 from unicode_comments_tbl1
++PREHOOK: type: CREATEVIEW
++PREHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++PREHOOK: Output: database:unicode_comments_db
++PREHOOK: Output: unicode_comments_db@unicode_comments_view1
++POSTHOOK: query: create view unicode_comments_view1 (col1 comment '第一列') comment '视图'
++as select col1 from unicode_comments_tbl1
++POSTHOOK: type: CREATEVIEW
++POSTHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: Output: database:unicode_comments_db
++POSTHOOK: Output: unicode_comments_db@unicode_comments_view1
++PREHOOK: query: create index index2 on table unicode_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment '索引'
++PREHOOK: type: CREATEINDEX
++PREHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: query: create index index2 on table unicode_comments_tbl1(col1) as 'COMPACT' with deferred rebuild comment '索引'
++POSTHOOK: type: CREATEINDEX
++POSTHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: Output: unicode_comments_db@unicode_comments_db__unicode_comments_tbl1_index2__
++PREHOOK: query: describe database extended unicode_comments_db
++PREHOOK: type: DESCDATABASE
++POSTHOOK: query: describe database extended unicode_comments_db
++POSTHOOK: type: DESCDATABASE
++unicode_comments_db	数据库	location/in/test	hive_test_user	USER	
++PREHOOK: query: show create table unicode_comments_tbl1
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: query: show create table unicode_comments_tbl1
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++CREATE TABLE `unicode_comments_tbl1`(
++  `col1` string COMMENT '第一列')
++COMMENT '表格'
++PARTITIONED BY ( 
++  `p1` string COMMENT '分割')
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++#### A masked pattern was here ####
++PREHOOK: query: describe formatted unicode_comments_tbl1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: query: describe formatted unicode_comments_tbl1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: unicode_comments_db@unicode_comments_tbl1
++# col_name            	data_type           	comment             
++	 	 
++col1                	string              	第一列                 
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++p1                  	string              	分割                  
++	 	 
++# Detailed Table Information	 	 
++Database:           	unicode_comments_db 	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++#### A masked pattern was here ####
++Table Type:         	MANAGED_TABLE       	 
++Table Parameters:	 	 
++	comment             	表格                  
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++Storage Desc Params:	 	 
++	serialization.format	1                   
++PREHOOK: query: show create table unicode_comments_view1
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: unicode_comments_db@unicode_comments_view1
++POSTHOOK: query: show create table unicode_comments_view1
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: unicode_comments_db@unicode_comments_view1
++CREATE VIEW `unicode_comments_view1` AS SELECT `col1` AS `col1` FROM (select `unicode_comments_tbl1`.`col1` from `unicode_comments_db`.`unicode_comments_tbl1`) `unicode_comments_db.unicode_comments_view1`
++PREHOOK: query: describe formatted unicode_comments_view1
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: unicode_comments_db@unicode_comments_view1
++POSTHOOK: query: describe formatted unicode_comments_view1
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: unicode_comments_db@unicode_comments_view1
++# col_name            	data_type           	comment             
++	 	 
++col1                	string              	第一列                 
++	 	 
++# Detailed Table Information	 	 
++Database:           	unicode_comments_db 	 
++#### A masked pattern was here ####
++Protect Mode:       	None                	 
++Retention:          	0                   	 
++Table Type:         	VIRTUAL_VIEW        	 
++Table Parameters:	 	 
++	comment             	视图                  
++#### A masked pattern was here ####
++	 	 
++# Storage Information	 	 
++SerDe Library:      	null                	 
++InputFormat:        	org.apache.hadoop.mapred.TextInputFormat	 
++OutputFormat:       	org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat	 
++Compressed:         	No                  	 
++Num Buckets:        	-1                  	 
++Bucket Columns:     	[]                  	 
++Sort Columns:       	[]                  	 
++	 	 
++# View Information	 	 
++View Original Text: 	select col1 from unicode_comments_tbl1	 
++View Expanded Text: 	SELECT `col1` AS `col1` FROM (select `unicode_comments_tbl1`.`col1` from `unicode_comments_db`.`unicode_comments_tbl1`) `unicode_comments_db.unicode_comments_view1`	 
++PREHOOK: query: show formatted index on unicode_comments_tbl1
++PREHOOK: type: SHOWINDEXES
++POSTHOOK: query: show formatted index on unicode_comments_tbl1
++POSTHOOK: type: SHOWINDEXES
++idx_name            	tab_name            	col_names           	idx_tab_name        	idx_type            	comment             
++	 	 	 	 	 
++	 	 	 	 	 
++index2              	unicode_comments_tbl1	col1                	unicode_comments_db__unicode_comments_tbl1_index2__	compact             	索引                  
++PREHOOK: query: drop database unicode_comments_db cascade
++PREHOOK: type: DROPDATABASE
++PREHOOK: Input: database:unicode_comments_db
++PREHOOK: Output: database:unicode_comments_db
++PREHOOK: Output: unicode_comments_db@unicode_comments_db__unicode_comments_tbl1_index2__
++PREHOOK: Output: unicode_comments_db@unicode_comments_tbl1
++PREHOOK: Output: unicode_comments_db@unicode_comments_view1
++POSTHOOK: query: drop database unicode_comments_db cascade
++POSTHOOK: type: DROPDATABASE
++POSTHOOK: Input: database:unicode_comments_db
++POSTHOOK: Output: database:unicode_comments_db
++POSTHOOK: Output: unicode_comments_db@unicode_comments_db__unicode_comments_tbl1_index2__
++POSTHOOK: Output: unicode_comments_db@unicode_comments_tbl1
++POSTHOOK: Output: unicode_comments_db@unicode_comments_view1
+-- 
+1.7.9.5
+

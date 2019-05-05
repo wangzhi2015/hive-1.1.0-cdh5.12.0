@@ -1,0 +1,716 @@
+From b195ad2090f87be5eb40871cfdb6a486637bea19 Mon Sep 17 00:00:00 2001
+From: Sahil Takiar <stakiar@cloudera.com>
+Date: Fri, 28 Oct 2016 10:50:58 -0500
+Subject: [PATCH 0829/1164] CLOUDERA-BUILD: CDH-47361: HIVE-15093: For
+ S3-to-S3 renames, files should be moved
+ individually rather than at a directory level
+
+Change-Id: I08d07e3f5fbcb34aa388f32673e39048e0917de9
+---
+ .../hadoop/hive/common/BlobStorageUtils.java       |   27 ++-
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   10 ++
+ .../hadoop/hive/common/TestBlobStorageUtils.java   |    8 +-
+ .../clientpositive/parallel_directory_rename.q     |    7 +
+ .../clientpositive/parallel_directory_rename.q.out |   35 ++++
+ .../hive/ql/exec/AbstractFileMergeOperator.java    |    2 +-
+ .../apache/hadoop/hive/ql/exec/JoinOperator.java   |    4 +-
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   22 ++-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   27 ++-
+ .../hive/ql/util/ParallelDirectoryRenamer.java     |  133 +++++++++++++++
+ .../hive/ql/util/ParallelDirectoryRenamerTest.java |  173 ++++++++++++++++++++
+ 11 files changed, 426 insertions(+), 22 deletions(-)
+ create mode 100644 itests/hive-blobstore/src/test/queries/clientpositive/parallel_directory_rename.q
+ create mode 100644 itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamer.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamerTest.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java b/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java
+index 6ca35e2..fd405af 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java
+@@ -24,18 +24,20 @@
+ 
+ import java.util.Collection;
+ 
++
+ /**
+  * Utilities for different blob (object) storage systems
+  */
+ public class BlobStorageUtils {
++
+     private static final boolean DISABLE_BLOBSTORAGE_AS_SCRATCHDIR = false;
+ 
+     public static boolean isBlobStoragePath(final Configuration conf, final Path path) {
+-        return (path == null) ? false : isBlobStorageScheme(conf, path.toUri().getScheme());
++        return path != null && isBlobStorageScheme(conf, path.toUri().getScheme());
+     }
+ 
+     public static boolean isBlobStorageFileSystem(final Configuration conf, final FileSystem fs) {
+-        return (fs == null) ? false : isBlobStorageScheme(conf, fs.getScheme());
++        return fs != null && isBlobStorageScheme(conf, fs.getUri().getScheme());
+     }
+ 
+     public static boolean isBlobStorageScheme(final Configuration conf, final String scheme) {
+@@ -51,4 +53,25 @@ public static boolean isBlobStorageAsScratchDir(final Configuration conf) {
+                 DISABLE_BLOBSTORAGE_AS_SCRATCHDIR
+         );
+     }
++
++    /**
++     * Returns true if {@link HiveConf.ConfVars#HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED} is true, false otherwise.
++     */
++    public static boolean areOptimizationsEnabled(final Configuration conf) {
++        return conf.getBoolean(
++                HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.varname,
++                HiveConf.ConfVars.HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED.defaultBoolVal
++        );
++    }
++
++    /**
++     * Returns true if a directory should be renamed in parallel, false otherwise.
++     */
++    public static boolean shouldRenameDirectoryInParallel(final Configuration conf, final FileSystem srcFs,
++                                                          final FileSystem destFs) {
++        return areOptimizationsEnabled(conf) && srcFs.getClass().equals(
++                destFs.getClass()) && BlobStorageUtils.isBlobStorageFileSystem(
++                srcFs.getConf(), srcFs) && BlobStorageUtils.isBlobStorageFileSystem(
++                destFs.getConf(), destFs);
++    }
+ }
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index bec1c53..68dd88f 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2169,6 +2169,16 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_BLOBSTORE_USE_BLOBSTORE_AS_SCRATCHDIR("hive.blobstore.use.blobstore.as.scratchdir", false,
+             "Enable the use of scratch directories directly on blob storage systems (it may cause performance penalties)."),
+ 
++    HIVE_BLOBSTORE_OPTIMIZATIONS_ENABLED("hive.blobstore.optimizations.enabled", true,
++            "This parameter enables a number of optimizations when running on blobstores:\n" +
++            "(1) When true, if renaming directories within a blobstore, rename files one at a time rather than at a\n"+
++            "directory level. This will improve the performance of directory renames when running on blobstores.\n" +
++            "When false rely on the connector implementation of directory renames. Since renames may require copying\n" +
++            "the entire file, each rename can take a long amount of time. Renaming at a directory level may not be\n" +
++            "ideal if the blobstore connector cannot efficiently rename a directory (e.g. HADOOP-13600). By default,\n" +
++            "renames are done using a thread pool which allows each individual file to be renamed in parallel. The\n" +
++            "size of the threadpool is controlled by the hive.mv.files.thread parameter."),
++
+     HIVE_QUERY_TIMEOUT_SECONDS("hive.query.timeout.seconds", "0s",
+         "Timeout for Running Query in seconds. A nonpositive value means infinite. " +
+         "If the query timeout is also set by thrift API call, the smaller one will be taken.");
+diff --git a/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java b/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java
+index 84a0d86..918ec95 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java
++++ b/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java
+@@ -64,18 +64,18 @@ public void testValidAndInvalidFileSystems() {
+ 
+     /* Valid FileSystem schemes */
+ 
+-    doReturn("s3a").when(fs).getScheme();
++    doReturn(URI.create("s3a:///")).when(fs).getUri();
+     assertTrue(isBlobStorageFileSystem(conf, fs));
+ 
+-    doReturn("swift").when(fs).getScheme();
++    doReturn(URI.create("swift:///")).when(fs).getUri();
+     assertTrue(isBlobStorageFileSystem(conf, fs));
+ 
+     /* Invalid FileSystem schemes */
+ 
+-    doReturn("hdfs").when(fs).getScheme();
++    doReturn(URI.create("hdfs:///")).when(fs).getUri();
+     assertFalse(isBlobStorageFileSystem(conf, fs));
+ 
+-    doReturn("").when(fs).getScheme();
++    doReturn(URI.create("")).when(fs).getUri();
+     assertFalse(isBlobStorageFileSystem(conf, fs));
+ 
+     assertFalse(isBlobStorageFileSystem(conf, null));
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/parallel_directory_rename.q b/itests/hive-blobstore/src/test/queries/clientpositive/parallel_directory_rename.q
+new file mode 100644
+index 0000000..1e740bc
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/parallel_directory_rename.q
+@@ -0,0 +1,7 @@
++SET hive.blobstore.optimizations.enabled=true;
++SET hive.blobstore.use.blobstore.as.scratchdir=true;
++
++DROP TABLE parallel_directory_rename;
++CREATE TABLE parallel_directory_rename (value int) LOCATION '${hiveconf:test.blobstore.path.unique}/parallel_directory_rename/';
++INSERT INTO parallel_directory_rename VALUES (1), (10), (100), (1000);
++SELECT * FROM parallel_directory_rename;
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out b/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out
+new file mode 100644
+index 0000000..c9fe96d
+--- /dev/null
++++ b/itests/hive-blobstore/src/test/results/clientpositive/parallel_directory_rename.q.out
+@@ -0,0 +1,35 @@
++PREHOOK: query: DROP TABLE parallel_directory_rename
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE parallel_directory_rename
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++PREHOOK: Input: ### test.blobstore.path ###/parallel_directory_rename
++PREHOOK: Output: database:default
++PREHOOK: Output: default@parallel_directory_rename
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Input: ### test.blobstore.path ###/parallel_directory_rename
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@parallel_directory_rename
++PREHOOK: query: INSERT INTO parallel_directory_rename VALUES (1), (10), (100), (1000)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@parallel_directory_rename
++POSTHOOK: query: INSERT INTO parallel_directory_rename VALUES (1), (10), (100), (1000)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@parallel_directory_rename
++POSTHOOK: Lineage: parallel_directory_rename.value EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: SELECT * FROM parallel_directory_rename
++PREHOOK: type: QUERY
++PREHOOK: Input: default@parallel_directory_rename
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM parallel_directory_rename
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@parallel_directory_rename
++#### A masked pattern was here ####
++1
++10
++100
++1000
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java
+index 5eea5a0..ee3445c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/AbstractFileMergeOperator.java
+@@ -219,7 +219,7 @@ public void closeOp(boolean abort) throws HiveException {
+           for (Path incompatFile : incompatFileSet) {
+             Path destDir = finalPath.getParent();
+             try {
+-              Utilities.renameOrMoveFiles(fs, incompatFile, destDir);
++              Utilities.renameOrMoveFiles(jc, fs, incompatFile, destDir);
+               LOG.info("Moved incompatible file " + incompatFile + " to " +
+                   destDir);
+             } catch (HiveException e) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/JoinOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/JoinOperator.java
+index 878df75..11b16f0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/JoinOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/JoinOperator.java
+@@ -195,7 +195,7 @@ private void moveUpFiles(Path specPath, Configuration hconf, Log log)
+       FileStatus[] taskOutputDirs = fs.listStatus(specPath);
+       if (taskOutputDirs != null) {
+         for (FileStatus dir : taskOutputDirs) {
+-          Utilities.renameOrMoveFiles(fs, dir.getPath(), specPath);
++          Utilities.renameOrMoveFiles(hconf, fs, dir.getPath(), specPath);
+           fs.delete(dir.getPath(), true);
+         }
+       }
+@@ -229,7 +229,7 @@ private void  mvFileToFinalPath(Path specPath, Configuration hconf,
+         Utilities.removeTempOrDuplicateFiles(fs, intermediatePath);
+         // Step3: move to the file destination
+         log.info("Moving tmp dir: " + intermediatePath + " to: " + specPath);
+-        Utilities.renameOrMoveFiles(fs, intermediatePath, specPath);
++        Utilities.renameOrMoveFiles(hconf, fs, intermediatePath, specPath);
+       }
+     } else {
+       fs.delete(tmpPath, true);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index d45fd9a..7ea62e9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -38,7 +38,6 @@
+ import java.io.Serializable;
+ import java.io.UnsupportedEncodingException;
+ import java.net.URI;
+-import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.net.URLClassLoader;
+ import java.security.MessageDigest;
+@@ -54,7 +53,6 @@
+ import java.util.Arrays;
+ import java.util.Calendar;
+ import java.util.Collection;
+-import java.util.Collections;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -69,6 +67,8 @@
+ import java.util.UUID;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+@@ -79,6 +79,7 @@
+ import java.util.zip.DeflaterOutputStream;
+ import java.util.zip.InflaterInputStream;
+ 
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.antlr.runtime.CommonToken;
+ import org.apache.commons.codec.binary.Base64;
+ import org.apache.commons.lang.StringUtils;
+@@ -95,6 +96,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hive.common.BlobStorageUtils;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.HiveInterruptCallback;
+ import org.apache.hadoop.hive.common.HiveInterruptUtils;
+@@ -161,6 +163,7 @@
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.ql.stats.StatsFactory;
+ import org.apache.hadoop.hive.ql.stats.StatsPublisher;
++import org.apache.hadoop.hive.ql.util.ParallelDirectoryRenamer;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+ import org.apache.hadoop.hive.serde2.SerDeUtils;
+@@ -1628,10 +1631,17 @@ public static void rename(FileSystem fs, Path src, Path dst) throws IOException,
+    *          the target directory
+    * @throws IOException
+    */
+-  public static void renameOrMoveFiles(FileSystem fs, Path src, Path dst) throws IOException,
++  public static void renameOrMoveFiles(Configuration conf, FileSystem fs, Path src, Path dst) throws IOException,
+       HiveException {
+     if (!fs.exists(dst)) {
+-      if (!fs.rename(src, dst)) {
++      final boolean shouldRenameDirectoryInParallel = BlobStorageUtils.shouldRenameDirectoryInParallel(conf, fs, fs);
++      if (shouldRenameDirectoryInParallel && conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25) > 0) {
++        final ExecutorService pool = Executors.newFixedThreadPool(
++                conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25),
++                new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Move-Thread-%d").build());
++        ParallelDirectoryRenamer.renameDirectoryInParallel(conf, fs, fs, src, dst, true, SessionState.get(), pool);
++        pool.shutdown();
++      } else if (!fs.rename(src, dst)) {
+         throw new HiveException("Unable to move: " + src + " to: " + dst);
+       }
+     } else {
+@@ -1643,7 +1653,7 @@ public static void renameOrMoveFiles(FileSystem fs, Path src, Path dst) throws I
+         String fileName = srcFilePath.getName();
+         Path dstFilePath = new Path(dst, fileName);
+         if (file.isDir()) {
+-          renameOrMoveFiles(fs, srcFilePath, dstFilePath);
++          renameOrMoveFiles(conf, fs, srcFilePath, dstFilePath);
+         }
+         else {
+           if (fs.exists(dstFilePath)) {
+@@ -1871,7 +1881,7 @@ public static void mvFileToFinalPath(Path specPath, Configuration hconf,
+ 
+         // move to the file destination
+         log.info("Moving tmp dir: " + tmpPath + " to: " + specPath);
+-        Utilities.renameOrMoveFiles(fs, tmpPath, specPath);
++        Utilities.renameOrMoveFiles(hconf, fs, tmpPath, specPath);
+       }
+     } else {
+       fs.delete(tmpPath, true);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 91ec8d4..d493de2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -49,12 +49,14 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.common.collect.ImmutableMap;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.BlobStorageUtils;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.HiveStatsUtils;
+ import org.apache.hadoop.hive.common.ObjectPair;
+@@ -79,7 +81,6 @@
+ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
+ import org.apache.hadoop.hive.metastore.api.CompactionType;
+ import org.apache.hadoop.hive.metastore.api.Database;
+-import org.apache.hadoop.hive.metastore.api.EventRequestType;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.metastore.api.FireEventRequest;
+ import org.apache.hadoop.hive.metastore.api.FireEventRequestData;
+@@ -120,6 +121,7 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+ import org.apache.hadoop.hive.ql.session.CreateTableAutomaticGrant;
+ import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.util.ParallelDirectoryRenamer;
+ import org.apache.hadoop.hive.serde2.Deserializer;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+ import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
+@@ -131,7 +133,6 @@
+ import org.apache.thrift.TException;
+ 
+ import com.google.common.collect.Sets;
+-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+ /**
+  * This class has functions that implement meta data/DDL operations using calls
+@@ -2728,6 +2729,7 @@ public static boolean moveFile(final HiveConf conf, Path srcf, final Path destf,
+         HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS);
+     HadoopShims shims = ShimLoader.getHadoopShims();
+     HadoopShims.HdfsFileStatus destStatus = null;
++    final boolean shouldRenameDirectoryInParallel = BlobStorageUtils.shouldRenameDirectoryInParallel(conf, srcFs, destFs);
+ 
+     // If source path is a subdirectory of the destination path:
+     //   ex: INSERT OVERWRITE DIRECTORY 'target/warehouse/dest4.out' SELECT src.value WHERE src.key >= 300;
+@@ -2779,6 +2781,7 @@ public static boolean moveFile(final HiveConf conf, Path srcf, final Path destf,
+               conf);
+         } else {
+           if (destIsSubDir) {
++
+             FileStatus[] srcs = destFs.listStatus(srcf, FileUtils.HIDDEN_FILES_PATH_FILTER);
+ 
+             List<Future<Void>> futures = new LinkedList<>();
+@@ -2831,13 +2834,23 @@ public Void call() throws Exception {
+             }
+             return true;
+           } else {
+-            if (destFs.rename(srcf, destf)) {
+-              if (inheritPerms) {
+-                ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, null, destFs, destf, true);
+-              }
++            if (shouldRenameDirectoryInParallel && conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25) > 0) {
++              final ExecutorService pool = Executors.newFixedThreadPool(
++                      conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25),
++                      new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Move-Thread-%d").build());
++              ParallelDirectoryRenamer.renameDirectoryInParallel(conf, srcFs, destFs, srcf, destf, inheritPerms,
++                      SessionState.get(), pool);
++              pool.shutdown();
+               return true;
++            } else {
++              if (destFs.rename(srcf, destf)) {
++                if (inheritPerms) {
++                  ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, null, destFs, destf, true);
++                }
++                return true;
++              }
++              return false;
+             }
+-            return false;
+           }
+         }
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamer.java b/ql/src/java/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamer.java
+new file mode 100644
+index 0000000..b5e97d8
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamer.java
+@@ -0,0 +1,133 @@
++package org.apache.hadoop.hive.ql.util;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Future;
++
++import com.google.common.base.Preconditions;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.BlobStorageUtils;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.session.SessionState;
++
++import org.apache.hadoop.hive.shims.HadoopShims;
++import org.apache.hadoop.hive.shims.ShimLoader;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++
++/**
++ * Given a source directory and a destination directory, moves all the files under the source to the destination
++ * folder. Rename operations are done using the specified {@link ExecutorService}.
++ *
++ * <p>
++ *   This class is useful when running on blob stores where rename operations require copying data from one location
++ *   to another. Specifically, this method should be used if the blobstore connector renames files under a directory
++ *   sequentially. This class will issue the renames in parallel, which can offer significant performance
++ *   improvements.
++ * </p>
++ */
++public class ParallelDirectoryRenamer {
++
++  private static final Logger LOG = LoggerFactory.getLogger(ParallelDirectoryRenamer.class);
++
++  /**
++   * Move all files under the srcPath to the destPath. The method preserves the behavior of a normal
++   * {@link FileSystem#rename(Path, Path)} operation, regardless of whether or not the src and dst paths exist, or if
++   * they are files or directories.
++   *
++   * <p>
++   *   Both the source and destination {@link FileSystem}s must be be blobstores, and they should both be of the same
++   *   class. This method is targeted for a very specific use case, copies of directories within the same blobstore.
++   * </p>
++   *
++   * @param conf          the {@link Configuration} to use when setting permissions
++   * @param srcFs         the source {@link FileSystem}
++   * @param destFs        the destination {@link FileSystem}
++   * @param srcPath       the source {@link Path}
++   * @param destPath      the destination {@link Path}
++   * @param inheritPerms  if true, renamed files with inherit their parent permissions, if false they will preserve
++   *                      their original permissions
++   * @param parentSession the parent {@link SessionState}
++   * @param pool          the {@link ExecutorService} to use to issue all the {@link FileSystem#rename(Path, Path)}
++   *                      requests
++   *
++   * @throws IOException   if their is an issuing renaming the files
++   * @throws HiveException if any other exception occurs while renaming the files
++   */
++  public static void renameDirectoryInParallel(final Configuration conf, final FileSystem srcFs,
++                                               final FileSystem destFs, final Path srcPath,
++                                               final Path destPath, final boolean inheritPerms,
++                                               final SessionState parentSession,
++                                               ExecutorService pool) throws IOException, HiveException {
++
++    Preconditions.checkArgument(srcFs.getClass().equals(destFs.getClass()),
++            "Source and destination filesystems must of the same type");
++    Preconditions.checkArgument(BlobStorageUtils.isBlobStorageFileSystem(conf, srcFs),
++            "Source and destinations filesystems must both be blobstores");
++    Preconditions.checkArgument(srcFs.exists(srcPath), "Source Path " + srcPath + " does not exist");
++
++    if (srcFs.isDirectory(srcPath)) {
++
++      // If the destination doesn't exist, create it and move all files under srcPath/ to destPath/
++      // If the destination does exist, then move all files under destPath/srcPath.name/, this is inline with the
++      // normal behavior of the FileSystem.rename operation
++      Path basePath;
++      if (!destFs.exists(destPath)) {
++        destFs.mkdirs(destPath);
++        basePath = destPath;
++      } else {
++        basePath = new Path(destPath, srcPath.getName());
++        Preconditions.checkArgument(!destFs.exists(basePath), "Path " + basePath + " already exists");
++      }
++
++      final HadoopShims shims = ShimLoader.getHadoopShims();
++      final HadoopShims.HdfsFileStatus desiredStatus = shims.getFullFileStatus(destFs.getConf(), destFs,
++              destPath);
++
++      List<Future<Void>> futures = new ArrayList<>();
++
++      for (final FileStatus srcStatus : srcFs.listStatus(srcPath)) {
++        final Path destFile = new Path(basePath, srcStatus.getPath().getName());
++        final String group = srcStatus.getGroup();
++        futures.add(pool.submit(new Callable<Void>() {
++          @Override
++          public Void call() throws Exception {
++            SessionState.setCurrentSessionState(parentSession);
++            if (destFs.rename(srcStatus.getPath(), destFile)) {
++              if (inheritPerms) {
++                shims.setFullFileStatus(conf, desiredStatus, group, destFs, destFile, false);
++              }
++            } else {
++              throw new IOException("rename for src path: " + srcStatus.getPath() + " to dest path: "
++                      + destFile + " returned false");
++            }
++            return null;
++          }
++        }));
++      }
++
++      for (Future<Void> future : futures) {
++        try {
++          future.get();
++        } catch (Exception e) {
++          LOG.debug(e.getMessage());
++          pool.shutdownNow();
++          throw new HiveException(e);
++        }
++      }
++    } else {
++      if (!destFs.rename(srcPath, destPath)) {
++        throw new IOException("rename for src path: " + srcPath + " to dest path: " + destPath + " returned false");
++      }
++    }
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamerTest.java b/ql/src/test/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamerTest.java
+new file mode 100644
+index 0000000..c9a10fc
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/util/ParallelDirectoryRenamerTest.java
+@@ -0,0 +1,173 @@
++package org.apache.hadoop.hive.ql.util;
++
++import java.io.IOException;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.session.SessionState;
++
++import org.junit.Before;
++import org.junit.Test;
++
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Matchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++
++public class ParallelDirectoryRenamerTest {
++
++  private HiveConf hiveConf;
++  private FileSystem localFs;
++  private SessionState mockSessionState;
++
++  @Before
++  public void setUp() throws IOException {
++    this.hiveConf = new HiveConf();
++    this.hiveConf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_SUPPORTED_SCHEMES.varname, "file");
++    this.localFs = FileSystem.getLocal(new Configuration());
++    this.mockSessionState = mock(SessionState.class);
++    when(this.mockSessionState.getConf()).thenReturn(this.hiveConf);
++  }
++
++  /**
++   * Test if {@link ParallelDirectoryRenamer#renameDirectoryInParallel(Configuration, FileSystem, FileSystem, Path, Path, boolean, SessionState, ExecutorService)}
++   * works as specified when the destination dir doesn't exist. The test checks that the directory is successfully renamed.
++   */
++  @Test
++  public void testRenameDirectoryInParallelDestNotExists() throws IOException, HiveException {
++    Path srcPath = new Path("testRenameDirectoryInParallel-input");
++    Path destPath = new Path("testRenameDirectoryInParallel-output");
++
++    String fileName1 = "test-1.txt";
++    String fileName2 = "test-2.txt";
++    String fileName3 = "test-3.txt";
++
++    try {
++      this.localFs.mkdirs(srcPath);
++
++      this.localFs.create(new Path(srcPath, fileName1)).close();
++      this.localFs.create(new Path(srcPath, fileName2)).close();
++      this.localFs.create(new Path(srcPath, fileName3)).close();
++
++      ExecutorService es = Executors.newFixedThreadPool(1);
++      ParallelDirectoryRenamer.renameDirectoryInParallel(this.hiveConf, this.localFs, this.localFs, srcPath, destPath,
++              true, this.mockSessionState,
++              es);
++      es.shutdown();
++
++      assertTrue(this.localFs.exists(new Path(destPath, fileName1)));
++      assertTrue(this.localFs.exists(new Path(destPath, fileName2)));
++      assertTrue(this.localFs.exists(new Path(destPath, fileName3)));
++    } finally {
++      try {
++        this.localFs.delete(srcPath, true);
++      } finally {
++        this.localFs.delete(destPath, true);
++      }
++    }
++  }
++
++  /**
++   * Test if {@link ParallelDirectoryRenamer#renameDirectoryInParallel(Configuration, FileSystem, FileSystem, Path, Path, boolean, SessionState, ExecutorService)}
++   * works as specified when the destination dir does exist. The test checks that the directory is successfully renamed.
++   */
++  @Test
++  public void testRenameDirectoryInParallelDestExists() throws IOException, HiveException {
++    Path srcPath = new Path("testRenameDirectoryInParallel-input");
++    Path destPath = new Path("testRenameDirectoryInParallel-output");
++
++    String fileName1 = "test-1.txt";
++    String fileName2 = "test-2.txt";
++    String fileName3 = "test-3.txt";
++
++    try {
++      this.localFs.mkdirs(srcPath);
++      this.localFs.mkdirs(destPath);
++
++      this.localFs.create(new Path(srcPath, fileName1)).close();
++      this.localFs.create(new Path(srcPath, fileName2)).close();
++      this.localFs.create(new Path(srcPath, fileName3)).close();
++
++      ExecutorService es = Executors.newFixedThreadPool(1);
++      ParallelDirectoryRenamer.renameDirectoryInParallel(this.hiveConf, this.localFs, this.localFs, srcPath, destPath,
++              true, this.mockSessionState,
++              es);
++      es.shutdown();
++
++      Path basePath = new Path(destPath, srcPath.getName());
++      assertTrue(this.localFs.exists(new Path(basePath, fileName1)));
++      assertTrue(this.localFs.exists(new Path(basePath, fileName2)));
++      assertTrue(this.localFs.exists(new Path(basePath, fileName3)));
++    } finally {
++      try {
++        this.localFs.delete(srcPath, true);
++      } finally {
++        this.localFs.delete(destPath, true);
++      }
++    }
++  }
++
++  /**
++   * Test if {@link ParallelDirectoryRenamer#renameDirectoryInParallel(Configuration, FileSystem, FileSystem, Path, Path, boolean, SessionState, ExecutorService)}
++   * works as specified. The test doesn't check the functionality of the method, it only verifies that the method
++   * executes the rename requests in parallel.
++   */
++  @Test
++  public void testRenameDirectoryInParallelMockThreadPool() throws IOException, HiveException {
++    Path srcPath = new Path("testRenameDirectoryInParallel-input");
++    Path destPath = new Path("testRenameDirectoryInParallel-output");
++
++    String fileName1 = "test-1.txt";
++    String fileName2 = "test-2.txt";
++    String fileName3 = "test-3.txt";
++
++    try {
++      this.localFs.mkdirs(srcPath);
++      this.localFs.mkdirs(destPath);
++
++      this.localFs.create(new Path(srcPath, fileName1)).close();
++      this.localFs.create(new Path(srcPath, fileName2)).close();
++      this.localFs.create(new Path(srcPath, fileName3)).close();
++
++      ExecutorService mockExecutorService = mock(ExecutorService.class);
++      when(mockExecutorService.submit(any(Callable.class))).thenAnswer(new Answer<Object>() {
++        @Override
++        public Object answer(InvocationOnMock invocationOnMock) throws Throwable {
++          Callable callable = (Callable) invocationOnMock.getArguments()[0];
++          Future mockFuture = mock(Future.class);
++          Object callableResult = callable.call();
++          when(mockFuture.get()).thenReturn(callableResult);
++          when(mockFuture.get(any(Long.class), any(TimeUnit.class))).thenReturn(callableResult);
++          return mockFuture;
++        }
++      });
++
++      ParallelDirectoryRenamer.renameDirectoryInParallel(this.hiveConf, this.localFs, this.localFs, srcPath, destPath,
++              true, this.mockSessionState,
++              mockExecutorService);
++      mockExecutorService.shutdown();
++
++      verify(mockExecutorService, times(3)).submit(any(Callable.class));
++    } finally {
++      try {
++        this.localFs.delete(srcPath, true);
++      } finally {
++        this.localFs.delete(destPath, true);
++      }
++    }
++  }
++}
+-- 
+1.7.9.5
+

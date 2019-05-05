@@ -1,0 +1,590 @@
+From 469783cfa6cd5f297524dd0ae70d9e78c933bc0a Mon Sep 17 00:00:00 2001
+From: Sahil Takiar <stakiar@cloudera.com>
+Date: Wed, 7 Dec 2016 23:47:49 -0800
+Subject: [PATCH 0868/1164] CDH-48006: HIVE-15385: Failure to inherit
+ permissions when running
+ HdfsUtils.setFullFileStatus(..., false) causes
+ queries to fail
+
+(cherry picked from commit e43861a1023920b23c126733ceca273bc766c58a)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+	ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+	ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
+	ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+	shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+	shims/0.23/pom.xml
+	shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+	shims/0.23/src/main/test/org/apache/hadoop/hive/shims/TestHadoop23Shims.java
+	shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+
+Change-Id: I2bbc837ef4cfb192732255bc532fb1d30a70e5eb
+---
+ .../org/apache/hadoop/hive/common/FileUtils.java   |   20 +-
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    6 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   13 +-
+ .../apache/hadoop/hive/shims/Hadoop20SShims.java   |   59 +++---
+ shims/0.23/pom.xml                                 |    6 +
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |   92 ++++++----
+ .../hadoop/hive/shims/TestHadoop23Shims.java       |  191 ++++++++++++++++++++
+ .../org/apache/hadoop/hive/shims/HadoopShims.java  |   22 ++-
+ 8 files changed, 308 insertions(+), 101 deletions(-)
+ create mode 100644 shims/0.23/src/main/test/org/apache/hadoop/hive/shims/TestHadoop23Shims.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+index dac7380..c242d77 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+@@ -528,12 +528,8 @@ public static boolean mkdir(FileSystem fs, Path f, boolean inheritPerms, Configu
+       } else {
+         HadoopShims shim = ShimLoader.getHadoopShims();
+         HdfsFileStatus fullFileStatus = shim.getFullFileStatus(conf, fs, lastExistingParent);
+-        try {
+-          //set on the entire subtree
+-          shim.setFullFileStatus(conf, fullFileStatus, null, fs, firstNonExistentParent, true);
+-        } catch (Exception e) {
+-          LOG.warn("Error setting permissions of " + firstNonExistentParent, e);
+-        }
++        //set on the entire subtree
++        shim.setFullFileStatus(conf, fullFileStatus, null, fs, firstNonExistentParent, true);
+         return true;
+       }
+     }
+@@ -576,11 +572,7 @@ public static boolean copy(FileSystem srcFS, Path src,
+     boolean inheritPerms = conf.getBoolVar(HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS);
+     if (copied && inheritPerms) {
+       HdfsFileStatus fullFileStatus = shims.getFullFileStatus(conf, dstFS, dst);
+-      try {
+-        shims.setFullFileStatus(conf, fullFileStatus, null, dstFS, dst, true);
+-      } catch (Exception e) {
+-        LOG.warn("Error setting permissions or group of " + dst, e);
+-      }
++      shims.setFullFileStatus(conf, fullFileStatus, null, dstFS, dst, true);
+     }
+     return copied;
+   }
+@@ -698,11 +690,7 @@ public static boolean renameWithPerms(FileSystem fs, Path sourcePath,
+       if (fs.rename(sourcePath, destPath)) {
+         HadoopShims shims = ShimLoader.getHadoopShims();
+         HdfsFileStatus fullFileStatus = shims.getFullFileStatus(conf, fs, destPath.getParent());
+-        try {
+-          shims.setFullFileStatus(conf, fullFileStatus, null, fs, destPath, true);
+-        } catch (Exception e) {
+-          LOG.warn("Error setting permissions or group of " + destPath, e);
+-        }
++        shims.setFullFileStatus(conf, fullFileStatus, null, fs, destPath, true);
+ 
+         return true;
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 9002cad..835435b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -4381,11 +4381,7 @@ private int truncateTable(Hive db, TruncateTableDesc truncateTableDesc) throws H
+         HdfsFileStatus fullFileStatus = shim.getFullFileStatus(conf, fs, location);
+         fs.delete(location, true);
+         fs.mkdirs(location);
+-        try {
+-          shim.setFullFileStatus(conf, fullFileStatus, null, fs, location, true);
+-        } catch (Exception e) {
+-          LOG.warn("Error setting permissions of " + location, e);
+-        }
++        shim.setFullFileStatus(conf, fullFileStatus, null, fs, location, true);
+       }
+     } catch (Exception e) {
+       throw new HiveException(e, ErrorMsg.GENERIC_ERROR);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index a56a477..cacd781 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -2562,12 +2562,7 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+     }
+     if (null == pool) {
+       if (inheritPerms) {
+-        try {
+-          ShimLoader.getHadoopShims().setFullFileStatus(conf, fullDestStatus, null, destFs, destf, true);
+-        } catch (IOException e) {
+-          LOG.error(String.format("Failed to move: {}", e.getMessage()));
+-          throw new HiveException(e.getCause());
+-        }
++        ShimLoader.getHadoopShims().setFullFileStatus(conf, fullDestStatus, null, destFs, destf, true);
+       }
+     } else {
+       pool.shutdown();
+@@ -2792,11 +2787,7 @@ public static boolean moveFile(final HiveConf conf, Path srcf, final Path destf,
+         // For local src file, copy to hdfs
+         destFs.copyFromLocalFile(srcf, destf);
+         if (inheritPerms) {
+-          try {
+-            ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, null, destFs, destf, true);
+-          } catch (IOException e) {
+-            LOG.warn("Error setting permission of file " + destf + ": "+ e.getMessage(), e);
+-          }
++          ShimLoader.getHadoopShims().setFullFileStatus(conf, destStatus, null, destFs, destf, true);
+         }
+         return true;
+       } else {
+diff --git a/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java b/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+index 85b0bb2..e0e01e9 100644
+--- a/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
++++ b/shims/0.20S/src/main/java/org/apache/hadoop/hive/shims/Hadoop20SShims.java
+@@ -481,34 +481,47 @@ public HdfsFileStatus getFullFileStatus(Configuration conf, FileSystem fs, Path
+   }
+ 
+   @Override
++  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup,
++    FileSystem fs, Path target, boolean recursive) {
++    setFullFileStatus(conf, sourceStatus, targetGroup, fs, target, recursive, recursive ? new FsShell() : null);
++  }
++
++  @Override
+   public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus,
+-    FileSystem fs, String targetGroup, Path target, boolean recursive) throws IOException {
+-    String group = sourceStatus.getFileStatus().getGroup();
+-    String permission = Integer.toString(sourceStatus.getFileStatus().getPermission().toShort(), 8);
+-    //use FsShell to change group and permissions recursively
+-    if (recursive) {
+-      try {
+-        FsShell fshell = new FsShell();
+-        fshell.setConf(conf);
+-        run(fshell, new String[]{"-chgrp", "-R", group, target.toString()});
+-        run(fshell, new String[]{"-chmod", "-R", permission, target.toString()});
+-      } catch (Exception e) {
+-        throw new IOException("Unable to set permissions of " + target, e);
+-      }
+-    } else {
+-      if (group != null && !group.isEmpty()) {
+-        if (targetGroup == null || !group.equals(targetGroup)) {
+-          fs.setOwner(target, null, group);
++    FileSystem fs, String targetGroup, Path target, boolean recursive, FsShell fsShell) throws IOException {
++    try {
++      String group = sourceStatus.getFileStatus().getGroup();
++      String permission = Integer.toString(sourceStatus.getFileStatus().getPermission().toShort(), 8);
++      //use FsShell to change group and permissions recursively
++      if (recursive) {
++        try {
++          FsShell fshell = new FsShell();
++          fshell.setConf(conf);
++          run(fshell, new String[]{"-chgrp", "-R", group, target.toString()});
++          run(fshell, new String[]{"-chmod", "-R", permission, target.toString()});
++        } catch (Exception e) {
++          throw new IOException("Unable to set permissions of " + target, e);
+         }
++      } else {
++        if (group != null && !group.isEmpty()) {
++          if (targetGroup == null || !group.equals(targetGroup)) {
++            fs.setOwner(target, null, group);
++          }
++        }
++        fs.setPermission(target, sourcePerm);
+       }
+-      fs.setPermission(target, sourcePerm);
+-    }
+-    try {
+-      if (LOG.isDebugEnabled()) {  //some trace logging
+-        getFullFileStatus(conf, fs, target).debugLog();
++      try {
++        if (LOG.isDebugEnabled()) {  //some trace logging
++          getFullFileStatus(conf, fs, target).debugLog();
++        }
++      } catch (Exception e) {
++        //ignore.
+       }
+     } catch (Exception e) {
+-      //ignore.
++      LOG.warn(
++              "Unable to inherit permissions for file " + target + " from file " + sourceStatus.getFileStatus().getPath() + " " +
++                      e.getMessage());
++      LOG.debug("Exception while inheriting permissions", e);
+     }
+   }
+ 
+diff --git a/shims/0.23/pom.xml b/shims/0.23/pom.xml
+index 0c29e52..300cc8a 100644
+--- a/shims/0.23/pom.xml
++++ b/shims/0.23/pom.xml
+@@ -151,4 +151,10 @@
+      <scope>provided</scope>
+    </dependency>
+    </dependencies>
++
++  <build>
++    <sourceDirectory>${basedir}/src/main/java</sourceDirectory>
++    <testSourceDirectory>${basedir}/src/main/test</testSourceDirectory>
++  </build>
++
+ </project>
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index e1e6e1b..fd637af 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -35,6 +35,7 @@
+ import java.util.Map;
+ import java.util.TreeMap;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.crypto.key.KeyProvider;
+@@ -742,29 +743,34 @@ public HdfsFileStatus getFullFileStatus(Configuration conf, FileSystem fs,
+ 
+   @Override
+   public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup,
+-    FileSystem fs, Path target, boolean recursive) throws IOException {
+-    String group = sourceStatus.getFileStatus().getGroup();
+-    //use FsShell to change group, permissions, and extended ACL's recursively
+-
+-    boolean aclEnabled = isExtendedAclEnabled(conf);
+-    List<AclEntry> aclEntries = null;
+-    FsPermission sourcePerm = sourceStatus.getFileStatus().getPermission();
+-    if (aclEnabled) {
+-      Hadoop23FileStatus status = (Hadoop23FileStatus) sourceStatus;
+-      if (status.getAclEntries() != null) {
+-        aclEntries = new ArrayList<>(status.getAclEntries());
+-        removeBaseAclEntries(aclEntries);
+-
+-        //the ACL api's also expect the tradition user/group/other permission in the form of ACL
+-        aclEntries.add(newAclEntry(AclEntryScope.ACCESS, AclEntryType.USER, sourcePerm.getUserAction()));
+-        aclEntries.add(newAclEntry(AclEntryScope.ACCESS, AclEntryType.GROUP, sourcePerm.getGroupAction()));
+-        aclEntries.add(newAclEntry(AclEntryScope.ACCESS, AclEntryType.OTHER, sourcePerm.getOtherAction()));
++    FileSystem fs, Path target, boolean recursive) {
++    setFullFileStatus(conf, sourceStatus, targetGroup, fs, target, recursive, recursive ? new FsShell() : null);
++  }
++
++  @Override
++  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup, FileSystem fs,
++    Path target, boolean recursive, FsShell fsShell) {
++    try {
++      String group = sourceStatus.getFileStatus().getGroup();
++      //use FsShell to change group, permissions, and extended ACL's recursively
++
++      boolean aclEnabled = isExtendedAclEnabled(conf);
++      List<AclEntry> aclEntries = null;
++      FsPermission sourcePerm = sourceStatus.getFileStatus().getPermission();
++      if (aclEnabled) {
++        Hadoop23FileStatus status = (Hadoop23FileStatus) sourceStatus;
++        if (status.getAclEntries() != null) {
++          aclEntries = new ArrayList<>(status.getAclEntries());
++          removeBaseAclEntries(aclEntries);
++
++          //the ACL api's also expect the tradition user/group/other permission in the form of ACL
++          aclEntries.add(newAclEntry(AclEntryScope.ACCESS, AclEntryType.USER, sourcePerm.getUserAction()));
++          aclEntries.add(newAclEntry(AclEntryScope.ACCESS, AclEntryType.GROUP, sourcePerm.getGroupAction()));
++          aclEntries.add(newAclEntry(AclEntryScope.ACCESS, AclEntryType.OTHER, sourcePerm.getOtherAction()));
++        }
+       }
+-    }
+ 
+-    if (recursive) {
+-      try {
+-        FsShell fsShell = new FsShell();
++      if (recursive) {
+         fsShell.setConf(conf);
+         //If there is no group of a file, no need to call chgrp
+         if (group != null && !group.isEmpty()) {
+@@ -788,29 +794,32 @@ public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, S
+           String permission = Integer.toString(sourceStatus.getFileStatus().getPermission().toShort(), 8);
+           run(fsShell, new String[]{"-chmod", "-R", permission, target.toString()});
+         }
+-      } catch (Exception e) {
+-        throw new IOException("Unable to set permissions of " + target, e);
+-      }
+-    } else {
+-      if (group != null && !group.isEmpty()) {
+-        if (targetGroup == null || !group.equals(targetGroup)) {
+-          fs.setOwner(target, null, group);
++      } else {
++        if (group != null && !group.isEmpty()) {
++          if (targetGroup == null || !group.equals(targetGroup)) {
++            fs.setOwner(target, null, group);
++          }
+         }
+-      }
+-      if (aclEnabled) {
+-        if (null != aclEntries) {
+-          fs.setAcl(target, aclEntries);
++        if (aclEnabled) {
++          if (null != aclEntries) {
++            fs.setAcl(target, aclEntries);
++          }
++        } else {
++          fs.setPermission(target, sourcePerm);
+         }
+-      } else {
+-        fs.setPermission(target, sourcePerm);
+       }
+-    }
+-    try {
+-      if (LOG.isDebugEnabled()) {  //some trace logging
+-        getFullFileStatus(conf, fs, target).debugLog();
++      try {
++        if (LOG.isDebugEnabled()) {  //some trace logging
++          getFullFileStatus(conf, fs, target).debugLog();
++        }
++      } catch (Exception e) {
++        //ignore.
+       }
+     } catch (Exception e) {
+-      //ignore.
++      LOG.warn(
++              "Unable to inherit permissions for file " + target + " from file " + sourceStatus.getFileStatus().getPath() + " " +
++                      e.getMessage());
++      LOG.debug("Exception while inheriting permissions", e);
+     }
+   }
+ 
+@@ -830,6 +839,11 @@ public FileStatus getFileStatus() {
+       return aclStatus == null ? null : Collections.unmodifiableList(aclStatus.getEntries());
+     }
+ 
++    @VisibleForTesting
++    AclStatus getAclStatus() {
++      return this.aclStatus;
++    }
++
+     @Override
+     public void debugLog() {
+       if (fileStatus != null) {
+diff --git a/shims/0.23/src/main/test/org/apache/hadoop/hive/shims/TestHadoop23Shims.java b/shims/0.23/src/main/test/org/apache/hadoop/hive/shims/TestHadoop23Shims.java
+new file mode 100644
+index 0000000..ae2aaa1
+--- /dev/null
++++ b/shims/0.23/src/main/test/org/apache/hadoop/hive/shims/TestHadoop23Shims.java
+@@ -0,0 +1,191 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * <p>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p>
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.shims;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FsShell;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.permission.AclEntry;
++import org.apache.hadoop.fs.permission.AclStatus;
++import org.apache.hadoop.fs.permission.FsPermission;
++
++import org.junit.Test;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.mockito.Matchers.any;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++public class TestHadoop23Shims {
++
++  /**
++   * Tests that {@link org.apache.hadoop.hive.shims.HadoopShims#setFullFileStatus(Configuration, HadoopShims.HdfsFileStatus, String, FileSystem, Path, boolean)}
++   * does not throw an exception when setting the group and without recursion.
++   */
++  @Test
++  public void testSetFullFileStatusFailInheritGroup() throws IOException {
++    Configuration conf = new Configuration();
++    conf.set("dfs.namenode.acls.enabled", "false");
++
++    HadoopShims.HdfsFileStatus mockHadoopFileStatus = mock(HadoopShims.HdfsFileStatus.class);
++    FileStatus mockSourceStatus = mock(FileStatus.class);
++    FileSystem fs = mock(FileSystem.class);
++
++    when(mockSourceStatus.getGroup()).thenReturn("fakeGroup1");
++    when(mockHadoopFileStatus.getFileStatus()).thenReturn(mockSourceStatus);
++    doThrow(RuntimeException.class).when(fs).setOwner(any(Path.class), any(String.class), any(String.class));
++
++    ShimLoader.getHadoopShims().setFullFileStatus(conf, mockHadoopFileStatus, "fakeGroup2", fs, new Path("fakePath"),
++            false);
++    verify(fs).setOwner(any(Path.class), any(String.class), any(String.class));
++  }
++
++  /**
++   * Tests that {{@link org.apache.hadoop.hive.shims.HadoopShims#setFullFileStatus(Configuration, HadoopShims.HdfsFileStatus, String, FileSystem, Path, boolean)}
++   * does not thrown an exception when setting ACLs and without recursion.
++   */
++  @Test
++  public void testSetFullFileStatusFailInheritAcls() throws IOException {
++    Configuration conf = new Configuration();
++    conf.set("dfs.namenode.acls.enabled", "true");
++
++    HadoopShims.HdfsFileStatus mockHadoopFileStatus = mock(Hadoop23Shims.Hadoop23FileStatus.class);
++    FileStatus mockSourceStatus = mock(FileStatus.class);
++    AclStatus mockAclStatus = mock(AclStatus.class);
++    FileSystem mockFs = mock(FileSystem.class);
++
++    when(mockSourceStatus.getPermission()).thenReturn(new FsPermission((short) 777));
++    when(mockAclStatus.toString()).thenReturn("");
++    when(mockHadoopFileStatus.getFileStatus()).thenReturn(mockSourceStatus);
++    when(((Hadoop23Shims.Hadoop23FileStatus) mockHadoopFileStatus).getAclEntries()).thenReturn(
++            new ArrayList<AclEntry>());
++    when(((Hadoop23Shims.Hadoop23FileStatus) mockHadoopFileStatus).getAclStatus()).thenReturn(mockAclStatus);
++    doThrow(RuntimeException.class).when(mockFs).setAcl(any(Path.class), any(List.class));
++
++    new Hadoop23Shims().setFullFileStatus(conf, mockHadoopFileStatus, null, mockFs, new Path("fakePath"),
++            false);
++    verify(mockFs).setAcl(any(Path.class), any(List.class));
++  }
++
++  /**
++   * Tests that {@link org.apache.hadoop.hive.shims.HadoopShims#setFullFileStatus(Configuration, HadoopShims.HdfsFileStatus, String, FileSystem, Path, boolean)}
++   * does not thrown an exception when setting permissions and without recursion.
++   */
++  @Test
++  public void testSetFullFileStatusFailInheritPerms() throws IOException {
++    Configuration conf = new Configuration();
++    conf.set("dfs.namenode.acls.enabled", "false");
++
++    HadoopShims.HdfsFileStatus mockHadoopFileStatus = mock(HadoopShims.HdfsFileStatus.class);
++    FileStatus mockSourceStatus = mock(FileStatus.class);
++    FileSystem mockFs = mock(FileSystem.class);
++
++    when(mockSourceStatus.getPermission()).thenReturn(new FsPermission((short) 777));
++    when(mockHadoopFileStatus.getFileStatus()).thenReturn(mockSourceStatus);
++    doThrow(RuntimeException.class).when(mockFs).setPermission(any(Path.class), any(FsPermission.class));
++
++    ShimLoader.getHadoopShims().setFullFileStatus(conf, mockHadoopFileStatus, null, mockFs, new Path("fakePath"),
++            false);
++    verify(mockFs).setPermission(any(Path.class), any(FsPermission.class));
++  }
++
++  /**
++   * Tests that {@link org.apache.hadoop.hive.shims.HadoopShims#setFullFileStatus(Configuration, HadoopShims.HdfsFileStatus, String, FileSystem, Path, boolean)}
++   * does not throw an exception when setting the group and with recursion.
++   */
++  @Test
++  public void testSetFullFileStatusFailInheritGroupRecursive() throws Exception {
++    Configuration conf = new Configuration();
++    conf.set("dfs.namenode.acls.enabled", "false");
++
++    String fakeSourceGroup = "fakeGroup1";
++    String fakeTargetGroup = "fakeGroup2";
++    Path fakeTarget = new Path("fakePath");
++    HadoopShims.HdfsFileStatus mockHadoopFileStatus = mock(HadoopShims.HdfsFileStatus.class);
++    FileStatus mockSourceStatus = mock(FileStatus.class);
++    FsShell mockFsShell = mock(FsShell.class);
++
++    when(mockSourceStatus.getGroup()).thenReturn(fakeSourceGroup);
++    when(mockHadoopFileStatus.getFileStatus()).thenReturn(mockSourceStatus);
++    doThrow(RuntimeException.class).when(mockFsShell).run(any(String[].class));
++
++    ShimLoader.getHadoopShims().setFullFileStatus(conf, mockHadoopFileStatus, fakeTargetGroup, mock(FileSystem.class),
++            fakeTarget,
++            true, mockFsShell);
++    verify(mockFsShell).run(new String[]{"-chgrp", "-R", fakeSourceGroup, fakeTarget.toString()});
++  }
++
++  /**
++   * Tests that {@link org.apache.hadoop.hive.shims.HadoopShims#setFullFileStatus(Configuration, HadoopShims.HdfsFileStatus, String, FileSystem, Path, boolean)}
++   * does not thrown an exception when setting ACLs and with recursion.
++   */
++  @Test
++  public void testSetFullFileStatusFailInheritAclsRecursive() throws Exception {
++    Configuration conf = new Configuration();
++    conf.set("dfs.namenode.acls.enabled", "true");
++
++    Path fakeTarget = new Path("fakePath");
++    HadoopShims.HdfsFileStatus mockHadoopFileStatus = mock(Hadoop23Shims.Hadoop23FileStatus.class);
++    FileStatus mockSourceStatus = mock(FileStatus.class);
++    FsShell mockFsShell = mock(FsShell.class);
++    AclStatus mockAclStatus = mock(AclStatus.class);
++
++    when(mockSourceStatus.getPermission()).thenReturn(new FsPermission((short) 777));
++    when(mockAclStatus.toString()).thenReturn("");
++    when(mockHadoopFileStatus.getFileStatus()).thenReturn(mockSourceStatus);
++    when(((Hadoop23Shims.Hadoop23FileStatus) mockHadoopFileStatus).getAclEntries()).thenReturn(
++            new ArrayList<AclEntry>());
++    when(((Hadoop23Shims.Hadoop23FileStatus) mockHadoopFileStatus).getAclStatus()).thenReturn(mockAclStatus);
++    doThrow(RuntimeException.class).when(mockFsShell).run(any(String[].class));
++
++    new Hadoop23Shims().setFullFileStatus(conf, mockHadoopFileStatus, "", mock(FileSystem.class), fakeTarget,
++            true, mockFsShell);
++    verify(mockFsShell).run(new String[]{"-setfacl", "-R", "--set", any(String.class), fakeTarget.toString()});
++  }
++
++  /**
++   * Tests that {@link org.apache.hadoop.hive.shims.HadoopShims#setFullFileStatus(Configuration, HadoopShims.HdfsFileStatus, String, FileSystem, Path, boolean)}
++   * does not thrown an exception when setting permissions and with recursion.
++   */
++  @Test
++  public void testSetFullFileStatusFailInheritPermsRecursive() throws Exception {
++    Configuration conf = new Configuration();
++    conf.set("dfs.namenode.acls.enabled", "false");
++
++    Path fakeTarget = new Path("fakePath");
++    HadoopShims.HdfsFileStatus mockHadoopFileStatus = mock(HadoopShims.HdfsFileStatus.class);
++    FileStatus mockSourceStatus = mock(FileStatus.class);
++    FsShell mockFsShell = mock(FsShell.class);
++
++    when(mockSourceStatus.getPermission()).thenReturn(new FsPermission((short) 777));
++    when(mockHadoopFileStatus.getFileStatus()).thenReturn(mockSourceStatus);
++    doThrow(RuntimeException.class).when(mockFsShell).run(any(String[].class));
++
++    ShimLoader.getHadoopShims().setFullFileStatus(conf, mockHadoopFileStatus, "", mock(FileSystem.class), fakeTarget,
++            true, mockFsShell);
++    verify(mockFsShell).run(new String[]{"-chmod", "-R", any(String.class), fakeTarget.toString()});
++  }
++}
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+index 64d69ed..214caf1 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+@@ -41,6 +41,7 @@
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FsShell;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.fs.permission.FsAction;
+@@ -294,15 +295,22 @@ RecordReader getRecordReader(JobConf job, CombineFileSplit split, Reporter repor
+   public HdfsFileStatus getFullFileStatus(Configuration conf, FileSystem fs, Path file) throws IOException;
+ 
+   /**
+-   * For a given file, set a given file status.
+-   * @param conf
+-   * @param sourceStatus
+-   * @param fs
+-   * @param target
+-   * @throws IOException
++   * Copy the permissions and group from a source {@link HdfsFileStatus} to a target {@link Path}. This method
++   * will only log a warning if permissions cannot be set, no exception will be thrown.
++   *
++   * @param conf the {@link Configuration} used when setting permissions
++   * @param sourceStatus the source {@link HdfsFileStatus} to copy permissions from
++   * @param targetGroup the group of the target {@link Path}, if this is set and it is equal to the source group, an
++   *                    extra set group operation is avoided
++   * @param fs the {@link FileSystem} that contains the target {@link Path}
++   * @param target the {@link Path} to copy permissions and group to
++   * @param recursive recursively set permissions on the target {@link Path}
+    */
+   public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup,
+-    FileSystem fs, Path target, boolean recursive) throws IOException;
++    FileSystem fs, Path target, boolean recursive);
++
++  public void setFullFileStatus(Configuration conf, HdfsFileStatus sourceStatus, String targetGroup,
++    FileSystem fs, Path target, boolean recursive, FsShell fsShell);
+ 
+   /**
+    * Includes the vanilla FileStatus, and AclStatus if it applies to this version of hadoop.
+-- 
+1.7.9.5
+

@@ -1,0 +1,173 @@
+From 219dafdc468fba903ff72d66d481d5c9597d11f4 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Fri, 29 Jan 2016 15:24:11 -0500
+Subject: [PATCH 0506/1164] CDH-37318: HIVE-12946: alter table should also add
+ default scheme and authority for the location
+ similar to create table (Aihua Xu, reviewed by
+ Yongzhi Chen)
+
+Change-Id: Ic7ea5397c5a4e5512ae5458c2f7beea506c612dd
+---
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   19 +++++++++++
+ .../java/org/apache/hadoop/hive/ql/ErrorMsg.java   |    2 +-
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    3 +-
+ .../clientnegative/alter_table_wrong_location2.q   |    3 ++
+ .../test/queries/clientpositive/schemeAuthority3.q |    7 ++++
+ .../alter_table_wrong_location2.q.out              |   14 ++++++++
+ .../results/clientpositive/schemeAuthority3.q.out  |   35 ++++++++++++++++++++
+ 7 files changed, 80 insertions(+), 3 deletions(-)
+ create mode 100644 ql/src/test/queries/clientnegative/alter_table_wrong_location2.q
+ create mode 100644 ql/src/test/queries/clientpositive/schemeAuthority3.q
+ create mode 100644 ql/src/test/results/clientnegative/alter_table_wrong_location2.q.out
+ create mode 100644 ql/src/test/results/clientpositive/schemeAuthority3.q.out
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 2672b8a..11d3ad0 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -3310,6 +3310,15 @@ private void rename_partition(final String db_name, final String tbl_name,
+         }
+       }
+ 
++      // Adds the missing scheme/authority for the new partition location
++      if (new_part.getSd() != null) {
++        String newLocation = new_part.getSd().getLocation();
++        if (org.apache.commons.lang.StringUtils.isNotEmpty(newLocation)) {
++          Path tblPath = wh.getDnsPath(new Path(newLocation));
++          new_part.getSd().setLocation(tblPath.toString());
++        }
++      }
++
+       Partition oldPart = null;
+       Exception ex = null;
+       try {
+@@ -3505,6 +3514,16 @@ private void alter_table_core(final String dbname, final String name, final Tabl
+         newTable.putToParameters(hive_metastoreConstants.DDL_TIME, Long.toString(System
+             .currentTimeMillis() / 1000));
+       }
++
++      // Adds the missing scheme/authority for the new table location
++      if (newTable.getSd() != null) {
++        String newLocation = newTable.getSd().getLocation();
++        if (org.apache.commons.lang.StringUtils.isNotEmpty(newLocation)) {
++          Path tblPath = wh.getDnsPath(new Path(newLocation));
++          newTable.getSd().setLocation(tblPath.toString());
++        }
++      }
++
+       boolean success = false;
+       Exception ex = null;
+       try {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+index 0b8e689..419168b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+@@ -360,7 +360,7 @@
+   TABLE_NOT_PARTITIONED(10241, "Table {0} is not a partitioned table", true),
+   DATABSAE_ALREADY_EXISTS(10242, "Database {0} already exists", true),
+   CANNOT_REPLACE_COLUMNS(10243, "Replace columns is not supported for table {0}. SerDe may be incompatible.", true),
+-  BAD_LOCATION_VALUE(10244, "{0}  is not absolute or has no scheme information.  Please specify a complete absolute uri with scheme information."),
++  BAD_LOCATION_VALUE(10244, "{0}  is not absolute.  Please specify a complete absolute uri."),
+   UNSUPPORTED_ALTER_TBL_OP(10245, "{0} alter table options is not supported"),
+   INVALID_BIGTABLE_MAPJOIN(10246, "{0} table chosen for streaming is not valid", true),
+   MISSING_OVER_CLAUSE(10247, "Missing over clause for function : "),
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index b42f42f..8d0063e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -3572,8 +3572,7 @@ private int alterTableOrSinglePartition(AlterTableDesc alterTbl, Table tbl, Part
+       String newLocation = alterTbl.getNewLocation();
+       try {
+         URI locUri = new URI(newLocation);
+-        if (!locUri.isAbsolute() || locUri.getScheme() == null
+-            || locUri.getScheme().trim().equals("")) {
++        if (!new Path(locUri).isAbsolute()) {
+           throw new HiveException(ErrorMsg.BAD_LOCATION_VALUE, newLocation);
+         }
+         sd.setLocation(newLocation);
+diff --git a/ql/src/test/queries/clientnegative/alter_table_wrong_location2.q b/ql/src/test/queries/clientnegative/alter_table_wrong_location2.q
+new file mode 100644
+index 0000000..ab2800e
+--- /dev/null
++++ b/ql/src/test/queries/clientnegative/alter_table_wrong_location2.q
+@@ -0,0 +1,3 @@
++create table testwrongloc(id int);
++
++alter table testwrongloc set location "relative/testwrongloc";
+diff --git a/ql/src/test/queries/clientpositive/schemeAuthority3.q b/ql/src/test/queries/clientpositive/schemeAuthority3.q
+new file mode 100644
+index 0000000..4a7f5c5
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/schemeAuthority3.q
+@@ -0,0 +1,7 @@
++set hive.mapred.mode=nonstrict;
++
++create table noschemeTable(key string) partitioned by (value string, value2 string) row format delimited fields terminated by '\\t' stored as textfile;
++insert into noschemeTable partition(value='0', value2='clusterA') select key from src where (key = 10) order by key;
++
++alter table noschemeTable set location '/tmp/newtest';
++alter table noschemeTable partition (value='0', value2='clusterA') set location '/tmp/newtest2/value=0/value2=clusterA';
+diff --git a/ql/src/test/results/clientnegative/alter_table_wrong_location2.q.out b/ql/src/test/results/clientnegative/alter_table_wrong_location2.q.out
+new file mode 100644
+index 0000000..b50786a
+--- /dev/null
++++ b/ql/src/test/results/clientnegative/alter_table_wrong_location2.q.out
+@@ -0,0 +1,14 @@
++PREHOOK: query: create table testwrongloc(id int)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@testwrongloc
++POSTHOOK: query: create table testwrongloc(id int)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@testwrongloc
++PREHOOK: query: alter table testwrongloc set location "relative/testwrongloc"
++PREHOOK: type: ALTERTABLE_LOCATION
++PREHOOK: Input: default@testwrongloc
++PREHOOK: Output: default@testwrongloc
++#### A masked pattern was here ####
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. {0}  is not absolute.  Please specify a complete absolute uri. relative/testwrongloc
+diff --git a/ql/src/test/results/clientpositive/schemeAuthority3.q.out b/ql/src/test/results/clientpositive/schemeAuthority3.q.out
+new file mode 100644
+index 0000000..b26bf42
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/schemeAuthority3.q.out
+@@ -0,0 +1,35 @@
++PREHOOK: query: create table noschemeTable(key string) partitioned by (value string, value2 string) row format delimited fields terminated by '\\t' stored as textfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@noschemeTable
++POSTHOOK: query: create table noschemeTable(key string) partitioned by (value string, value2 string) row format delimited fields terminated by '\\t' stored as textfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@noschemeTable
++PREHOOK: query: insert into noschemeTable partition(value='0', value2='clusterA') select key from src where (key = 10) order by key
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@noschemetable@value=0/value2=clusterA
++POSTHOOK: query: insert into noschemeTable partition(value='0', value2='clusterA') select key from src where (key = 10) order by key
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@noschemetable@value=0/value2=clusterA
++POSTHOOK: Lineage: noschemetable PARTITION(value=0,value2=clusterA).key SIMPLE [(src)src.FieldSchema(name:key, type:string, comment:default), ]
++#### A masked pattern was here ####
++PREHOOK: type: ALTERTABLE_LOCATION
++PREHOOK: Input: default@noschemetable
++PREHOOK: Output: default@noschemetable
++#### A masked pattern was here ####
++POSTHOOK: type: ALTERTABLE_LOCATION
++POSTHOOK: Input: default@noschemetable
++POSTHOOK: Output: default@noschemetable
++#### A masked pattern was here ####
++PREHOOK: type: ALTERPARTITION_LOCATION
++PREHOOK: Input: default@noschemetable
++PREHOOK: Output: default@noschemetable@value=0/value2=clusterA
++#### A masked pattern was here ####
++POSTHOOK: type: ALTERPARTITION_LOCATION
++POSTHOOK: Input: default@noschemetable
++POSTHOOK: Input: default@noschemetable@value=0/value2=clusterA
++POSTHOOK: Output: default@noschemetable@value=0/value2=clusterA
++#### A masked pattern was here ####
+-- 
+1.7.9.5
+

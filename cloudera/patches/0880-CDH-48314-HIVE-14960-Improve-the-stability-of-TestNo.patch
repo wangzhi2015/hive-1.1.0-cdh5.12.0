@@ -1,0 +1,84 @@
+From 5c053a6bc8d386904598e3b6beb54d01f272076e Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Mon, 12 Dec 2016 09:23:24 -0500
+Subject: [PATCH 0880/1164] CDH-48314 HIVE-14960: Improve the stability of
+ TestNotificationListener (Marta Kuczora via Aihua
+ Xu)
+
+(cherry picked from commit d556689e3b3379e1abcef589a54d2d12c8b63c5e)
+
+Change-Id: I3954e16c25801e7cdb2506df844e794f1374d43b
+---
+ .../listener/TestNotificationListener.java         |   29 ++++++++++++++------
+ 1 file changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/hcatalog/server-extensions/src/test/java/org/apache/hive/hcatalog/listener/TestNotificationListener.java b/hcatalog/server-extensions/src/test/java/org/apache/hive/hcatalog/listener/TestNotificationListener.java
+index b667454..18a030d 100644
+--- a/hcatalog/server-extensions/src/test/java/org/apache/hive/hcatalog/listener/TestNotificationListener.java
++++ b/hcatalog/server-extensions/src/test/java/org/apache/hive/hcatalog/listener/TestNotificationListener.java
+@@ -24,6 +24,8 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Vector;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
+ 
+ import javax.jms.Connection;
+ import javax.jms.ConnectionFactory;
+@@ -65,6 +67,18 @@
+ public class TestNotificationListener extends HCatBaseTest implements MessageListener {
+ 
+   private List<String> actualMessages = new Vector<String>();
++  private static final int MSG_RECEIVED_TIMEOUT = 30;
++  private static final List<String> expectedMessages = Arrays.asList(
++      HCatConstants.HCAT_CREATE_DATABASE_EVENT,
++      HCatConstants.HCAT_CREATE_TABLE_EVENT,
++      HCatConstants.HCAT_ADD_PARTITION_EVENT,
++      HCatConstants.HCAT_ALTER_PARTITION_EVENT,
++      HCatConstants.HCAT_DROP_PARTITION_EVENT,
++      HCatConstants.HCAT_ALTER_TABLE_EVENT,
++      HCatConstants.HCAT_DROP_TABLE_EVENT,
++      HCatConstants.HCAT_DROP_DATABASE_EVENT);
++  private static final CountDownLatch messageReceivedSignal =
++      new CountDownLatch(expectedMessages.size());
+ 
+   @Before
+   public void setUp() throws Exception {
+@@ -102,15 +116,6 @@ public void setUp() throws Exception {
+ 
+   @After
+   public void tearDown() throws Exception {
+-    List<String> expectedMessages = Arrays.asList(
+-        HCatConstants.HCAT_CREATE_DATABASE_EVENT,
+-        HCatConstants.HCAT_CREATE_TABLE_EVENT,
+-        HCatConstants.HCAT_ADD_PARTITION_EVENT,
+-        HCatConstants.HCAT_ALTER_PARTITION_EVENT,
+-        HCatConstants.HCAT_DROP_PARTITION_EVENT,
+-        HCatConstants.HCAT_ALTER_TABLE_EVENT,
+-        HCatConstants.HCAT_DROP_TABLE_EVENT,
+-        HCatConstants.HCAT_DROP_DATABASE_EVENT);
+     Assert.assertEquals(expectedMessages, actualMessages);
+   }
+ 
+@@ -129,6 +134,9 @@ public void testAMQListener() throws Exception {
+     driver.run("alter table mytbl add columns (c int comment 'this is an int', d decimal(3,2))");
+     driver.run("drop table mytbl");
+     driver.run("drop database mydb");
++
++    // Wait until either all messages are processed or a maximum time limit is reached.
++    messageReceivedSignal.await(MSG_RECEIVED_TIMEOUT, TimeUnit.SECONDS);
+   }
+ 
+   @Override
+@@ -245,5 +253,8 @@ public void onMessage(Message msg) {
+       e.printStackTrace(System.err);
+       assert false;
+     }
++    finally {
++      messageReceivedSignal.countDown();
++    }
+   }
+ }
+-- 
+1.7.9.5
+

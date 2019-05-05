@@ -1,0 +1,147 @@
+From 4ad8a6886a3262e4dd8926677aa68f178f1cfabe Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Mon, 27 Jun 2016 10:55:48 -0500
+Subject: [PATCH 0648/1164] CDH-41420: HIVE-14098: Logging task properties,
+ and environment variables might contain passwords
+ (Peter Vary, reviewed by Sergio Pena)
+
+Change-Id: I817dde2cc371b69a2502bfd5b41d691fd9d66c11
+---
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   23 ++++++++++++++++++++
+ .../hadoop/hive/ql/exec/mr/MapredLocalTask.java    |    2 +-
+ .../hive/ql/exec/spark/HiveSparkClientFactory.java |   11 +++++-----
+ .../apache/hadoop/hive/ql/exec/TestUtilities.java  |   11 ++++++++++
+ 4 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index bf3c0be..af78672 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -213,6 +213,13 @@
+   public static final String HIVE_ADDED_JARS = "hive.added.jars";
+ 
+   /**
++   * Constants for log masking
++   */
++  private static String KEY_TO_MASK_WITH = "password";
++  private static String MASKED_VALUE = "###_MASKED_###";
++
++
++  /**
+    * ReduceField:
+    * KEY: record key
+    * VALUE: record value
+@@ -3828,4 +3835,20 @@ public static String getQualifiedPath(HiveConf conf, Path path) throws HiveExcep
+   public static boolean isDefaultNameNode(HiveConf conf) {
+     return !conf.getChangedProperties().containsKey(HiveConf.ConfVars.HADOOPFS.varname);
+   }
++
++  /**
++   * Returns MASKED_VALUE if the key contains KEY_TO_MASK_WITH or the original property otherwise.
++   * Used to mask environment variables, and properties in logs which contain passwords
++   * @param key The property key to check
++   * @param value The original value of the property
++   * @return The masked property value
++   */
++  public static String maskIfPassword(String key, String value) {
++    if (key!=null && value!=null) {
++      if (key.toLowerCase().indexOf(KEY_TO_MASK_WITH) != -1) {
++        return MASKED_VALUE;
++      }
++    }
++    return value;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+index 9e21cfd..39ceea7 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/MapredLocalTask.java
+@@ -305,7 +305,7 @@ public int executeInChildVM(DriverContext driverContext) {
+         String name = entry.getKey();
+         String value = entry.getValue();
+         env[pos++] = name + "=" + value;
+-        LOG.debug("Setting env: " + env[pos-1]);
++        LOG.debug("Setting env: " + name + "=" + Utilities.maskIfPassword(name, value));
+       }
+ 
+       LOG.info("Executing: " + cmdLine);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
+index 216f2ae..8218e00 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/HiveSparkClientFactory.java
+@@ -29,6 +29,7 @@
+ import org.apache.commons.compress.utils.CharsetNames;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -96,7 +97,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+             sparkConf.put(propertyName, properties.getProperty(propertyName));
+             LOG.info(String.format(
+               "load spark property from %s (%s -> %s).",
+-              SPARK_DEFAULT_CONF_FILE, propertyName, value));
++              SPARK_DEFAULT_CONF_FILE, propertyName, Utilities.maskIfPassword(propertyName,value)));
+           }
+         }
+       }
+@@ -133,7 +134,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         sparkConf.put(propertyName, value);
+         LOG.info(String.format(
+           "load spark property from hive configuration (%s -> %s).",
+-          propertyName, value));
++          propertyName, Utilities.maskIfPassword(propertyName,value)));
+       } else if (propertyName.startsWith("yarn") &&
+         (sparkMaster.equals("yarn-client") || sparkMaster.equals("yarn-cluster"))) {
+         String value = hiveConf.get(propertyName);
+@@ -143,7 +144,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         sparkConf.put("spark.hadoop." + propertyName, value);
+         LOG.info(String.format(
+           "load yarn property from hive configuration in %s mode (%s -> %s).",
+-          sparkMaster, propertyName, value));
++          sparkMaster, propertyName, Utilities.maskIfPassword(propertyName,value)));
+       } else if (propertyName.equals(HiveConf.ConfVars.HADOOPFS.varname)) {
+         String value = hiveConf.get(propertyName);
+         if (value != null && !value.isEmpty()) {
+@@ -156,7 +157,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         String value = hiveConf.get(propertyName);
+         sparkConf.put("spark.hadoop." + propertyName, value);
+         LOG.info(String.format(
+-          "load HBase configuration (%s -> %s).", propertyName, value));
++          "load HBase configuration (%s -> %s).", propertyName, Utilities.maskIfPassword(propertyName,value)));
+       }
+ 
+       if (RpcConfiguration.HIVE_SPARK_RSC_CONFIGS.contains(propertyName)) {
+@@ -164,7 +165,7 @@ public static HiveSparkClient createHiveSparkClient(HiveConf hiveconf) throws Ex
+         sparkConf.put(propertyName, value);
+         LOG.info(String.format(
+           "load RPC property from hive configuration (%s -> %s).",
+-          propertyName, value));
++          propertyName, Utilities.maskIfPassword(propertyName,value)));
+       }
+     }
+ 
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+index 69f8889..6c28b31 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestUtilities.java
+@@ -140,4 +140,15 @@ public void testGetJarFilesByPath() {
+       FileUtils.deleteQuietly(f);
+     }
+   }
++
++  public void testMaskIfPassword() {
++    Assert.assertNull(Utilities.maskIfPassword("",null));
++    Assert.assertNull(Utilities.maskIfPassword(null,null));
++    Assert.assertEquals("test",Utilities.maskIfPassword(null,"test"));
++    Assert.assertEquals("test2",Utilities.maskIfPassword("any","test2"));
++    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("password","test3"));
++    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("a_passWord","test4"));
++    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("password_a","test5"));
++    Assert.assertEquals("###_MASKED_###",Utilities.maskIfPassword("a_PassWord_a","test6"));
++  }
+ }
+-- 
+1.7.9.5
+

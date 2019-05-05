@@ -1,0 +1,109 @@
+From 67c6851a3bfdc790c45ee187a160d94d591f389a Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Mon, 8 Aug 2016 13:27:26 -0700
+Subject: [PATCH 0799/1164] CDH-45867: HIVE-14421. FS.deleteOnExit holds
+ references to _tmp_space.db files. (Siddharth
+ Seth, reviewed by Thejas Nair)
+
+(cherry picked from commit 0438701395161325a429b4fd8211213276aa0fef)
+
+Change-Id: I631f183f87c67bb658a66f208a4e3a753ae72f31
+---
+ .../org/apache/hadoop/hive/common/FileUtils.java   |    3 ++
+ .../hadoop/hive/ql/exec/tez/TezSessionState.java   |    3 +-
+ .../hadoop/hive/ql/session/SessionState.java       |   35 ++++++++++++++++----
+ 3 files changed, 33 insertions(+), 8 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+index a8a2f4d..7453b74 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+@@ -828,6 +828,9 @@ public static void deleteDirectory(File directory) throws IOException {
+   /**
+    * create temporary file and register it to delete-on-exit hook.
+    * File.deleteOnExit is not used for possible memory leakage.
++   *
++   * Make sure to use {@link #deleteTmpFile(File)} after the file is no longer required,
++   * and has been deleted to avoid a memory leak.
+    */
+   public static File createTempFile(String lScratchDir, String prefix, String suffix) throws IOException {
+     File tmpDir = lScratchDir == null ? null : new File(lScratchDir);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java
+index 03e4c92..4709678 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezSessionState.java
+@@ -317,9 +317,8 @@ private Path createTezDir(String sessionId)
+     fs.mkdirs(tezDir, fsPermission);
+     // Make sure the path is normalized (we expect validation to pass since we just created it).
+     tezDir = DagUtils.validateTargetDir(tezDir, conf).getPath();
+-    // don't keep the directory around on non-clean exit
+-    fs.deleteOnExit(tezDir);
+ 
++    // Directory removal will be handled by cleanup at the SessionState level.
+     return tezDir;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index c9d571a..5a3f29b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -616,7 +616,9 @@ private void createSessionDirs(String userName) throws IOException {
+     conf.set(LOCAL_SESSION_PATH_KEY, localSessionPath.toUri().toString());
+     // 7. HDFS temp table space
+     hdfsTmpTableSpace = new Path(hdfsSessionPath, TMP_PREFIX);
+-    createPath(conf, hdfsTmpTableSpace, scratchDirPermission, false, true);
++    // This is a sub-dir under the hdfsSessionPath. Will be removed along with that dir.
++    // Don't register with deleteOnExit
++    createPath(conf, hdfsTmpTableSpace, scratchDirPermission, false, false);
+     conf.set(TMP_TABLE_SPACE_KEY, hdfsTmpTableSpace.toUri().toString());
+   }
+ 
+@@ -732,19 +734,40 @@ void releaseSessionLockFile() throws IOException {
+   private void dropSessionPaths(Configuration conf) throws IOException {
+     if (hdfsSessionPath != null) {
+       if (hdfsSessionPathLockFile != null) {
+-        hdfsSessionPathLockFile.close();
++        try {
++          hdfsSessionPathLockFile.close();
++        } catch (IOException e) {
++          LOG.error("Failed while closing remoteFsSessionLockFile", e);
++        }
+       }
+-      hdfsSessionPath.getFileSystem(conf).delete(hdfsSessionPath, true);
+-      LOG.info("Deleted HDFS directory: " + hdfsSessionPath);
++      dropPathAndUnregisterDeleteOnExit(hdfsSessionPath, conf, false);
+     }
+     if (localSessionPath != null) {
+-      FileSystem.getLocal(conf).delete(localSessionPath, true);
+-      LOG.info("Deleted local directory: " + localSessionPath);
++      dropPathAndUnregisterDeleteOnExit(localSessionPath, conf, true);
+     }
+     deleteTmpOutputFile();
+     deleteTmpErrOutputFile();
+   }
+ 
++  private void dropPathAndUnregisterDeleteOnExit(Path path, Configuration conf, boolean localFs) {
++    FileSystem fs = null;
++    try {
++      if (localFs) {
++        fs = FileSystem.getLocal(conf);
++      } else {
++        fs = path.getFileSystem(conf);
++      }
++      fs.cancelDeleteOnExit(path);
++      fs.delete(path, true);
++      LOG.info(String.format("Deleted directory: %s on fs with scheme %s", String.valueOf(path),
++          String.valueOf(fs.getScheme())));
++    } catch (IOException e) {
++      LOG.error(String.format("Failed to delete path at %s on fs with scheme %s",
++          String.valueOf(path),
++          (fs == null ? "Unknown-null" : String.valueOf(fs.getScheme()))), e);
++    }
++  }
++
+   /**
+    * Setup authentication and authorization plugins for this session.
+    */
+-- 
+1.7.9.5
+

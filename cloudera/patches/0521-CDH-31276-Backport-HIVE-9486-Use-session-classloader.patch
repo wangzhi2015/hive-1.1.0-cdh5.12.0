@@ -1,0 +1,689 @@
+From 85f2298e0523791cb59b750cdf574ae9f31cd320 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Tue, 3 Mar 2015 23:58:55 +0000
+Subject: [PATCH 0521/1164] CDH-31276 : Backport HIVE-9486 : Use session
+ classloader instead of application loader (Navis
+ via Szehon Ho)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1663832 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit 6c3ca4cd82e7caddc8486fb2c88875e1c746ba0d)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
+
+Change-Id: I78b1fd8880ac39c3b4a31fbbd6cfb43b30a1bc61
+---
+ .../org/apache/hadoop/hive/accumulo/Utils.java     |    3 ++-
+ .../predicate/PrimitiveComparisonFilter.java       |    5 +++--
+ .../accumulo/serde/AccumuloSerDeParameters.java    |    5 +++--
+ .../org/apache/hadoop/hive/common/JavaUtils.java   |    8 ++++++++
+ .../apache/hadoop/hive/hbase/HBaseSerDeHelper.java |    5 +++--
+ .../hadoop/hive/hbase/HBaseSerDeParameters.java    |    3 ++-
+ .../hive/hcatalog/templeton/tool/JobState.java     |    2 +-
+ .../apache/hadoop/hive/ql/exec/mr/ExecDriver.java  |    7 ++++---
+ .../persistence/MapJoinTableContainerSerDe.java    |    3 ++-
+ .../hive/ql/exec/spark/SparkPlanGenerator.java     |    5 +++--
+ .../hive/ql/exec/tez/HivePreWarmProcessor.java     |    3 ++-
+ .../hive/ql/exec/tez/HiveSplitGenerator.java       |    3 ++-
+ .../hive/ql/index/compact/CompactIndexHandler.java |    4 ++--
+ .../hadoop/hive/ql/io/CombineHiveRecordReader.java |    3 ++-
+ .../hadoop/hive/ql/io/HiveFileFormatUtils.java     |    5 +++--
+ .../apache/hadoop/hive/ql/io/orc/WriterImpl.java   |    3 ++-
+ .../hive/ql/io/rcfile/stats/PartialScanTask.java   |    4 ++--
+ .../ql/io/rcfile/truncate/ColumnTruncateTask.java  |    4 ++--
+ .../hive/ql/optimizer/AbstractSMBJoinProc.java     |    7 ++++---
+ .../hive/ql/optimizer/ConvertJoinMapJoin.java      |    7 ++++---
+ .../hadoop/hive/ql/parse/DDLSemanticAnalyzer.java  |    3 ++-
+ .../hadoop/hive/ql/plan/PTFDeserializer.java       |    4 ++--
+ .../org/apache/hadoop/hive/ql/plan/PlanUtils.java  |    9 +++++----
+ .../hive/ql/stats/jdbc/JDBCStatsAggregator.java    |    3 ++-
+ .../hive/ql/stats/jdbc/JDBCStatsPublisher.java     |    5 +++--
+ .../hadoop/hive/ql/txn/compactor/CompactorMR.java  |    3 ++-
+ .../hive/ql/udf/generic/GenericUDFReflect.java     |    3 ++-
+ 27 files changed, 74 insertions(+), 45 deletions(-)
+
+diff --git a/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/Utils.java b/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/Utils.java
+index 16abac2..dc4782a 100644
+--- a/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/Utils.java
++++ b/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/Utils.java
+@@ -42,6 +42,7 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.util.StringUtils;
+ import org.apache.log4j.Logger;
+ 
+@@ -207,7 +208,7 @@ private static String getJar(Class<?> my_class) {
+     Class<?> jarFinder = null;
+     try {
+       log.debug("Looking for " + hadoopJarFinder + ".");
+-      jarFinder = Class.forName(hadoopJarFinder);
++      jarFinder = JavaUtils.loadClass(hadoopJarFinder);
+       log.debug(hadoopJarFinder + " found.");
+       Method getJar = jarFinder.getMethod("getJar", Class.class);
+       ret = (String) getJar.invoke(null, my_class);
+diff --git a/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/predicate/PrimitiveComparisonFilter.java b/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/predicate/PrimitiveComparisonFilter.java
+index ef459aa..4b5fae6 100644
+--- a/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/predicate/PrimitiveComparisonFilter.java
++++ b/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/predicate/PrimitiveComparisonFilter.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.hive.accumulo.columns.HiveAccumuloColumnMapping;
+ import org.apache.hadoop.hive.accumulo.predicate.compare.CompareOp;
+ import org.apache.hadoop.hive.accumulo.predicate.compare.PrimitiveComparison;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+ import org.apache.hadoop.io.Text;
+ import org.apache.log4j.Logger;
+@@ -117,8 +118,8 @@ public void init(SortedKeyValueIterator<Key,Value> source, Map<String,String> op
+     cqHolder = new Text();
+ 
+     try {
+-      Class<?> pClass = Class.forName(options.get(P_COMPARE_CLASS));
+-      Class<?> cClazz = Class.forName(options.get(COMPARE_OPT_CLASS));
++      Class<?> pClass = JavaUtils.loadClass(options.get(P_COMPARE_CLASS));
++      Class<?> cClazz = JavaUtils.loadClass(options.get(COMPARE_OPT_CLASS));
+       PrimitiveComparison pCompare = pClass.asSubclass(PrimitiveComparison.class).newInstance();
+       compOpt = cClazz.asSubclass(CompareOp.class).newInstance();
+       byte[] constant = getConstant(options);
+diff --git a/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/serde/AccumuloSerDeParameters.java b/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/serde/AccumuloSerDeParameters.java
+index 6a3bd2a..4dac675 100644
+--- a/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/serde/AccumuloSerDeParameters.java
++++ b/accumulo-handler/src/java/org/apache/hadoop/hive/accumulo/serde/AccumuloSerDeParameters.java
+@@ -28,6 +28,7 @@
+ import org.apache.hadoop.hive.accumulo.columns.ColumnMapper;
+ import org.apache.hadoop.hive.accumulo.columns.ColumnMapping;
+ import org.apache.hadoop.hive.accumulo.columns.HiveAccumuloRowIdColumnMapping;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+ import org.apache.hadoop.hive.serde2.lazy.LazySerDeParameters;
+@@ -116,7 +117,7 @@ protected AccumuloRowIdFactory createRowIdFactory(Configuration job, Properties
+     String factoryClassName = tbl.getProperty(COMPOSITE_ROWID_FACTORY);
+     if (factoryClassName != null) {
+       log.info("Loading CompositeRowIdFactory class " + factoryClassName);
+-      Class<?> factoryClazz = Class.forName(factoryClassName);
++      Class<?> factoryClazz = JavaUtils.loadClass(factoryClassName);
+       return (AccumuloRowIdFactory) ReflectionUtils.newInstance(factoryClazz, job);
+     }
+ 
+@@ -124,7 +125,7 @@ protected AccumuloRowIdFactory createRowIdFactory(Configuration job, Properties
+     String keyClassName = tbl.getProperty(COMPOSITE_ROWID_CLASS);
+     if (keyClassName != null) {
+       log.info("Loading CompositeRowId class " + keyClassName);
+-      Class<?> keyClass = Class.forName(keyClassName);
++      Class<?> keyClass = JavaUtils.loadClass(keyClassName);
+       Class<? extends AccumuloCompositeRowId> compositeRowIdClass = keyClass
+           .asSubclass(AccumuloCompositeRowId.class);
+       return new CompositeAccumuloRowIdFactory(compositeRowIdClass);
+diff --git a/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java b/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java
+index b6e88fd..3dd8f75 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/JavaUtils.java
+@@ -70,6 +70,14 @@ public static ClassLoader getClassLoader() {
+     return classLoader;
+   }
+ 
++  public static Class loadClass(String className) throws ClassNotFoundException {
++    return loadClass(className, true);
++  }
++
++  public static Class loadClass(String className, boolean init) throws ClassNotFoundException {
++    return Class.forName(className, init, getClassLoader());
++  }
++
+   public static boolean closeClassLoadersTo(ClassLoader current, ClassLoader stop) {
+     if (!isValidHierarchy(current, stop)) {
+       return false;
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeHelper.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeHelper.java
+index 9f2f02f..3bcc5c0 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeHelper.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeHelper.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.hbase.ColumnMappings.ColumnMapping;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+@@ -466,7 +467,7 @@ private static void generateAvroStructFromClass(String serClassName, StringBuild
+       throws SerDeException {
+     Class<?> serClass;
+     try {
+-      serClass = Class.forName(serClassName);
++      serClass = JavaUtils.loadClass(serClassName);
+     } catch (ClassNotFoundException e) {
+       throw new SerDeException("Error obtaining descriptor for " + serClassName, e);
+     }
+@@ -562,7 +563,7 @@ private static String filter(String name) {
+ 
+     Class<?> keyClass;
+     try {
+-      keyClass = Class.forName(compKeyClassName);
++      keyClass = JavaUtils.loadClass(compKeyClassName);
+       keyFactory = new CompositeHBaseKeyFactory(keyClass);
+     } catch (Exception e) {
+       throw new SerDeException(e);
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeParameters.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeParameters.java
+index 2dd27f2..71f5da5 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeParameters.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseSerDeParameters.java
+@@ -25,6 +25,7 @@
+ import org.apache.avro.Schema;
+ import org.apache.avro.reflect.ReflectData;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.hbase.ColumnMappings.ColumnMapping;
+ import org.apache.hadoop.hive.hbase.struct.AvroHBaseValueFactory;
+ import org.apache.hadoop.hive.hbase.struct.DefaultHBaseValueFactory;
+@@ -200,7 +201,7 @@ private static HBaseKeyFactory createKeyFactory(Configuration job, Properties tb
+     if (configuration != null) {
+       return configuration.getClassByName(className);
+     }
+-    return Class.forName(className);
++    return JavaUtils.loadClass(className);
+   }
+ 
+   private List<HBaseValueFactory> initValueFactories(Configuration conf, Properties tbl)
+diff --git a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/JobState.java b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/JobState.java
+index 36b64da..e813399 100644
+--- a/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/JobState.java
++++ b/hcatalog/webhcat/svr/src/main/java/org/apache/hive/hcatalog/templeton/tool/JobState.java
+@@ -70,7 +70,7 @@ public static TempletonStorage getStorageInstance(Configuration conf) {
+     TempletonStorage storage = null;
+     try {
+       storage = (TempletonStorage)
+-        Class.forName(conf.get(TempletonStorage.STORAGE_CLASS))
++          Class.forName(conf.get(TempletonStorage.STORAGE_CLASS))
+           .newInstance();
+     } catch (Exception e) {
+       LOG.warn("No storage method found: " + e.getMessage());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+index d0693ef..51b5941 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/mr/ExecDriver.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.CompressionUtils;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.common.LogUtils;
+ import org.apache.hadoop.hive.common.LogUtils.LogInitializationException;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -239,8 +240,8 @@ public int execute(DriverContext driverContext) {
+     job.setMapOutputValueClass(BytesWritable.class);
+ 
+     try {
+-      job.setPartitionerClass((Class<? extends Partitioner>) (Class.forName(HiveConf.getVar(job,
+-          HiveConf.ConfVars.HIVEPARTITIONER))));
++      String partitioner = HiveConf.getVar(job, ConfVars.HIVEPARTITIONER);
++      job.setPartitionerClass((Class<? extends Partitioner>) JavaUtils.loadClass(partitioner));
+     } catch (ClassNotFoundException e) {
+       throw new RuntimeException(e.getMessage(), e);
+     }
+@@ -286,7 +287,7 @@ public int execute(DriverContext driverContext) {
+     LOG.info("Using " + inpFormat);
+ 
+     try {
+-      job.setInputFormat((Class<? extends InputFormat>) (Class.forName(inpFormat)));
++      job.setInputFormat((Class<? extends InputFormat>) JavaUtils.loadClass(inpFormat));
+     } catch (ClassNotFoundException e) {
+       throw new RuntimeException(e.getMessage(), e);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinTableContainerSerDe.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinTableContainerSerDe.java
+index adb50f0..92625f2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinTableContainerSerDe.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/persistence/MapJoinTableContainerSerDe.java
+@@ -29,6 +29,7 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.serde2.SerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+@@ -194,7 +195,7 @@ private MapJoinPersistableTableContainer create(
+     try {
+       @SuppressWarnings("unchecked")
+       Class<? extends MapJoinPersistableTableContainer> clazz =
+-          (Class<? extends MapJoinPersistableTableContainer>)Class.forName(name);
++          (Class<? extends MapJoinPersistableTableContainer>) JavaUtils.loadClass(name);
+       Constructor<? extends MapJoinPersistableTableContainer> constructor =
+           clazz.getDeclaredConstructor(Map.class);
+       return constructor.newInstance(metaData);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
+index ce8085d..9f5b1e1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
+@@ -30,6 +30,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.ql.io.merge.MergeFileMapper;
+ import org.apache.hadoop.hive.ql.io.merge.MergeFileOutputFormat;
+ import org.apache.hadoop.hive.ql.io.merge.MergeFileWork;
+@@ -170,7 +171,7 @@ private SparkTran generateParentTran(SparkPlan sparkPlan, SparkWork sparkWork,
+ 
+     Class inputFormatClass;
+     try {
+-      inputFormatClass = Class.forName(inpFormat);
++      inputFormatClass = JavaUtils.loadClass(inpFormat);
+     } catch (ClassNotFoundException e) {
+       String message = "Failed to load specified input format class:"
+           + inpFormat;
+@@ -262,7 +263,7 @@ private JobConf cloneJobConf(BaseWork work) throws Exception {
+     HiveConf.setVar(cloned, HiveConf.ConfVars.PLAN, "");
+     try {
+       cloned.setPartitionerClass((Class<? extends Partitioner>)
+-          (Class.forName(HiveConf.getVar(cloned, HiveConf.ConfVars.HIVEPARTITIONER))));
++          JavaUtils.loadClass(HiveConf.getVar(cloned, HiveConf.ConfVars.HIVEPARTITIONER)));
+     } catch (ClassNotFoundException e) {
+       String msg = "Could not find partitioner class: " + e.getMessage()
+         + " which is specified by: " + HiveConf.ConfVars.HIVEPARTITIONER.varname;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HivePreWarmProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HivePreWarmProcessor.java
+index ce3b1d6..52c36eb 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HivePreWarmProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HivePreWarmProcessor.java
+@@ -22,6 +22,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.io.ReadaheadPool;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.tez.common.TezUtils;
+@@ -99,7 +100,7 @@ public void run(Map<String, LogicalInput> inputs,
+              * in hive-exec.jar. These are the relatively safe ones - operators & io classes.
+              */
+             if(klass.indexOf("vector") != -1 || klass.indexOf("Operator") != -1) {
+-              Class.forName(klass);
++              JavaUtils.loadClass(klass);
+             }
+           }
+         }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HiveSplitGenerator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HiveSplitGenerator.java
+index afe83d9..a6f4b55 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HiveSplitGenerator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/HiveSplitGenerator.java
+@@ -28,6 +28,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
+ import org.apache.hadoop.hive.ql.plan.MapWork;
+@@ -114,7 +115,7 @@ public HiveSplitGenerator() {
+     if (groupingEnabled) {
+       // Need to instantiate the realInputFormat
+       InputFormat<?, ?> inputFormat =
+-          (InputFormat<?, ?>) ReflectionUtils.newInstance(Class.forName(realInputFormatName),
++          (InputFormat<?, ?>) ReflectionUtils.newInstance(JavaUtils.loadClass(realInputFormatName),
+               jobConf);
+ 
+       int totalResource = rootInputContext.getTotalAvailableResource().getMemory();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java b/ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+index 0ca5d22..1dbe230 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+@@ -28,7 +28,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hive.common.StatsSetupConst;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+@@ -220,7 +220,7 @@ public void generateIndexQuery(List<Index> indexes, ExprNodeDesc predicate,
+           // We can only perform a binary search with HiveInputFormat and CombineHiveInputFormat
+           // and BucketizedHiveInputFormat
+           try {
+-            if (!HiveInputFormat.class.isAssignableFrom(Class.forName(inputFormat))) {
++            if (!HiveInputFormat.class.isAssignableFrom(JavaUtils.loadClass(inputFormat))) {
+               work = null;
+               break;
+             }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveRecordReader.java b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveRecordReader.java
+index ede3b6e..aa607cc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveRecordReader.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveRecordReader.java
+@@ -21,6 +21,7 @@
+ import java.io.IOException;
+ 
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.ql.exec.mr.ExecMapper;
+ import org.apache.hadoop.hive.ql.io.CombineHiveInputFormat.CombineHiveInputSplit;
+ import org.apache.hadoop.io.Writable;
+@@ -50,7 +51,7 @@ public CombineHiveRecordReader(InputSplit split, Configuration conf,
+     String inputFormatClassName = hsplit.inputFormatClassName();
+     Class inputFormatClass = null;
+     try {
+-      inputFormatClass = Class.forName(inputFormatClassName);
++      inputFormatClass = JavaUtils.loadClass(inputFormatClassName);
+     } catch (ClassNotFoundException e) {
+       throw new IOException("CombineHiveRecordReader: class not found "
+           + inputFormatClassName);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/HiveFileFormatUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/io/HiveFileFormatUtils.java
+index e2ae25b..d06f372 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/HiveFileFormatUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/HiveFileFormatUtils.java
+@@ -32,6 +32,7 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.FileSinkOperator.RecordWriter;
+ import org.apache.hadoop.hive.ql.exec.Operator;
+@@ -232,8 +233,8 @@ public static RecordWriter getHiveRecordWriter(JobConf jc,
+         jc_output = new JobConf(jc);
+         String codecStr = conf.getCompressCodec();
+         if (codecStr != null && !codecStr.trim().equals("")) {
+-          Class<? extends CompressionCodec> codec = (Class<? extends CompressionCodec>) Class
+-              .forName(codecStr);
++          Class<? extends CompressionCodec> codec = 
++              (Class<? extends CompressionCodec>) JavaUtils.loadClass(codecStr);
+           FileOutputFormat.setOutputCompressorClass(jc_output, codec);
+         }
+         String type = conf.getCompressType();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java
+index 2d000ec..eb423dd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java
+@@ -31,6 +31,7 @@
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.common.type.HiveDecimal;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.io.IOConstants;
+@@ -286,7 +287,7 @@ static CompressionCodec createCodec(CompressionKind kind) {
+         try {
+           Class<? extends CompressionCodec> lzo =
+               (Class<? extends CompressionCodec>)
+-                  Class.forName("org.apache.hadoop.hive.ql.io.orc.LzoCodec");
++                  JavaUtils.loadClass("org.apache.hadoop.hive.ql.io.orc.LzoCodec");
+           return lzo.newInstance();
+         } catch (ClassNotFoundException e) {
+           throw new IllegalArgumentException("LZO is not available.", e);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/stats/PartialScanTask.java b/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/stats/PartialScanTask.java
+index 0f7e833..f4ffdd6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/stats/PartialScanTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/stats/PartialScanTask.java
+@@ -31,6 +31,7 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.Context;
+ import org.apache.hadoop.hive.ql.DriverContext;
+@@ -144,8 +145,7 @@ public int execute(DriverContext driverContext) {
+     LOG.info("Using " + inpFormat);
+ 
+     try {
+-      job.setInputFormat((Class<? extends InputFormat>) (Class
+-          .forName(inpFormat)));
++      job.setInputFormat((Class<? extends InputFormat>) JavaUtils.loadClass(inpFormat));
+     } catch (ClassNotFoundException e) {
+       throw new RuntimeException(e.getMessage(), e);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/truncate/ColumnTruncateTask.java b/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/truncate/ColumnTruncateTask.java
+index 73c6dcc..4633820 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/truncate/ColumnTruncateTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/rcfile/truncate/ColumnTruncateTask.java
+@@ -24,6 +24,7 @@
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.Context;
+ import org.apache.hadoop.hive.ql.DriverContext;
+@@ -120,8 +121,7 @@ public int execute(DriverContext driverContext) {
+     LOG.info("Using " + inpFormat);
+ 
+     try {
+-      job.setInputFormat((Class<? extends InputFormat>) (Class
+-          .forName(inpFormat)));
++      job.setInputFormat((Class<? extends InputFormat>) JavaUtils.loadClass(inpFormat));
+     } catch (ClassNotFoundException e) {
+       throw new RuntimeException(e.getMessage(), e);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/AbstractSMBJoinProc.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/AbstractSMBJoinProc.java
+index ff34682..9509f8e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/AbstractSMBJoinProc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/AbstractSMBJoinProc.java
+@@ -26,6 +26,7 @@
+ import java.util.Set;
+ import java.util.Stack;
+ 
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.Order;
+ import org.apache.hadoop.hive.ql.ErrorMsg;
+@@ -440,10 +441,10 @@ protected boolean canConvertJoinToBucketMapJoin(
+ 
+     Class<? extends BigTableSelectorForAutoSMJ> bigTableMatcherClass = null;
+     try {
++      String selector = HiveConf.getVar(pGraphContext.getConf(),
++          HiveConf.ConfVars.HIVE_AUTO_SORTMERGE_JOIN_BIGTABLE_SELECTOR);
+       bigTableMatcherClass =
+-        (Class<? extends BigTableSelectorForAutoSMJ>)
+-          (Class.forName(HiveConf.getVar(pGraphContext.getConf(),
+-            HiveConf.ConfVars.HIVE_AUTO_SORTMERGE_JOIN_BIGTABLE_SELECTOR)));
++        (Class<? extends BigTableSelectorForAutoSMJ>) JavaUtils.loadClass(selector);
+     } catch (ClassNotFoundException e) {
+       throw new SemanticException(e.getMessage());
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConvertJoinMapJoin.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConvertJoinMapJoin.java
+index 6bef5f5..4a1bd15 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConvertJoinMapJoin.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ConvertJoinMapJoin.java
+@@ -28,6 +28,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.AppMasterEventOperator;
+ import org.apache.hadoop.hive.ql.exec.CommonMergeJoinOperator;
+@@ -181,10 +182,10 @@ private Object checkAndConvertSMBJoin(OptimizeTezProcContext context, JoinOperat
+     }
+     Class<? extends BigTableSelectorForAutoSMJ> bigTableMatcherClass = null;
+     try {
++      String selector = HiveConf.getVar(context.parseContext.getConf(),
++          HiveConf.ConfVars.HIVE_AUTO_SORTMERGE_JOIN_BIGTABLE_SELECTOR);
+       bigTableMatcherClass =
+-          (Class<? extends BigTableSelectorForAutoSMJ>) (Class.forName(HiveConf.getVar(
+-              context.parseContext.getConf(),
+-              HiveConf.ConfVars.HIVE_AUTO_SORTMERGE_JOIN_BIGTABLE_SELECTOR)));
++          (Class<? extends BigTableSelectorForAutoSMJ>) JavaUtils.loadClass(selector);
+     } catch (ClassNotFoundException e) {
+       throw new SemanticException(e.getMessage());
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
+index 372c0e0..d96b677 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
+@@ -45,6 +45,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+@@ -1036,7 +1037,7 @@ private void analyzeCreateIndex(ASTNode ast) throws SemanticException {
+       typeName = indexType.getHandlerClsName();
+     } else {
+       try {
+-        Class.forName(typeName);
++        JavaUtils.loadClass(typeName);
+       } catch (Exception e) {
+         throw new SemanticException("class name provided for index handler not found.", e);
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/PTFDeserializer.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/PTFDeserializer.java
+index f75bec5..830a8eb 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/PTFDeserializer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/PTFDeserializer.java
+@@ -27,7 +27,7 @@
+ import java.util.Properties;
+ 
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.ql.exec.ExprNodeEvaluator;
+ import org.apache.hadoop.hive.ql.exec.PTFPartition;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+@@ -288,7 +288,7 @@ private TableFunctionResolver constructResolver(String className) throws HiveExc
+     try {
+       @SuppressWarnings("unchecked")
+       Class<? extends TableFunctionResolver> rCls = (Class<? extends TableFunctionResolver>)
+-          Class.forName(className);
++          JavaUtils.loadClass(className);
+       return ReflectionUtils.newInstance(rCls, null);
+     } catch (Exception e) {
+       throw new HiveException(e);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
+index d778e9a..97bcb07 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/PlanUtils.java
+@@ -31,6 +31,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+@@ -145,7 +146,7 @@ public static TableDesc getDefaultTableDesc(CreateTableDesc directoryDesc,
+             serdeConstants.SERIALIZATION_LIB, directoryDesc.getSerName());
+       }
+       if (directoryDesc.getOutputFormat() != null){
+-        ret.setOutputFileFormatClass(Class.forName(directoryDesc.getOutputFormat()));
++        ret.setOutputFileFormatClass(JavaUtils.loadClass(directoryDesc.getOutputFormat()));
+       }
+       if (directoryDesc.getNullFormat() != null) {
+         properties.setProperty(serdeConstants.SERIALIZATION_NULL_FORMAT,
+@@ -308,7 +309,7 @@ public static TableDesc getTableDesc(CreateTableDesc crtTblDesc, String cols,
+ 
+     try {
+       if (crtTblDesc.getSerName() != null) {
+-        Class c = Class.forName(crtTblDesc.getSerName());
++        Class c = JavaUtils.loadClass(crtTblDesc.getSerName());
+         serdeClass = c;
+       }
+ 
+@@ -360,8 +361,8 @@ public static TableDesc getTableDesc(CreateTableDesc crtTblDesc, String cols,
+ 
+       // replace the default input & output file format with those found in
+       // crtTblDesc
+-      Class c1 = Class.forName(crtTblDesc.getInputFormat());
+-      Class c2 = Class.forName(crtTblDesc.getOutputFormat());
++      Class c1 = JavaUtils.loadClass(crtTblDesc.getInputFormat());
++      Class c2 = JavaUtils.loadClass(crtTblDesc.getOutputFormat());
+       Class<? extends InputFormat> in_class = c1;
+       Class<? extends HiveOutputFormat> out_class = c2;
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsAggregator.java b/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsAggregator.java
+index e26031c..c17ce23 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsAggregator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsAggregator.java
+@@ -32,6 +32,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+@@ -69,7 +70,7 @@ public boolean connect(Configuration hiveconf, Task sourceTask) {
+     this.sourceTask = sourceTask;
+ 
+     try {
+-      Class.forName(driver).newInstance();
++      JavaUtils.loadClass(driver).newInstance();
+     } catch (Exception e) {
+       LOG.error("Error during instantiating JDBC driver " + driver + ". ", e);
+       return false;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsPublisher.java b/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsPublisher.java
+index 32826e7..afeed9c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsPublisher.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/stats/jdbc/JDBCStatsPublisher.java
+@@ -35,6 +35,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.stats.StatsPublisher;
+@@ -69,7 +70,7 @@ public boolean connect(Configuration hiveconf) {
+     String driver = HiveConf.getVar(hiveconf, HiveConf.ConfVars.HIVESTATSJDBCDRIVER);
+ 
+     try {
+-      Class.forName(driver).newInstance();
++      JavaUtils.loadClass(driver).newInstance();
+     } catch (Exception e) {
+       LOG.error("Error during instantiating JDBC driver " + driver + ". ", e);
+       return false;
+@@ -272,7 +273,7 @@ public boolean init(Configuration hconf) {
+       this.hiveconf = hconf;
+       connectionString = HiveConf.getVar(hconf, HiveConf.ConfVars.HIVESTATSDBCONNECTIONSTRING);
+       String driver = HiveConf.getVar(hconf, HiveConf.ConfVars.HIVESTATSJDBCDRIVER);
+-      Class.forName(driver).newInstance();
++      JavaUtils.loadClass(driver).newInstance();
+       synchronized(DriverManager.class) {
+         DriverManager.setLoginTimeout(timeout);
+         conn = DriverManager.getConnection(connectionString);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorMR.java b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorMR.java
+index d3ad515..b8e18ea 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorMR.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/txn/compactor/CompactorMR.java
+@@ -24,6 +24,7 @@
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.common.ValidTxnList;
+ import org.apache.hadoop.hive.common.ValidReadTxnList;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -647,7 +648,7 @@ public String toString() {
+   private static <T> T instantiate(Class<T> classType, String classname) throws IOException {
+     T t = null;
+     try {
+-      Class c = Class.forName(classname);
++      Class c = JavaUtils.loadClass(classname);
+       Object o = c.newInstance();
+       if (classType.isAssignableFrom(o.getClass())) {
+         t = (T)o;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFReflect.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFReflect.java
+index 89496ea..17cab51 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFReflect.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFReflect.java
+@@ -20,6 +20,7 @@
+ import java.lang.reflect.Method;
+ import java.util.Arrays;
+ 
++import org.apache.hadoop.hive.common.JavaUtils;
+ import org.apache.hadoop.hive.ql.exec.Description;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
+ import org.apache.hadoop.hive.ql.exec.UDFArgumentLengthException;
+@@ -102,7 +103,7 @@ public Object evaluate(DeferredObject[] arguments) throws HiveException {
+       className = ObjectInspectorUtils.copyToStandardObject(newClassName, inputClassNameOI);
+       String classNameString = classNameOI.getPrimitiveJavaObject(className);
+       try {
+-        c = Class.forName(classNameString);
++        c = JavaUtils.loadClass(classNameString);
+       } catch (ClassNotFoundException ex) {
+         throw new HiveException("UDFReflect evaluate ", ex);
+       }
+-- 
+1.7.9.5
+

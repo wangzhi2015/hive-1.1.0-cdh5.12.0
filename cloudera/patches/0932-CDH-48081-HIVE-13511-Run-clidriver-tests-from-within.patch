@@ -1,0 +1,240 @@
+From 1538b1f962bc898f79a8ae3f8c3381da0d5d3631 Mon Sep 17 00:00:00 2001
+From: Siddharth Seth <sseth@apache.org>
+Date: Sat, 28 May 2016 08:35:55 -0500
+Subject: [PATCH 0932/1164] CDH-48081 : HIVE-13511 : Run clidriver tests from
+ within the qtest dir for the precommit tests.
+ (Siddharth Seth, reviewed by Ashutosh Chauhan)
+
+Change-Id: I9df822b9765846b630e757e30fbf256219b5674e
+---
+ .../apache/hive/ptest/execution/HostExecutor.java  |    4 ++++
+ .../org/apache/hive/ptest/execution/PTest.java     |    1 +
+ .../hive/ptest/execution/conf/QFileTestBatch.java  |   12 ++++++++++--
+ .../hive/ptest/execution/conf/TestBatch.java       |    1 +
+ .../hive/ptest/execution/conf/TestParser.java      |   20 +++++++++++++++++---
+ .../hive/ptest/execution/conf/UnitTestBatch.java   |    6 ++++++
+ .../hive/ptest/execution/TestExecutionPhase.java   |    4 +++-
+ .../ptest/execution/conf/TestQFileTestBatch.java   |   12 +++++++++---
+ 8 files changed, 51 insertions(+), 9 deletions(-)
+
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+index 9e638a3..5f84f00 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/HostExecutor.java
+@@ -40,6 +40,7 @@
+ import org.apache.hive.ptest.execution.ssh.SSHCommandExecutor;
+ import org.apache.hive.ptest.execution.ssh.SSHExecutionException;
+ import org.apache.hive.ptest.execution.ssh.SSHResult;
++import org.apache.logging.log4j.util.Strings;
+ import org.slf4j.Logger;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+@@ -243,6 +244,9 @@ private boolean executeTestBatch(Drone drone, TestBatch batch, Set<TestBatch> fa
+     templateVariables.put("testArguments", batch.getTestArguments());
+     templateVariables.put("localDir", drone.getLocalDirectory());
+     templateVariables.put("logDir", drone.getLocalLogDirectory());
++    if (!Strings.isEmpty(batch.getTestModule())) {
++      templateVariables.put("testModule", batch.getTestModule());
++    }
+     String command = Templates.getTemplateResult("bash $localDir/$instanceName/scratch/" + script.getName(),
+         templateVariables);
+     Templates.writeTemplateResult("batch-exec.vm", script, templateVariables);
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+index 1fd8ed0..6b2ef8f 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/PTest.java
+@@ -162,6 +162,7 @@ public int run() {
+     Map<String, Long> elapsedTimes = Maps.newTreeMap();
+     try {
+       mLogger.info("Running tests with " + mConfiguration);
++      mLogger.info("Running tests with configuration context=[{}]", mConfiguration.getContext());
+       for(Phase phase : mPhases) {
+         String msg = "Executing " + phase.getClass().getName();
+         mLogger.info(msg);
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
+index 61ecc88..fa213db 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/QFileTestBatch.java
+@@ -29,10 +29,11 @@
+   private final String driver;
+   private final String queryFilesProperty;
+   private final String name;
++  private final String moduleName;
+   private final Set<String> tests;
+   private final boolean isParallel;
+   public QFileTestBatch(String testCasePropertyName, String driver, 
+-      String queryFilesProperty, Set<String> tests, boolean isParallel) {
++      String queryFilesProperty, Set<String> tests, boolean isParallel, String moduleName) {
+     this.testCasePropertyName = testCasePropertyName;
+     this.driver = driver;
+     this.queryFilesProperty = queryFilesProperty;
+@@ -44,6 +45,7 @@ public QFileTestBatch(String testCasePropertyName, String driver,
+     }
+     this.name = name;
+     this.isParallel = isParallel;
++    this.moduleName = moduleName;
+   }
+   public String getDriver() {
+     return driver;
+@@ -66,12 +68,18 @@ public String getTestArguments() {
+   public String toString() {
+     return "QFileTestBatch [driver=" + driver + ", queryFilesProperty="
+         + queryFilesProperty + ", name=" + name + ", tests=" + tests
+-        + ", isParallel=" + isParallel + "]";
++        + ", isParallel=" + isParallel + ", moduleName=" + moduleName + "]";
+   }
+   @Override
+   public boolean isParallel() {
+     return isParallel;
+   }
++
++  @Override
++  public String getTestModule() {
++    return moduleName;
++  }
++
+   @Override
+   public int hashCode() {
+     final int prime = 31;
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
+index fc5a7c5..4ebb670 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestBatch.java
+@@ -28,4 +28,5 @@
+ 
+   public boolean isParallel();
+ 
++  public String getTestModule();
+ }
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
+index fb0d2f1..5da804f 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/TestParser.java
+@@ -47,6 +47,9 @@
+   private static final Splitter TEST_SPLITTER = Splitter.onPattern("[, ]")
+     .trimResults().omitEmptyStrings();
+ 
++  private static final String QTEST_MODULE_NAME = "itests/qtest";
++  private static final String QTEST_SPARK_MODULE_NAME = "itests/qtest-spark";
++
+   private final Context context;
+   private final String testCasePropertyName;
+   private final File sourceDirectory;
+@@ -182,17 +185,20 @@ public TestParser(Context context, String testCasePropertyName,
+         logger.info("Exlcuding test " + driver + " " + test);
+       } else if(isolated.contains(test)) {
+         logger.info("Executing isolated test " + driver + " " + test);
+-        testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty, Sets.newHashSet(test), isParallel));
++        testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty,
++            Sets.newHashSet(test), isParallel, getModuleName(driver)));
+       } else {
+         if(testBatch.size() >= batchSize) {
+-          testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty, Sets.newHashSet(testBatch), isParallel));
++          testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty,
++              Sets.newHashSet(testBatch), isParallel, getModuleName(driver)));
+           testBatch = Lists.newArrayList();
+         }
+         testBatch.add(test);
+       }
+     }
+     if(!testBatch.isEmpty()) {
+-      testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty, Sets.newHashSet(testBatch), isParallel));
++      testBatches.add(new QFileTestBatch(testCasePropertyName, driver, queryFilesProperty,
++          Sets.newHashSet(testBatch), isParallel, getModuleName(driver)));
+     }
+     return testBatches;
+   }
+@@ -264,6 +270,14 @@ private void expandTestProperties(Set<String> tests, Map<String, Properties> pro
+     tests.addAll(toAdd);
+   }
+ 
++  private String getModuleName(String driverName) {
++    if (driverName.toLowerCase().contains("spark")) {
++      return QTEST_SPARK_MODULE_NAME;
++    } else {
++      return QTEST_MODULE_NAME;
++    }
++  }
++
+   public Supplier<List<TestBatch>> parse() {
+     return new Supplier<List<TestBatch>>() {
+       @Override
+diff --git a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
+index ca1adec..51f7f90 100644
+--- a/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
++++ b/testutils/ptest2/src/main/java/org/apache/hive/ptest/execution/conf/UnitTestBatch.java
+@@ -51,6 +51,12 @@ public String toString() {
+   public boolean isParallel() {
+     return isParallel;
+   }
++
++  @Override
++  public String getTestModule() {
++    return null;
++  }
++
+   @Override
+   public int hashCode() {
+     final int prime = 31;
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
+index 09f237e..29d148b 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/TestExecutionPhase.java
+@@ -69,7 +69,9 @@ private ExecutionPhase getPhase() throws IOException {
+   private void setupQFile(boolean isParallel) throws Exception {
+     testDir = Dirs.create( new File(baseDir, "test"));
+     Assert.assertTrue(new File(testDir, QFILENAME).createNewFile());
+-    testBatch = new QFileTestBatch("testcase", DRIVER, "qfile", Sets.newHashSet(QFILENAME), isParallel);
++    testBatch =
++        new QFileTestBatch("testcase", DRIVER, "qfile", Sets.newHashSet(QFILENAME), isParallel,
++            "testModule");
+     testBatches = Collections.singletonList(testBatch);
+   }
+   private void setupUnitTest() throws Exception {
+diff --git a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
+index 67349fc..0257591 100644
+--- a/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
++++ b/testutils/ptest2/src/test/java/org/apache/hive/ptest/execution/conf/TestQFileTestBatch.java
+@@ -32,6 +32,7 @@
+ 
+   private static final String DRIVER = "driver";
+   private static final String QUERY_FILES_PROPERTY = "qfile";
++  private static final String TEST_MODULE_NAME = "testModule";
+ 
+   private Set<String> tests;
+ 
+@@ -42,23 +43,28 @@ public void setup() {
+ 
+   @Test
+   public void testParallel() throws Exception {
+-    QFileTestBatch batch = new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true);
++    QFileTestBatch batch =
++        new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
+     Assert.assertTrue(batch.isParallel());
+     Assert.assertEquals(DRIVER, batch.getDriver());
+     Assert.assertEquals(Joiner.on("-").join(DRIVER, "a", "b", "c"), batch.getName());
+     Assert.assertEquals(String.format("-Dtestcase=%s -D%s=a,b,c", DRIVER,
+         QUERY_FILES_PROPERTY), batch.getTestArguments());
++    Assert.assertEquals(TEST_MODULE_NAME, batch.getTestModule());
+   }
+   @Test
+   public void testMoreThanThreeTests() throws Exception {
+     Assert.assertTrue(tests.add("d"));
+-    QFileTestBatch batch = new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true);
++    QFileTestBatch batch =
++        new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, true, TEST_MODULE_NAME);
+     Assert.assertEquals(Joiner.on("-").join(DRIVER, "a", "b", "c", "and", "1", "more"),
+         batch.getName());
+   }
+   @Test
+   public void testNotParallel() throws Exception {
+-    QFileTestBatch batch = new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, false);
++    QFileTestBatch batch =
++        new QFileTestBatch("testcase", DRIVER, QUERY_FILES_PROPERTY, tests, false,
++            TEST_MODULE_NAME);
+     Assert.assertFalse(batch.isParallel());
+   }
+ }
+-- 
+1.7.9.5
+

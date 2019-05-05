@@ -1,0 +1,754 @@
+From 37320e8b041415735f413d913cf0932c7cfc5109 Mon Sep 17 00:00:00 2001
+From: Misha Dmitriev <misha@cloudera.com>
+Date: Thu, 26 Jan 2017 18:36:34 -0800
+Subject: [PATCH 1003/1164] CDH-49031 HIVE-15882 : Intern strings in various
+ critical places to reduce memory consumption
+
+Change-Id: I8647c0f8158c81ef248491dcc05815efbaf2057f
+---
+ .../hadoop/hive/common/StringInternUtils.java      |  144 ++++++++++++++++++++
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   12 +-
+ .../org/apache/hadoop/hive/ql/hooks/Entity.java    |    6 +-
+ .../hadoop/hive/ql/io/CombineHiveInputFormat.java  |    5 +-
+ .../apache/hadoop/hive/ql/io/HiveInputFormat.java  |    4 +-
+ .../hadoop/hive/ql/io/SymbolicInputFormat.java     |    1 +
+ .../hadoop/hive/ql/lockmgr/HiveLockObject.java     |   14 +-
+ .../apache/hadoop/hive/ql/metadata/Partition.java  |    6 +-
+ .../org/apache/hadoop/hive/ql/metadata/Table.java  |    2 +-
+ .../hadoop/hive/ql/optimizer/GenMapRedUtils.java   |    6 +-
+ .../optimizer/physical/GenMRSkewJoinProcessor.java |   18 ++-
+ .../physical/GenSparkSkewJoinProcessor.java        |    2 +-
+ .../optimizer/physical/NullScanTaskDispatcher.java |    5 +-
+ .../ql/plan/ConditionalResolverMergeFiles.java     |    5 +-
+ .../org/apache/hadoop/hive/ql/plan/MapWork.java    |   13 +-
+ .../org/apache/hadoop/hive/ql/plan/MsckDesc.java   |    4 +-
+ .../apache/hadoop/hive/ql/plan/PartitionDesc.java  |   19 +--
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |   21 +++
+ 18 files changed, 240 insertions(+), 47 deletions(-)
+ create mode 100644 common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java b/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java
+new file mode 100644
+index 0000000..828e45d
+--- /dev/null
++++ b/common/src/java/org/apache/hadoop/hive/common/StringInternUtils.java
+@@ -0,0 +1,144 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.common;
++
++import org.apache.hadoop.fs.Path;
++
++import java.lang.reflect.Field;
++import java.net.URI;
++import java.util.List;
++import java.util.ListIterator;
++import java.util.Map;
++
++/**
++ * Collection of utilities for string interning, common across Hive.
++ * We use the standard String.intern() call, that performs very well
++ * (no problems with PermGen overflowing, etc.) starting from JDK 7.
++ */
++public class StringInternUtils {
++
++  // When a URI instance is initialized, it creates a bunch of private String
++  // fields, never bothering about their possible duplication. It would be
++  // best if we could tell URI constructor to intern these strings right away.
++  // Without this option, we can only use reflection to "fix" strings in these
++  // fields after a URI has been created.
++  private static Class uriClass = URI.class;
++  private static Field stringField, schemeField, authorityField, hostField, pathField,
++      fragmentField, schemeSpecificPartField;
++
++  static {
++    try {
++      stringField = uriClass.getDeclaredField("string");
++      schemeField = uriClass.getDeclaredField("scheme");
++      authorityField = uriClass.getDeclaredField("authority");
++      hostField = uriClass.getDeclaredField("host");
++      pathField = uriClass.getDeclaredField("path");
++      fragmentField = uriClass.getDeclaredField("fragment");
++      schemeSpecificPartField = uriClass.getDeclaredField("schemeSpecificPart");
++    } catch (NoSuchFieldException e) {
++      throw new RuntimeException(e);
++    }
++
++    // Note that the calls below will throw an exception if a Java SecurityManager
++    // is installed and configured to forbid invoking setAccessible(). In practice
++    // this is not a problem in Hive.
++    stringField.setAccessible(true);
++    schemeField.setAccessible(true);
++    authorityField.setAccessible(true);
++    hostField.setAccessible(true);
++    pathField.setAccessible(true);
++    fragmentField.setAccessible(true);
++    schemeSpecificPartField.setAccessible(true);
++  }
++
++  public static URI internStringsInUri(URI uri) {
++    if (uri == null) return null;
++    try {
++      String string = (String) stringField.get(uri);
++      if (string != null) stringField.set(uri, string.intern());
++      String scheme = (String) schemeField.get(uri);
++      if (scheme != null) schemeField.set(uri, scheme.intern());
++      String authority = (String) authorityField.get(uri);
++      if (authority != null) authorityField.set(uri, authority.intern());
++      String host = (String) hostField.get(uri);
++      if (host != null) hostField.set(uri, host.intern());
++      String path = (String) pathField.get(uri);
++      if (path != null) pathField.set(uri, path.intern());
++      String fragment = (String) fragmentField.get(uri);
++      if (fragment != null) fragmentField.set(uri, fragment.intern());
++      String schemeSpecificPart = (String) schemeSpecificPartField.get(uri);
++      if (schemeSpecificPart != null) schemeSpecificPartField.set(uri, schemeSpecificPart.intern());
++    } catch (Exception e) {
++      throw new RuntimeException(e);
++    }
++    return uri;
++  }
++
++  public static Path internUriStringsInPath(Path path) {
++    if (path != null) internStringsInUri(path.toUri());
++    return path;
++  }
++
++  public static Path[] internUriStringsInPathArray(Path[] paths) {
++    if (paths != null) {
++      for (Path path : paths) {
++        internUriStringsInPath(path);
++      }
++    }
++    return paths;
++  }
++
++  /**
++   * This method interns all the strings in the given list in place. That is,
++   * it iterates over the list, replaces each element with the interned copy
++   * and eventually returns the same list.
++   */
++  public static List<String> internStringsInList(List<String> list) {
++    if (list != null) {
++      ListIterator<String> it = list.listIterator();
++      while (it.hasNext()) {
++        it.set(it.next().intern());
++      }
++    }
++    return list;
++  }
++
++  /** Interns all the strings in the given array in place, returning the same array */
++  public static String[] internStringsInArray(String[] strings) {
++    for (int i = 0; i < strings.length; i++) {
++      if (strings[i] != null) {
++        strings[i] = strings[i].intern();
++      }
++    }
++    return strings;
++  }
++
++  public static <K> Map<K, String> internValuesInMap(Map<K, String> map) {
++    if (map != null) {
++      for (K key : map.keySet()) {
++        String value = map.get(key);
++        if (value != null) {
++          map.put(key, value.intern());
++        }
++      }
++    }
++    return map;
++  }
++
++  public static String internIfNotNull(String s) {
++    if (s != null) s = s.intern();
++    return s;
++  }
++}
+\ No newline at end of file
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 734b8da..f8c3e8b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -104,6 +104,7 @@
+ import org.apache.hadoop.hive.common.HiveInterruptUtils;
+ import org.apache.hadoop.hive.common.HiveStatsUtils;
+ import org.apache.hadoop.hive.common.JavaUtils;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+@@ -3422,8 +3423,8 @@ public static double getHighestSamplePercentage (MapWork work) {
+             continue;
+           }
+ 
++          StringInternUtils.internUriStringsInPath(file);
+           pathsProcessed.add(file);
+-
+           LOG.info("Adding input file " + file);
+           pathsToAdd.add(file);
+         }
+@@ -3524,7 +3525,7 @@ private static Path createEmptyFile(Path hiveScratchDir,
+     }
+     recWriter.close(false);
+ 
+-    return newPath;
++    return StringInternUtils.internUriStringsInPath(newPath);
+   }
+ 
+   @SuppressWarnings("rawtypes")
+@@ -3555,7 +3556,7 @@ private static Path createDummyFileForEmptyPartition(Path path, JobConf job, Map
+     }
+ 
+     // update the work
+-    String strNewPath = newPath.toString();
++    String strNewPath = newPath.toString().intern();
+ 
+     LinkedHashMap<String, ArrayList<String>> pathToAliases = work.getPathToAliases();
+     pathToAliases.put(strNewPath, pathToAliases.get(strPath));
+@@ -3594,16 +3595,17 @@ private static Path createDummyFileForEmptyTable(JobConf job, MapWork work,
+ 
+     // update the work
+ 
++    String newPathStr = newPath.toUri().toString().intern();
+     LinkedHashMap<String, ArrayList<String>> pathToAliases = work.getPathToAliases();
+     ArrayList<String> newList = new ArrayList<String>();
+     newList.add(alias);
+-    pathToAliases.put(newPath.toUri().toString(), newList);
++    pathToAliases.put(newPathStr, newList);
+ 
+     work.setPathToAliases(pathToAliases);
+ 
+     LinkedHashMap<String, PartitionDesc> pathToPartitionInfo = work.getPathToPartitionInfo();
+     PartitionDesc pDesc = work.getAliasToPartnInfo().get(alias).clone();
+-    pathToPartitionInfo.put(newPath.toUri().toString(), pDesc);
++    pathToPartitionInfo.put(newPathStr, pDesc);
+     work.setPathToPartitionInfo(pathToPartitionInfo);
+ 
+     return newPath;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/hooks/Entity.java b/ql/src/java/org/apache/hadoop/hive/ql/hooks/Entity.java
+index 174b5a8..ceaee7b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/hooks/Entity.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/hooks/Entity.java
+@@ -100,7 +100,7 @@ public String getName() {
+   }
+ 
+   public void setName(String name) {
+-    this.name = name;
++    this.name = name.intern();
+   }
+ 
+   public Database getDatabase() {
+@@ -330,6 +330,10 @@ public String toString() {
+   }
+ 
+   private String computeName() {
++    return doComputeName().intern();
++  }
++
++  private String doComputeName() {
+     switch (typ) {
+     case DATABASE:
+       return "database:" + database.getName();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+index 12affcf..9776cb1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+@@ -44,6 +44,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.hive.common.FileUtils;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.Operator;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+@@ -347,7 +348,7 @@ public int hashCode() {
+ 
+     // combine splits only from same tables and same partitions. Do not combine splits from multiple
+     // tables or multiple partitions.
+-    Path[] paths = combine.getInputPathsShim(job);
++    Path[] paths = StringInternUtils.internUriStringsInPathArray(combine.getInputPathsShim(job));
+ 
+     List<Path> inpDirs = new ArrayList<Path>();
+     List<Path> inpFiles = new ArrayList<Path>();
+@@ -647,7 +648,7 @@ private void processPaths(JobConf job, CombineFileInputFormatShim combine,
+   Map<String, ArrayList<String>> removeScheme(Map<String, ArrayList<String>> pathToAliases) {
+     Map<String, ArrayList<String>> result = new HashMap<String, ArrayList<String>>();
+     for (Map.Entry <String, ArrayList<String>> entry : pathToAliases.entrySet()) {
+-      String newKey = new Path(entry.getKey()).toUri().getPath();
++      String newKey = new Path(entry.getKey()).toUri().getPath().intern();
+       result.put(newKey, entry.getValue());
+     }
+     return result;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
+index e9cc031..feef3f8 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
+@@ -35,6 +35,7 @@
+ import org.apache.hadoop.conf.Configurable;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.io.HiveIOExceptionHandlerUtil;
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+@@ -311,6 +312,7 @@ private void addSplitsForGroup(List<Path> dirs, TableScanOperator tableScan, Job
+ 
+   Path[] getInputPaths(JobConf job) throws IOException {
+     Path[] dirs = FileInputFormat.getInputPaths(job);
++
+     if (dirs.length == 0) {
+       // on tez we're avoiding to duplicate the file info in FileInputFormat.
+       if (HiveConf.getVar(job, HiveConf.ConfVars.HIVE_EXECUTION_ENGINE).equals("tez")) {
+@@ -324,7 +326,7 @@ private void addSplitsForGroup(List<Path> dirs, TableScanOperator tableScan, Job
+         throw new IOException("No input paths specified in job");
+       }
+     }
+-    return dirs;
++    return StringInternUtils.internUriStringsInPathArray(dirs);
+   }
+ 
+   public InputSplit[] getSplits(JobConf job, int numSplits) throws IOException {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/SymbolicInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/SymbolicInputFormat.java
+index feef854..ca03f55 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/SymbolicInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/SymbolicInputFormat.java
+@@ -75,6 +75,7 @@ public void rework(HiveConf job, MapredWork work) throws IOException {
+             while ((line = reader.readLine()) != null) {
+               // no check for the line? How to check?
+               // if the line is invalid for any reason, the job will fail.
++              line = line.intern();
+               toAddPathToPart.put(line, partDesc);
+               pathToAliases.put(line, aliases);
+             }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java
+index f751bb4..f77b025 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/lockmgr/HiveLockObject.java
+@@ -20,6 +20,7 @@
+ 
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.lang.builder.HashCodeBuilder;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.ql.metadata.DummyPartition;
+ import org.apache.hadoop.hive.ql.metadata.Partition;
+ import org.apache.hadoop.hive.ql.metadata.Table;
+@@ -48,9 +49,10 @@ public HiveLockObjectData(String queryId,
+         String lockMode,
+         String queryStr) {
+       this.queryId = removeDelimiter(queryId);
+-      this.lockTime = removeDelimiter(lockTime);
++      this.lockTime = StringInternUtils.internIfNotNull(removeDelimiter(lockTime));
+       this.lockMode = removeDelimiter(lockMode);
+-      this.queryStr = removeDelimiter(queryStr == null ? null : queryStr.trim());
++      this.queryStr = StringInternUtils.internIfNotNull(
++          removeDelimiter(queryStr == null ? null : queryStr.trim()));
+     }
+ 
+     /**
+@@ -66,9 +68,9 @@ public HiveLockObjectData(String data) {
+ 
+       String[] elem = data.split(":");
+       queryId = elem[0];
+-      lockTime = elem[1];
++      lockTime = StringInternUtils.internIfNotNull(elem[1]);
+       lockMode = elem[2];
+-      queryStr = elem[3];
++      queryStr = StringInternUtils.internIfNotNull(elem[3]);
+       if (elem.length >= 5) {
+         clientIp = elem[4];
+       }
+@@ -173,12 +175,12 @@ public HiveLockObject() {
+ 
+   public HiveLockObject(String path, HiveLockObjectData lockData) {
+     this.pathNames = new String[1];
+-    this.pathNames[0] = path;
++    this.pathNames[0] = StringInternUtils.internIfNotNull(path);
+     this.data = lockData;
+   }
+ 
+   public HiveLockObject(String[] paths, HiveLockObjectData lockData) {
+-    this.pathNames = paths;
++    this.pathNames = StringInternUtils.internStringsInArray(paths);
+     this.data = lockData;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java
+index 08ff2e9..074dae1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Partition.java
+@@ -33,6 +33,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.FileUtils;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+ import org.apache.hadoop.hive.metastore.ProtectMode;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+@@ -181,7 +182,7 @@ protected void initialize(Table table,
+       org.apache.hadoop.hive.metastore.api.Partition tPartition) throws HiveException {
+ 
+     this.table = table;
+-    this.tPartition = tPartition;
++    setTPartition(tPartition);
+ 
+     if (table.isView()) {
+       return;
+@@ -484,6 +485,7 @@ public void setTable(Table table) {
+    */
+   public void setTPartition(
+       org.apache.hadoop.hive.metastore.api.Partition partition) {
++    StringInternUtils.internStringsInList(partition.getValues());
+     tPartition = partition;
+   }
+ 
+@@ -535,7 +537,7 @@ public void setValues(Map<String, String> partSpec)
+         throw new HiveException(
+             "partition spec is invalid. field.getName() does not exist in input.");
+       }
+-      pvals.add(val);
++      pvals.add(val.intern());
+     }
+     tPartition.setValues(pvals);
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+index 806854f..f707958 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+@@ -853,7 +853,7 @@ public boolean isIndexTable() {
+ 
+     List<FieldSchema> fsl = getPartCols();
+     List<String> tpl = tp.getValues();
+-    LinkedHashMap<String, String> spec = new LinkedHashMap<String, String>();
++    LinkedHashMap<String, String> spec = new LinkedHashMap<>(fsl.size());
+     for (int i = 0; i < fsl.size(); i++) {
+       FieldSchema fs = fsl.get(i);
+       String value = tpl.get(i);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+index c29461b..5ac8a87 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+@@ -246,6 +246,7 @@ private static void setUnionPlan(GenMRProcContext opProcCtx,
+           TableDesc tt_desc = tt_descLst.get(pos);
+           MapWork mWork = plan.getMapWork();
+           if (mWork.getPathToAliases().get(taskTmpDir) == null) {
++            taskTmpDir = taskTmpDir.intern();
+             mWork.getPathToAliases().put(taskTmpDir,
+                 new ArrayList<String>());
+             mWork.getPathToAliases().get(taskTmpDir).add(taskTmpDir);
+@@ -700,7 +701,7 @@ public static void setMapWork(MapWork plan, ParseContext parseCtx, Set<ReadEntit
+     if (!local) {
+       while (iterPath.hasNext()) {
+         assert iterPartnDesc.hasNext();
+-        String path = iterPath.next().toString();
++        String path = iterPath.next().toString().intern();
+ 
+         PartitionDesc prtDesc = iterPartnDesc.next();
+ 
+@@ -765,6 +766,7 @@ public static void setTaskPlan(String path, String alias,
+     }
+ 
+     if (!local) {
++      path = path.intern();
+       if (plan.getPathToAliases().get(path) == null) {
+         plan.getPathToAliases().put(path, new ArrayList<String>());
+       }
+@@ -1499,7 +1501,7 @@ private static MapWork createMRWorkForMergingFiles (HiveConf conf,
+     Operator<? extends OperatorDesc> topOp,  FileSinkDesc fsDesc) {
+ 
+     ArrayList<String> aliases = new ArrayList<String>();
+-    String inputDir = fsDesc.getFinalDirName().toString();
++    String inputDir = fsDesc.getFinalDirName().toString().intern();
+     TableDesc tblDesc = fsDesc.getTableInfo();
+     aliases.add(inputDir); // dummy alias: just use the input path
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenMRSkewJoinProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenMRSkewJoinProcessor.java
+index 15f0d70..4f4ec0d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenMRSkewJoinProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenMRSkewJoinProcessor.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hive.ql.optimizer.physical;
+ 
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.ColumnInfo;
+ import org.apache.hadoop.hive.ql.exec.ConditionalTask;
+@@ -265,10 +266,10 @@ public static void processSkewJoin(JoinOperator joinOp,
+       Operator<? extends OperatorDesc> tblScan_op = parentOps[i];
+ 
+       ArrayList<String> aliases = new ArrayList<String>();
+-      String alias = src.toString();
++      String alias = src.toString().intern();
+       aliases.add(alias);
+       Path bigKeyDirPath = bigKeysDirMap.get(src);
+-      newPlan.getPathToAliases().put(bigKeyDirPath.toString(), aliases);
++      newPlan.getPathToAliases().put(bigKeyDirPath.toString().intern(), aliases);
+ 
+       newPlan.getAliasToWork().put(alias, tblScan_op);
+       PartitionDesc part = new PartitionDesc(tableDescList.get(src), null);
+@@ -392,18 +393,21 @@ public static boolean skewJoinEnabled(HiveConf conf, JoinOperator joinOp) {
+   private static String RESULTS = "results";
+ 
+   static Path getBigKeysDir(Path baseDir, Byte srcTbl) {
+-    return new Path(baseDir, skewJoinPrefix + UNDERLINE + BIGKEYS + UNDERLINE + srcTbl);
++    return StringInternUtils.internUriStringsInPath(
++        new Path(baseDir, skewJoinPrefix + UNDERLINE + BIGKEYS + UNDERLINE + srcTbl));
+   }
+ 
+   static Path getBigKeysSkewJoinResultDir(Path baseDir, Byte srcTbl) {
+-    return new Path(baseDir, skewJoinPrefix + UNDERLINE + BIGKEYS
+-        + UNDERLINE + RESULTS + UNDERLINE + srcTbl);
++    return StringInternUtils.internUriStringsInPath(
++        new Path(baseDir, skewJoinPrefix + UNDERLINE + BIGKEYS
++        + UNDERLINE + RESULTS + UNDERLINE + srcTbl));
+   }
+ 
+   static Path getSmallKeysDir(Path baseDir, Byte srcTblBigTbl,
+       Byte srcTblSmallTbl) {
+-    return new Path(baseDir, skewJoinPrefix + UNDERLINE + SMALLKEYS
+-        + UNDERLINE + srcTblBigTbl + UNDERLINE + srcTblSmallTbl);
++    return StringInternUtils.internUriStringsInPath(
++        new Path(baseDir, skewJoinPrefix + UNDERLINE + SMALLKEYS
++        + UNDERLINE + srcTblBigTbl + UNDERLINE + srcTblSmallTbl));
+   }
+ 
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenSparkSkewJoinProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenSparkSkewJoinProcessor.java
+index f3fb541..f81f84c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenSparkSkewJoinProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/GenSparkSkewJoinProcessor.java
+@@ -292,7 +292,7 @@ public static void processSkewJoin(JoinOperator joinOp, Task<? extends Serializa
+         } else {
+           path = smallTblDirs.get(tags[j]);
+         }
+-        mapWork.getPathToAliases().put(path.toString(), aliases);
++        mapWork.getPathToAliases().put(path.toString().intern(), aliases);
+         mapWork.getAliasToWork().put(alias, tableScan);
+         PartitionDesc partitionDesc = new PartitionDesc(tableDescList.get(tags[j]), null);
+         mapWork.getPathToPartitionInfo().put(path.toString(), partitionDesc);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/NullScanTaskDispatcher.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/NullScanTaskDispatcher.java
+index f901812..857aeeb 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/NullScanTaskDispatcher.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/NullScanTaskDispatcher.java
+@@ -109,8 +109,9 @@ private void processAlias(MapWork work, String path, ArrayList<String> aliasesAf
+       PartitionDesc newPartition = changePartitionToMetadataOnly(partDesc);
+       Path fakePath = new Path(physicalContext.getContext().getMRTmpPath()
+           + newPartition.getTableName() + encode(newPartition.getPartSpec()));
+-      work.getPathToPartitionInfo().put(fakePath.getName(), newPartition);
+-      work.getPathToAliases().put(fakePath.getName(), new ArrayList<String>(allowed));
++      String fakePathName = fakePath.getName().intern();
++      work.getPathToPartitionInfo().put(fakePathName, newPartition);
++      work.getPathToAliases().put(fakePathName, new ArrayList<String>(allowed));
+       aliasesAffected.removeAll(allowed);
+       if (aliasesAffected.isEmpty()) {
+         work.getPathToAliases().remove(path);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ConditionalResolverMergeFiles.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ConditionalResolverMergeFiles.java
+index 3f07ea7..efd945b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ConditionalResolverMergeFiles.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ConditionalResolverMergeFiles.java
+@@ -317,10 +317,9 @@ private void generateActualTasks(HiveConf conf, List<Task<? extends Serializable
+ 
+   private PartitionDesc generateDPFullPartSpec(DynamicPartitionCtx dpCtx, FileStatus[] status,
+       TableDesc tblDesc, int i) {
+-    Map<String, String> fullPartSpec = new LinkedHashMap<String, String>(
+-        dpCtx.getPartSpec());
++    LinkedHashMap<String, String> fullPartSpec = new LinkedHashMap<>(dpCtx.getPartSpec());
+     Warehouse.makeSpecFromName(fullPartSpec, status[i].getPath());
+-    PartitionDesc pDesc = new PartitionDesc(tblDesc, (LinkedHashMap) fullPartSpec);
++    PartitionDesc pDesc = new PartitionDesc(tblDesc, fullPartSpec);
+     return pDesc;
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java
+index 5b7b8fb..e14f91c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/MapWork.java
+@@ -139,7 +139,10 @@ public MapWork(String name) {
+ 
+   public void setPathToAliases(
+       final LinkedHashMap<String, ArrayList<String>> pathToAliases) {
+-    this.pathToAliases = pathToAliases;
++    this.pathToAliases = new LinkedHashMap<>(pathToAliases.size());
++    for (Map.Entry<String, ArrayList<String>> e : pathToAliases.entrySet()) {
++      this.pathToAliases.put(e.getKey().intern(), e.getValue());
++    }
+   }
+ 
+   /**
+@@ -262,6 +265,7 @@ public void addMapWork(String path, String alias, Operator<?> work,
+     if (curAliases == null) {
+       assert (pathToPartitionInfo.get(path) == null);
+       curAliases = new ArrayList<String>();
++      path = path.intern();
+       pathToAliases.put(path, curAliases);
+       pathToPartitionInfo.put(path, pd);
+     } else {
+@@ -292,8 +296,9 @@ public void setInputFormatSorted(boolean inputFormatSorted) {
+ 
+   public void resolveDynamicPartitionStoredAsSubDirsMerge(HiveConf conf, Path path,
+       TableDesc tblDesc, ArrayList<String> aliases, PartitionDesc partDesc) {
+-    pathToAliases.put(path.toString(), aliases);
+-    pathToPartitionInfo.put(path.toString(), partDesc);
++    String pathStr = path.toString().intern();
++    pathToAliases.put(pathStr, aliases);
++    pathToPartitionInfo.put(pathStr, partDesc);
+   }
+ 
+   /**
+@@ -347,8 +352,10 @@ public void replaceRoots(Map<Operator<?>, Operator<?>> replacementMap) {
+ 
+   public void mergeAliasedInput(String alias, String pathDir, PartitionDesc partitionInfo) {
+     ArrayList<String> aliases = pathToAliases.get(pathDir);
++    alias = alias.intern();
+     if (aliases == null) {
+       aliases = new ArrayList<String>(Arrays.asList(alias));
++      pathDir = pathDir.intern();
+       pathToAliases.put(pathDir, aliases);
+       pathToPartitionInfo.put(pathDir, partitionInfo);
+     } else {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/MsckDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/MsckDesc.java
+index b7a7e4b..68a0164 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/MsckDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/MsckDesc.java
+@@ -59,8 +59,8 @@ public MsckDesc(String tableName, List<? extends Map<String, String>> partSpecs,
+     super();
+     this.tableName = tableName;
+     this.partSpecs = new ArrayList<LinkedHashMap<String, String>>(partSpecs.size());
+-    for (int i = 0; i < partSpecs.size(); i++) {
+-      this.partSpecs.add(new LinkedHashMap<String, String>(partSpecs.get(i)));
++    for (Map<String, String> partSpec : partSpecs) {
++      this.partSpecs.add(new LinkedHashMap<>(partSpec));
+     }
+     this.resFile = resFile.toString();
+     this.repairPartitions = repairPartitions;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/PartitionDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/PartitionDesc.java
+index ba5c511..ccfef72 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/PartitionDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/PartitionDesc.java
+@@ -29,6 +29,7 @@
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.StringInternUtils;
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+ import org.apache.hadoop.hive.ql.io.HiveFileFormatUtils;
+@@ -68,7 +69,7 @@
+   private String baseFileName;
+ 
+   public void setBaseFileName(String baseFileName) {
+-    this.baseFileName = baseFileName;
++    this.baseFileName = baseFileName.intern();
+   }
+ 
+   public PartitionDesc() {    
+@@ -76,13 +77,13 @@ public PartitionDesc() {
+ 
+   public PartitionDesc(final TableDesc table, final LinkedHashMap<String, String> partSpec) {
+     this.tableDesc = table;
+-    this.partSpec = partSpec;
++    setPartSpec(partSpec);
+   }
+ 
+   public PartitionDesc(final Partition part) throws HiveException {
+     this.tableDesc = getTableDesc(part.getTable());
+     setProperties(part.getMetadataFromPartitionSchema());
+-    partSpec = part.getSpec();
++    setPartSpec(part.getSpec());
+     setInputFileFormatClass(part.getInputFormatClass());
+     setOutputFileFormatClass(part.getOutputFormatClass());
+   }
+@@ -90,7 +91,7 @@ public PartitionDesc(final Partition part) throws HiveException {
+   public PartitionDesc(final Partition part,final TableDesc tblDesc) throws HiveException {
+     this.tableDesc = tblDesc;
+     setProperties(part.getSchemaFromTableSchema(tblDesc.getProperties())); // each partition maintains a large properties
+-    partSpec = part.getSpec();
++    setPartSpec(part.getSpec());
+     setOutputFileFormatClass(part.getInputFormatClass());
+     setOutputFileFormatClass(part.getOutputFormatClass());
+   }
+@@ -110,10 +111,11 @@ public void setTableDesc(TableDesc tableDesc) {
+   }
+ 
+   public void setPartSpec(final LinkedHashMap<String, String> partSpec) {
++    StringInternUtils.internValuesInMap(partSpec);
+     this.partSpec = partSpec;
+   }
+ 
+-    public Class<? extends InputFormat> getInputFileFormatClass() {
++  public Class<? extends InputFormat> getInputFileFormatClass() {
+     if (inputFileFormatClass == null && tableDesc != null) {
+       setInputFileFormatClass(tableDesc.getInputFileFormatClass());
+     }
+@@ -254,8 +256,7 @@ public PartitionDesc clone() {
+     ret.tableDesc = (TableDesc) tableDesc.clone();
+     // The partition spec is not present
+     if (partSpec != null) {
+-      ret.partSpec = new java.util.LinkedHashMap<String, String>();
+-      ret.partSpec.putAll(partSpec);
++      ret.partSpec = new LinkedHashMap<>(partSpec);
+     }
+     return ret;
+   }
+@@ -275,11 +276,11 @@ public void deriveBaseFileName(String path) {
+     }
+     try {
+       Path p = new Path(path);
+-      baseFileName = p.getName();
++      baseFileName = p.getName().intern();
+     } catch (Exception ex) {
+       // don't really care about the exception. the goal is to capture the
+       // the last component at the minimum - so set to the complete path
+-      baseFileName = path;
++      baseFileName = path.intern();
+     }
+   }
+ 
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index b3febd5..360304b 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -132,6 +132,27 @@ public RecordReader getRecordReader(InputSplit split,
+ 
+       @Override
+       protected List<FileStatus> listStatus(JobContext job) throws IOException {
++        // NOTE: with a large number of partitions, each call below may consume
++        // a lot of memory, though only for the duration of the call. That's because
++        // internally super.listStatus() calls, in particular
++        //   Path[] dirs = getInputPaths(job);
++        // Each Path instance in turn creates a URI instance, and when there are
++        // many partitions, each of these URIs ends up containing a separate copy
++        // of the same string like host name, protocol name, etc. Furthermore, if
++        // many queries over the same set of partitions run concurrently, we may
++        // end up with a proportionally larger number of duplicate strings flooding
++        // memory in a short burst. There are other calls inside super.listStatus()
++        // as well, that create more chunks of temporary data.
++        // Probably the best way to address this problem would be to add a method in
++        // the superclass called listStatusIterator(), with the idea similar to HDFS
++        // FileSystem.listStatusIterator(). In this way, processing files one by one,
++        // we will avoid the big data burst that happens when temporary data for all
++        // these files is kept in memory at the same time.
++        // I have also tried to serialize calls below, i.e. surround it with
++        // synchronized (staticLockObject) { ... }. But this may have bad performance
++        // implications when memory is not an issue, but there is a really large number
++        // of concurrent calls to listStatus(). So far looks like this optimization is
++        // not absolutely critical.
+         List<FileStatus> result = super.listStatus(job);
+         Iterator<FileStatus> it = result.iterator();
+         while (it.hasNext()) {
+-- 
+1.7.9.5
+

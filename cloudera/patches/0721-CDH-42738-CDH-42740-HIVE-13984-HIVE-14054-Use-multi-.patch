@@ -1,0 +1,196 @@
+From 142484e6d8c3315495069b38b0567eb10176409a Mon Sep 17 00:00:00 2001
+From: Pengcheng Xiong <pxiong@apache.org>
+Date: Thu, 16 Jun 2016 11:30:20 -0700
+Subject: [PATCH 0721/1164] CDH-42738 CDH-42740 : HIVE-13984 HIVE-14054 : Use
+ multi-threaded approach to listing files for msck
+ (Pengcheng Xiong, reviewed by Prasanth
+ Jayachandran, Hari Sankar Sivarama Subramaniyan,
+ Rajesh Balamohan)
+
+HIVE-13984 causes test failure which is fixed in HIVE-14054, so bringing
+both patches in one commit
+
+(cherry picked from commit 7583e391d18bacd50ce7c34bb3f7d4663268b70d)
+
+Change-Id: I11d397b3c3bbc64a8d319a4095119bbeaccf8569
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    4 +-
+ .../hive/ql/metadata/HiveMetaStoreChecker.java     |  108 +++++++++++++++++---
+ 2 files changed, 94 insertions(+), 18 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 32aacce..6e57eb9 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1936,7 +1936,9 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_CONF_HIDDEN_LIST("hive.conf.hidden.list",
+         METASTOREPWD.varname + "," + HIVE_SERVER2_SSL_KEYSTORE_PASSWORD.varname,
+         "Comma separated list of configuration options which should not be read by normal user like passwords"),
+-
++    HIVE_MOVE_FILES_THREAD_COUNT("hive.mv.files.thread", 25, "Number of threads"
++         + " used to move files in move task. Set it to 0 to disable multi-threaded file moves. This parameter is also used by"
++         + " MSCK to check tables."),
+     // If this is set all move tasks at the end of a multi-insert query will only begin once all
+     // outputs are ready
+     HIVE_MULTI_INSERT_MOVE_TASKS_SHARE_DEPENDENCIES(
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
+index 33b9c58..ec9910f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
+@@ -21,9 +21,17 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashSet;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.ThreadPoolExecutor;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -32,6 +40,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.MetaStoreUtils;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+@@ -41,6 +50,8 @@
+ import org.apache.hadoop.hive.ql.parse.PrunedPartitionList;
+ import org.apache.thrift.TException;
+ 
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++
+ /**
+  * Verify that the information in the metastore matches what is on the
+  * filesystem. Return a CheckResult object containing lists of missing and any
+@@ -290,9 +301,10 @@ void checkTable(Table table, List<Partition> parts,
+    *          Result object
+    * @throws IOException
+    *           Thrown if we fail at fetching listings from the fs.
++   * @throws HiveException 
+    */
+   void findUnknownPartitions(Table table, Set<Path> partPaths,
+-      CheckResult result) throws IOException {
++      CheckResult result) throws IOException, HiveException {
+ 
+     Path tablePath = table.getPath();
+     // now check the table folder and see if we find anything
+@@ -357,28 +369,90 @@ private String getPartitionName(Path tablePath, Path partitionPath) {
+    *          This set will contain the leaf paths at the end.
+    * @throws IOException
+    *           Thrown if we can't get lists from the fs.
++   * @throws HiveException 
+    */
+ 
+-  private void getAllLeafDirs(Path basePath, Set<Path> allDirs)
+-      throws IOException {
+-    getAllLeafDirs(basePath, allDirs, basePath.getFileSystem(conf));
++  private void getAllLeafDirs(Path basePath, Set<Path> allDirs) throws IOException, HiveException {
++    ConcurrentLinkedQueue<Path> basePaths = new ConcurrentLinkedQueue<>();
++    basePaths.add(basePath);
++    // we only use the keySet of ConcurrentHashMap
++    // Neither the key nor the value can be null.
++    Map<Path, Object> dirSet = new ConcurrentHashMap<>();
++    // Here we just reuse the THREAD_COUNT configuration for
++    // HIVE_MOVE_FILES_THREAD_COUNT
++    final ExecutorService pool = conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25) > 0 ? Executors
++        .newFixedThreadPool(conf.getInt(ConfVars.HIVE_MOVE_FILES_THREAD_COUNT.varname, 25),
++            new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MSCK-GetPaths-%d").build())
++            : null;
++    if (pool == null) {
++      LOG.debug("Not-using threaded version of MSCK-GetPaths");
++    } else {
++      LOG.debug("Using threaded version of MSCK-GetPaths with number of threads "
++          + ((ThreadPoolExecutor) pool).getPoolSize());
++    }
++    getAllLeafDirs(pool, basePaths, dirSet, basePath.getFileSystem(conf));
++    pool.shutdown();
++    allDirs.addAll(dirSet.keySet());
+   }
+ 
+-  private void getAllLeafDirs(Path basePath, Set<Path> allDirs, FileSystem fs)
+-      throws IOException {
+-
+-    FileStatus[] statuses = fs.listStatus(basePath, FileUtils.HIDDEN_FILES_PATH_FILTER);
+-    boolean directoryFound=false;
++  // process the basePaths in parallel and then the next level of basePaths
++  private void getAllLeafDirs(final ExecutorService pool, final ConcurrentLinkedQueue<Path> basePaths,
++      final Map<Path, Object> allDirs, final FileSystem fs) throws IOException, HiveException {
++    final ConcurrentLinkedQueue<Path> nextLevel = new ConcurrentLinkedQueue<>();
++    if (null == pool) {
++      for (final Path path : basePaths) {
++        FileStatus[] statuses = fs.listStatus(path, FileUtils.HIDDEN_FILES_PATH_FILTER);
++        boolean directoryFound = false;
++        for (FileStatus status : statuses) {
++          if (status.isDir()) {
++            directoryFound = true;
++            nextLevel.add(status.getPath());
++          }
++        }
+ 
+-    for (FileStatus status : statuses) {
+-      if (status.isDir()) {
+-        directoryFound = true;
+-        getAllLeafDirs(status.getPath(), allDirs, fs);
++        if (!directoryFound) {
++          // true is just a boolean object place holder because neither the key nor the value can be null.
++          allDirs.put(path, true);
++        }
++        if (!nextLevel.isEmpty()) {
++          getAllLeafDirs(pool, nextLevel, allDirs, fs);
++        }
++      }
++    } else {
++      final List<Future<Void>> futures = new LinkedList<>();
++      for (final Path path : basePaths) {
++        futures.add(pool.submit(new Callable<Void>() {
++          @Override
++          public Void call() throws Exception {
++            FileStatus[] statuses = fs.listStatus(path, FileUtils.HIDDEN_FILES_PATH_FILTER);
++            boolean directoryFound = false;
++
++            for (FileStatus status : statuses) {
++              if (status.isDir()) {
++                directoryFound = true;
++                nextLevel.add(status.getPath());
++              }
++            }
++
++            if (!directoryFound) {
++              allDirs.put(path, true);
++            }
++            return null;
++          }
++        }));
++      }
++      for (Future<Void> future : futures) {
++        try {
++          future.get();
++        } catch (Exception e) {
++          LOG.error(e.getMessage());
++          pool.shutdownNow();
++          throw new HiveException(e.getCause());
++        }
++      }
++      if (!nextLevel.isEmpty()) {
++        getAllLeafDirs(pool, nextLevel, allDirs, fs);
+       }
+-    }
+-
+-    if(!directoryFound){
+-      allDirs.add(basePath);
+     }
+   }
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,258 @@
+From ea16df990d66d8573310454d0b1eb1641e8e8329 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@cloudera.com>
+Date: Thu, 8 Oct 2015 11:31:59 -0700
+Subject: [PATCH 0360/1164] HIVE-12187: Release plan once a query is executed
+
+Change-Id: I5aebe2a88d83c34067f7c938419cda95a3886502
+---
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |  100 +++++++++++++-------
+ .../java/org/apache/hadoop/hive/ql/exec/Task.java  |    8 ++
+ 2 files changed, 73 insertions(+), 35 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index bb78997..95cb827 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -140,6 +140,9 @@
+   private String SQLState;
+   private Throwable downstreamError;
+ 
++  private FetchTask fetchTask;
++  List<HiveLock> hiveLocks = new ArrayList<HiveLock>();
++
+   // A list of FileSinkOperators writing in an ACID compliant manner
+   private Set<FileSinkDesc> acidSinks;
+ 
+@@ -365,9 +368,8 @@ public int compile(String command, boolean resetTaskIds) {
+     //holder for parent command type/string when executing reentrant queries
+     QueryState queryState = new QueryState();
+ 
+-    if (plan != null) {
++    if (ctx != null) {
+       close();
+-      plan = null;
+     }
+ 
+     if (resetTaskIds) {
+@@ -995,14 +997,11 @@ private int acquireLocksAndOpenTxn() {
+   }
+ 
+   /**
+-   * @param hiveLocks
+-   *          list of hive locks to be released Release all the locks specified. If some of the
+-   *          locks have already been released, ignore them
+    * @param commit if there is an open transaction and if true, commit,
+    *               if false rollback.  If there is no open transaction this parameter is ignored.
+    *
+    **/
+-  private void releaseLocksAndCommitOrRollback(List<HiveLock> hiveLocks, boolean commit)
++  private void releaseLocksAndCommitOrRollback(boolean commit)
+       throws LockException {
+     PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.RELEASE_LOCKS);
+@@ -1022,15 +1021,42 @@ private void releaseLocksAndCommitOrRollback(List<HiveLock> hiveLocks, boolean c
+         ss.setCurrentTxn(SessionState.NO_CURRENT_TXN);
+       }
+     } else {
+-      if (hiveLocks != null) {
++      //since there is no tx, we only have locks for current query (if any)
++      if (ctx != null && ctx.getHiveLocks() != null) {
++        hiveLocks.addAll(ctx.getHiveLocks());
++      }
++      if (!hiveLocks.isEmpty()) {
+         txnMgr.getLockManager().releaseLocks(hiveLocks);
+       }
+     }
+-    ctx.setHiveLocks(null);
++    hiveLocks.clear();
++    if (ctx != null) {
++      ctx.setHiveLocks(null);
++    }
+ 
+     perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.RELEASE_LOCKS);
+   }
+ 
++  /**
++   * Release some resources after a query is executed
++   * while keeping the result around.
++   */
++  private void releaseResources() {
++    if (plan != null) {
++      fetchTask = plan.getFetchTask();
++      if (fetchTask != null) {
++        fetchTask.setDriverContext(null);
++        fetchTask.setQueryPlan(null);
++      }
++    }
++
++    if (driverCxt != null) {
++      driverCxt.shutdown();
++      driverCxt = null;
++    }
++    plan = null;
++  }
++
+   @Override
+   public CommandProcessorResponse run(String command)
+       throws CommandNeedRetryException {
+@@ -1044,7 +1070,13 @@ public CommandProcessorResponse run()
+ 
+   public CommandProcessorResponse run(String command, boolean alreadyCompiled)
+         throws CommandNeedRetryException {
+-    CommandProcessorResponse cpr = runInternal(command, alreadyCompiled);
++    CommandProcessorResponse cpr;
++    try {
++      cpr = runInternal(command, alreadyCompiled);
++    } finally {
++      releaseResources();
++    }
++
+     if(cpr.getResponseCode() == 0) {
+       return cpr;
+     }
+@@ -1111,7 +1143,7 @@ private int compileInternal(String command) {
+     }
+     if (ret != 0) {
+       try {
+-        releaseLocksAndCommitOrRollback(ctx.getHiveLocks(), false);
++        releaseLocksAndCommitOrRollback(false);
+       } catch (LockException e) {
+         LOG.warn("Exception in releasing locks. "
+             + org.apache.hadoop.util.StringUtils.stringifyException(e));
+@@ -1170,7 +1202,7 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+       ret = acquireLocksAndOpenTxn();
+       if (ret != 0) {
+         try {
+-          releaseLocksAndCommitOrRollback(ctx.getHiveLocks(), false);
++          releaseLocksAndCommitOrRollback(false);
+         } catch (LockException e) {
+           // Not much to do here
+         }
+@@ -1182,7 +1214,7 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+     if (ret != 0) {
+       //if needRequireLock is false, the release here will do nothing because there is no lock
+       try {
+-        releaseLocksAndCommitOrRollback(ctx.getHiveLocks(), false);
++        releaseLocksAndCommitOrRollback(false);
+       } catch (LockException e) {
+         // Nothing to do here
+       }
+@@ -1191,7 +1223,7 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+ 
+     //if needRequireLock is false, the release here will do nothing because there is no lock
+     try {
+-      releaseLocksAndCommitOrRollback(ctx.getHiveLocks(), true);
++      releaseLocksAndCommitOrRollback(true);
+     } catch (LockException e) {
+       errorMessage = "FAILED: Hive Internal Error: " + Utilities.getNameMessage(e);
+       SQLState = ErrorMsg.findSQLState(e.getMessage());
+@@ -1639,7 +1671,7 @@ private TaskRunner launchTask(Task<? extends Serializable> tsk, String queryId,
+   }
+ 
+   public boolean isFetchingTable() {
+-    return plan != null && plan.getFetchTask() != null;
++    return fetchTask != null;
+   }
+ 
+   @SuppressWarnings("unchecked")
+@@ -1648,9 +1680,8 @@ public boolean getResults(List res) throws IOException, CommandNeedRetryExceptio
+       throw new IOException("FAILED: Operation cancelled");
+     }
+     if (isFetchingTable()) {
+-      FetchTask ft = plan.getFetchTask();
+-      ft.setMaxRows(maxRows);
+-      return ft.fetch(res);
++      fetchTask.setMaxRows(maxRows);
++      return fetchTask.fetch(res);
+     }
+ 
+     if (resStream == null) {
+@@ -1700,13 +1731,14 @@ public boolean getResults(List res) throws IOException, CommandNeedRetryExceptio
+   }
+ 
+   public void resetFetch() throws IOException {
+-    if (plan != null && plan.getFetchTask() != null) {
++    if (isFetchingTable()) {
+       try {
+-        plan.getFetchTask().clearFetch();
++        fetchTask.clearFetch();
+       } catch (Exception e) {
+         throw new IOException("Error closing the current fetch task", e);
+       }
+-      plan.getFetchTask().initialize(conf, plan, null);
++      // FetchTask should not depend on the plan.
++      fetchTask.initialize(conf, null, null);
+     } else {
+       ctx.resetStream();
+       resStream = null;
+@@ -1721,25 +1753,23 @@ public void setTryCount(int tryCount) {
+     this.tryCount = tryCount;
+   }
+ 
+-
+   public int close() {
+     try {
+-      if (plan != null) {
+-        FetchTask fetchTask = plan.getFetchTask();
+-        if (null != fetchTask) {
+-          try {
+-            fetchTask.clearFetch();
+-          } catch (Exception e) {
+-            LOG.debug(" Exception while clearing the Fetch task ", e);
+-          }
++      if (fetchTask != null) {
++        try {
++          fetchTask.clearFetch();
++        } catch (Exception e) {
++          LOG.debug(" Exception while clearing the Fetch task ", e);
+         }
+-      }
+-      if (driverCxt != null) {
+-        driverCxt.shutdown();
+-        driverCxt = null;
++        fetchTask = null;
+       }
+       if (ctx != null) {
+         ctx.clear();
++        if (ctx.getHiveLocks() != null) {
++          hiveLocks.addAll(ctx.getHiveLocks());
++          ctx.setHiveLocks(null);
++        }
++        ctx = null;
+       }
+       if (null != resStream) {
+         try {
+@@ -1762,9 +1792,9 @@ public void destroy() {
+       return;
+     }
+     destroyed = true;
+-    if (ctx != null) {
++    if (!hiveLocks.isEmpty()) {
+       try {
+-        releaseLocksAndCommitOrRollback(ctx.getHiveLocks(), false);
++        releaseLocksAndCommitOrRollback(false);
+       } catch (LockException e) {
+         LOG.warn("Exception when releasing locking in destroy: " +
+             e.getMessage());
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
+index 2a55527..8a7aacd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Task.java
+@@ -506,6 +506,14 @@ public QueryPlan getQueryPlan() {
+     return queryPlan;
+   }
+ 
++  public DriverContext getDriverContext() {
++    return driverContext;
++  }
++
++  public void setDriverContext(DriverContext driverContext) {
++    this.driverContext = driverContext;
++  }
++
+   public void setQueryPlan(QueryPlan queryPlan) {
+     this.queryPlan = queryPlan;
+   }
+-- 
+1.7.9.5
+

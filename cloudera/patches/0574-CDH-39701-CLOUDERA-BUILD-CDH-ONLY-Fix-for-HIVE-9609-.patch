@@ -1,0 +1,80 @@
+From d370a37cfd7fd8a4bfe666e07d5e13c68b1514a1 Mon Sep 17 00:00:00 2001
+From: Mohit Sabharwal <mohit@cloudera.com>
+Date: Tue, 26 Apr 2016 16:17:02 -0700
+Subject: [PATCH 0574/1164] CDH-39701 : CLOUDERA-BUILD CDH-ONLY Fix for
+ HIVE-9609 to avoid breaking API compatibility
+
+The method getPartitions() was removed upstream in Hive 1.2 in HIVE-9609.
+And replaced by getPartitionIterator() for memory efficiency.
+Additionally, the new method fixes a bug for the case where
+we can end up returning null when AddPartitionEvent was
+initialized on a PartitionSpec rather than a List<Partition>.
+Because we cannot change this public API in CDH5, we are
+adding the bug fix in the old API.
+When we move to CDH6, we no longer needed this CDH-ONLY fix
+since at that point, it is ok to break API compatibility.
+Sentry and possibly customer code extending MetaStoreEventListener
+is vulnerable to this change.
+
+Change-Id: I1f1de3c79483b3c694bf1223f228e29270db289c
+---
+ .../apache/hive/hcatalog/api/TestHCatClient.java   |    1 -
+ .../hive/metastore/events/AddPartitionEvent.java   |   21 +++++++++++++++++++-
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
+index 032c3ac..656126b 100644
+--- a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
++++ b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
+@@ -1226,7 +1226,6 @@ public void testPartitionRegistrationWithCustomSchema() throws Exception {
+    * @throws Exception
+    */
+   @Test
+-  @Ignore 
+   public void testPartitionSpecRegistrationWithCustomSchema() throws Exception {
+     try {
+       startReplicationTargetMetaStoreIfRequired();
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java b/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java
+index 5b9c350..25fa9ce 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.hive.metastore.events;
+ 
++import com.google.common.collect.ImmutableList;
+ import org.apache.hadoop.hive.metastore.HiveMetaStore.HMSHandler;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.Table;
+@@ -63,9 +64,27 @@ public Table getTable() {
+ 
+   /**
+    * @return List of partitions.
++   * CDH-ONLY FIX
++   * The method was removed upstream in Hive 1.2 in HIVE-9609.
++   * And replaced by getPartitionIterator() for memory efficiency.
++   * Additionally, the new method fixes a bug for the case where
++   * we can end up returning null when AddPartitionEvent was
++   * initialized on a PartitionSpec rather than a List<Partition>.
++   * Because we cannot change this public API in CDH5, we are
++   * adding the bug fix in the old API.
++   * When we move to CDH6, we no longer needed this CDH-ONLY fix
++   * since at that point, it is ok to break API compatibility.
++   * Sentry and possibly customer code extending MetaStoreEventListener
++   * is vulnerable to this change.
+    */
+   public List<Partition> getPartitions() {
+-    return partitions;
++    if (partitions != null) {
++      return partitions;
++    } else  if (partitionSpecProxy != null){
++      return ImmutableList.copyOf(partitionSpecProxy.getPartitionIterator());
++    } else {
++      return null;
++    }
+   }
+ 
+   /**
+-- 
+1.7.9.5
+

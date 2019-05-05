@@ -1,0 +1,1136 @@
+From aae47395b2f1be20f3623d1657c79bfaae2afb89 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Tue, 17 Nov 2015 14:48:59 -0800
+Subject: [PATCH 0402/1164] CDH-34733: HIVE-12271 : Add metrics around HS2
+ query execution and job submission for Hive
+ (Szehon, reviewed by Jimmy Xiang)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+	common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+	common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+	service/src/java/org/apache/hive/service/cli/operation/Operation.java
+	service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+
+Change-Id: I4edb729d9213f67a7a5d0a6129aec2e1089f6f17
+---
+ common/pom.xml                                     |   17 +++
+ .../hadoop/hive/common/metrics/LegacyMetrics.java  |   27 +++--
+ .../hadoop/hive/common/metrics/common/Metrics.java |   28 ++++-
+ .../common/metrics/common/MetricsConstant.java     |   19 +++-
+ .../hive/common/metrics/common/MetricsScope.java   |   33 ++++++
+ .../common/metrics/metrics2/CodahaleMetrics.java   |   45 ++++++--
+ .../org/apache/hadoop/hive/ql/log/PerfLogger.java  |   27 +++++
+ .../hive/common/metrics/MetricsTestUtils.java      |   61 ++++++++++
+ .../hive/common/metrics/TestLegacyMetrics.java     |   46 ++++----
+ .../metrics/metrics2/TestCodahaleMetrics.java      |    8 +-
+ itests/hive-unit/pom.xml                           |    7 ++
+ .../apache/hive/jdbc/miniHS2/TestHs2Metrics.java   |  116 ++++++++++++++++++++
+ .../hadoop/hive/metastore/HiveMetaStore.java       |    4 +-
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |    1 -
+ service/pom.xml                                    |    7 ++
+ .../hive/service/cli/operation/Operation.java      |   43 ++++++++
+ .../hive/service/cli/session/SessionManager.java   |   25 ++++-
+ .../cli/session/TestSessionManagerMetrics.java     |  100 +++++++++++++++++
+ 18 files changed, 555 insertions(+), 59 deletions(-)
+ create mode 100644 common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsScope.java
+ create mode 100644 common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+ create mode 100644 itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+ create mode 100644 service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+
+diff --git a/common/pom.xml b/common/pom.xml
+index 8137634..418338c 100644
+--- a/common/pom.xml
++++ b/common/pom.xml
+@@ -230,6 +230,23 @@
+           </execution>
+         </executions>
+       </plugin>
++        <plugin>
++          <groupId>org.apache.maven.plugins</groupId>
++          <artifactId>maven-jar-plugin</artifactId>
++          <executions>
++            <execution>
++              <goals>
++                <goal>test-jar</goal>
++              </goals>
++              <configuration>
++                <!--exclude configuration xml that might be picked up-->
++                <excludes>
++                   <exclude>*.xml</exclude>
++                </excludes>
++              </configuration>
++            </execution>
++          </executions>
++        </plugin>
+     </plugins>
+   </build>
+ </project>
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
+index 52d99e4..9be9b50 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/LegacyMetrics.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.hive.common.metrics;
+ 
+ import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ 
+@@ -56,7 +57,7 @@ private LegacyMetrics() {
+    *   (i) a "number of calls" counter ( &lt;name&gt;.n ), and
+    *  (ii) a "number of msecs spent between scope open and close" counter. ( &lt;name&gt;.t)
+    */
+-  public static class MetricsScope {
++  public static class LegacyMetricsScope implements MetricsScope {
+ 
+     final LegacyMetrics metrics;
+ 
+@@ -73,7 +74,7 @@ private LegacyMetrics() {
+      * @param name - name of the variable
+      * @throws IOException
+      */
+-    private MetricsScope(String name, LegacyMetrics metrics) throws IOException {
++    private LegacyMetricsScope(String name, LegacyMetrics metrics) throws IOException {
+       this.metrics = metrics;
+       this.name = name;
+       this.numCounter = name + ".n";
+@@ -150,11 +151,11 @@ public void reopen() throws IOException {
+     }
+   }
+ 
+-  private static final ThreadLocal<HashMap<String, MetricsScope>> threadLocalScopes
+-    = new ThreadLocal<HashMap<String,MetricsScope>>() {
++  private static final ThreadLocal<HashMap<String, LegacyMetricsScope>> threadLocalScopes
++    = new ThreadLocal<HashMap<String, LegacyMetricsScope>>() {
+     @Override
+-    protected HashMap<String,MetricsScope> initialValue() {
+-      return new HashMap<String,MetricsScope>();
++    protected HashMap<String, LegacyMetricsScope> initialValue() {
++      return new HashMap<String, LegacyMetricsScope>();
+     }
+   };
+ 
+@@ -212,15 +213,15 @@ public Object get(String name) throws IOException{
+     return metrics.get(name);
+   }
+ 
+-  public void startScope(String name) throws IOException{
++  public void startStoredScope(String name) throws IOException{
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).open();
+     } else {
+-      threadLocalScopes.get().put(name, new MetricsScope(name, this));
++      threadLocalScopes.get().put(name, new LegacyMetricsScope(name, this));
+     }
+   }
+ 
+-  public MetricsScope getScope(String name) throws IOException {
++  public MetricsScope getStoredScope(String name) throws IOException {
+     if (threadLocalScopes.get().containsKey(name)) {
+       return threadLocalScopes.get().get(name);
+     } else {
+@@ -228,13 +229,19 @@ public MetricsScope getScope(String name) throws IOException {
+     }
+   }
+ 
+-  public void endScope(String name) throws IOException{
++  public void endStoredScope(String name) throws IOException{
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).close();
+     }
+   }
+ 
++  public MetricsScope createScope(String name) throws IOException {
++    return new LegacyMetricsScope(name, this);
++  }
+ 
++  public void endScope(MetricsScope scope) throws IOException {
++    ((LegacyMetricsScope) scope).close();
++  }
+ 
+   /**
+    * Resets the static context state to initial.
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
+index 49b2b32..4297233 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/Metrics.java
+@@ -28,20 +28,40 @@
+  */
+ public interface Metrics {
+ 
+-  //Must declare CTOR taking in HiveConf.
+-
+   /**
+    * Deinitializes the Metrics system.
+    */
+   public void close() throws Exception;
+ 
+   /**
++   *
++   * @param name starts a scope of a given name.  Scopes is stored as thread-local variable.
++   * @throws IOException
++   */
++  public void startStoredScope(String name) throws IOException;
++
++  /**
++   * Closes the stored scope of a given name.
++   * Note that this must be called on the same thread as where the scope was started.
++   * @param name
++   * @throws IOException
++   */
++  public void endStoredScope(String name) throws IOException;
++
++  /**
++   * Create scope with given name and returns it.
+    * @param name
++   * @return
+    * @throws IOException
+    */
+-  public void startScope(String name) throws IOException;
++  public MetricsScope createScope(String name) throws IOException;
+ 
+-  public void endScope(String name) throws IOException;
++  /**
++   * Close the given scope.
++   * @param scope
++   * @throws IOException
++   */
++  public void endScope(MetricsScope scope) throws IOException;
+ 
+   //Counter-related methods
+ 
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+index 13c3cf9..9c9247d 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+@@ -29,8 +29,19 @@
+   public static String OPEN_CONNECTIONS = "open_connections";
+   public static String OPEN_OPERATIONS = "open_operations";
+ 
+-  public static String JDO_ACTIVE_TRANSACTIONS = "active_jdo_transactions";
+-  public static String JDO_ROLLBACK_TRANSACTIONS = "rollbacked_jdo_transactions";
+-  public static String JDO_COMMIT_TRANSACTIONS = "committed_jdo_transactions";
+-  public static String JDO_OPEN_TRANSACTIONS = "opened_jdo_transactions";
++  public static final String JDO_ACTIVE_TRANSACTIONS = "active_jdo_transactions";
++  public static final String JDO_ROLLBACK_TRANSACTIONS = "rollbacked_jdo_transactions";
++  public static final String JDO_COMMIT_TRANSACTIONS = "committed_jdo_transactions";
++  public static final String JDO_OPEN_TRANSACTIONS = "opened_jdo_transactions";
++
++  public static final String METASTORE_HIVE_LOCKS = "metastore_hive_locks";
++  public static final String ZOOKEEPER_HIVE_SHAREDLOCKS = "zookeeper_hive_sharedlocks";
++  public static final String ZOOKEEPER_HIVE_EXCLUSIVELOCKS = "zookeeper_hive_exclusivelocks";
++  public static final String ZOOKEEPER_HIVE_SEMISHAREDLOCKS = "zookeeper_hive_semisharedlocks";
++
++  public static final String EXEC_ASYNC_QUEUE_SIZE = "exec_async_queue_size";
++  public static final String EXEC_ASYNC_POOL_SIZE = "exec_async_pool_size";
++
++  public static final String OPERATION_PREFIX = "hs2_operation_";
++  public static final String COMPLETED_OPERATION_PREFIX = "hs2_completed_operation_";
+ }
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsScope.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsScope.java
+new file mode 100644
+index 0000000..3d6a23e
+--- /dev/null
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsScope.java
+@@ -0,0 +1,33 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.common.metrics.common;
++
++/**
++ * Metrics Scope to represent duration of an event.
++ *
++ * Implementation can capture information like the average duration of open scopes,
++ * number of open scopes, number of completed scopes.
++ *
++ * Scopes are created via the Metrics framework (see Metrics#createScope or Metrics$createStoredScope)
++ *
++ * Scope may be stored by the Metrics framework via 'storedScope' concept for further reference.
++ *
++ * In either case, it is the caller's responsibility to end the scope via the Metrics framework (see Metrics#endScope)
++ */
++public interface MetricsScope {
++}
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+index 5f002f5..1b5c645 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/metrics2/CodahaleMetrics.java
+@@ -44,6 +44,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
++import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ 
+@@ -71,6 +72,8 @@
+  */
+ public class CodahaleMetrics implements org.apache.hadoop.hive.common.metrics.common.Metrics {
+   public static final String API_PREFIX = "api_";
++  public static final String ACTIVE_CALLS = "active_calls_";
++
+   public static final Log LOGGER = LogFactory.getLog(CodahaleMetrics.class);
+ 
+   public final MetricRegistry metricRegistry = new MetricRegistry();
+@@ -85,15 +88,15 @@
+   private HiveConf conf;
+   private final Set<Closeable> reporters = new HashSet<Closeable>();
+ 
+-  private final ThreadLocal<HashMap<String, MetricsScope>> threadLocalScopes
+-    = new ThreadLocal<HashMap<String,MetricsScope>>() {
++  private final ThreadLocal<HashMap<String, CodahaleMetricsScope>> threadLocalScopes
++    = new ThreadLocal<HashMap<String, CodahaleMetricsScope>>() {
+     @Override
+-    protected HashMap<String,MetricsScope> initialValue() {
+-      return new HashMap<String,MetricsScope>();
++    protected HashMap<String, CodahaleMetricsScope> initialValue() {
++      return new HashMap<String, CodahaleMetricsScope>();
+     }
+   };
+ 
+-  public static class MetricsScope {
++  public static class CodahaleMetricsScope implements MetricsScope {
+ 
+     final String name;
+     final Timer timer;
+@@ -107,7 +110,7 @@
+      * @param name - name of the variable
+      * @throws IOException
+      */
+-    private MetricsScope(String name, CodahaleMetrics metrics) throws IOException {
++    private CodahaleMetricsScope(String name, CodahaleMetrics metrics) throws IOException {
+       this.name = name;
+       this.metrics = metrics;
+       this.timer = metrics.getTimer(name);
+@@ -123,6 +126,7 @@ public void open() throws IOException {
+       if (!isOpen) {
+         isOpen = true;
+         this.timerContext = timer.time();
++        metrics.incrementCounter(ACTIVE_CALLS + name);
+       } else {
+         throw new IOException("Scope named " + name + " is not closed, cannot be opened.");
+       }
+@@ -135,7 +139,7 @@ public void open() throws IOException {
+     public void close() throws IOException {
+       if (isOpen) {
+         timerContext.close();
+-
++        metrics.decrementCounter(ACTIVE_CALLS + name);
+       } else {
+         throw new IOException("Scope named " + name + " is not open, cannot be closed.");
+       }
+@@ -206,22 +210,43 @@ public void close() throws Exception {
+     counters.invalidateAll();
+   }
+ 
+-  public void startScope(String name) throws IOException {
++  @Override
++  public void startStoredScope(String name) throws IOException {
+     name = API_PREFIX + name;
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).open();
+     } else {
+-      threadLocalScopes.get().put(name, new MetricsScope(name, this));
++      threadLocalScopes.get().put(name, new CodahaleMetricsScope(name, this));
+     }
+   }
+ 
+-  public void endScope(String name) throws IOException {
++  @Override
++  public void endStoredScope(String name) throws IOException {
+     name = API_PREFIX + name;
+     if (threadLocalScopes.get().containsKey(name)) {
+       threadLocalScopes.get().get(name).close();
++      threadLocalScopes.get().remove(name);
++    }
++  }
++
++  public MetricsScope getStoredScope(String name) throws IOException {
++    if (threadLocalScopes.get().containsKey(name)) {
++      return threadLocalScopes.get().get(name);
++    } else {
++      throw new IOException("No metrics scope named " + name);
+     }
+   }
+ 
++  public MetricsScope createScope(String name) throws IOException {
++    name = API_PREFIX + name;
++    return new CodahaleMetricsScope(name, this);
++  }
++
++  public void endScope(MetricsScope scope) throws IOException {
++    ((CodahaleMetricsScope) scope).close();
++  }
++
++  @Override
+   public Long incrementCounter(String name) throws IOException {
+     return incrementCounter(name, 1L);
+   }
+diff --git a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+index 9085d36..0b79630 100644
+--- a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
++++ b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+@@ -20,9 +20,12 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.util.ReflectionUtils;
+ 
++import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+@@ -117,6 +120,7 @@ public void PerfLogBegin(String callerName, String method) {
+     long startTime = System.currentTimeMillis();
+     LOG.info("<PERFLOG method=" + method + " from=" + callerName + ">");
+     startTimes.put(method, new Long(startTime));
++    beginMetrics(method);
+   }
+   /**
+    * Call this function in correspondence of PerfLogBegin to mark the end of the measurement.
+@@ -157,6 +161,8 @@ public long PerfLogEnd(String callerName, String method, String additionalInfo)
+     sb.append(">");
+     LOG.info(sb);
+ 
++    endMetrics(method);
++
+     return duration;
+   }
+ 
+@@ -194,4 +200,25 @@ public Long getDuration(String method) {
+     return duration;
+   }
+ 
++  private void beginMetrics(String method) {
++    Metrics metrics = MetricsFactory.getInstance();
++    try {
++      if (metrics != null) {
++        metrics.startStoredScope(method);
++      }
++    } catch (IOException e) {
++      LOG.warn("Error recording metrics", e);
++    }
++  }
++
++  private void endMetrics(String method) {
++    Metrics metrics = MetricsFactory.getInstance();
++    try {
++      if (metrics != null) {
++        metrics.endStoredScope(method);
++      }
++    } catch (IOException e) {
++      LOG.warn("Error recording metrics", e);
++    }
++  }
+ }
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+new file mode 100644
+index 0000000..fd420f7
+--- /dev/null
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/MetricsTestUtils.java
+@@ -0,0 +1,61 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.common.metrics;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.junit.Assert;
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++
++/**
++ * Utilities for codahale metrics verification.
++ */
++public class MetricsTestUtils {
++
++  public static final MetricsCategory COUNTER = new MetricsCategory("counters", "count");
++  public static final MetricsCategory TIMER = new MetricsCategory("timers", "count");
++  public static final MetricsCategory GAUGE = new MetricsCategory("gauges", "value");
++
++  static class MetricsCategory {
++    String category;
++    String metricsHandle;
++    MetricsCategory(String category, String metricsHandle) {
++      this.category = category;
++      this.metricsHandle = metricsHandle;
++    }
++  }
++
++  public static void verifyMetricFile(File jsonReportFile, MetricsCategory category, String metricsName,
++    Object value) throws Exception {
++    JsonNode jsonNode = getJsonNode(jsonReportFile, category, metricsName);
++    Assert.assertEquals(jsonNode.asText(), value.toString());
++  }
++
++  private static JsonNode getJsonNode(File jsonReportFile, MetricsCategory category, String metricsName) throws Exception {
++    byte[] jsonData = Files.readAllBytes(Paths.get(jsonReportFile.getAbsolutePath()));
++    ObjectMapper objectMapper = new ObjectMapper();
++    JsonNode rootNode = objectMapper.readTree(jsonData);
++    JsonNode categoryNode = rootNode.path(category.category);
++    JsonNode metricsNode = categoryNode.path(metricsName);
++    return metricsNode.path(category.metricsHandle);
++  }
++}
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java b/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java
+index c3e8282..a3fb04f 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/TestLegacyMetrics.java
+@@ -32,7 +32,7 @@
+ import javax.management.ObjectName;
+ 
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
+-import org.apache.hadoop.hive.common.metrics.LegacyMetrics.MetricsScope;
++import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -124,8 +124,8 @@ public void testMetricsMBean() throws Exception {
+ 
+   @Test
+   public void testScopeSingleThread() throws Exception {
+-    metrics.startScope(scopeName);
+-    final MetricsScope fooScope = metrics.getScope(scopeName);
++    metrics.startStoredScope(scopeName);
++    final LegacyMetrics.LegacyMetricsScope fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
+     // the time and number counters become available only after the 1st
+     // scope close:
+     expectIOE(new Callable<Long>() {
+@@ -151,15 +151,15 @@ public Void call() throws Exception {
+       }
+     });
+ 
+-    assertSame(fooScope, metrics.getScope(scopeName));
++    assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs+ 1);
+     // 1st close:
+     // closing of open scope should be ok:
+-    metrics.endScope(scopeName);
++    metrics.endStoredScope(scopeName);
+     expectIOE(new Callable<Void>() {
+       @Override
+       public Void call() throws Exception {
+-        metrics.endScope(scopeName); // closing of closed scope not allowed
++        metrics.endStoredScope(scopeName); // closing of closed scope not allowed
+         return null;
+       }
+     });
+@@ -168,15 +168,15 @@ public Void call() throws Exception {
+     final long t1 = fooScope.getTimeCounter().longValue();
+     assertTrue(t1 > periodMs);
+ 
+-    assertSame(fooScope, metrics.getScope(scopeName));
++    assertSame(fooScope, metrics.getStoredScope(scopeName));
+ 
+    // opening allowed after closing:
+-    metrics.startScope(scopeName);
++    metrics.startStoredScope(scopeName);
+     // opening of already open scope not allowed:
+     expectIOE(new Callable<Void>() {
+       @Override
+       public Void call() throws Exception {
+-        metrics.startScope(scopeName);
++        metrics.startStoredScope(scopeName);
+         return null;
+       }
+     });
+@@ -184,7 +184,7 @@ public Void call() throws Exception {
+     assertEquals(Long.valueOf(1), fooScope.getNumCounter());
+     assertEquals(t1, fooScope.getTimeCounter().longValue());
+ 
+-    assertSame(fooScope, metrics.getScope(scopeName));
++    assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs + 1);
+     // Reopening (close + open) allowed in opened state:
+     fooScope.reopen();
+@@ -204,8 +204,8 @@ public Void call() throws Exception {
+ 
+   @Test
+   public void testScopeConcurrency() throws Exception {
+-    metrics.startScope(scopeName);
+-    MetricsScope fooScope = metrics.getScope(scopeName);
++    metrics.startStoredScope(scopeName);
++    LegacyMetrics.LegacyMetricsScope fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
+     final int threads = 10;
+     ExecutorService executorService = Executors.newFixedThreadPool(threads);
+     for (int i=0; i<threads; i++) {
+@@ -221,17 +221,17 @@ public Void call() throws Exception {
+     executorService.shutdown();
+     assertTrue(executorService.awaitTermination(periodMs * 3 * threads, TimeUnit.MILLISECONDS));
+ 
+-    fooScope = metrics.getScope(scopeName);
++    fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
+     assertEquals(Long.valueOf(3 * threads), fooScope.getNumCounter());
+     assertTrue(fooScope.getTimeCounter().longValue() > 3 * periodMs * threads);
+     Double avgT = (Double) metrics.get("foo.avg_t");
+     assertTrue(avgT.doubleValue() > periodMs);
+-    metrics.endScope(scopeName);
++    metrics.endStoredScope(scopeName);
+   }
+ 
+   void testScopeImpl(int n) throws Exception {
+-    metrics.startScope(scopeName);
+-    final MetricsScope fooScope = metrics.getScope(scopeName);
++    metrics.startStoredScope(scopeName);
++    final LegacyMetrics.LegacyMetricsScope fooScope = (LegacyMetrics.LegacyMetricsScope) metrics.getStoredScope(scopeName);
+       // cannot open scope that is already open:
+     expectIOE(new Callable<Void>() {
+       @Override
+@@ -241,10 +241,10 @@ public Void call() throws Exception {
+       }
+     });
+ 
+-    assertSame(fooScope, metrics.getScope(scopeName));
++    assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs+ 1);
+     // 1st close:
+-    metrics.endScope(scopeName); // closing of open scope should be ok.
++    metrics.endStoredScope(scopeName); // closing of open scope should be ok.
+ 
+     assertTrue(fooScope.getNumCounter().longValue() >= 1);
+     final long t1 = fooScope.getTimeCounter().longValue();
+@@ -253,15 +253,15 @@ public Void call() throws Exception {
+     expectIOE(new Callable<Void>() {
+       @Override
+       public Void call() throws Exception {
+-        metrics.endScope(scopeName); // closing of closed scope not allowed
++        metrics.endStoredScope(scopeName); // closing of closed scope not allowed
+         return null;
+       }
+     });
+ 
+-    assertSame(fooScope, metrics.getScope(scopeName));
++    assertSame(fooScope, metrics.getStoredScope(scopeName));
+ 
+    // opening allowed after closing:
+-    metrics.startScope(scopeName);
++    metrics.startStoredScope(scopeName);
+ 
+     assertTrue(fooScope.getNumCounter().longValue() >= 1);
+     assertTrue(fooScope.getTimeCounter().longValue() >= t1);
+@@ -270,12 +270,12 @@ public Void call() throws Exception {
+     expectIOE(new Callable<Void>() {
+       @Override
+       public Void call() throws Exception {
+-        metrics.startScope(scopeName);
++        metrics.startStoredScope(scopeName);
+         return null;
+       }
+     });
+ 
+-    assertSame(fooScope, metrics.getScope(scopeName));
++    assertSame(fooScope, metrics.getStoredScope(scopeName));
+     Thread.sleep(periodMs + 1);
+     // Reopening (close + open) allowed in opened state:
+     fooScope.reopen();
+diff --git a/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java b/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java
+index a3aa549..27825b1 100644
+--- a/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java
++++ b/common/src/test/org/apache/hadoop/hive/common/metrics/metrics2/TestCodahaleMetrics.java
+@@ -77,8 +77,8 @@ public void after() throws Exception {
+   public void testScope() throws Exception {
+     int runs = 5;
+     for (int i = 0; i < runs; i++) {
+-      MetricsFactory.getInstance().startScope("method1");
+-      MetricsFactory.getInstance().endScope("method1");
++      MetricsFactory.getInstance().startStoredScope("method1");
++      MetricsFactory.getInstance().endStoredScope("method1");
+     }
+ 
+     Timer timer = metricRegistry.getTimers().get("api_method1");
+@@ -106,8 +106,8 @@ public void testConcurrency() throws Exception {
+       executorService.submit(new Callable<Void>() {
+         @Override
+         public Void call() throws Exception {
+-          MetricsFactory.getInstance().startScope("method2");
+-          MetricsFactory.getInstance().endScope("method2");
++          MetricsFactory.getInstance().startStoredScope("method2");
++          MetricsFactory.getInstance().endStoredScope("method2");
+           return null;
+         }
+       });
+diff --git a/itests/hive-unit/pom.xml b/itests/hive-unit/pom.xml
+index ff87947..cf9b6ba 100644
+--- a/itests/hive-unit/pom.xml
++++ b/itests/hive-unit/pom.xml
+@@ -115,6 +115,13 @@
+       <version>${project.version}</version>
+       <classifier>tests</classifier>
+     </dependency>
++    <dependency>
++      <groupId>org.apache.hive</groupId>
++      <artifactId>hive-common</artifactId>
++      <version>${project.version}</version>
++      <type>test-jar</type>
++      <scope>test</scope>
++    </dependency>
+     <!-- test inter-project -->
+     <dependency>
+       <groupId>org.apache.spark</groupId>
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+new file mode 100644
+index 0000000..873e126
+--- /dev/null
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+@@ -0,0 +1,116 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.jdbc.miniHS2;
++
++import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.exec.Task;
++import org.apache.hadoop.hive.ql.parse.ASTNode;
++import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHook;
++import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHookContext;
++import org.apache.hadoop.hive.ql.parse.SemanticException;
++import org.apache.hive.service.cli.CLIServiceClient;
++import org.apache.hive.service.cli.SessionHandle;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Tests HiveServer2 metrics.
++ */
++public class TestHs2Metrics {
++
++  private static MiniHS2 miniHS2;
++  private static Map<String, String> confOverlay;
++  private static File jsonReportFile;
++
++  //Check metrics during semantic analysis.
++  public static class MetricCheckingHook implements HiveSemanticAnalyzerHook {
++    @Override
++    public ASTNode preAnalyze(HiveSemanticAnalyzerHookContext context,
++      ASTNode ast) throws SemanticException {
++      try {
++        //Pre-analyze hook is fired in the middle of these calls
++        MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 1);
++        MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_compile", 1);
++        MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 1);
++      } catch (Exception e) {
++        throw new SemanticException("metrics verification failed", e);
++      }
++      return ast;
++    }
++
++    @Override
++    public void postAnalyze(HiveSemanticAnalyzerHookContext context,
++      List<Task<? extends Serializable>> rootTasks) throws SemanticException {
++    }
++  }
++
++  @BeforeClass
++  public static void setup() throws Exception {
++    miniHS2 = new MiniHS2(new HiveConf());
++    confOverlay = new HashMap<String, String>();
++    confOverlay.put(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname, "false");
++    confOverlay.put(HiveConf.ConfVars.SEMANTIC_ANALYZER_HOOK.varname, MetricCheckingHook.class.getName());
++    miniHS2.start(confOverlay);
++
++    //for Metrics.  MiniHS2 init code-path doesn't go through HiveServer2.startHiveServer2().
++    File workDir = new File(System.getProperty("test.tmp.dir"));
++    jsonReportFile = new File(workDir, "json_reporting");
++    jsonReportFile.delete();
++    HiveConf conf = new HiveConf();
++    conf.setBoolVar(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED, true);
++    conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_REPORTER, MetricsReporting.JSON_FILE.name() + "," + MetricsReporting.JMX.name());
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_LOCATION, jsonReportFile.toString());
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "100ms");
++    MetricsFactory.init(conf);
++  }
++
++  @Test
++  public void testMetrics() throws Exception {
++    String tableName = "testMetrics";
++    CLIServiceClient serviceClient = miniHS2.getServiceClient();
++    SessionHandle sessHandle = serviceClient.openSession("foo", "bar");
++
++    //Block on semantic analysis to check 'active_calls'
++    serviceClient.executeStatement(sessHandle, "CREATE TABLE " + tableName + " (id INT)", confOverlay);
++    Thread.sleep(2000);
++
++    //check that all calls were recorded.
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_hs2_operation_INITIALIZED", 1);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_hs2_operation_PENDING", 1);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_hs2_operation_RUNNING", 1);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "hs2_completed_operation_FINISHED", 1);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.TIMER, "api_Driver.run", 1);
++
++    //but there should be no more active calls.
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 0);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_compile", 0);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 0);
++
++  }
++
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index a4f4472..0317b8d 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -765,7 +765,7 @@ private String startFunction(String function, String extraLogInfo) {
+           function + extraLogInfo);
+       if (MetricsFactory.getInstance() != null) {
+         try {
+-          MetricsFactory.getInstance().startScope(function);
++          MetricsFactory.getInstance().startStoredScope(function);
+         } catch (IOException e) {
+           LOG.debug("Exception when starting metrics scope"
+             + e.getClass().getName() + " " + e.getMessage(), e);
+@@ -809,7 +809,7 @@ private void endFunction(String function, boolean successful, Exception e,
+     private void endFunction(String function, MetaStoreEndFunctionContext context) {
+       if (MetricsFactory.getInstance() != null) {
+         try {
+-          MetricsFactory.getInstance().endScope(function);
++          MetricsFactory.getInstance().endStoredScope(function);
+         } catch (IOException e) {
+           LOG.debug("Exception when closing metrics scope" + e);
+         }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 46684fa..a1df254 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -1426,7 +1426,6 @@ public int execute() throws CommandNeedRetryException {
+         // Launch upto maxthreads tasks
+         Task<? extends Serializable> task;
+         while ((task = driverCxt.getRunnable(maxthreads)) != null) {
+-          perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.TASK + task.getName() + "." + task.getId());
+           TaskRunner runner = launchTask(task, queryId, noName, jobname, jobs, driverCxt);
+           if (!runner.isRunning()) {
+             break;
+diff --git a/service/pom.xml b/service/pom.xml
+index 430b248..dcace2a 100644
+--- a/service/pom.xml
++++ b/service/pom.xml
+@@ -104,6 +104,13 @@
+       <scope>test</scope>
+       <classifier>tests</classifier>
+     </dependency>
++      <dependency>
++        <groupId>org.apache.hive</groupId>
++        <artifactId>hive-common</artifactId>
++        <version>${project.version}</version>
++        <scope>test</scope>
++        <type>test-jar</type>
++      </dependency>
+     <!-- test inter-project -->
+     <dependency>
+       <groupId>junit</groupId>
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index e9df6c6..36b6eb4 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -19,7 +19,9 @@
+ 
+ import java.io.File;
+ import java.io.FileNotFoundException;
++import java.io.IOException;
+ import java.util.EnumSet;
++import java.util.Set;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -28,6 +30,8 @@
+ import org.apache.hadoop.hive.common.metrics.common.Metrics;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
+ import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import com.google.common.collect.Sets;
++import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.OperationLog;
+@@ -45,6 +49,7 @@
+ public abstract class Operation {
+   protected final HiveSession parentSession;
+   private OperationState state = OperationState.INITIALIZED;
++  private MetricsScope currentStateScope;
+   private final OperationHandle opHandle;
+   private HiveConf configuration;
+   public static final Log LOG = LogFactory.getLog(Operation.class.getName());
+@@ -70,6 +75,7 @@ protected Operation(HiveSession parentSession, OperationType opType, boolean run
+     lastAccessTime = System.currentTimeMillis();
+     operationTimeout = HiveConf.getTimeVar(parentSession.getHiveConf(),
+         HiveConf.ConfVars.HIVE_SERVER2_IDLE_OPERATION_TIMEOUT, TimeUnit.MILLISECONDS);
++    setMetrics(state);
+   }
+ 
+   public Future<?> getBackgroundHandle() {
+@@ -128,6 +134,7 @@ public OperationLog getOperationLog() {
+   protected final OperationState setState(OperationState newState) throws HiveSQLException {
+     state.validateTransition(newState);
+     this.state = newState;
++    setMetrics(state);
+     this.lastAccessTime = System.currentTimeMillis();
+     return this.state;
+   }
+@@ -330,4 +337,40 @@ protected HiveSQLException toSQLException(String prefix, CommandProcessorRespons
+     }
+     return ex;
+   }
++
++  //list of operation states to measure duration of.
++  protected static Set<OperationState> scopeStates = Sets.immutableEnumSet(
++    OperationState.INITIALIZED,
++    OperationState.PENDING,
++    OperationState.RUNNING
++  );
++
++  //list of terminal operation states.  We measure only completed counts for operations in these states.
++  protected static Set<OperationState> terminalStates = Sets.immutableEnumSet(
++    OperationState.CLOSED,
++    OperationState.CANCELED,
++    OperationState.FINISHED,
++    OperationState.ERROR,
++    OperationState.UNKNOWN
++  );
++
++  protected void setMetrics(OperationState state) {
++     Metrics metrics = MetricsFactory.getInstance();
++     if (metrics != null) {
++       try {
++         if (currentStateScope != null) {
++           metrics.endScope(currentStateScope);
++           currentStateScope = null;
++         }
++         if (scopeStates.contains(state)) {
++           currentStateScope = metrics.createScope(MetricsConstant.OPERATION_PREFIX + state.toString());
++         }
++         if (terminalStates.contains(state)) {
++           metrics.incrementCounter(MetricsConstant.COMPLETED_OPERATION_PREFIX + state.toString());
++         }
++       } catch (IOException e) {
++         LOG.warn("Error metrics", e);
++       }
++    }
++  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/session/SessionManager.java b/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+index 36a30b1..950440c 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
++++ b/service/src/java/org/apache/hive/service/cli/session/SessionManager.java
+@@ -24,6 +24,7 @@
+ import java.util.Date;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.LinkedBlockingQueue;
+@@ -33,6 +34,11 @@
+ import org.apache.commons.io.FileUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.common.MetricsVariable;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.ql.hooks.HookUtils;
+@@ -99,8 +105,9 @@ private void createBackgroundOperationPool() {
+     // Threads terminate when they are idle for more than the keepAliveTime
+     // A bounded blocking queue is used to queue incoming operations, if #operations > poolSize
+     String threadPoolName = "HiveServer2-Background-Pool";
++    final BlockingQueue queue = new LinkedBlockingQueue<Runnable>(poolQueueSize);
+     backgroundOperationPool = new ThreadPoolExecutor(poolSize, poolSize,
+-        keepAliveTime, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(poolQueueSize),
++        keepAliveTime, TimeUnit.SECONDS, queue,
+         new ThreadFactoryWithGarbageCleanup(threadPoolName));
+     backgroundOperationPool.allowCoreThreadTimeOut(true);
+ 
+@@ -110,6 +117,22 @@ private void createBackgroundOperationPool() {
+         hiveConf, ConfVars.HIVE_SERVER2_IDLE_SESSION_TIMEOUT, TimeUnit.MILLISECONDS);
+     checkOperation = HiveConf.getBoolVar(hiveConf,
+         ConfVars.HIVE_SERVER2_IDLE_SESSION_CHECK_OPERATION);
++
++    Metrics m = MetricsFactory.getInstance();
++    if (m != null) {
++      m.addGauge(MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, new MetricsVariable() {
++        @Override
++        public Object getValue() {
++          return queue.size();
++        }
++      });
++      m.addGauge(MetricsConstant.EXEC_ASYNC_POOL_SIZE, new MetricsVariable() {
++        @Override
++        public Object getValue() {
++          return backgroundOperationPool.getPoolSize();
++        }
++      });
++    }
+   }
+ 
+   private void initOperationLogRootDir() {
+diff --git a/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java b/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+new file mode 100644
+index 0000000..aaeecbe
+--- /dev/null
++++ b/service/src/test/org/apache/hive/service/cli/session/TestSessionManagerMetrics.java
+@@ -0,0 +1,100 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.service.cli.session;
++
++import org.apache.hadoop.hive.common.metrics.MetricsTestUtils;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.metrics2.MetricsReporting;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hive.service.server.HiveServer2;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.File;
++
++/**
++ * Test metrics from SessionManager.
++ */
++public class TestSessionManagerMetrics {
++
++  private static SessionManager sm;
++  private static File jsonReportFile;
++
++  @BeforeClass
++  public static void setup() throws Exception {
++    HiveConf conf = new HiveConf();
++    conf.setIntVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_THREADS, 2);
++    conf.setIntVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_WAIT_QUEUE_SIZE, 10);
++    conf.setVar(HiveConf.ConfVars.HIVE_SERVER2_ASYNC_EXEC_KEEPALIVE_TIME, "1000000s");
++
++    File workDir = new File(System.getProperty("test.tmp.dir"));
++    jsonReportFile = new File(workDir, "json_reporting");
++    jsonReportFile.delete();
++    conf.setBoolVar(HiveConf.ConfVars.HIVE_SERVER2_METRICS_ENABLED, true);
++    conf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_REPORTER, MetricsReporting.JSON_FILE.name() + "," + MetricsReporting.JMX.name());
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_LOCATION, jsonReportFile.toString());
++    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_JSON_FILE_INTERVAL, "100ms");
++    MetricsFactory.init(conf);
++
++    HiveServer2 hs2 = new HiveServer2();
++    sm = new SessionManager(hs2);
++    sm.init(conf);
++  }
++
++  final Object barrier = new Object();
++
++  class BarrierRunnable implements Runnable {
++    @Override
++    public void run() {
++      synchronized (barrier) {
++        try {
++          barrier.wait();
++        } catch (InterruptedException e) {
++          throw new RuntimeException(e);
++        }
++      }
++    }
++  }
++
++  /**
++   * Tests metrics regarding async thread pool.
++   */
++  @Test
++  public void testThreadPoolMetrics() throws Exception {
++
++    sm.submitBackgroundOperation(new BarrierRunnable());
++    sm.submitBackgroundOperation(new BarrierRunnable());
++    sm.submitBackgroundOperation(new BarrierRunnable());
++    sm.submitBackgroundOperation(new BarrierRunnable());
++
++    Thread.sleep(2000);
++
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_POOL_SIZE, 2);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, 2);
++
++    synchronized (barrier) {
++      barrier.notifyAll();
++    }
++    Thread.sleep(2000);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_POOL_SIZE, 2);
++    MetricsTestUtils.verifyMetricFile(jsonReportFile, MetricsTestUtils.GAUGE, MetricsConstant.EXEC_ASYNC_QUEUE_SIZE, 0);
++  }
++}
+-- 
+1.7.9.5
+

@@ -1,0 +1,325 @@
+From 5697b9e24f7f774d879dd74795278bf51d3a39f7 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Wed, 1 Feb 2017 14:23:15 -0500
+Subject: [PATCH 0995/1164] CDH-49972: HIVE-15782: query on parquet table
+ returns incorrect result when
+ hive.optimize.index.filter is set to true (Aihua
+ Xu, reviewed by Yongzhi Chen)
+
+(cherry picked from commit d31dc22ae5d9f0983d985f45551f20058777d524)
+
+Change-Id: Ieda807762e2e3bfee0c6225f9f2008ee978dfaf1
+---
+ .../hive/ql/io/parquet/LeafFilterFactory.java      |   12 +++--
+ .../read/ParquetFilterPredicateConverter.java      |   19 ++++----
+ .../io/parquet/TestParquetRecordReaderWrapper.java |   47 ++++++++++--------
+ .../clientpositive/parquet_ppd_multifiles.q        |   13 +++++
+ .../clientpositive/parquet_ppd_multifiles.q.out    |   50 ++++++++++++++++++++
+ 5 files changed, 108 insertions(+), 33 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/parquet_ppd_multifiles.q
+ create mode 100644 ql/src/test/results/clientpositive/parquet_ppd_multifiles.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/LeafFilterFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/LeafFilterFactory.java
+index e425334..b4a8589 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/LeafFilterFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/LeafFilterFactory.java
+@@ -19,6 +19,7 @@
+ import org.apache.hadoop.hive.ql.io.sarg.PredicateLeaf;
+ import org.apache.hadoop.hive.ql.io.sarg.PredicateLeaf.Operator;
+ 
++import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import parquet.filter2.predicate.FilterApi;
+ import parquet.filter2.predicate.FilterPredicate;
+ import parquet.io.api.Binary;
+@@ -167,9 +168,11 @@ public FilterPredicate buildPredict(Operator op, Object constant,
+    * supported yet.
+    * @param type FilterPredicateType
+    * @return
++   * @throws HiveException Exception is thrown for unsupported data types so we can skip filtering
+    */
+-    public FilterPredicateLeafBuilder getLeafFilterBuilderByType(PredicateLeaf.Type type,
+-                                                               Type parquetType){
++  public FilterPredicateLeafBuilder getLeafFilterBuilderByType(
++      PredicateLeaf.Type type,
++      Type parquetType) throws HiveException {
+     switch (type){
+       case LONG:
+         if (parquetType.asPrimitiveType().getPrimitiveTypeName() ==
+@@ -193,8 +196,9 @@ public FilterPredicateLeafBuilder getLeafFilterBuilderByType(PredicateLeaf.Type
+       case DECIMAL:
+       case TIMESTAMP:
+       default:
+-        LOG.debug("Conversion to Parquet FilterPredicate not supported for " + type);
+-        return null;
++        String msg = "Conversion to Parquet FilterPredicate not supported for " + type;
++        LOG.debug(msg);
++        throw new HiveException(msg);
+     }
+   }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetFilterPredicateConverter.java b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetFilterPredicateConverter.java
+index b40ccb5..3a41b26 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetFilterPredicateConverter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/parquet/read/ParquetFilterPredicateConverter.java
+@@ -39,7 +39,8 @@
+   /**
+    * Translate the search argument to the filter predicate parquet uses. It includes
+    * only the columns from the passed schema.
+-   * @return translate the sarg into a filter predicate
++   * @return  a filter predicate translated from search argument. null is returned
++   *          if failed to convert.
+    */
+   public static FilterPredicate toFilterPredicate(SearchArgument sarg, MessageType schema) {
+     Set<String> columns = null;
+@@ -50,13 +51,17 @@ public static FilterPredicate toFilterPredicate(SearchArgument sarg, MessageType
+       }
+     }
+ 
+-    return translate(sarg.getExpression(), sarg.getLeaves(), columns, schema);
++    try {
++      return translate(sarg.getExpression(), sarg.getLeaves(), columns, schema);
++    } catch(Exception e) {
++      return null;
++    }
+   }
+ 
+   private static FilterPredicate translate(ExpressionTree root,
+                                            List<PredicateLeaf> leaves,
+                                            Set<String> columns,
+-                                           MessageType schema) {
++                                           MessageType schema) throws Exception {
+     FilterPredicate p = null;
+     switch (root.getOperator()) {
+       case OR:
+@@ -113,15 +118,13 @@ private static FilterPredicate translate(ExpressionTree root,
+   }
+ 
+   private static FilterPredicate buildFilterPredicateFromPredicateLeaf
+-      (PredicateLeaf leaf, Type parquetType) {
++      (PredicateLeaf leaf, Type parquetType) throws Exception {
+     LeafFilterFactory leafFilterFactory = new LeafFilterFactory();
+     FilterPredicateLeafBuilder builder;
+     try {
+       builder = leafFilterFactory
+           .getLeafFilterBuilderByType(leaf.getType(), parquetType);
+-      if (builder == null) {
+-        return null;
+-      }
++
+       if (isMultiLiteralsOperator(leaf.getOperator())) {
+         return builder.buildPredicate(leaf.getOperator(),
+             leaf.getLiteralList(PredicateLeaf.FileFormat.PARQUET),
+@@ -134,7 +137,7 @@ private static FilterPredicate translate(ExpressionTree root,
+       }
+     } catch (Exception e) {
+       LOG.error("fail to build predicate filter leaf with errors" + e, e);
+-      return null;
++      throw e;
+     }
+   }
+ 
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRecordReaderWrapper.java b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRecordReaderWrapper.java
+index b7ee1e5..9de4c20 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRecordReaderWrapper.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/io/parquet/TestParquetRecordReaderWrapper.java
+@@ -18,18 +18,19 @@
+ 
+ package org.apache.hadoop.hive.ql.io.parquet;
+ 
+-import static junit.framework.Assert.assertEquals;
+-
+ import org.apache.hadoop.hive.common.type.HiveChar;
++import org.apache.hadoop.hive.common.type.HiveDecimal;
+ import org.apache.hadoop.hive.common.type.HiveVarchar;
+ import org.apache.hadoop.hive.ql.io.parquet.read.ParquetFilterPredicateConverter;
+ import org.apache.hadoop.hive.ql.io.sarg.PredicateLeaf;
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
+-import org.apache.hadoop.hive.ql.io.sarg.SearchArgument.TruthValue;
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory;
++import org.apache.hadoop.hive.serde2.io.DateWritable;
+ import org.apache.hadoop.hive.serde2.io.HiveDecimalWritable;
+ import org.junit.Test;
+ 
++import static org.junit.Assert.assertEquals;
++
+ import java.sql.Date;
+ 
+ import parquet.filter2.predicate.FilterPredicate;
+@@ -41,10 +42,6 @@
+  */
+ public class TestParquetRecordReaderWrapper {
+ 
+-  private static TruthValue[] values(TruthValue... vals) {
+-    return vals;
+-  }
+-
+   @Test
+   public void testBuilder() throws Exception {
+      SearchArgument sarg = SearchArgumentFactory.newBuilder()
+@@ -69,23 +66,30 @@ public void testBuilder() throws Exception {
+     assertEquals(expected, p.toString());
+   }
+ 
++  /**
++   * Check the converted filter predicate is null if unsupported types are included
++   * @throws Exception
++   */
+   @Test
+   public void testBuilderComplexTypes() throws Exception {
+     SearchArgument sarg =
+         SearchArgumentFactory.newBuilder()
+             .startAnd()
++            .lessThan("x", new DateWritable(Date.valueOf("1970-1-11")))
+             .lessThanEquals("y", new HiveChar("hi", 10).toString())
++            .equals("z", HiveDecimal.create("1.0"))
+             .end()
+             .build();
+     MessageType schema = MessageTypeParser.parseMessageType("message test {" +
+         " required int32 x; required binary y; required binary z;}");
+-    assertEquals("lteq(y, Binary{\"hi        \"})",
+-        ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema).toString());
++    assertEquals(null,
++        ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema));
+ 
+     sarg = SearchArgumentFactory.newBuilder()
+         .startNot()
+         .startOr()
+         .isNull("x")
++        .between("y", HiveDecimal.create("10"), HiveDecimal.create("20.0"))
+         .in("z", 1, 2, 3)
+         .nullSafeEquals("a", new HiveVarchar("stinger", 100).toString())
+         .end()
+@@ -95,30 +99,34 @@ public void testBuilderComplexTypes() throws Exception {
+     schema = MessageTypeParser.parseMessageType("message test {" +
+         " optional int32 x; required binary y; required int32 z;" +
+         " optional binary a;}");
+-    FilterPredicate p = ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema);
+-    String expected =
+-        "and(and(not(eq(x, null)), not(or(or(eq(z, 1), eq(z, 2)), eq(z, 3)))), " +
+-        "not(eq(a, Binary{\"stinger\"})))";
+-    assertEquals(expected, p.toString());
++    assertEquals(null,
++        ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema));
+   }
+ 
++  /**
++   * Check the converted filter predicate is null if unsupported types are included
++   * @throws Exception
++   */
+   @Test
+   public void testBuilderComplexTypes2() throws Exception {
+     SearchArgument sarg =
+         SearchArgumentFactory.newBuilder()
+             .startAnd()
++            .lessThan("x", new DateWritable(Date.valueOf("2005-3-12")))
+             .lessThanEquals("y", new HiveChar("hi", 10).toString())
++            .equals("z", HiveDecimal.create("1.0"))
+             .end()
+             .build();
+     MessageType schema = MessageTypeParser.parseMessageType("message test {" +
+         " required int32 x; required binary y; required binary z;}");
+-    assertEquals("lteq(y, Binary{\"hi        \"})",
+-        ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema).toString());
++    assertEquals(null,
++        ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema));
+ 
+     sarg = SearchArgumentFactory.newBuilder()
+         .startNot()
+         .startOr()
+         .isNull("x")
++        .between("y", HiveDecimal.create("10"), HiveDecimal.create("20.0"))
+         .in("z", 1, 2, 3)
+         .nullSafeEquals("a", new HiveVarchar("stinger", 100).toString())
+         .end()
+@@ -127,11 +135,8 @@ public void testBuilderComplexTypes2() throws Exception {
+     schema = MessageTypeParser.parseMessageType("message test {" +
+         " optional int32 x; required binary y; required int32 z;" +
+         " optional binary a;}");
+-
+-    FilterPredicate p = ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema);
+-    String expected = "and(and(not(eq(x, null)), not(or(or(eq(z, 1), eq(z, 2)), eq(z, 3)))), " +
+-        "not(eq(a, Binary{\"stinger\"})))";
+-    assertEquals(expected, p.toString());
++    assertEquals(null,
++        ParquetFilterPredicateConverter.toFilterPredicate(sarg, schema));
+   }
+ 
+   @Test
+diff --git a/ql/src/test/queries/clientpositive/parquet_ppd_multifiles.q b/ql/src/test/queries/clientpositive/parquet_ppd_multifiles.q
+new file mode 100644
+index 0000000..6483684
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/parquet_ppd_multifiles.q
+@@ -0,0 +1,13 @@
++CREATE TABLE parquet_ppd_multifiles (
++  name string,
++  dec decimal(5,0)
++) stored as parquet;
++
++insert into table parquet_ppd_multifiles values('Jim', 3);
++insert into table parquet_ppd_multifiles values('Tom', 5);
++
++set hive.optimize.index.filter=false;
++select * from parquet_ppd_multifiles where (name = 'Jim' or dec = 5);
++
++set hive.optimize.index.filter=true;
++select * from parquet_ppd_multifiles where (name = 'Jim' or dec = 5);
+diff --git a/ql/src/test/results/clientpositive/parquet_ppd_multifiles.q.out b/ql/src/test/results/clientpositive/parquet_ppd_multifiles.q.out
+new file mode 100644
+index 0000000..d7688f8
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/parquet_ppd_multifiles.q.out
+@@ -0,0 +1,50 @@
++PREHOOK: query: CREATE TABLE parquet_ppd_multifiles (
++  name string,
++  dec decimal(5,0)
++) stored as parquet
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@parquet_ppd_multifiles
++POSTHOOK: query: CREATE TABLE parquet_ppd_multifiles (
++  name string,
++  dec decimal(5,0)
++) stored as parquet
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@parquet_ppd_multifiles
++PREHOOK: query: insert into table parquet_ppd_multifiles values('Jim', 3)
++PREHOOK: type: QUERY
++PREHOOK: Output: default@parquet_ppd_multifiles
++POSTHOOK: query: insert into table parquet_ppd_multifiles values('Jim', 3)
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@parquet_ppd_multifiles
++POSTHOOK: Lineage: parquet_ppd_multifiles.dec EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: parquet_ppd_multifiles.name SIMPLE [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: insert into table parquet_ppd_multifiles values('Tom', 5)
++PREHOOK: type: QUERY
++PREHOOK: Output: default@parquet_ppd_multifiles
++POSTHOOK: query: insert into table parquet_ppd_multifiles values('Tom', 5)
++POSTHOOK: type: QUERY
++POSTHOOK: Output: default@parquet_ppd_multifiles
++POSTHOOK: Lineage: parquet_ppd_multifiles.dec EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++POSTHOOK: Lineage: parquet_ppd_multifiles.name SIMPLE [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: select * from parquet_ppd_multifiles where (name = 'Jim' or dec = 5)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@parquet_ppd_multifiles
++#### A masked pattern was here ####
++POSTHOOK: query: select * from parquet_ppd_multifiles where (name = 'Jim' or dec = 5)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@parquet_ppd_multifiles
++#### A masked pattern was here ####
++Jim	3
++Tom	5
++PREHOOK: query: select * from parquet_ppd_multifiles where (name = 'Jim' or dec = 5)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@parquet_ppd_multifiles
++#### A masked pattern was here ####
++POSTHOOK: query: select * from parquet_ppd_multifiles where (name = 'Jim' or dec = 5)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@parquet_ppd_multifiles
++#### A masked pattern was here ####
++Jim	3
++Tom	5
+-- 
+1.7.9.5
+

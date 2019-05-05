@@ -1,0 +1,78 @@
+From 49e92cd3bf6130c2b4555a263b0b3700d03f5741 Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Fri, 2 Sep 2016 21:09:33 -0700
+Subject: [PATCH 0942/1164] CDH-45923 : HIVE-14693 : Some paritions will be
+ left out when partition number is the multiple of
+ the option hive.msck.repair.batch.size (Ferdinand
+ Xu via Thejas Nair)
+
+Change-Id: I634ef4235f7176e5de9303fe7cf614f5186e97c4
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |    3 +--
+ .../queries/clientpositive/msck_repair_batchsize.q |    5 ++++-
+ .../clientpositive/msck_repair_batchsize.q.out     |    5 +++--
+ 3 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 835435b..9d65bac 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -1755,10 +1755,9 @@ private int msck(Hive db, MsckDesc msckDesc) {
+               apd.addPartition(Warehouse.makeSpecFromName(part.getPartitionName()), null);
+               repairOutput.add("Repair: Added partition to metastore " + msckDesc.getTableName()
+                   + ':' + part.getPartitionName());
+-              if (counter == batch_size) {
++              if (counter % batch_size == 0 || counter == partsNotInMs.size()) {
+                 db.createPartitions(apd);
+                 apd = new AddPartitionDesc(table.getDbName(), table.getTableName(), false);
+-                counter = 0;
+               }
+             }
+           } else {
+diff --git a/ql/src/test/queries/clientpositive/msck_repair_batchsize.q b/ql/src/test/queries/clientpositive/msck_repair_batchsize.q
+index 60970e2..06e4507 100644
+--- a/ql/src/test/queries/clientpositive/msck_repair_batchsize.q
++++ b/ql/src/test/queries/clientpositive/msck_repair_batchsize.q
+@@ -1,4 +1,4 @@
+-set hive.msck.repair.batch.size=1;
++set hive.msck.repair.batch.size=2;
+ 
+ DROP TABLE IF EXISTS repairtable;
+ 
+@@ -8,7 +8,10 @@ MSCK TABLE repairtable;
+ 
+ dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=a/p2=a;
+ dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=b/p2=a;
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c/p2=a;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=a/p2=a/datafile;
+ dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=b/p2=a/datafile;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/datafile;
+ 
+ MSCK TABLE default.repairtable;
+ 
+diff --git a/ql/src/test/results/clientpositive/msck_repair_batchsize.q.out b/ql/src/test/results/clientpositive/msck_repair_batchsize.q.out
+index 86ac031..0300f20 100644
+--- a/ql/src/test/results/clientpositive/msck_repair_batchsize.q.out
++++ b/ql/src/test/results/clientpositive/msck_repair_batchsize.q.out
+@@ -18,14 +18,15 @@ PREHOOK: query: MSCK TABLE default.repairtable
+ PREHOOK: type: MSCK
+ POSTHOOK: query: MSCK TABLE default.repairtable
+ POSTHOOK: type: MSCK
+-Partitions not in metastore:	repairtable:p1=a/p2=a	repairtable:p1=b/p2=a
++Partitions not in metastore:	repairtable:p1=a/p2=a	repairtable:p1=b/p2=a	repairtable:p1=c/p2=a
+ PREHOOK: query: MSCK REPAIR TABLE default.repairtable
+ PREHOOK: type: MSCK
+ POSTHOOK: query: MSCK REPAIR TABLE default.repairtable
+ POSTHOOK: type: MSCK
+-Partitions not in metastore:	repairtable:p1=a/p2=a	repairtable:p1=b/p2=a
++Partitions not in metastore:	repairtable:p1=a/p2=a	repairtable:p1=b/p2=a	repairtable:p1=c/p2=a
+ Repair: Added partition to metastore default.repairtable:p1=a/p2=a
+ Repair: Added partition to metastore default.repairtable:p1=b/p2=a
++Repair: Added partition to metastore default.repairtable:p1=c/p2=a
+ PREHOOK: query: MSCK TABLE repairtable
+ PREHOOK: type: MSCK
+ POSTHOOK: query: MSCK TABLE repairtable
+-- 
+1.7.9.5
+

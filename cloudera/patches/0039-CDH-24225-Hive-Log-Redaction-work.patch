@@ -1,0 +1,194 @@
+From 1663b4d6b5cafdddc8f1d4bf5b9af4a982c17695 Mon Sep 17 00:00:00 2001
+From: Brock Noland <brock@apache.org>
+Date: Tue, 24 Feb 2015 09:19:06 -0800
+Subject: [PATCH 0039/1164] CDH-24225 - Hive Log Redaction work
+
+---
+ ql/pom.xml                                         |    5 ++
+ .../hadoop/hive/ql/hooks/QueryRedactor.java        |   50 ++++++++++++
+ .../hadoop/hive/ql/hooks/TestQueryRedactor.java    |   82 ++++++++++++++++++++
+ ql/src/test/resources/test-query-redactor.json     |   10 +++
+ 4 files changed, 147 insertions(+)
+ create mode 100644 ql/src/java/org/cloudera/hadoop/hive/ql/hooks/QueryRedactor.java
+ create mode 100644 ql/src/test/org/cloudera/hadoop/hive/ql/hooks/TestQueryRedactor.java
+ create mode 100644 ql/src/test/resources/test-query-redactor.json
+
+diff --git a/ql/pom.xml b/ql/pom.xml
+index d2326df..921a96c 100644
+--- a/ql/pom.xml
++++ b/ql/pom.xml
+@@ -96,6 +96,11 @@
+        <version>${commons-lang3.version}</version>
+     </dependency>
+     <dependency>
++      <groupId>org.cloudera.logredactor</groupId>
++      <artifactId>logredactor</artifactId>
++      <version>${cdh.logredactor.version}</version>
++    </dependency>
++    <dependency>
+       <groupId>commons-lang</groupId>
+       <artifactId>commons-lang</artifactId>
+       <version>${commons-lang.version}</version>
+diff --git a/ql/src/java/org/cloudera/hadoop/hive/ql/hooks/QueryRedactor.java b/ql/src/java/org/cloudera/hadoop/hive/ql/hooks/QueryRedactor.java
+new file mode 100644
+index 0000000..409c26a
+--- /dev/null
++++ b/ql/src/java/org/cloudera/hadoop/hive/ql/hooks/QueryRedactor.java
+@@ -0,0 +1,50 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.cloudera.hadoop.hive.ql.hooks;
++
++import org.cloudera.log4j.redactor.StringRedactor;
++import org.apache.hadoop.hive.ql.hooks.Redactor;
++import org.apache.hadoop.conf.Configurable;
++import org.apache.hadoop.conf.Configuration;
++
++public class QueryRedactor extends Redactor {
++
++  private StringRedactor redactor;
++
++  @Override
++  public void setConf(Configuration conf) {
++    String logRedactorPath = conf.get("hive.query.redaction.rules", "").trim();
++    if (!logRedactorPath.isEmpty()) {
++      try {
++        redactor = StringRedactor.createFromJsonFile(logRedactorPath);
++      } catch (Exception e) {
++        String msg = "Error loading from " + logRedactorPath + ": " + e;
++        throw new IllegalStateException(msg, e);
++      }
++    }
++  }
++
++
++  public String redactQuery(String query) {
++    if (redactor != null) {
++      return redactor.redact(query);
++    }
++    return query;
++  }
++}
+diff --git a/ql/src/test/org/cloudera/hadoop/hive/ql/hooks/TestQueryRedactor.java b/ql/src/test/org/cloudera/hadoop/hive/ql/hooks/TestQueryRedactor.java
+new file mode 100644
+index 0000000..e2516a2
+--- /dev/null
++++ b/ql/src/test/org/cloudera/hadoop/hive/ql/hooks/TestQueryRedactor.java
+@@ -0,0 +1,82 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.cloudera.hadoop.hive.ql.hooks;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.Driver;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.AfterClass;
++import org.junit.Test;
++
++public class TestQueryRedactor {
++
++  @BeforeClass
++  public static void onetimeSetup() throws Exception {
++    HiveConf conf = new HiveConf(TestQueryRedactor.class);
++    Driver driver = createDriver(conf);
++    int ret = driver.run("create table t1(i int)").getResponseCode();
++    assertEquals("Checking command success", 0, ret);
++  }
++
++  @AfterClass
++  public static void onetimeTeardown() throws Exception {
++    HiveConf conf = new HiveConf(TestQueryRedactor.class);
++    Driver driver = createDriver(conf);
++    driver.run("drop table t1");
++  }
++
++  @Before
++  public void setup() {
++  }
++
++  @Test
++  public void testQueryRedactor() throws Exception {
++    HiveConf conf = new HiveConf(TestQueryRedactor.class);
++    HiveConf.setVar(conf, HiveConf.ConfVars.QUERYREDACTORHOOKS,
++      QueryRedactor.class.getName());
++    String hiveRoot = System.getProperty("hive.root");
++    assertNotNull("Hive root cannot be null", hiveRoot);
++    conf.set("hive.query.redaction.rules", hiveRoot + "/ql/src/test/resources/test-query-redactor.json");
++    Driver driver;
++    int ret;
++    driver = createDriver(conf);
++    ret = driver.compile("select '0000-1111-2222-3333' from t1");
++    assertEquals("Checking command success", 0, ret);
++    assertEquals("select 'XXXX-XXXX-XXXX-3333' from t1", HiveConf.getVar(conf, HiveConf.ConfVars.HIVEQUERYSTRING));
++    conf.set("hive.query.redaction.rules", "");
++    driver = createDriver(conf);
++    ret = driver.compile("select '0000-1111-2222-3333' from t1");
++    assertEquals("Checking command success", 0, ret);
++    assertEquals("select '0000-1111-2222-3333' from t1", HiveConf.getVar(conf, HiveConf.ConfVars.HIVEQUERYSTRING));
++
++  }
++
++  private static Driver createDriver(HiveConf conf) {
++    HiveConf.setBoolVar(conf, HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
++    SessionState.start(conf);
++    Driver driver = new Driver(conf);
++    driver.init();
++    return driver;
++  }
++
++}
+diff --git a/ql/src/test/resources/test-query-redactor.json b/ql/src/test/resources/test-query-redactor.json
+new file mode 100644
+index 0000000..3f0c9a9
+--- /dev/null
++++ b/ql/src/test/resources/test-query-redactor.json
+@@ -0,0 +1,10 @@
++{
++  "version": "1",
++  "rules": [
++    {
++      "description": "Credit Card numbers - redact all but last 4",
++      "search": "\\d{4}.\\d{4}.\\d{4}.(\\d{4})",
++      "replace": "XXXX-XXXX-XXXX-$1"
++    }
++  ]
++}
+-- 
+1.7.9.5
+

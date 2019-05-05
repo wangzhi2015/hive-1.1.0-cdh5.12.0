@@ -1,0 +1,111 @@
+From 84362b1f661fe7a406c3829c7ee3d4951ef8b85e Mon Sep 17 00:00:00 2001
+From: Aleksei Statkevich <me.aleksei@gmail.com>
+Date: Mon, 19 Oct 2015 22:37:00 -0800
+Subject: [PATCH 0581/1164] HIVE-12164 : non-ascii characters shows improper
+ with insert into (Aleksei Statkevich via Xuefu
+ Zhang)
+
+Change-Id: I5e27a43422079f68f9f9b5a7e39e0f66aab9f22e
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   16 ++++++++---
+ .../clientpositive/insert_values_nonascii.q        |    9 +++++++
+ .../clientpositive/insert_values_nonascii.q.out    |   28 ++++++++++++++++++++
+ 3 files changed, 50 insertions(+), 3 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/insert_values_nonascii.q
+ create mode 100644 ql/src/test/results/clientpositive/insert_values_nonascii.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 1850761..32e29fc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -213,6 +213,7 @@
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.mapred.InputFormat;
+ import org.apache.hadoop.mapred.OutputFormat;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -728,6 +729,15 @@ private String processTable(QB qb, ASTNode tabref) throws SemanticException {
+   }
+ 
+   /**
++   * Convert a string to Text format and write its bytes in the same way TextOutputFormat would do.
++   * This is needed to properly encode non-ascii characters.
++   */
++  private static void writeAsText(String text, FSDataOutputStream out) throws IOException {
++    Text to = new Text(text);
++    out.write(to.getBytes(), 0, to.getLength());
++  }
++
++  /**
+    * Generate a temp table out of a value clause
+    * See also {@link #preProcessForInsert(ASTNode, QB)}
+    */
+@@ -805,10 +815,10 @@ private ASTNode genValuesTempTable(ASTNode originalFrom, QB qb) throws SemanticE
+             fields.add(new FieldSchema("tmp_values_col" + nextColNum++, "string", ""));
+           }
+           if (isFirst) isFirst = false;
+-          else out.writeBytes("\u0001");
+-          out.writeBytes(unparseExprForValuesClause(value));
++          else writeAsText("\u0001", out);
++          writeAsText(unparseExprForValuesClause(value), out);
+         }
+-        out.writeBytes("\n");
++        writeAsText("\n", out);
+         firstRow = false;
+       }
+       out.close();
+diff --git a/ql/src/test/queries/clientpositive/insert_values_nonascii.q b/ql/src/test/queries/clientpositive/insert_values_nonascii.q
+new file mode 100644
+index 0000000..2e4ef41
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/insert_values_nonascii.q
+@@ -0,0 +1,9 @@
++set hive.support.concurrency=true;
++set hive.txn.manager=org.apache.hadoop.hive.ql.lockmgr.DbTxnManager;
++set hive.enforce.bucketing=true;
++
++create table insert_values_nonascii(t1 char(32), t2 string);
++
++insert into insert_values_nonascii values("Абвгде Garçu 谢谢",  "Kôkaku ありがとう"), ("ございます", "kidôtai한국어");
++
++select * from insert_values_nonascii;
+diff --git a/ql/src/test/results/clientpositive/insert_values_nonascii.q.out b/ql/src/test/results/clientpositive/insert_values_nonascii.q.out
+new file mode 100644
+index 0000000..ca07bef
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/insert_values_nonascii.q.out
+@@ -0,0 +1,28 @@
++PREHOOK: query: create table insert_values_nonascii(t1 char(32), t2 string)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@insert_values_nonascii
++POSTHOOK: query: create table insert_values_nonascii(t1 char(32), t2 string)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@insert_values_nonascii
++PREHOOK: query: insert into insert_values_nonascii values("Абвгде Garçu 谢谢",  "Kôkaku ありがとう"), ("ございます", "kidôtai한국어")
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__1
++PREHOOK: Output: default@insert_values_nonascii
++POSTHOOK: query: insert into insert_values_nonascii values("Абвгде Garçu 谢谢",  "Kôkaku ありがとう"), ("ございます", "kidôtai한국어")
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__1
++POSTHOOK: Output: default@insert_values_nonascii
++POSTHOOK: Lineage: insert_values_nonascii.t1 EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++POSTHOOK: Lineage: insert_values_nonascii.t2 SIMPLE [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col2, type:string, comment:), ]
++PREHOOK: query: select * from insert_values_nonascii
++PREHOOK: type: QUERY
++PREHOOK: Input: default@insert_values_nonascii
++#### A masked pattern was here ####
++POSTHOOK: query: select * from insert_values_nonascii
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@insert_values_nonascii
++#### A masked pattern was here ####
++Абвгде Garçu 谢谢                 	Kôkaku ありがとう
++ございます                           	kidôtai한국어
+-- 
+1.7.9.5
+

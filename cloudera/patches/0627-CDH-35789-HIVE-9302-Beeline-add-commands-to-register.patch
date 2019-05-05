@@ -1,0 +1,582 @@
+From 83ec0a072631ec0c495ce47a4cdd545b5b3f9ef9 Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xuefu@apache.org>
+Date: Fri, 6 Mar 2015 22:47:14 +0000
+Subject: [PATCH 0627/1164] CDH-35789: HIVE-9302: Beeline add commands to
+ register local jdbc driver names and jars
+ (Ferdinand Xu via Xuefu)
+
+Change-Id: I1dc5e6d35d3bbd292c439b672793463d0dd0630a
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1664751 13f79535-47bb-0310-9956-ffa450edef68
+---
+ LICENSE                                            |   31 +++++++-
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |   48 +++++++++++-
+ .../apache/hive/beeline/ClassNameCompleter.java    |   78 ++++++++++++++++++--
+ .../src/java/org/apache/hive/beeline/Commands.java |   41 ++++++++++
+ .../apache/hive/beeline/DatabaseConnection.java    |   35 ++++++++-
+ beeline/src/main/resources/BeeLine.properties      |    5 ++
+ .../apache/hive/beeline/TestBeelineArgParsing.java |   74 ++++++++++++++++++-
+ 7 files changed, 296 insertions(+), 16 deletions(-)
+
+diff --git a/LICENSE b/LICENSE
+index c973c36..db3777d 100644
+--- a/LICENSE
++++ b/LICENSE
+@@ -465,4 +465,33 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+-OF THE POSSIBILITY OF SUCH DAMAGE.
+\ No newline at end of file
++OF THE POSSIBILITY OF SUCH DAMAGE.
++
++For the PostgreSQL JDBC driver jar file:
++
++Copyright (c) 1997-2011, PostgreSQL Global Development Group
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice,
++   this list of conditions and the following disclaimer.
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++3. Neither the name of the PostgreSQL Global Development Group nor the names
++   of its contributors may be used to endorse or promote products derived
++   from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
+\ No newline at end of file
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index 8050263..9d43d17 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -28,7 +28,6 @@
+ import java.io.EOFException;
+ import java.io.File;
+ import java.io.FileInputStream;
+-import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.PrintStream;
+@@ -53,6 +52,7 @@
+ import java.text.ChoiceFormat;
+ import java.text.MessageFormat;
+ import java.util.Arrays;
++import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Date;
+@@ -82,7 +82,6 @@
+ import jline.console.history.History;
+ import jline.console.history.FileHistory;
+ 
+-import jline.internal.Log;
+ import org.apache.commons.cli.CommandLine;
+ import org.apache.commons.cli.GnuParser;
+ import org.apache.commons.cli.OptionBuilder;
+@@ -162,6 +161,8 @@
+       "xmlelements", new XMLElementOutputFormat(this),
+   });
+ 
++  private List<String> supportedLocalDriver =
++    new ArrayList<String>(Arrays.asList("com.mysql.jdbc.Driver", "org.postgresql.Driver"));
+ 
+   final CommandHandler[] commandHandlers = new CommandHandler[] {
+       new ReflectiveCommandHandler(this, new String[] {"quit", "done", "exit"},
+@@ -254,6 +255,10 @@
+           null),
+       new ReflectiveCommandHandler(this, new String[] {"nullemptystring"},
+           new Completer[] {new BooleanCompleter()}),
++      new ReflectiveCommandHandler(this, new String[]{"addlocaldriverjar"},
++          null),
++      new ReflectiveCommandHandler(this, new String[]{"addlocaldrivername"},
++          null)
+   };
+ 
+ 
+@@ -1731,6 +1736,11 @@ boolean scanForDriver(String url) {
+         return true;
+       }
+ 
++      // find whether exists a local driver to accept the url
++      if (findLocalDriver(url) != null) {
++        return true;
++      }
++
+       return false;
+     } catch (Exception e) {
+       debug(e.toString());
+@@ -1753,6 +1763,40 @@ private Driver findRegisteredDriver(String url) {
+     return null;
+   }
+ 
++  public Driver findLocalDriver(String url) throws Exception {
++    if(drivers == null){
++      return null;
++    }
++
++    for (Driver d : drivers) {
++      try {
++        String clazzName = d.getClass().getName();
++        Driver driver = (Driver) Class.forName(clazzName, true,
++          Thread.currentThread().getContextClassLoader()).newInstance();
++        if (driver.acceptsURL(url) && isSupportedLocalDriver(driver)) {
++          return driver;
++        }
++      } catch (SQLException e) {
++        error(e);
++        throw new Exception(e);
++      }
++    }
++    return null;
++  }
++
++  public boolean isSupportedLocalDriver(Driver driver) {
++    String driverName = driver.getClass().getName();
++    for (String name : supportedLocalDriver) {
++      if (name.equals(driverName)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  public void addLocalDriverClazz(String driverClazz) {
++    supportedLocalDriver.add(driverClazz);
++  }
+ 
+   Driver[] scanDrivers(String line) throws IOException {
+     return scanDrivers(false);
+diff --git a/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java b/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java
+index 065eab4..d630e46 100644
+--- a/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java
++++ b/beeline/src/java/org/apache/hive/beeline/ClassNameCompleter.java
+@@ -52,9 +52,12 @@
+ package org.apache.hive.beeline;
+ 
+ import jline.console.completer.StringsCompleter;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.io.FileInputStream;
+ import java.net.JarURLConnection;
+ import java.net.URL;
+ import java.net.URLClassLoader;
+@@ -62,11 +65,15 @@
+ import java.util.Arrays;
+ import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.List;
++import java.util.ArrayList;
+ import java.util.Set;
+ import java.util.jar.JarEntry;
+ import java.util.jar.JarFile;
+ import java.util.Enumeration;
+ import java.util.TreeSet;
++import java.util.zip.ZipInputStream;
++import java.util.zip.ZipEntry;
+ 
+ /**
+  * the completer is original provided in JLine 0.9.94 and is being removed in 2.12. Add the
+@@ -74,6 +81,10 @@
+  */
+ public class ClassNameCompleter extends StringsCompleter {
+ 
++  private static final Log LOG = LogFactory.getLog(ClassNameCompleter.class.getName());
++  public final static String clazzFileNameExtension = ".class";
++  public final static String jarFileNameExtension = ".jar";
++
+   public ClassNameCompleter(String... candidates) {
+     super(candidates);
+   }
+@@ -81,7 +92,7 @@ public ClassNameCompleter(String... candidates) {
+   public static String[] getClassNames() throws IOException {
+     Set urls = new HashSet();
+ 
+-    for (ClassLoader loader = ClassNameCompleter.class.getClassLoader(); loader != null;
++    for (ClassLoader loader = Thread.currentThread().getContextClassLoader(); loader != null;
+          loader = loader.getParent()) {
+       if (!(loader instanceof URLClassLoader)) {
+         continue;
+@@ -97,7 +108,7 @@ public ClassNameCompleter(String... candidates) {
+ 
+     for (int i = 0; i < systemClasses.length; i++) {
+       URL classURL = systemClasses[i]
+-              .getResource("/" + systemClasses[i].getName().replace('.', '/') + ".class");
++              .getResource("/" + systemClasses[i].getName().replace('.', '/') + clazzFileNameExtension);
+ 
+       if (classURL != null) {
+         URLConnection uc = classURL.openConnection();
+@@ -136,12 +147,14 @@ public ClassNameCompleter(String... candidates) {
+ 
+         String name = entry.getName();
+ 
+-        if (!name.endsWith(".class")) {
++        if (isClazzFile(name)) {
+           /* only use class file*/
++          classes.add(name);
++        } else if (isJarFile(name)) {
++          classes.addAll(getClassNamesFromJar(name));
++        } else {
+           continue;
+         }
+-
+-        classes.add(name);
+       }
+     }
+ 
+@@ -151,8 +164,7 @@ public ClassNameCompleter(String... candidates) {
+ 
+     for (Iterator i = classes.iterator(); i.hasNext(); ) {
+       String name = (String) i.next();
+-      classNames.add(name.replace('/', '.').
+-              substring(0, name.length() - 6));
++      classNames.add(name.replace('/', '.').substring(0, name.length() - 6));
+     }
+ 
+     return (String[]) classNames.toArray(new String[classNames.size()]);
+@@ -173,7 +185,7 @@ private static Set getClassFiles(String root, Set holder, File directory, int[]
+         continue;
+       } else if (files[i].isDirectory()) {
+         getClassFiles(root, holder, files[i], maxDirectories);
+-      } else if (files[i].getName().endsWith(".class")) {
++      } else if (files[i].getName().endsWith(clazzFileNameExtension)) {
+         holder.add(files[i].getAbsolutePath().
+                 substring(root.length() + 1));
+       }
+@@ -181,4 +193,54 @@ private static Set getClassFiles(String root, Set holder, File directory, int[]
+ 
+     return holder;
+   }
++
++  /**
++   * Get clazz names from a jar file path
++   * @param path specifies the jar file's path
++   * @return
++   */
++  private static List<String> getClassNamesFromJar(String path) {
++    List<String> classNames = new ArrayList<String>();
++    ZipInputStream zip = null;
++    try {
++      zip = new ZipInputStream(new FileInputStream(path));
++      ZipEntry entry = zip.getNextEntry();
++      while (entry != null) {
++        if (!entry.isDirectory() && entry.getName().endsWith(clazzFileNameExtension)) {
++          StringBuilder className = new StringBuilder();
++          for (String part : entry.getName().split("/")) {
++            if (className.length() != 0) {
++              className.append(".");
++            }
++            className.append(part);
++            if (part.endsWith(clazzFileNameExtension)) {
++              className.setLength(className.length() - clazzFileNameExtension.length());
++            }
++          }
++          classNames.add(className.toString());
++        }
++        entry = zip.getNextEntry();
++      }
++    } catch (IOException e) {
++      LOG.error("Fail to parse the class name from the Jar file due to the exception:" + e);
++    } finally {
++      if (zip != null) {
++        try {
++          zip.close();
++        } catch (IOException e) {
++          LOG.error("Fail to close the file due to the exception:" + e);
++        }
++      }
++    }
++
++    return classNames;
++  }
++
++  private static boolean isJarFile(String fileName) {
++    return fileName.endsWith(jarFileNameExtension);
++  }
++
++  private static boolean isClazzFile(String clazzName) {
++    return clazzName.endsWith(clazzFileNameExtension);
++  }
+ }
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 2fa2978..82fe12e 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -36,6 +36,7 @@
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.lang.reflect.Method;
++import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.net.URLClassLoader;
+ import java.sql.CallableStatement;
+@@ -136,6 +137,46 @@ public boolean metadata(String cmd, String[] args) {
+     return true;
+   }
+ 
++  public boolean addlocaldrivername(String line) {
++    String driverName = arg1(line, "driver class name");
++    try {
++      beeLine.setDrivers(Arrays.asList(beeLine.scanDrivers(false)));
++    } catch (IOException e) {
++      beeLine.error("Fail to scan drivers due to the exception:" + e);
++      beeLine.error(e);
++    }
++    for (Driver d : beeLine.getDrivers()) {
++      if (driverName.equals(d.getClass().getName())) {
++        beeLine.addLocalDriverClazz(driverName);
++        return true;
++      }
++    }
++    beeLine.error("Fail to find a driver which contains the driver class");
++    return false;
++  }
++
++  public boolean addlocaldriverjar(String line) {
++    // If jar file is in the hdfs, it should be downloaded first.
++    String jarPath = arg1(line, "jar path");
++    File p = new File(jarPath);
++    if (!p.exists()) {
++      beeLine.error("The jar file in the path " + jarPath + " can't be found!");
++      return false;
++    }
++
++    URLClassLoader classLoader = (URLClassLoader) Thread.currentThread().getContextClassLoader();
++    try {
++      beeLine.debug(jarPath + " is added to the local beeline.");
++      URLClassLoader newClassLoader = new URLClassLoader(new URL[]{p.toURL()}, classLoader);
++
++      Thread.currentThread().setContextClassLoader(newClassLoader);
++      beeLine.setDrivers(Arrays.asList(beeLine.scanDrivers(false)));
++    } catch (Exception e) {
++      beeLine.error("Fail to add local jar due to the exception:" + e);
++      beeLine.error(e);
++    }
++    return true;
++  }
+ 
+   public boolean history(String line) {
+     Iterator hist = beeLine.getConsoleReader().getHistory().entries();
+diff --git a/beeline/src/java/org/apache/hive/beeline/DatabaseConnection.java b/beeline/src/java/org/apache/hive/beeline/DatabaseConnection.java
+index 8ba0232..02b2eec 100644
+--- a/beeline/src/java/org/apache/hive/beeline/DatabaseConnection.java
++++ b/beeline/src/java/org/apache/hive/beeline/DatabaseConnection.java
+@@ -25,9 +25,12 @@
+ import java.io.IOException;
+ import java.sql.Connection;
+ import java.sql.DatabaseMetaData;
++import java.sql.Driver;
+ import java.sql.DriverManager;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
++import java.util.Arrays;
++import java.util.Collection;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+@@ -112,9 +115,9 @@ boolean connect() throws SQLException {
+       return beeLine.error(cnfe);
+     }
+ 
+-    boolean foundDriver = false;
++    boolean isDriverRegistered = false;
+     try {
+-      foundDriver = DriverManager.getDriver(getUrl()) != null;
++      isDriverRegistered = DriverManager.getDriver(getUrl()) != null;
+     } catch (Exception e) {
+     }
+ 
+@@ -134,7 +137,13 @@ boolean connect() throws SQLException {
+       info.put(HIVE_CONF_PREFIX + var.getKey(), var.getValue());
+     }
+ 
+-    setConnection(DriverManager.getConnection(getUrl(), info));
++    if (isDriverRegistered) {
++      // if the driver registered in the driver manager, get the connection via the driver manager
++      setConnection(DriverManager.getConnection(getUrl(), info));
++    } else {
++      beeLine.debug("Use the driver from local added jar file.");
++      setConnection(getConnectionFromLocalDriver(getUrl(), info));
++    }
+     setDatabaseMetaData(getConnection().getMetaData());
+ 
+     try {
+@@ -170,6 +179,26 @@ boolean connect() throws SQLException {
+     return true;
+   }
+ 
++  public Connection getConnectionFromLocalDriver(String url, Properties properties) {
++    Collection<Driver> drivers = beeLine.getDrivers();
++    for (Driver d : drivers) {
++      try {
++        if (d.acceptsURL(url) && beeLine.isSupportedLocalDriver(d)) {
++          String clazzName = d.getClass().getName();
++          beeLine.debug("Driver name is " + clazzName);
++          Driver driver =
++            (Driver) Class.forName(clazzName, true, Thread.currentThread().getContextClassLoader())
++              .newInstance();
++          return driver.connect(url, properties);
++        }
++      } catch (Exception e) {
++        beeLine.error("Fail to connect with a local driver due to the exception:" + e);
++        beeLine.error(e);
++      }
++    }
++    return null;
++  }
++
+ 
+   public Connection getConnection() throws SQLException {
+     if (connection != null) {
+diff --git a/beeline/src/main/resources/BeeLine.properties b/beeline/src/main/resources/BeeLine.properties
+index 7bf6ec1..b05e41e 100644
+--- a/beeline/src/main/resources/BeeLine.properties
++++ b/beeline/src/main/resources/BeeLine.properties
+@@ -71,6 +71,8 @@ help-properties: Connect to the database specified in the properties file(s)
+ help-outputformat: Set the output format for displaying results (table,vertical,csv2,dsv,tsv2,xmlattrs,xmlelements, and deprecated formats(csv, tsv))
+ help-delimiterForDSV: Set the delimiter for dsv output format
+ help-nullemptystring: Set to true to get historic behavior of printing null as empty string. Default is false.
++help-addlocaldriverjar: Add driver jar file in the beeline client side.
++help-addlocaldrivername: Add driver name that needs to be supported in the beeline client side.
+ 
+ jline-missing: The JLine jar was not found. Please ensure it is installed.
+ 
+@@ -176,6 +178,8 @@ cmd-usage: Usage: java org.apache.hive.cli.beeline.BeeLine \n \
+ \  --delimiterForDSV=DELIMITER     specify the delimiter for delimiter-separated values output format (default: |)\n \
+ \  --isolation=LEVEL               set the transaction isolation level\n \
+ \  --nullemptystring=[true/false]  set to true to get historic behavior of printing null as empty string\n \
++\  --addlocaldriverjar=DRIVERJARNAME Add driver jar file in the beeline client side\n \
++\  --addlocaldrivername=DRIVERNAME Add drvier name needs to be supported in the beeline client side\n \
+ \  --help                          display this message\n \
+ \n \
+ \  Example:\n \
+@@ -189,3 +193,4 @@ cmd-usage: Usage: java org.apache.hive.cli.beeline.BeeLine \n \
+ \   $ beeline jdbc:hive2://localhost:10000/default;ssl=true;sslTrustStore=/usr/local/truststore;trustStorePassword=mytruststorepassword\n\n \
+ \   5. Connect using LDAP authentication\n \
+ \   $ beeline -u jdbc:hive2://hs2.local:10013/default <ldap-username> <ldap-password>\n \
++
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java b/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
+index 8f5c9ae..a0debba 100644
+--- a/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
++++ b/beeline/src/test/org/apache/hive/beeline/TestBeelineArgParsing.java
+@@ -19,18 +19,39 @@
+ package org.apache.hive.beeline;
+ 
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
+ import java.util.List;
+ import java.io.File;
+ import java.io.FileOutputStream;
+ 
+-import junit.framework.Assert;
+-
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hive.common.util.HiveTestUtils;
++import org.junit.Assert;
+ import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameters;
+ 
+ /**
+  * Unit test for Beeline arg parser.
+  */
++@RunWith(Parameterized.class)
+ public class TestBeelineArgParsing {
++  private static final Log LOG = LogFactory.getLog(TestBeelineArgParsing.class.getName());
++  private String connectionString;
++  private String driverClazzName;
++  private String driverJarFileName;
++  private boolean defaultSupported;
++
++  public TestBeelineArgParsing(String connectionString, String driverClazzName, String driverJarFileName,
++                               boolean defaultSupported) {
++    this.connectionString = connectionString;
++    this.driverClazzName = driverClazzName;
++    this.driverJarFileName = driverJarFileName;
++    this.defaultSupported = defaultSupported;
++  }
+ 
+   public class TestBeeline extends BeeLine {
+ 
+@@ -51,6 +72,27 @@ boolean dispatch(String command) {
+       }
+       return true;
+     }
++
++    public boolean addlocaldrivername(String driverName) {
++      String line = "addlocaldrivername " + driverName;
++      return getCommands().addlocaldrivername(line);
++    }
++
++    public boolean addLocalJar(String url){
++      String line = "addlocaldriverjar " + url;
++      return getCommands().addlocaldriverjar(line);
++    }
++  }
++
++  @Parameters
++  public static Collection<Object[]> data() {
++    return Arrays.asList(
++        new Object[][] {
++            {"jdbc:postgresql://host:5432/testdb", "org.postgresql.Driver", "postgresql-9.3.jdbc3.jar",
++                true},
++            {"jdbc:dummy://host:5432/testdb", "org.apache.dummy.DummyDriver",
++                "DummyDriver-1.0-SNAPSHOT.jar", false}
++        });
+   }
+ 
+   @Test
+@@ -169,4 +211,32 @@ public void testUnmatchedArgs() throws Exception {
+     Assert.assertEquals(-1, bl.initArgs(args));
+   }
+ 
++  @Test
++  public void testAddLocalJar() throws Exception {
++    TestBeeline bl = new TestBeeline();
++    Assert.assertNull(bl.findLocalDriver(connectionString));
++
++    LOG.info("Add " + driverJarFileName + " for the driver class " + driverClazzName);
++    String mysqlDriverPath = HiveTestUtils.getFileFromClasspath(driverJarFileName);
++
++    bl.addLocalJar(mysqlDriverPath);
++    bl.addlocaldrivername(driverClazzName);
++    Assert.assertEquals(bl.findLocalDriver(connectionString).getClass().getName(), driverClazzName);
++  }
++
++  @Test
++  public void testAddLocalJarWithoutAddDriverClazz() throws Exception {
++    TestBeeline bl = new TestBeeline();
++
++    LOG.info("Add " + driverJarFileName + " for the driver class " + driverClazzName);
++    String mysqlDriverPath = HiveTestUtils.getFileFromClasspath(driverJarFileName);
++
++    bl.addLocalJar(mysqlDriverPath);
++    if (!defaultSupported) {
++      Assert.assertNull(bl.findLocalDriver(connectionString));
++    } else {
++      // no need to add for the default supported local jar driver
++      Assert.assertEquals(bl.findLocalDriver(connectionString).getClass().getName(), driverClazzName);
++    }
++  }
+ }
+-- 
+1.7.9.5
+

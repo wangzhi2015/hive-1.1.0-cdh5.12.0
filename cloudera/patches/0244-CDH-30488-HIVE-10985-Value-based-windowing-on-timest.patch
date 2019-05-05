@@ -1,0 +1,216 @@
+From cada4b1f828ef0a982d12f8acee4ec0e0af07b6a Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@gmail.com>
+Date: Fri, 12 Jun 2015 07:21:00 -0700
+Subject: [PATCH 0244/1164] CDH-30488: HIVE-10985: Value based windowing on
+ timestamp and double can't handle NULL value
+ (Aihua Xu via Ashutosh Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../hive/ql/udf/ptf/WindowingTableFunction.java    |   56 +++++++++-----
+ .../queries/clientpositive/windowing_windowspec3.q |   20 +++++
+ .../clientpositive/windowing_windowspec3.q.out     |   80 ++++++++++++++++++++
+ 3 files changed, 136 insertions(+), 20 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
+index dd7da8a..3e911f2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/ptf/WindowingTableFunction.java
+@@ -1099,20 +1099,28 @@ public LongValueBoundaryScanner(BoundaryDef bndDef, Order order,
+ 
+     @Override
+     public boolean isGreater(Object v1, Object v2, int amt) {
+-      long l1 = PrimitiveObjectInspectorUtils.getLong(v1,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      long l2 = PrimitiveObjectInspectorUtils.getLong(v2,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      return (l1 -l2) > amt;
++      if (v1 != null && v2 != null) {
++        long l1 = PrimitiveObjectInspectorUtils.getLong(v1,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        long l2 = PrimitiveObjectInspectorUtils.getLong(v2,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        return (l1 -l2) > amt;
++      }
++
++      return v1 != null || v2 != null; // True if only one value is null
+     }
+ 
+     @Override
+     public boolean isEqual(Object v1, Object v2) {
+-      long l1 = PrimitiveObjectInspectorUtils.getLong(v1,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      long l2 = PrimitiveObjectInspectorUtils.getLong(v2,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      return l1 == l2;
++      if (v1 != null && v2 != null) {
++        long l1 = PrimitiveObjectInspectorUtils.getLong(v1,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        long l2 = PrimitiveObjectInspectorUtils.getLong(v2,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        return l1 == l2;
++      }
++
++      return v1 == null && v2 == null; // True if both are null
+     }
+   }
+ 
+@@ -1124,20 +1132,28 @@ public DoubleValueBoundaryScanner(BoundaryDef bndDef, Order order,
+ 
+     @Override
+     public boolean isGreater(Object v1, Object v2, int amt) {
+-      double d1 = PrimitiveObjectInspectorUtils.getDouble(v1,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      double d2 = PrimitiveObjectInspectorUtils.getDouble(v2,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      return (d1 -d2) > amt;
++      if (v1 != null && v2 != null) {
++        double d1 = PrimitiveObjectInspectorUtils.getDouble(v1,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        double d2 = PrimitiveObjectInspectorUtils.getDouble(v2,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        return (d1 -d2) > amt;
++      }
++
++      return v1 != null || v2 != null; // True if only one value is null
+     }
+ 
+     @Override
+     public boolean isEqual(Object v1, Object v2) {
+-      double d1 = PrimitiveObjectInspectorUtils.getDouble(v1,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      double d2 = PrimitiveObjectInspectorUtils.getDouble(v2,
+-          (PrimitiveObjectInspector) expressionDef.getOI());
+-      return d1 == d2;
++      if (v1 != null && v2 != null) {
++        double d1 = PrimitiveObjectInspectorUtils.getDouble(v1,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        double d2 = PrimitiveObjectInspectorUtils.getDouble(v2,
++            (PrimitiveObjectInspector) expressionDef.getOI());
++        return d1 == d2;
++      }
++
++      return v1 == null && v2 == null; // True if both are null
+     }
+   }
+ 
+diff --git a/ql/src/test/queries/clientpositive/windowing_windowspec3.q b/ql/src/test/queries/clientpositive/windowing_windowspec3.q
+index c87aaff..608a6cf 100644
+--- a/ql/src/test/queries/clientpositive/windowing_windowspec3.q
++++ b/ql/src/test/queries/clientpositive/windowing_windowspec3.q
+@@ -29,3 +29,23 @@ select deptno, empno, hiredate, salary,
+     sum(salary) over (partition by deptno order by hiredate range between 10 following and unbounded following),
+     sum(salary) over (partition by deptno order by hiredate range between unbounded preceding and 10 following)
+ from emp;
++
++-- Support timestamp datatype. Value in seconds (90days = 90 * 24 * 3600 seconds)
++select deptno, empno, hirets, salary,
++    sum(salary) over (partition by deptno order by hirets range 7776000 preceding),
++    sum(salary) over (partition by deptno order by hirets range between 7776000 preceding and 7776000 following),
++    sum(salary) over (partition by deptno order by hirets range between 7776000 preceding and 864000 preceding),
++    sum(salary) over (partition by deptno order by hirets range between 864000 following and 7776000 following),
++    sum(salary) over (partition by deptno order by hirets range between 864000 following and unbounded following),
++    sum(salary) over (partition by deptno order by hirets range between unbounded preceding and 864000 following)
++from emp;
++
++-- Support double datatype
++select deptno, empno, bonus,
++    avg(bonus) over (partition by deptno order by bonus range 200 preceding),
++    avg(bonus) over (partition by deptno order by bonus range between 200 preceding and 200 following),
++    avg(bonus) over (partition by deptno order by bonus range between 200 preceding and 100 preceding),
++    avg(bonus) over (partition by deptno order by bonus range between 100 following and 200 following),
++    avg(bonus) over (partition by deptno order by bonus range between 200 following and unbounded following),
++    avg(bonus) over (partition by deptno order by bonus range between unbounded preceding and 200 following)
++from emp;
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/windowing_windowspec3.q.out b/ql/src/test/results/clientpositive/windowing_windowspec3.q.out
+index bf7797a..42c042f 100644
+--- a/ql/src/test/results/clientpositive/windowing_windowspec3.q.out
++++ b/ql/src/test/results/clientpositive/windowing_windowspec3.q.out
+@@ -108,3 +108,83 @@ POSTHOOK: Input: default@emp
+ 30	7844	1981-09-08	1500.0	1500.0	3700.0	NULL	2200.0	2200.0	7200.0
+ 30	7654	1981-09-28	1250.0	2750.0	3700.0	1500.0	950.0	950.0	8450.0
+ 30	7900	1981-12-03	950.0	3700.0	3700.0	2750.0	NULL	NULL	9400.0
++PREHOOK: query: -- Support timestamp datatype. Value in seconds (90days = 90 * 24 * 3600 seconds)
++select deptno, empno, hirets, salary,
++    sum(salary) over (partition by deptno order by hirets range 7776000 preceding),
++    sum(salary) over (partition by deptno order by hirets range between 7776000 preceding and 7776000 following),
++    sum(salary) over (partition by deptno order by hirets range between 7776000 preceding and 864000 preceding),
++    sum(salary) over (partition by deptno order by hirets range between 864000 following and 7776000 following),
++    sum(salary) over (partition by deptno order by hirets range between 864000 following and unbounded following),
++    sum(salary) over (partition by deptno order by hirets range between unbounded preceding and 864000 following)
++from emp
++PREHOOK: type: QUERY
++PREHOOK: Input: default@emp
++#### A masked pattern was here ####
++POSTHOOK: query: -- Support timestamp datatype. Value in seconds (90days = 90 * 24 * 3600 seconds)
++select deptno, empno, hirets, salary,
++    sum(salary) over (partition by deptno order by hirets range 7776000 preceding),
++    sum(salary) over (partition by deptno order by hirets range between 7776000 preceding and 7776000 following),
++    sum(salary) over (partition by deptno order by hirets range between 7776000 preceding and 864000 preceding),
++    sum(salary) over (partition by deptno order by hirets range between 864000 following and 7776000 following),
++    sum(salary) over (partition by deptno order by hirets range between 864000 following and unbounded following),
++    sum(salary) over (partition by deptno order by hirets range between unbounded preceding and 864000 following)
++from emp
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@emp
++#### A masked pattern was here ####
++10	7988	NULL	1500.0	3000.0	3000.0	NULL	NULL	8750.0	3000.0
++10	7987	NULL	1500.0	3000.0	3000.0	NULL	NULL	8750.0	3000.0
++10	7782	1981-06-09 00:00:00	2450.0	2450.0	2450.0	NULL	NULL	6300.0	5450.0
++10	7839	1981-11-17 00:00:00	5000.0	5000.0	6300.0	NULL	1300.0	1300.0	10450.0
++10	7934	1982-01-23 00:00:00	1300.0	6300.0	6300.0	5000.0	NULL	NULL	11750.0
++20	7369	1980-12-17 00:00:00	800.0	800.0	800.0	NULL	NULL	10075.0	800.0
++20	7566	1981-04-02 00:00:00	2975.0	2975.0	2975.0	NULL	NULL	7100.0	3775.0
++20	7902	1981-12-03 00:00:00	3000.0	3000.0	3000.0	NULL	NULL	4100.0	6775.0
++20	7788	1982-12-09 00:00:00	3000.0	3000.0	4100.0	NULL	1100.0	1100.0	9775.0
++20	7876	1983-01-12 00:00:00	1100.0	4100.0	4100.0	3000.0	NULL	NULL	10875.0
++30	7499	1981-02-20 00:00:00	1600.0	1600.0	5700.0	NULL	2850.0	6550.0	2850.0
++30	7521	1981-02-22 00:00:00	1250.0	2850.0	5700.0	NULL	2850.0	6550.0	2850.0
++30	7698	1981-05-01 00:00:00	2850.0	5700.0	5700.0	2850.0	NULL	3700.0	5700.0
++30	7844	1981-09-08 00:00:00	1500.0	1500.0	3700.0	NULL	2200.0	2200.0	7200.0
++30	7654	1981-09-28 00:00:00	1250.0	2750.0	3700.0	1500.0	950.0	950.0	8450.0
++30	7900	1981-12-03 00:00:00	950.0	3700.0	3700.0	2750.0	NULL	NULL	9400.0
++PREHOOK: query: -- Support double datatype
++select deptno, empno, bonus,
++    avg(bonus) over (partition by deptno order by bonus range 200 preceding),
++    avg(bonus) over (partition by deptno order by bonus range between 200 preceding and 200 following),
++    avg(bonus) over (partition by deptno order by bonus range between 200 preceding and 100 preceding),
++    avg(bonus) over (partition by deptno order by bonus range between 100 following and 200 following),
++    avg(bonus) over (partition by deptno order by bonus range between 200 following and unbounded following),
++    avg(bonus) over (partition by deptno order by bonus range between unbounded preceding and 200 following)
++from emp
++PREHOOK: type: QUERY
++PREHOOK: Input: default@emp
++#### A masked pattern was here ####
++POSTHOOK: query: -- Support double datatype
++select deptno, empno, bonus,
++    avg(bonus) over (partition by deptno order by bonus range 200 preceding),
++    avg(bonus) over (partition by deptno order by bonus range between 200 preceding and 200 following),
++    avg(bonus) over (partition by deptno order by bonus range between 200 preceding and 100 preceding),
++    avg(bonus) over (partition by deptno order by bonus range between 100 following and 200 following),
++    avg(bonus) over (partition by deptno order by bonus range between 200 following and unbounded following),
++    avg(bonus) over (partition by deptno order by bonus range between unbounded preceding and 200 following)
++from emp
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@emp
++#### A masked pattern was here ####
++10	7934	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++10	7987	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++10	7839	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++10	7988	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++10	7782	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++20	7788	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++20	7902	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++20	7876	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++20	7566	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++20	7369	NULL	NULL	NULL	NULL	NULL	NULL	NULL
++30	7698	NULL	NULL	NULL	NULL	NULL	550.0	NULL
++30	7900	NULL	NULL	NULL	NULL	NULL	550.0	NULL
++30	7844	0.0	0.0	0.0	NULL	NULL	733.3333333333334	0.0
++30	7499	300.0	300.0	400.0	NULL	500.0	1400.0	266.6666666666667
++30	7521	500.0	400.0	400.0	300.0	NULL	1400.0	266.6666666666667
++30	7654	1400.0	1400.0	1400.0	NULL	NULL	NULL	550.0
+-- 
+1.7.9.5
+

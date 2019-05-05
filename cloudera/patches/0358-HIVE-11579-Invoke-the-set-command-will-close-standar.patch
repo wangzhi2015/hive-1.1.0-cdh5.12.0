@@ -1,0 +1,135 @@
+From 50ed8622516581889404b57f0a4d6e6544abfe06 Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Wed, 19 Aug 2015 21:12:00 -0400
+Subject: [PATCH 0358/1164] HIVE-11579: Invoke the set command will close
+ standard error output[beeline-cli](Ferdinand Xu,
+ reviewed by Xuefu Zhang)
+
+Change-Id: I52ae6206919fb598f6efa9fa6af0a027b53cf2b5
+---
+ .../java/org/apache/hive/beeline/BeeLineOpts.java  |    1 -
+ .../hadoop/hive/ql/session/SessionState.java       |   21 ++++++++++++++++++++
+ .../cli/operation/HiveCommandOperation.java        |   18 +++++++++--------
+ .../hive/service/cli/operation/SQLOperation.java   |    4 ++++
+ 4 files changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java b/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java
+index c1ec82a..17cf7a1 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLineOpts.java
+@@ -219,7 +219,6 @@ public void load(InputStream fin) throws IOException {
+     loadProperties(p);
+   }
+ 
+-
+   public void loadProperties(Properties props) {
+     for (Object element : props.keySet()) {
+       String key = element.toString();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index be4e55a..21b60bd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -154,6 +154,11 @@
+   protected File tmpOutputFile;
+ 
+   /**
++   * Temporary file name used to store error output of executing non-Hive commands (e.g., set, dfs)
++   */
++  protected File tmpErrOutputFile;
++
++  /**
+    * type of the command.
+    */
+   private HiveOperation commandType;
+@@ -293,6 +298,14 @@ public void setTmpOutputFile(File f) {
+     tmpOutputFile = f;
+   }
+ 
++  public File getTmpErrOutputFile() {
++    return tmpErrOutputFile;
++  }
++
++  public void setTmpErrOutputFile(File tmpErrOutputFile) {
++    this.tmpErrOutputFile = tmpErrOutputFile;
++  }
++
+   public boolean getIsSilent() {
+     if(conf != null) {
+       return conf.getBoolVar(HiveConf.ConfVars.HIVESESSIONSILENT);
+@@ -504,6 +517,14 @@ public static SessionState start(SessionState startSs) {
+         }
+       }
+ 
++      // Set temp file containing error output to be sent to client
++      if (startSs.getTmpErrOutputFile() == null) {
++        try {
++          startSs.setTmpErrOutputFile(createTempFile(startSs.getConf()));
++        } catch (IOException e) {
++          throw new RuntimeException(e);
++        }
++      }
+     } catch (Exception e) {
+       // Catch-all due to some exec time dependencies on session state
+       // that would cause ClassNoFoundException otherwise
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java b/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java
+index bcc66cf..1d1e995 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/HiveCommandOperation.java
+@@ -66,13 +66,14 @@ protected HiveCommandOperation(HiveSession parentSession, String statement,
+ 
+   private void setupSessionIO(SessionState sessionState) {
+     try {
+-      LOG.info("Putting temp output to file " + sessionState.getTmpOutputFile().toString());
++      LOG.info("Putting temp output to file " + sessionState.getTmpOutputFile().toString()
++          + " and error output to file " + sessionState.getTmpErrOutputFile().toString());
+       sessionState.in = null; // hive server's session input stream is not used
+-      // open a per-session file in auto-flush mode for writing temp results
+-      sessionState.out = new PrintStream(new FileOutputStream(sessionState.getTmpOutputFile()), true, "UTF-8");
+-      // TODO: for hadoop jobs, progress is printed out to session.err,
+-      // we should find a way to feed back job progress to client
+-      sessionState.err = new PrintStream(System.err, true, "UTF-8");
++      // open a per-session file in auto-flush mode for writing temp results and tmp error output
++      sessionState.out =
++          new PrintStream(new FileOutputStream(sessionState.getTmpOutputFile()), true, "UTF-8");
++      sessionState.err =
++          new PrintStream(new FileOutputStream(sessionState.getTmpErrOutputFile()), true, "UTF-8");
+     } catch (IOException e) {
+       LOG.error("Error in creating temp output file ", e);
+       try {
+@@ -90,8 +91,7 @@ private void setupSessionIO(SessionState sessionState) {
+ 
+ 
+   private void tearDownSessionIO() {
+-    IOUtils.cleanup(LOG, parentSession.getSessionState().out);
+-    IOUtils.cleanup(LOG, parentSession.getSessionState().err);
++    IOUtils.cleanup(LOG, parentSession.getSessionState().out, parentSession.getSessionState().err);
+   }
+ 
+   @Override
+@@ -202,6 +202,8 @@ private void cleanTmpFile() {
+     SessionState sessionState = getParentSession().getSessionState();
+     File tmp = sessionState.getTmpOutputFile();
+     tmp.delete();
++    tmp = sessionState.getTmpErrOutputFile();
++    tmp.delete();
+   }
+ 
+   private void resetResultReader() {
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index ab6bee1..36a8a7c 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -281,6 +281,10 @@ private void cleanup(OperationState state) throws HiveSQLException {
+     if (ss.getTmpOutputFile() != null) {
+       ss.getTmpOutputFile().delete();
+     }
++
++    if (ss.getTmpErrOutputFile() != null) {
++      ss.getTmpErrOutputFile().delete();
++    }
+   }
+ 
+   @Override
+-- 
+1.7.9.5
+

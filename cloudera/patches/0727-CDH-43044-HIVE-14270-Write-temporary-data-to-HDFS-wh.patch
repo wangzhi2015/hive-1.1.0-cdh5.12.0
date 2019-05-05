@@ -1,0 +1,453 @@
+From a317ccacc61a21b45be0d605c73c21c720757906 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Wed, 27 Jul 2016 10:34:08 -0500
+Subject: [PATCH 0727/1164] CDH-43044: HIVE-14270: Write temporary data to
+ HDFS when doing inserts on tables located on S3
+ (Sergio Pena, reviewed by Ashutosh Chauhan, Lefty
+ Leverenz)
+
+Change-Id: If2a4c40e3de8d2795c8744bd1b032fb913d508c0
+---
+ .../hadoop/hive/common/BlobStorageUtils.java       |   54 +++++++++++
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   10 ++-
+ .../hadoop/hive/common/TestBlobStorageUtils.java   |   95 ++++++++++++++++++++
+ ql/src/java/org/apache/hadoop/hive/ql/Context.java |   20 +++++
+ .../hadoop/hive/ql/optimizer/GenMapRedUtils.java   |    9 +-
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   11 +--
+ .../apache/hadoop/hive/ql/plan/FileSinkDesc.java   |    9 +-
+ .../apache/hadoop/hive/ql/exec/TestContext.java    |   63 +++++++++++++
+ .../hadoop/hive/ql/exec/TestFileSinkOperator.java  |    2 +-
+ 9 files changed, 261 insertions(+), 12 deletions(-)
+ create mode 100644 common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java
+ create mode 100644 common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/exec/TestContext.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java b/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java
+new file mode 100644
+index 0000000..6ca35e2
+--- /dev/null
++++ b/common/src/java/org/apache/hadoop/hive/common/BlobStorageUtils.java
+@@ -0,0 +1,54 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.common;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++
++import java.util.Collection;
++
++/**
++ * Utilities for different blob (object) storage systems
++ */
++public class BlobStorageUtils {
++    private static final boolean DISABLE_BLOBSTORAGE_AS_SCRATCHDIR = false;
++
++    public static boolean isBlobStoragePath(final Configuration conf, final Path path) {
++        return (path == null) ? false : isBlobStorageScheme(conf, path.toUri().getScheme());
++    }
++
++    public static boolean isBlobStorageFileSystem(final Configuration conf, final FileSystem fs) {
++        return (fs == null) ? false : isBlobStorageScheme(conf, fs.getScheme());
++    }
++
++    public static boolean isBlobStorageScheme(final Configuration conf, final String scheme) {
++        Collection<String> supportedBlobStoreSchemes =
++                conf.getStringCollection(HiveConf.ConfVars.HIVE_BLOBSTORE_SUPPORTED_SCHEMES.varname);
++
++        return supportedBlobStoreSchemes.contains(scheme);
++    }
++
++    public static boolean isBlobStorageAsScratchDir(final Configuration conf) {
++        return conf.getBoolean(
++                HiveConf.ConfVars.HIVE_BLOBSTORE_USE_BLOBSTORE_AS_SCRATCHDIR.varname,
++                DISABLE_BLOBSTORAGE_AS_SCRATCHDIR
++        );
++    }
++}
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 6e57eb9..e798758 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2141,7 +2141,15 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         new StringSet("throw", "skip", "ignore"), "The approach msck should take with HDFS " +
+        "directories that are partition-like but contain unsupported characters. 'throw' (an " +
+        "exception) is the default; 'skip' will skip the invalid directories and still repair the" +
+-       " others; 'ignore' will skip the validation (legacy behavior, causes bugs in many cases)");
++       " others; 'ignore' will skip the validation (legacy behavior, causes bugs in many cases)"),
++
++    /* BLOBSTORE section */
++
++    HIVE_BLOBSTORE_SUPPORTED_SCHEMES("hive.blobstore.supported.schemes", "s3,s3a,s3n",
++            "Comma-separated list of supported blobstore schemes."),
++
++    HIVE_BLOBSTORE_USE_BLOBSTORE_AS_SCRATCHDIR("hive.blobstore.use.blobstore.as.scratchdir", false,
++            "Enable the use of scratch directories directly on blob storage systems (it may cause performance penalties).");
+ 
+     public final String varname;
+     private final String defaultExpr;
+diff --git a/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java b/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java
+new file mode 100644
+index 0000000..84a0d86
+--- /dev/null
++++ b/common/src/test/org/apache/hadoop/hive/common/TestBlobStorageUtils.java
+@@ -0,0 +1,95 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.common;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.IOException;
++import java.net.URI;
++
++import static org.apache.hadoop.hive.common.BlobStorageUtils.*;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.mock;
++
++public class TestBlobStorageUtils {
++  private static final Configuration conf = new Configuration();
++
++  @Before
++  public void setUp() {
++    conf.set(HiveConf.ConfVars.HIVE_BLOBSTORE_SUPPORTED_SCHEMES.varname, "s3a,swift");
++    conf.setBoolean(HiveConf.ConfVars.HIVE_BLOBSTORE_USE_BLOBSTORE_AS_SCRATCHDIR.varname, false);
++  }
++
++  @Test
++  public void testValidAndInvalidPaths() throws IOException {
++    // Valid paths
++    assertTrue(isBlobStoragePath(conf, new Path("s3a://bucket/path")));
++    assertTrue(isBlobStoragePath(conf, new Path("swift://bucket/path")));
++
++    // Invalid paths
++    assertFalse(isBlobStoragePath(conf, new Path("/tmp/a-path")));
++    assertFalse(isBlobStoragePath(conf, new Path("s3fs://tmp/file")));
++    assertFalse(isBlobStoragePath(conf, null));
++    assertFalse(isBlobStorageFileSystem(conf, null));
++    assertFalse(isBlobStoragePath(conf, new Path(URI.create(""))));
++  }
++
++  @Test
++  public void testValidAndInvalidFileSystems() {
++    FileSystem fs = mock(FileSystem.class);
++
++    /* Valid FileSystem schemes */
++
++    doReturn("s3a").when(fs).getScheme();
++    assertTrue(isBlobStorageFileSystem(conf, fs));
++
++    doReturn("swift").when(fs).getScheme();
++    assertTrue(isBlobStorageFileSystem(conf, fs));
++
++    /* Invalid FileSystem schemes */
++
++    doReturn("hdfs").when(fs).getScheme();
++    assertFalse(isBlobStorageFileSystem(conf, fs));
++
++    doReturn("").when(fs).getScheme();
++    assertFalse(isBlobStorageFileSystem(conf, fs));
++
++    assertFalse(isBlobStorageFileSystem(conf, null));
++  }
++
++  @Test
++  public void testValidAndInvalidSchemes() {
++    // Valid schemes
++    assertTrue(isBlobStorageScheme(conf, "s3a"));
++    assertTrue(isBlobStorageScheme(conf, "swift"));
++
++    // Invalid schemes
++    assertFalse(isBlobStorageScheme(conf, "hdfs"));
++    assertFalse(isBlobStorageScheme(conf, ""));
++    assertFalse(isBlobStorageScheme(conf, null));
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Context.java b/ql/src/java/org/apache/hadoop/hive/ql/Context.java
+index 347f5e3..9f5c54e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Context.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Context.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hive.common.FileUtils;
++import org.apache.hadoop.hive.common.BlobStorageUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.TaskRunner;
+ import org.apache.hadoop.hive.ql.hooks.WriteEntity;
+@@ -335,6 +336,25 @@ public Path getMRScratchDir() {
+     }
+   }
+ 
++  /**
++   * Create a temporary directory depending of the path specified.
++   * - If path is an Object store filesystem, then use the default MR scratch directory (HDFS)
++   * - If path is on HDFS, then create a staging directory inside the path
++   *
++   * @param path Path used to verify the Filesystem to use for temporary directory
++   * @return A path to the new temporary directory
++     */
++  public Path getTempDirForPath(Path path) {
++    if (BlobStorageUtils.isBlobStoragePath(conf, path) && !BlobStorageUtils.isBlobStorageAsScratchDir(conf)) {
++      // For better write performance, we use HDFS for temporary data when object store is used.
++      // Note that the scratch directory configuration variable must use HDFS or any other non-blobstorage system
++      // to take advantage of this performance.
++      return getMRTmpPath();
++    } else {
++      return getExtTmpPathRelTo(path);
++    }
++  }
++
+   private Path getExternalScratchDir(URI extURI) {
+     return getStagingDir(new Path(extURI.getScheme(), extURI.getAuthority(), extURI.getPath()), !explain);
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+index 1acc952..cf09558 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMapRedUtils.java
+@@ -36,6 +36,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.common.BlobStorageUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.Warehouse;
+@@ -1751,15 +1752,17 @@ public static Path createMoveTask(Task<? extends Serializable> currTask, boolean
+     Path dest = null;
+ 
+     if (chDir) {
+-      dest = fsOp.getConf().getFinalDirName();
++      FileSinkDesc fileSinkDesc = fsOp.getConf();
++      dest = fileSinkDesc.getFinalDirName();
+ 
+       // generate the temporary file
+       // it must be on the same file system as the current destination
+       Context baseCtx = parseCtx.getContext();
+ 
+-      Path tmpDir = baseCtx.getExternalTmpPath(dest);
++      // Create the required temporary file in the HDFS location if the destination
++      // path of the FileSinkOperator table is a blobstore path.
++      Path tmpDir = baseCtx.getTempDirForPath(fileSinkDesc.getDestPath());
+ 
+-      FileSinkDesc fileSinkDesc = fsOp.getConf();
+       // Change all the linked file sink descriptors
+       if (fileSinkDesc.isLinkedFileSink()) {
+         for (FileSinkDesc fsConf:fileSinkDesc.getLinkedFileSinkDesc()) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index e74dfd6..71fa248 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -6079,7 +6079,7 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+       if (isNonNativeTable) {
+         queryTmpdir = dest_path;
+       } else {
+-        queryTmpdir = ctx.getExtTmpPathRelTo(dest_path);
++        queryTmpdir = ctx.getTempDirForPath(dest_path);
+       }
+       if (dpCtx != null) {
+         // set the root of the temporary path where dynamic partition columns will populate
+@@ -6198,7 +6198,7 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+       dest_path = new Path(tabPath.toUri().getScheme(), tabPath.toUri()
+           .getAuthority(), partPath.toUri().getPath());
+ 
+-      queryTmpdir = ctx.getExternalTmpPath(dest_path);
++      queryTmpdir = ctx.getTempDirForPath(dest_path);
+       table_desc = Utilities.getTableDesc(dest_tab);
+ 
+       // Add sorting/bucketing if needed
+@@ -6260,7 +6260,7 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+ 
+         try {
+           Path qPath = FileUtils.makeQualified(dest_path, conf);
+-          queryTmpdir = ctx.getExtTmpPathRelTo(qPath);
++          queryTmpdir = ctx.getTempDirForPath(qPath);
+         } catch (Exception e) {
+           throw new SemanticException("Error creating temporary folder on: "
+               + dest_path, e);
+@@ -6410,7 +6410,8 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+       rsCtx.getNumFiles(),
+       rsCtx.getTotalFiles(),
+       rsCtx.getPartnCols(),
+-      dpCtx);
++      dpCtx,
++      dest_path);
+ 
+     // If this is an insert, update, or delete on an ACID table then mark that so the
+     // FileSinkOperator knows how to properly write to it.
+@@ -6438,7 +6439,7 @@ private Operator genFileSinkPlan(String dest, QB qb, Operator input)
+     // it should be the same as the MoveWork's sourceDir.
+     fileSinkDesc.setStatsAggPrefix(fileSinkDesc.getDirName().toString());
+     if (HiveConf.getVar(conf, HIVESTATSDBCLASS).equalsIgnoreCase(StatDB.fs.name())) {
+-      String statsTmpLoc = ctx.getExtTmpPathRelTo(queryTmpdir).toString();
++      String statsTmpLoc = ctx.getTempDirForPath(dest_path).toString();
+       LOG.info("Set stats collection dir : " + statsTmpLoc);
+       conf.set(StatsSetupConst.STATS_TMP_LOC, statsTmpLoc);
+     }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java
+index ddb19e4..e7fe091 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/FileSinkDesc.java
+@@ -91,6 +91,7 @@
+   private long txnId = 0;  // transaction id for this operation
+ 
+   private transient Table table;
++  private Path destPath;
+ 
+   public FileSinkDesc() {
+   }
+@@ -98,7 +99,7 @@ public FileSinkDesc() {
+   public FileSinkDesc(final Path dirName, final TableDesc tableInfo,
+       final boolean compressed, final int destTableId, final boolean multiFileSpray,
+       final boolean canBeMerged, final int numFiles, final int totalFiles,
+-      final ArrayList<ExprNodeDesc> partitionCols, final DynamicPartitionCtx dpCtx) {
++      final ArrayList<ExprNodeDesc> partitionCols, final DynamicPartitionCtx dpCtx, Path destPath) {
+ 
+     this.dirName = dirName;
+     this.tableInfo = tableInfo;
+@@ -132,7 +133,7 @@ public FileSinkDesc(final Path dirName, final TableDesc tableInfo,
+   public Object clone() throws CloneNotSupportedException {
+     FileSinkDesc ret = new FileSinkDesc(dirName, tableInfo, compressed,
+         destTableId, multiFileSpray, canBeMerged, numFiles, totalFiles,
+-        partitionCols, dpCtx);
++        partitionCols, dpCtx, destPath);
+     ret.setCompressCodec(compressCodec);
+     ret.setCompressType(compressType);
+     ret.setGatherStats(gatherStats);
+@@ -425,6 +426,10 @@ public long getTransactionId() {
+     return txnId;
+   }
+ 
++  public Path getDestPath() {
++    return destPath;
++  }
++
+   public Table getTable() {
+     return table;
+   }
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestContext.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestContext.java
+new file mode 100644
+index 0000000..b2a68ed
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestContext.java
+@@ -0,0 +1,63 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.exec;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.Context;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.IOException;
++
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Mockito.*;
++
++public class TestContext {
++    private static HiveConf conf = new HiveConf(TestContext.class);
++
++    private Context context;
++
++    @Before
++    public void setUp() throws IOException {
++        /* Only called to create session directories used by the Context class */
++        SessionState.start(conf);
++        SessionState.detachSession();
++
++        context = new Context(conf);
++    }
++
++    @Test
++    public void testGetScratchDirectoriesForPaths() throws IOException {
++        Context spyContext = spy(context);
++
++        // When Object store paths are used, then getMRTmpPatch() is called to get a temporary
++        // directory on the default scratch diretory location (usually /temp)
++        Path mrTmpPath = new Path("hdfs://hostname/tmp/scratch");
++        doReturn(mrTmpPath).when(spyContext).getMRTmpPath();
++        assertEquals(mrTmpPath, spyContext.getTempDirForPath(new Path("s3a://bucket/dir")));
++
++        // When Non-Object store paths are used, then getExtTmpPathRelTo is called to get a temporary
++        // directory on the same path passed as a parameter
++        Path tmpPathRelTo = new Path("hdfs://hostname/user");
++        doReturn(tmpPathRelTo).when(spyContext).getExtTmpPathRelTo(any(Path.class));
++        assertEquals(tmpPathRelTo, spyContext.getTempDirForPath(new Path("/user")));
++    }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestFileSinkOperator.java b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestFileSinkOperator.java
+index 627b244..5a1a867 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/exec/TestFileSinkOperator.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/exec/TestFileSinkOperator.java
+@@ -303,7 +303,7 @@ private FileSinkOperator getFileSink(AcidUtils.Operation writeType,
+       Map<String, String> partColNames = new HashMap<String, String>(1);
+       partColNames.put(PARTCOL_NAME, PARTCOL_NAME);
+       dpCtx.setInputToDPCols(partColNames);
+-      desc = new FileSinkDesc(basePath, tableDesc, false, 1, false, false, 1, 1, partCols, dpCtx);
++      desc = new FileSinkDesc(basePath, tableDesc, false, 1, false, false, 1, 1, partCols, dpCtx, null);
+     } else {
+       desc = new FileSinkDesc(basePath, tableDesc, false);
+     }
+-- 
+1.7.9.5
+

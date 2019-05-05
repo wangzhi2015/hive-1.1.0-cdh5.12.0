@@ -1,0 +1,220 @@
+From c1fbf739c02eb3f8f0c87c538f949a58b112fb49 Mon Sep 17 00:00:00 2001
+From: Prasanth J <prasanthj@apache.org>
+Date: Tue, 21 Apr 2015 07:26:20 +0000
+Subject: [PATCH 0542/1164] CDH-38685: HIVE-10303: HIVE-9471 broke forward
+ compatibility of ORC files (Prasanth Jayachandran
+ reviewed by Owen O'Malley)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1675053 13f79535-47bb-0310-9956-ffa450edef68
+
+Conflicts:
+	ql/src/test/resources/orc-file-has-null.out
+
+Change-Id: I47f2b6881baa251adcfb4d364e8aec474bfba94a
+---
+ .../hadoop/hive/ql/io/orc/IntegerWriter.java       |    5 ---
+ .../hive/ql/io/orc/RunLengthIntegerWriter.java     |    9 +----
+ .../hive/ql/io/orc/RunLengthIntegerWriterV2.java   |   11 ++---
+ .../apache/hadoop/hive/ql/io/orc/WriterImpl.java   |    9 +----
+ ql/src/test/resources/orc-file-has-null.out        |   42 +++++++++++---------
+ 5 files changed, 29 insertions(+), 47 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/IntegerWriter.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/IntegerWriter.java
+index 594a616..775d02e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/IntegerWriter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/IntegerWriter.java
+@@ -40,11 +40,6 @@
+   void write(long value) throws IOException;
+ 
+   /**
+-   * Suppress underlying stream.
+-   */
+-  void suppress();
+-
+-  /**
+    * Flush the buffer
+    * @throws IOException
+    */
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriter.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriter.java
+index 4acf227..078eae8 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriter.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriter.java
+@@ -31,7 +31,7 @@
+   static final int MIN_DELTA = -128;
+   static final int MAX_LITERAL_SIZE = 128;
+   private static final int MAX_REPEAT_SIZE = 127 + MIN_REPEAT_SIZE;
+-  private final OutStream output;
++  private final PositionedOutputStream output;
+   private final boolean signed;
+   private final long[] literals = new long[MAX_LITERAL_SIZE];
+   private int numLiterals = 0;
+@@ -40,7 +40,7 @@
+   private int tailRunLength = 0;
+   private SerializationUtils utils;
+ 
+-  RunLengthIntegerWriter(OutStream output,
++  RunLengthIntegerWriter(PositionedOutputStream output,
+                          boolean signed) {
+     this.output = output;
+     this.signed = signed;
+@@ -135,11 +135,6 @@ public void write(long value) throws IOException {
+   }
+ 
+   @Override
+-  public void suppress() {
+-    this.output.suppress();
+-  }
+-
+-  @Override
+   public void getPosition(PositionRecorder recorder) throws IOException {
+     output.getPosition(recorder);
+     recorder.addPosition(numLiterals);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriterV2.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriterV2.java
+index eef9ec5..6344a66 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriterV2.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/RunLengthIntegerWriterV2.java
+@@ -138,7 +138,7 @@
+   private int fixedRunLength = 0;
+   private int variableRunLength = 0;
+   private final long[] literals = new long[MAX_SCOPE];
+-  private final OutStream output;
++  private final PositionedOutputStream output;
+   private final boolean signed;
+   private EncodingType encoding;
+   private int numLiterals;
+@@ -160,11 +160,11 @@
+   private SerializationUtils utils;
+   private boolean alignedBitpacking;
+ 
+-  RunLengthIntegerWriterV2(OutStream output, boolean signed) {
++  RunLengthIntegerWriterV2(PositionedOutputStream output, boolean signed) {
+     this(output, signed, true);
+   }
+ 
+-  RunLengthIntegerWriterV2(OutStream output, boolean signed,
++  RunLengthIntegerWriterV2(PositionedOutputStream output, boolean signed,
+       boolean alignedBitpacking) {
+     this.output = output;
+     this.signed = signed;
+@@ -818,11 +818,6 @@ public void write(long val) throws IOException {
+     }
+   }
+ 
+-  @Override
+-  public void suppress() {
+-    this.output.suppress();
+-  }
+-
+   private void initializeLiterals(long val) {
+     literals[numLiterals++] = val;
+     fixedRunLength = 1;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java
+index eb423dd..deaea3c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/WriterImpl.java
+@@ -631,7 +631,7 @@ protected ColumnStatisticsImpl getFileStatistics() {
+       return rowIndexEntry;
+     }
+ 
+-    IntegerWriter createIntegerWriter(OutStream output,
++    IntegerWriter createIntegerWriter(PositionedOutputStream output,
+                                       boolean signed, boolean isDirectV2,
+                                       StreamFactory writer) {
+       if (isDirectV2) {
+@@ -1163,13 +1163,6 @@ private void flushDictionary() throws IOException {
+         // Write the dictionary by traversing the red-black tree writing out
+         // the bytes and lengths; and creating the map from the original order
+         // to the final sorted order.
+-        if (dictionary.size() == 0) {
+-          if (LOG.isWarnEnabled()) {
+-            LOG.warn("Empty dictionary. Suppressing dictionary stream.");
+-          }
+-          stringOutput.suppress();
+-          lengthOutput.suppress();
+-        }
+ 
+         dictionary.visit(new StringRedBlackTree.Visitor() {
+           private int currentId = 0;
+diff --git a/ql/src/test/resources/orc-file-has-null.out b/ql/src/test/resources/orc-file-has-null.out
+index e26bcd5..f1dfcd3 100644
+--- a/ql/src/test/resources/orc-file-has-null.out
++++ b/ql/src/test/resources/orc-file-has-null.out
+@@ -48,7 +48,7 @@ Stripes:
+       Entry 2:count: 1000 hasNull: false min: RG3 max: RG3 sum: 3000 positions: 0,2,125,0,0,66,488
+       Entry 3:count: 0 hasNull: true positions: 0,4,125,0,0,136,488
+       Entry 4:count: 0 hasNull: true positions: 0,6,125,0,0,136,488
+-  Stripe: offset: 424 data: 156 rows: 5000 tail: 55 index: 119
++  Stripe: offset: 424 data: 156 rows: 5000 tail: 60 index: 119
+     Stream: column 0 section ROW_INDEX start: 424 length 17
+     Stream: column 1 section ROW_INDEX start: 441 length 63
+     Stream: column 2 section ROW_INDEX start: 504 length 39
+@@ -56,6 +56,8 @@ Stripes:
+     Stream: column 1 section LENGTH start: 656 length 32
+     Stream: column 2 section PRESENT start: 688 length 11
+     Stream: column 2 section DATA start: 699 length 0
++    Stream: column 2 section LENGTH start: 699 length 0
++    Stream: column 2 section DICTIONARY_DATA start: 699 length 0
+     Encoding column 0: DIRECT
+     Encoding column 1: DIRECT_V2
+     Encoding column 2: DICTIONARY_V2[0]
+@@ -65,15 +67,15 @@ Stripes:
+       Entry 2:count: 0 hasNull: true positions: 0,2,120,0,0,0,0
+       Entry 3:count: 0 hasNull: true positions: 0,4,115,0,0,0,0
+       Entry 4:count: 0 hasNull: true positions: 0,6,110,0,0,0,0
+-  Stripe: offset: 754 data: 186 rows: 5000 tail: 60 index: 148
+-    Stream: column 0 section ROW_INDEX start: 754 length 17
+-    Stream: column 1 section ROW_INDEX start: 771 length 63
+-    Stream: column 2 section ROW_INDEX start: 834 length 68
+-    Stream: column 1 section DATA start: 902 length 113
+-    Stream: column 1 section LENGTH start: 1015 length 32
+-    Stream: column 2 section DATA start: 1047 length 24
+-    Stream: column 2 section LENGTH start: 1071 length 6
+-    Stream: column 2 section DICTIONARY_DATA start: 1077 length 11
++  Stripe: offset: 759 data: 186 rows: 5000 tail: 60 index: 148
++    Stream: column 0 section ROW_INDEX start: 759 length 17
++    Stream: column 1 section ROW_INDEX start: 776 length 63
++    Stream: column 2 section ROW_INDEX start: 839 length 68
++    Stream: column 1 section DATA start: 907 length 113
++    Stream: column 1 section LENGTH start: 1020 length 32
++    Stream: column 2 section DATA start: 1052 length 24
++    Stream: column 2 section LENGTH start: 1076 length 6
++    Stream: column 2 section DICTIONARY_DATA start: 1082 length 11
+     Encoding column 0: DIRECT
+     Encoding column 1: DIRECT_V2
+     Encoding column 2: DICTIONARY_V2[1]
+@@ -83,14 +85,16 @@ Stripes:
+       Entry 2:count: 1000 hasNull: false min: STRIPE-3 max: STRIPE-3 sum: 8000 positions: 0,198,464
+       Entry 3:count: 1000 hasNull: false min: STRIPE-3 max: STRIPE-3 sum: 8000 positions: 0,330,440
+       Entry 4:count: 1000 hasNull: false min: STRIPE-3 max: STRIPE-3 sum: 8000 positions: 0,462,416
+-  Stripe: offset: 1148 data: 156 rows: 5000 tail: 55 index: 119
+-    Stream: column 0 section ROW_INDEX start: 1148 length 17
+-    Stream: column 1 section ROW_INDEX start: 1165 length 63
+-    Stream: column 2 section ROW_INDEX start: 1228 length 39
+-    Stream: column 1 section DATA start: 1267 length 113
+-    Stream: column 1 section LENGTH start: 1380 length 32
+-    Stream: column 2 section PRESENT start: 1412 length 11
+-    Stream: column 2 section DATA start: 1423 length 0
++  Stripe: offset: 1153 data: 156 rows: 5000 tail: 60 index: 119
++    Stream: column 0 section ROW_INDEX start: 1153 length 17
++    Stream: column 1 section ROW_INDEX start: 1170 length 63
++    Stream: column 2 section ROW_INDEX start: 1233 length 39
++    Stream: column 1 section DATA start: 1272 length 113
++    Stream: column 1 section LENGTH start: 1385 length 32
++    Stream: column 2 section PRESENT start: 1417 length 11
++    Stream: column 2 section DATA start: 1428 length 0
++    Stream: column 2 section LENGTH start: 1428 length 0
++    Stream: column 2 section DICTIONARY_DATA start: 1428 length 0
+     Encoding column 0: DIRECT
+     Encoding column 1: DIRECT_V2
+     Encoding column 2: DICTIONARY_V2[0]
+@@ -101,6 +105,6 @@ Stripes:
+       Entry 3:count: 0 hasNull: true positions: 0,4,115,0,0,0,0
+       Entry 4:count: 0 hasNull: true positions: 0,6,110,0,0,0,0
+ 
+-File length: 1728 bytes
++File length: 1736 bytes
+ Padding length: 0 bytes
+ Padding ratio: 0%
+-- 
+1.7.9.5
+

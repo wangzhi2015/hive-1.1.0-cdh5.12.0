@@ -1,0 +1,66 @@
+From 931b44ac85fd05d12d0a0ad5073060c2922613d1 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Wed, 2 Mar 2016 17:28:26 -0500
+Subject: [PATCH 0582/1164] CDH-36124: HIVE-12481: Occasionally "Request is a
+ replay" will be thrown from HS2 (Reviewed by
+ Yongzhi Chen)
+
+Change-Id: Id761708fe1c10a9c9ca09d1fb293899d4462cad8
+---
+ .../java/org/apache/hive/jdbc/HiveConnection.java  |   17 +++++++++++++++--
+ jdbc/src/java/org/apache/hive/jdbc/Utils.java      |    4 ++++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+index 7486c28..ac644c6 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/HiveConnection.java
+@@ -185,6 +185,13 @@ public HiveConnection(String uri, Properties info) throws SQLException {
+   }
+ 
+   private void openTransport() throws SQLException {
++    int numRetries = 0;
++    int maxRetries = 1;
++    try {
++      maxRetries = Integer.parseInt(sessConfMap.get(JdbcConnectionParams.RETRIES));
++    } catch(NumberFormatException e) {
++    }
++
+     while (true) {
+       try {
+         assumeSubject =
+@@ -216,8 +223,14 @@ private void openTransport() throws SQLException {
+           host = connParams.getHost();
+           port = connParams.getPort();
+         } else {
+-          throw new SQLException("Could not open client transport with JDBC Uri: " + jdbcUriString
+-              + ": " + e.getMessage(), " 08S01", e);
++          // Retry maxRetries times
++          String errMsg = "Could not open client transport with JDBC Uri: " +
++              jdbcUriString + ": " + e.getMessage();
++          if (++numRetries >= maxRetries) {
++            throw new SQLException(errMsg, " 08S01", e);
++          } else {
++            LOG.warn(errMsg + " Retrying " + numRetries + " of " + maxRetries);
++          }
+         }
+       }
+     }
+diff --git a/jdbc/src/java/org/apache/hive/jdbc/Utils.java b/jdbc/src/java/org/apache/hive/jdbc/Utils.java
+index 60c3c09..054161d 100644
+--- a/jdbc/src/java/org/apache/hive/jdbc/Utils.java
++++ b/jdbc/src/java/org/apache/hive/jdbc/Utils.java
+@@ -69,6 +69,10 @@
+     // client side params are specified in sess_var_list
+ 
+     // Client param names:
++
++    // Retry setting
++    static final String RETRIES = "retries";
++
+     static final String AUTH_TYPE = "auth";
+     // We're deprecating this variable's name.
+     static final String AUTH_QOP_DEPRECATED = "sasl.qop";
+-- 
+1.7.9.5
+

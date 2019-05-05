@@ -1,0 +1,171 @@
+From 3903058e0d725e68e8ef999a6a670d30e88e63eb Mon Sep 17 00:00:00 2001
+From: Eugene Koifman <ekoifman@hortonworks.com>
+Date: Fri, 1 May 2015 09:27:21 -0700
+Subject: [PATCH 0143/1164] HIVE-10151 - insert into A select from B is broken
+ when both A and B are Acid tables and bucketed
+ the same way (Eugene Koifman, reviewed by Alan
+ Gates)
+
+---
+ .../org/apache/hadoop/hive/ql/exec/Operator.java   |    4 ++
+ .../BucketingSortingReduceSinkOptimizer.java       |   12 ++++++
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |    2 +-
+ .../apache/hadoop/hive/ql/TestTxnCommands2.java    |   44 ++++++++++----------
+ 4 files changed, 39 insertions(+), 23 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java
+index d2b5c05..29e2f52 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java
+@@ -1167,6 +1167,10 @@ public boolean isUseBucketizedHiveInputFormat() {
+     return useBucketizedHiveInputFormat;
+   }
+ 
++  /**
++   * Before setting this to {@code true} make sure it's not reading ACID tables
++   * @param useBucketizedHiveInputFormat
++   */
+   public void setUseBucketizedHiveInputFormat(boolean useBucketizedHiveInputFormat) {
+     this.useBucketizedHiveInputFormat = useBucketizedHiveInputFormat;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/BucketingSortingReduceSinkOptimizer.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/BucketingSortingReduceSinkOptimizer.java
+index 24ca89f..00c9146 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/BucketingSortingReduceSinkOptimizer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/BucketingSortingReduceSinkOptimizer.java
+@@ -51,6 +51,7 @@
+ import org.apache.hadoop.hive.ql.metadata.Table;
+ import org.apache.hadoop.hive.ql.parse.ParseContext;
+ import org.apache.hadoop.hive.ql.parse.PrunedPartitionList;
++import org.apache.hadoop.hive.ql.parse.SemanticAnalyzer;
+ import org.apache.hadoop.hive.ql.parse.SemanticException;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+@@ -216,6 +217,9 @@ private boolean checkTable(Table table,
+     private void storeBucketPathMapping(TableScanOperator tsOp, FileStatus[] srcs) {
+       Map<String, Integer> bucketFileNameMapping = new HashMap<String, Integer>();
+       for (int pos = 0; pos < srcs.length; pos++) {
++        if(!srcs[pos].isFile()) {
++          throw new RuntimeException("Was expecting '" + srcs[pos].getPath() + "' to be bucket file.");
++        }
+         bucketFileNameMapping.put(srcs[pos].getPath().getName(), pos);
+       }
+       tsOp.getConf().setBucketFileNameMapping(bucketFileNameMapping);
+@@ -378,6 +382,14 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx procCtx,
+         return null;
+       }
+ 
++      if(stack.get(0) instanceof TableScanOperator) {
++        TableScanOperator tso = ((TableScanOperator)stack.get(0));
++        if(SemanticAnalyzer.isAcidTable(tso.getConf().getTableMetadata())) {
++          /*ACID tables have complex directory layout and require merging of delta files
++          * on read thus we should not try to read bucket files directly*/
++          return null;
++        }
++      }
+       // Support for dynamic partitions can be added later
+       if (fsOp.getConf().getDynPartCtx() != null) {
+         return null;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 51493a5..db0277f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -12281,7 +12281,7 @@ else return (ltd.getReplace() ? WriteEntity.WriteType.INSERT_OVERWRITE :
+ 
+   // Even if the table is of Acid type, if we aren't working with an Acid compliant TxnManager
+   // then return false.
+-  private boolean isAcidTable(Table tab) {
++  public static boolean isAcidTable(Table tab) {
+     if (tab == null) return false;
+     if (!SessionState.get().getTxnMgr().supportsAcid()) return false;
+     String tableIsTransactional =
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java b/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
+index 1431e19..f5140c4 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/TestTxnCommands2.java
+@@ -98,8 +98,8 @@ public void tearDown() throws Exception {
+         d.destroy();
+         d.close();
+         d = null;
+-        TxnDbUtil.cleanDb();
+       }
++      TxnDbUtil.cleanDb();
+     } finally {
+       FileUtils.deleteDirectory(new File(TEST_DATA_DIR));
+     }
+@@ -107,15 +107,15 @@ public void tearDown() throws Exception {
+   @Ignore("not needed but useful for testing")
+   @Test
+   public void testNonAcidInsert() throws Exception {
+-    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + "(a,b) values(1,2)");
++    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + " values(1,2)");
+     List<String> rs = runStatementOnDriver("select a,b from " + Table.NONACIDORCTBL);
+-    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + "(a,b) values(2,3)");
++    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + " values(2,3)");
+     List<String> rs1 = runStatementOnDriver("select a,b from " + Table.NONACIDORCTBL);
+   }
+   @Test
+   public void testUpdateMixedCase() throws Exception {
+     int[][] tableData = {{1,2},{3,3},{5,3}};
+-    runStatementOnDriver("insert into " + Table.ACIDTBL + "(a,b) " + makeValuesClause(tableData));
++    runStatementOnDriver("insert into " + Table.ACIDTBL + " " + makeValuesClause(tableData));
+     runStatementOnDriver("update " + Table.ACIDTBL + " set B = 7 where A=1");
+     List<String> rs = runStatementOnDriver("select a,b from " + Table.ACIDTBL + " order by a,b");
+     int[][] updatedData = {{1,7},{3,3},{5,3}};
+@@ -125,27 +125,27 @@ public void testUpdateMixedCase() throws Exception {
+     int[][] updatedData2 = {{1,8},{3,3},{5,3}};
+     Assert.assertEquals("Update failed", stringifyValues(updatedData2), rs2);
+   }
++
++  /**
++   * https://issues.apache.org/jira/browse/HIVE-10151
++   */
+   @Test
+-  public void testDeleteIn() throws Exception {
+-    int[][] tableData = {{1,2},{3,2},{5,2},{1,3},{3,3},{5,3}};
+-    runStatementOnDriver("insert into " + Table.ACIDTBL + "(a,b) " + makeValuesClause(tableData));
+-    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + "(a,b) values(1,7),(3,7)");
+-    //todo: once multistatement txns are supported, add a test to run next 2 statements in a single txn
+-    runStatementOnDriver("delete from " + Table.ACIDTBL + " where a in(select a from " + Table.NONACIDORCTBL + ")");
+-    runStatementOnDriver("insert into " + Table.ACIDTBL + "(a,b) select a,b from " + Table.NONACIDORCTBL);
+-    List<String> rs = runStatementOnDriver("select a,b from " + Table.ACIDTBL + " order by a,b");
+-    int[][] updatedData = {{1,7},{3,7},{5,2},{5,3}};
+-    Assert.assertEquals("Bulk update failed", stringifyValues(updatedData), rs);
+-    runStatementOnDriver("update " + Table.ACIDTBL + " set b=19 where b in(select b from " + Table.NONACIDORCTBL + " where a = 3)");
+-    List<String> rs2 = runStatementOnDriver("select a,b from " + Table.ACIDTBL + " order by a,b");
+-    int[][] updatedData2 = {{1,19},{3,19},{5,2},{5,3}};
+-    Assert.assertEquals("Bulk update2 failed", stringifyValues(updatedData2), rs2);
+-  }
++  public void testBucketizedInputFormat() throws Exception {
++    int[][] tableData = {{1,2}};
++    runStatementOnDriver("insert into " + Table.ACIDTBLPART + " partition(p=1) " + makeValuesClause(tableData));
+ 
++    runStatementOnDriver("insert into " + Table.ACIDTBL + " select a,b from " + Table.ACIDTBLPART + " where p = 1");
++    List<String> rs = runStatementOnDriver("select a,b from " + Table.ACIDTBL);//no order by as it's just 1 row
++    Assert.assertEquals("Insert into " + Table.ACIDTBL + " didn't match:", stringifyValues(tableData), rs);
++
++    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + " select a,b from " + Table.ACIDTBLPART + " where p = 1");
++    List<String> rs2 = runStatementOnDriver("select a,b from " + Table.NONACIDORCTBL);//no order by as it's just 1 row
++    Assert.assertEquals("Insert into " + Table.NONACIDORCTBL + " didn't match:", stringifyValues(tableData), rs2);
++  }
+   @Test
+   public void testInsertOverwriteWithSelfJoin() throws Exception {
+     int[][] part1Data = {{1,7}};
+-    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + "(a,b) " + makeValuesClause(part1Data));
++    runStatementOnDriver("insert into " + Table.NONACIDORCTBL + " " + makeValuesClause(part1Data));
+     //this works because logically we need S lock on NONACIDORCTBL to read and X lock to write, but
+     //LockRequestBuilder dedups locks on the same entity to only keep the highest level lock requested
+     runStatementOnDriver("insert overwrite table " + Table.NONACIDORCTBL + " select 2, 9 from " + Table.NONACIDORCTBL + " T inner join " + Table.NONACIDORCTBL + " S on T.a=S.a");
+@@ -153,8 +153,8 @@ public void testInsertOverwriteWithSelfJoin() throws Exception {
+     int[][] joinData = {{2,9}};
+     Assert.assertEquals("Self join non-part insert overwrite failed", stringifyValues(joinData), rs);
+     int[][] part2Data = {{1,8}};
+-    runStatementOnDriver("insert into " + Table.NONACIDPART + " partition(p=1) (a,b) " + makeValuesClause(part1Data));
+-    runStatementOnDriver("insert into " + Table.NONACIDPART + " partition(p=2) (a,b) " + makeValuesClause(part2Data));
++    runStatementOnDriver("insert into " + Table.NONACIDPART + " partition(p=1) " + makeValuesClause(part1Data));
++    runStatementOnDriver("insert into " + Table.NONACIDPART + " partition(p=2) " + makeValuesClause(part2Data));
+     //here we need X lock on p=1 partition to write and S lock on 'table' to read which should
+     //not block each other since they are part of the same txn
+     runStatementOnDriver("insert overwrite table " + Table.NONACIDPART + " partition(p=1) select a,b from " + Table.NONACIDPART);
+-- 
+1.7.9.5
+

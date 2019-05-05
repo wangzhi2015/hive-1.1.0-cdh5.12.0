@@ -1,0 +1,105 @@
+From 589dea853eeaa38921a3936f0e03ff5a2650de05 Mon Sep 17 00:00:00 2001
+From: Pengcheng Xiong <pxiong@apache.org>
+Date: Mon, 7 Nov 2016 23:13:51 -0800
+Subject: [PATCH 0869/1164] HIVE-14924: MSCK REPAIR table with single threaded
+ is throwing null pointer exception (Pengcheng
+ Xiong, reviewed by Ashutosh Chauhan)
+
+Change-Id: Id2d635de139b5796c16b5eb9dcf0fae297e98d10
+---
+ .../hive/ql/metadata/HiveMetaStoreChecker.java     |    4 +-
+ ql/src/test/queries/clientpositive/msck_repair_0.q |   19 ++++++++++
+ .../results/clientpositive/msck_repair_0.q.out     |   40 ++++++++++++++++++++
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+ create mode 100644 ql/src/test/queries/clientpositive/msck_repair_0.q
+ create mode 100644 ql/src/test/results/clientpositive/msck_repair_0.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
+index ec9910f..1410419 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java
+@@ -391,7 +391,9 @@ private void getAllLeafDirs(Path basePath, Set<Path> allDirs) throws IOException
+           + ((ThreadPoolExecutor) pool).getPoolSize());
+     }
+     getAllLeafDirs(pool, basePaths, dirSet, basePath.getFileSystem(conf));
+-    pool.shutdown();
++    if (pool != null) {
++      pool.shutdown();
++    }
+     allDirs.addAll(dirSet.keySet());
+   }
+ 
+diff --git a/ql/src/test/queries/clientpositive/msck_repair_0.q b/ql/src/test/queries/clientpositive/msck_repair_0.q
+new file mode 100644
+index 0000000..ce8ef42
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/msck_repair_0.q
+@@ -0,0 +1,19 @@
++set hive.msck.repair.batch.size=1;
++set hive.mv.files.thread=0;
++
++DROP TABLE IF EXISTS repairtable;
++
++CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
++
++MSCK TABLE repairtable;
++
++dfs ${system:test.dfs.mkdir} ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b;
++dfs -touchz ${system:test.warehouse.dir}/repairtable/p1=c/p2=a/p3=b/datafile;
++
++MSCK TABLE default.repairtable;
++
++MSCK REPAIR TABLE default.repairtable;
++
++MSCK TABLE repairtable;
++
++DROP TABLE default.repairtable;
+diff --git a/ql/src/test/results/clientpositive/msck_repair_0.q.out b/ql/src/test/results/clientpositive/msck_repair_0.q.out
+new file mode 100644
+index 0000000..3d3bef8
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/msck_repair_0.q.out
+@@ -0,0 +1,40 @@
++PREHOOK: query: DROP TABLE IF EXISTS repairtable
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS repairtable
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repairtable
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++PREHOOK: query: MSCK TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a/p3=b
++PREHOOK: query: MSCK REPAIR TABLE default.repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK REPAIR TABLE default.repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a/p3=b
++Repair: Added partition to metastore default.repairtable:p1=c/p2=a/p3=b
++PREHOOK: query: MSCK TABLE repairtable
++PREHOOK: type: MSCK
++POSTHOOK: query: MSCK TABLE repairtable
++POSTHOOK: type: MSCK
++Partitions not in metastore:	repairtable:p1=c/p2=a/p3=b
++PREHOOK: query: DROP TABLE default.repairtable
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repairtable
++PREHOOK: Output: default@repairtable
++POSTHOOK: query: DROP TABLE default.repairtable
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repairtable
++POSTHOOK: Output: default@repairtable
+-- 
+1.7.9.5
+

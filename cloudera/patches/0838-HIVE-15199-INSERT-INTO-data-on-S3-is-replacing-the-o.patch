@@ -1,0 +1,667 @@
+From 1d8d4d0b46bf845671eb998bb2145b255f808bf9 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Wed, 23 Nov 2016 12:43:55 -0600
+Subject: [PATCH 0838/1164] HIVE-15199: INSERT INTO data on S3 is replacing
+ the old rows with the new ones (Sergio Pena,
+ reviewed by Yongzhi Chen, Sahil Takiar, Illya
+ Yalovyy, Steve Loughran)
+
+Change-Id: If526b17839a54e7245bef6959b5a48e0d3ac762b
+---
+ .../src/test/queries/clientpositive/insert_into.q  |    1 +
+ .../test/results/clientpositive/insert_into.q.out  |  102 +++++++++++++++-----
+ .../write_final_output_blobstore.q.out             |   98 +++++++++++++------
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   85 ++++++++++------
+ 4 files changed, 203 insertions(+), 83 deletions(-)
+
+diff --git a/itests/hive-blobstore/src/test/queries/clientpositive/insert_into.q b/itests/hive-blobstore/src/test/queries/clientpositive/insert_into.q
+index 919ff7d..c9ed57d 100644
+--- a/itests/hive-blobstore/src/test/queries/clientpositive/insert_into.q
++++ b/itests/hive-blobstore/src/test/queries/clientpositive/insert_into.q
+@@ -3,5 +3,6 @@ set hive.blobstore.use.blobstore.as.scratchdir=true;
+ DROP TABLE qtest;
+ CREATE TABLE qtest (value int) LOCATION '${hiveconf:test.blobstore.path.unique}/qtest/';
+ INSERT INTO qtest VALUES (1), (10), (100), (1000);
++INSERT INTO qtest VALUES (2), (20), (200), (2000);
+ EXPLAIN EXTENDED INSERT INTO qtest VALUES (1), (10), (100), (1000);
+ SELECT * FROM qtest;
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out b/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out
+index c25d0c4..3fd58cd 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/insert_into.q.out
+@@ -21,10 +21,36 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@values__tmp__table__1
+ POSTHOOK: Output: default@qtest
+ POSTHOOK: Lineage: qtest.value EXPRESSION [(values__tmp__table__1)values__tmp__table__1.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
++PREHOOK: query: INSERT INTO qtest VALUES (2), (20), (200), (2000)
++PREHOOK: type: QUERY
++PREHOOK: Input: default@values__tmp__table__2
++PREHOOK: Output: default@qtest
++POSTHOOK: query: INSERT INTO qtest VALUES (2), (20), (200), (2000)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@values__tmp__table__2
++POSTHOOK: Output: default@qtest
++POSTHOOK: Lineage: qtest.value EXPRESSION [(values__tmp__table__2)values__tmp__table__2.FieldSchema(name:tmp_values_col1, type:string, comment:), ]
+ PREHOOK: query: EXPLAIN EXTENDED INSERT INTO qtest VALUES (1), (10), (100), (1000)
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN EXTENDED INSERT INTO qtest VALUES (1), (10), (100), (1000)
+ POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_QUERY
++   TOK_FROM
++      null
++         null
++            Values__Tmp__Table__3
++   TOK_INSERT
++      TOK_INSERT_INTO
++         TOK_TAB
++            TOK_TABNAME
++               qtest
++      TOK_SELECT
++         TOK_SELEXPR
++            TOK_ALLCOLREF
++
++
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-7 depends on stages: Stage-1 , consists of Stage-4, Stage-3, Stage-5
+@@ -40,7 +66,7 @@ STAGE PLANS:
+     Map Reduce
+       Map Operator Tree:
+           TableScan
+-            alias: values__tmp__table__2
++            alias: values__tmp__table__3
+             Statistics: Num rows: 1 Data size: 14 Basic stats: COMPLETE Column stats: NONE
+             GatherStats: false
+             Select Operator
+@@ -58,6 +84,7 @@ STAGE PLANS:
+                     input format: org.apache.hadoop.mapred.TextInputFormat
+                     output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+                     properties:
++                      COLUMN_STATS_ACCURATE true
+                       bucket_count -1
+                       columns value
+                       columns.comments 
+@@ -65,11 +92,13 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+                       location ### test.blobstore.path ###/qtest
+                       name default.qtest
+-                      numFiles 1
++                      numFiles 0
++                      numRows 8
++                      rawDataSize 20
+                       serialization.ddl struct qtest { i32 value}
+                       serialization.format 1
+                       serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                      totalSize 14
++                      totalSize 0
+ #### A masked pattern was here ####
+                     serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+                     name: default.qtest
+@@ -81,7 +110,7 @@ STAGE PLANS:
+       Path -> Partition:
+ #### A masked pattern was here ####
+           Partition
+-            base file name: Values__Tmp__Table__2
++            base file name: Values__Tmp__Table__3
+             input format: org.apache.hadoop.mapred.TextInputFormat
+             output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+             properties:
+@@ -90,8 +119,8 @@ STAGE PLANS:
+               columns.comments 
+               columns.types string
+ #### A masked pattern was here ####
+-              name default.values__tmp__table__2
+-              serialization.ddl struct values__tmp__table__2 { string tmp_values_col1}
++              name default.values__tmp__table__3
++              serialization.ddl struct values__tmp__table__3 { string tmp_values_col1}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+             serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+@@ -104,13 +133,13 @@ STAGE PLANS:
+                 columns.comments 
+                 columns.types string
+ #### A masked pattern was here ####
+-                name default.values__tmp__table__2
+-                serialization.ddl struct values__tmp__table__2 { string tmp_values_col1}
++                name default.values__tmp__table__3
++                serialization.ddl struct values__tmp__table__3 { string tmp_values_col1}
+                 serialization.format 1
+                 serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+               serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              name: default.values__tmp__table__2
+-            name: default.values__tmp__table__2
++              name: default.values__tmp__table__3
++            name: default.values__tmp__table__3
+       Truncated Path -> Alias:
+ #### A masked pattern was here ####
+ 
+@@ -133,6 +162,7 @@ STAGE PLANS:
+               input format: org.apache.hadoop.mapred.TextInputFormat
+               output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+               properties:
++                COLUMN_STATS_ACCURATE true
+                 bucket_count -1
+                 columns value
+                 columns.comments 
+@@ -140,11 +170,13 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+                 location ### test.blobstore.path ###/qtest
+                 name default.qtest
+-                numFiles 1
++                numFiles 0
++                numRows 8
++                rawDataSize 20
+                 serialization.ddl struct qtest { i32 value}
+                 serialization.format 1
+                 serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 14
++                totalSize 0
+ #### A masked pattern was here ####
+               serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+               name: default.qtest
+@@ -167,6 +199,7 @@ STAGE PLANS:
+                   input format: org.apache.hadoop.mapred.TextInputFormat
+                   output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+                   properties:
++                    COLUMN_STATS_ACCURATE true
+                     bucket_count -1
+                     columns value
+                     columns.comments 
+@@ -174,11 +207,13 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+                     location ### test.blobstore.path ###/qtest
+                     name default.qtest
+-                    numFiles 1
++                    numFiles 0
++                    numRows 8
++                    rawDataSize 20
+                     serialization.ddl struct qtest { i32 value}
+                     serialization.format 1
+                     serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    totalSize 14
++                    totalSize 0
+ #### A masked pattern was here ####
+                   serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+                   name: default.qtest
+@@ -194,6 +229,7 @@ STAGE PLANS:
+             input format: org.apache.hadoop.mapred.TextInputFormat
+             output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+             properties:
++              COLUMN_STATS_ACCURATE true
+               bucket_count -1
+               columns value
+               columns.comments 
+@@ -201,17 +237,20 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+               location ### test.blobstore.path ###/qtest
+               name default.qtest
+-              numFiles 1
++              numFiles 0
++              numRows 8
++              rawDataSize 20
+               serialization.ddl struct qtest { i32 value}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 14
++              totalSize 0
+ #### A masked pattern was here ####
+             serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+           
+               input format: org.apache.hadoop.mapred.TextInputFormat
+               output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+               properties:
++                COLUMN_STATS_ACCURATE true
+                 bucket_count -1
+                 columns value
+                 columns.comments 
+@@ -219,11 +258,13 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+                 location ### test.blobstore.path ###/qtest
+                 name default.qtest
+-                numFiles 1
++                numFiles 0
++                numRows 8
++                rawDataSize 20
+                 serialization.ddl struct qtest { i32 value}
+                 serialization.format 1
+                 serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 14
++                totalSize 0
+ #### A masked pattern was here ####
+               serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+               name: default.qtest
+@@ -245,6 +286,7 @@ STAGE PLANS:
+                   input format: org.apache.hadoop.mapred.TextInputFormat
+                   output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+                   properties:
++                    COLUMN_STATS_ACCURATE true
+                     bucket_count -1
+                     columns value
+                     columns.comments 
+@@ -252,11 +294,13 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+                     location ### test.blobstore.path ###/qtest
+                     name default.qtest
+-                    numFiles 1
++                    numFiles 0
++                    numRows 8
++                    rawDataSize 20
+                     serialization.ddl struct qtest { i32 value}
+                     serialization.format 1
+                     serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    totalSize 14
++                    totalSize 0
+ #### A masked pattern was here ####
+                   serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+                   name: default.qtest
+@@ -272,6 +316,7 @@ STAGE PLANS:
+             input format: org.apache.hadoop.mapred.TextInputFormat
+             output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+             properties:
++              COLUMN_STATS_ACCURATE true
+               bucket_count -1
+               columns value
+               columns.comments 
+@@ -279,17 +324,20 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+               location ### test.blobstore.path ###/qtest
+               name default.qtest
+-              numFiles 1
++              numFiles 0
++              numRows 8
++              rawDataSize 20
+               serialization.ddl struct qtest { i32 value}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 14
++              totalSize 0
+ #### A masked pattern was here ####
+             serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+           
+               input format: org.apache.hadoop.mapred.TextInputFormat
+               output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+               properties:
++                COLUMN_STATS_ACCURATE true
+                 bucket_count -1
+                 columns value
+                 columns.comments 
+@@ -297,11 +345,13 @@ STAGE PLANS:
+ #### A masked pattern was here ####
+                 location ### test.blobstore.path ###/qtest
+                 name default.qtest
+-                numFiles 1
++                numFiles 0
++                numRows 8
++                rawDataSize 20
+                 serialization.ddl struct qtest { i32 value}
+                 serialization.format 1
+                 serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 14
++                totalSize 0
+ #### A masked pattern was here ####
+               serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+               name: default.qtest
+@@ -328,3 +378,7 @@ POSTHOOK: Input: default@qtest
+ 10
+ 100
+ 1000
++2
++20
++200
++2000
+diff --git a/itests/hive-blobstore/src/test/results/clientpositive/write_final_output_blobstore.q.out b/itests/hive-blobstore/src/test/results/clientpositive/write_final_output_blobstore.q.out
+index 1b1ea97..8aa901e 100644
+--- a/itests/hive-blobstore/src/test/results/clientpositive/write_final_output_blobstore.q.out
++++ b/itests/hive-blobstore/src/test/results/clientpositive/write_final_output_blobstore.q.out
+@@ -36,6 +36,37 @@ PREHOOK: query: EXPLAIN EXTENDED FROM hdfs_table INSERT OVERWRITE TABLE blobstor
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN EXTENDED FROM hdfs_table INSERT OVERWRITE TABLE blobstore_table SELECT hdfs_table.key GROUP BY hdfs_table.key ORDER BY hdfs_table.key
+ POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_QUERY
++   TOK_FROM
++      TOK_TABREF
++         TOK_TABNAME
++            hdfs_table
++   TOK_INSERT
++      TOK_DESTINATION
++         TOK_TAB
++            TOK_TABNAME
++               blobstore_table
++      TOK_SELECT
++         TOK_SELEXPR
++            .
++               TOK_TABLE_OR_COL
++                  hdfs_table
++               key
++      TOK_GROUPBY
++         .
++            TOK_TABLE_OR_COL
++               hdfs_table
++            key
++      TOK_ORDERBY
++         TOK_TABSORTCOLNAMEASC
++            .
++               TOK_TABLE_OR_COL
++                  hdfs_table
++               key
++
++
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-2 depends on stages: Stage-1
+@@ -52,16 +83,15 @@ STAGE PLANS:
+             GatherStats: false
+             Select Operator
+               expressions: key (type: int)
+-              outputColumnNames: key
++              outputColumnNames: _col0
+               Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+               Group By Operator
+-                keys: key (type: int)
++                keys: _col0 (type: int)
+                 mode: hash
+                 outputColumnNames: _col0
+                 Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+                 Reduce Output Operator
+                   key expressions: _col0 (type: int)
+-                  null sort order: a
+                   sort order: +
+                   Map-reduce partition columns: _col0 (type: int)
+                   Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+@@ -76,46 +106,36 @@ STAGE PLANS:
+             input format: org.apache.hadoop.mapred.TextInputFormat
+             output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+             properties:
+-              COLUMN_STATS_ACCURATE {"BASIC_STATS":"true"}
+               bucket_count -1
+               columns key
+               columns.comments 
+               columns.types int
+ #### A masked pattern was here ####
+               name default.hdfs_table
+-              numFiles 0
+-              numRows 0
+-              rawDataSize 0
+               serialization.ddl struct hdfs_table { i32 key}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 0
+ #### A masked pattern was here ####
+             serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+           
+               input format: org.apache.hadoop.mapred.TextInputFormat
+               output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+               properties:
+-                COLUMN_STATS_ACCURATE {"BASIC_STATS":"true"}
+                 bucket_count -1
+                 columns key
+                 columns.comments 
+                 columns.types int
+ #### A masked pattern was here ####
+                 name default.hdfs_table
+-                numFiles 0
+-                numRows 0
+-                rawDataSize 0
+                 serialization.ddl struct hdfs_table { i32 key}
+                 serialization.format 1
+                 serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 0
+ #### A masked pattern was here ####
+               serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+               name: default.hdfs_table
+             name: default.hdfs_table
+       Truncated Path -> Alias:
+-        /hdfs_table [hdfs_table]
++        /hdfs_table [$hdt$_0:$hdt$_0:hdfs_table]
+       Needs Tagging: false
+       Reduce Operator Tree:
+         Group By Operator
+@@ -148,7 +168,6 @@ STAGE PLANS:
+             GatherStats: false
+             Reduce Output Operator
+               key expressions: _col0 (type: int)
+-              null sort order: a
+               sort order: +
+               Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+               tag: -1
+@@ -243,6 +262,37 @@ PREHOOK: query: EXPLAIN EXTENDED FROM hdfs_table INSERT OVERWRITE TABLE blobstor
+ PREHOOK: type: QUERY
+ POSTHOOK: query: EXPLAIN EXTENDED FROM hdfs_table INSERT OVERWRITE TABLE blobstore_table SELECT hdfs_table.key GROUP BY hdfs_table.key ORDER BY hdfs_table.key
+ POSTHOOK: type: QUERY
++ABSTRACT SYNTAX TREE:
++  
++TOK_QUERY
++   TOK_FROM
++      TOK_TABREF
++         TOK_TABNAME
++            hdfs_table
++   TOK_INSERT
++      TOK_DESTINATION
++         TOK_TAB
++            TOK_TABNAME
++               blobstore_table
++      TOK_SELECT
++         TOK_SELEXPR
++            .
++               TOK_TABLE_OR_COL
++                  hdfs_table
++               key
++      TOK_GROUPBY
++         .
++            TOK_TABLE_OR_COL
++               hdfs_table
++            key
++      TOK_ORDERBY
++         TOK_TABSORTCOLNAMEASC
++            .
++               TOK_TABLE_OR_COL
++                  hdfs_table
++               key
++
++
+ STAGE DEPENDENCIES:
+   Stage-1 is a root stage
+   Stage-2 depends on stages: Stage-1
+@@ -259,16 +309,15 @@ STAGE PLANS:
+             GatherStats: false
+             Select Operator
+               expressions: key (type: int)
+-              outputColumnNames: key
++              outputColumnNames: _col0
+               Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+               Group By Operator
+-                keys: key (type: int)
++                keys: _col0 (type: int)
+                 mode: hash
+                 outputColumnNames: _col0
+                 Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+                 Reduce Output Operator
+                   key expressions: _col0 (type: int)
+-                  null sort order: a
+                   sort order: +
+                   Map-reduce partition columns: _col0 (type: int)
+                   Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+@@ -283,46 +332,36 @@ STAGE PLANS:
+             input format: org.apache.hadoop.mapred.TextInputFormat
+             output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+             properties:
+-              COLUMN_STATS_ACCURATE {"BASIC_STATS":"true"}
+               bucket_count -1
+               columns key
+               columns.comments 
+               columns.types int
+ #### A masked pattern was here ####
+               name default.hdfs_table
+-              numFiles 0
+-              numRows 0
+-              rawDataSize 0
+               serialization.ddl struct hdfs_table { i32 key}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-              totalSize 0
+ #### A masked pattern was here ####
+             serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+           
+               input format: org.apache.hadoop.mapred.TextInputFormat
+               output format: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+               properties:
+-                COLUMN_STATS_ACCURATE {"BASIC_STATS":"true"}
+                 bucket_count -1
+                 columns key
+                 columns.comments 
+                 columns.types int
+ #### A masked pattern was here ####
+                 name default.hdfs_table
+-                numFiles 0
+-                numRows 0
+-                rawDataSize 0
+                 serialization.ddl struct hdfs_table { i32 key}
+                 serialization.format 1
+                 serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                totalSize 0
+ #### A masked pattern was here ####
+               serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+               name: default.hdfs_table
+             name: default.hdfs_table
+       Truncated Path -> Alias:
+-        /hdfs_table [hdfs_table]
++        /hdfs_table [$hdt$_0:$hdt$_0:hdfs_table]
+       Needs Tagging: false
+       Reduce Operator Tree:
+         Group By Operator
+@@ -355,7 +394,6 @@ STAGE PLANS:
+             GatherStats: false
+             Reduce Output Operator
+               key expressions: _col0 (type: int)
+-              null sort order: a
+               sort order: +
+               Statistics: Num rows: 1 Data size: 0 Basic stats: PARTIAL Column stats: NONE
+               tag: -1
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 4672fbfb..99930d8 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -52,6 +52,7 @@
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.commons.io.FilenameUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -2521,31 +2522,16 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+       for (final FileStatus srcFile : files) {
+         final Path srcP = srcFile.getPath();
+         final boolean needToCopy = needToCopy(srcP, destf, srcFs, destFs);
+-        // Strip off the file type, if any so we don't make:
+-        // 000000_0.gz -> 000000_0.gz_copy_1
+-        final String name;
+-        final String filetype;
+-        String itemName = srcP.getName();
+-        int index = itemName.lastIndexOf('.');
+-        if (index >= 0) {
+-          filetype = itemName.substring(index);
+-          name = itemName.substring(0, index);
+-        } else {
+-          name = itemName;
+-          filetype = "";
+-        }
+ 
++        final boolean isRenameAllowed = !needToCopy && !isSrcLocal;
++        // If we do a rename for a non-local file, we will be transfering the original
++        // file permissions from source to the destination. Else, in case of mvFile() where we
++        // copy from source to destination, we will inherit the destination's parent group ownership.
+         final String srcGroup = srcFile.getGroup();
+         if (null == pool) {
+-          Path destPath = new Path(destf, srcP.getName());
+           try {
+-            if (!needToCopy && !isSrcLocal) {
+-              for (int counter = 1; !destFs.rename(srcP,destPath); counter++) {
+-                destPath = new Path(destf, name + ("_copy_" + counter) + filetype);
+-              }
+-            } else {
+-              destPath = mvFile(conf, srcP, destPath, isSrcLocal, srcFs, destFs, name, filetype);
+-            }
++            Path destPath = mvFile(conf, srcFs, srcP, destFs, destf, isSrcLocal, isRenameAllowed);
++
+             if (null != newFiles) {
+               newFiles.add(destPath);
+             }
+@@ -2558,14 +2544,8 @@ private static void copyFiles(final HiveConf conf, final FileSystem destFs,
+             @Override
+             public ObjectPair<Path, Path> call() throws Exception {
+               SessionState.setCurrentSessionState(parentSession);
+-              Path destPath = new Path(destf, srcP.getName());
+-              if (!needToCopy && !isSrcLocal) {
+-                for (int counter = 1; !destFs.rename(srcP,destPath); counter++) {
+-                  destPath = new Path(destf, name + ("_copy_" + counter) + filetype);
+-                }
+-              } else {
+-                destPath = mvFile(conf, srcP, destPath, isSrcLocal, srcFs, destFs, name, filetype);
+-              }
++
++              Path destPath = mvFile(conf, srcFs, srcP, destFs, destf, isSrcLocal, isRenameAllowed);
+ 
+               if (inheritPerms) {
+                 ShimLoader.getHadoopShims().setFullFileStatus(conf, fullDestStatus, srcGroup, destFs, destPath, false);
+@@ -2657,6 +2637,53 @@ private static String getQualifiedPathWithoutSchemeAndAuthority(Path srcf, FileS
+     return ShimLoader.getHadoopShims().getPathWithoutSchemeAndAuthority(path).toString();
+   }
+ 
++  private static Path mvFile(HiveConf conf, FileSystem sourceFs, Path sourcePath, FileSystem destFs, Path destDirPath,
++                             boolean isSrcLocal, boolean isRenameAllowed) throws IOException {
++
++    boolean isBlobStoragePath = BlobStorageUtils.isBlobStoragePath(conf, destDirPath);
++
++    // Strip off the file type, if any so we don't make:
++    // 000000_0.gz -> 000000_0.gz_copy_1
++    final String fullname = sourcePath.getName();
++    final String name = FilenameUtils.getBaseName(sourcePath.getName());
++    final String type = FilenameUtils.getExtension(sourcePath.getName());
++
++    Path destFilePath = new Path(destDirPath, fullname);
++
++    /*
++       * The below loop may perform bad when the destination file already exists and it has too many _copy_
++       * files as well. A desired approach was to call listFiles() and get a complete list of files from
++       * the destination, and check whether the file exists or not on that list. However, millions of files
++       * could live on the destination directory, and on concurrent situations, this can cause OOM problems.
++       *
++       * I'll leave the below loop for now until a better approach is found.
++       */
++    
++    int counter = 1;
++    if (!isRenameAllowed || isBlobStoragePath) {
++      while (destFs.exists(destFilePath)) {
++        destFilePath =  new Path(destDirPath, name + ("_copy_" + counter) + type);
++        counter++;
++      }
++    }
++
++    if (isRenameAllowed) {
++      while (!destFs.rename(sourcePath, destFilePath)) {
++        destFilePath =  new Path(destDirPath, name + ("_copy_" + counter) + type);
++        counter++;
++      }
++    } else if (isSrcLocal) {
++      destFs.copyFromLocalFile(sourcePath, destFilePath);
++    } else {
++      FileUtils.copy(sourceFs, sourcePath, destFs, destFilePath,
++          true,   // delete source
++          false,  // overwrite destination
++          conf);
++    }
++
++    return destFilePath;
++  }
++
+   // Clears the dest dir when src is sub-dir of dest.
+   public static void clearDestForSubDirSrc(final HiveConf conf, Path dest,
+                                            Path src, boolean isSrcLocal) throws IOException {
+-- 
+1.7.9.5
+

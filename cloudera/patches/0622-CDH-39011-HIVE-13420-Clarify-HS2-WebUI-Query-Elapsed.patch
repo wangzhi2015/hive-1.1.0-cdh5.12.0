@@ -1,0 +1,208 @@
+From 25cf16c72f48775ecead4554b3b319d14e252676 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Sun, 10 Apr 2016 01:07:44 -0700
+Subject: [PATCH 0622/1164] CDH-39011 : HIVE-13420 : Clarify HS2 WebUI Query
+ 'Elapsed Time' (Szehon, reviewed by Aihua Xu and
+ Mohit Sabharwal)
+
+Change-Id: I23f612ef38aaf16baffa948fd40624193c3f5cb4
+---
+ .../hive/service/cli/session/TestQueryDisplay.java |    2 ++
+ .../org/apache/hive/tmpl/QueryProfileTmpl.jamon    |   16 ++++++++------
+ .../hive/service/cli/operation/Operation.java      |    2 +-
+ .../hive/service/cli/operation/SQLOperation.java   |    5 +++++
+ .../service/cli/operation/SQLOperationDisplay.java |    9 ++++++++
+ .../hive-webapps/hiveserver2/hiveserver2.jsp       |   22 ++++++++++++--------
+ 6 files changed, 40 insertions(+), 16 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
+index 4cda428..5a889d5 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
+@@ -151,8 +151,10 @@ private void verifyDDL(SQLOperationDisplay display, String stmt, String handle,
+     if (finished) {
+       Assert.assertTrue(display.getEndTime() > 0 && display.getEndTime() >= display.getBeginTime()
+         && display.getEndTime() <= System.currentTimeMillis());
++      Assert.assertTrue(display.getRuntime() > 0);
+     } else {
+       Assert.assertNull(display.getEndTime());
++      //For runtime, query may have finished.
+     }
+ 
+     QueryDisplay qDisplay1 = display.getQueryDisplay();
+diff --git a/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon b/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon
+index 1831d9f..dd98e43 100644
+--- a/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon
++++ b/service/src/jamon/org/apache/hive/tmpl/QueryProfileTmpl.jamon
+@@ -129,7 +129,7 @@ org.apache.hive.service.cli.operation.SQLOperationDisplay;
+             <td><% sod.getQueryDisplay() == null ? "Unknown" : sod.getQueryDisplay().getQueryString() %></td>
+         </tr>
+         <tr>
+-            <td>Query Id</td>
++            <td>Id</td>
+             <td><% sod.getQueryDisplay() == null ? "Unknown" : sod.getQueryDisplay().getQueryId() %></td>
+         </tr>
+         <tr>
+@@ -141,23 +141,27 @@ org.apache.hive.service.cli.operation.SQLOperationDisplay;
+             <td><% sod.getState() %></td>
+         </tr>
+         <tr>
+-            <td>Begin Time</td>
++            <td>Opened Timestamp</td>
+             <td><% new Date(sod.getBeginTime()) %></td>
+         </tr>
+         <tr>
+-            <td>Elapsed Time (s)</td>
++            <td>Opened (s)</td>
+             <td><% sod.getElapsedTime()/1000 %></td>
+         </tr>
+         <tr>
+-            <td>End Time</td>
+-            <td><% sod.getEndTime() == null ? "In Progress" : new Date(sod.getEndTime()) %></td>
++            <td>Closed Timestamp</td>
++            <td><% sod.getEndTime() == null ? "Open" : new Date(sod.getEndTime()) %></td>
+         </tr>
+         <%if sod.getQueryDisplay() != null && sod.getQueryDisplay().getErrorMessage() != null %>
+             <tr>
+                 <td>Error</td>
+-                <td><% sod.getEndTime() == null ? "In Progress" : new Date(sod.getEndTime()) %></td>
++                <td><% sod.getQueryDisplay().getErrorMessage() %></td>
+             </tr>
+         </%if>
++        <tr>
++            <td>Latency (s)</td>
++            <td><% sod.getRuntime()/1000 %></td>
++        </tr>
+     </table>
+ </%def>
+ 
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index c5afa22..1367639 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -447,7 +447,7 @@ protected OperationState getState() {
+   protected void onNewState(OperationState state, OperationState prevState) {
+     switch(state) {
+       case RUNNING:
+-      markOperationStartTime();
++        markOperationStartTime();
+         break;
+       case ERROR:
+       case FINISHED:
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index 1ec1fe0..d882b0f 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -555,6 +555,11 @@ protected void onNewState(OperationState state, OperationState prevState) {
+       }
+     }
+ 
++    if (state == OperationState.FINISHED || state == OperationState.CANCELED || state == OperationState.ERROR) {
++      //update runtime
++      sqlOpDisplay.setRuntime(getOperationComplete() - getOperationStart());
++    }
++
+     if (state == OperationState.CLOSED) {
+       sqlOpDisplay.closed();
+     } else {
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperationDisplay.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperationDisplay.java
+index d2ca1e7..fe93426 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperationDisplay.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperationDisplay.java
+@@ -32,6 +32,7 @@
+   public final String executionEngine;
+   public final long beginTime;
+   public final String operationId;
++  public Long runtime;  //tracks only running portion of the query.
+ 
+   public Long endTime;
+   public OperationState state;
+@@ -96,4 +97,12 @@ public String getOperationId() {
+   public synchronized void closed() {
+     this.endTime = System.currentTimeMillis();
+   }
++
++  public synchronized void setRuntime(long runtime) {
++    this.runtime = runtime;
++  }
++
++  public synchronized Long getRuntime() {
++    return runtime;
++  }
+ }
+diff --git a/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp b/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
+index 8b46550..293a8ef 100644
+--- a/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
++++ b/service/src/resources/hive-webapps/hiveserver2/hiveserver2.jsp
+@@ -125,15 +125,16 @@ for (HiveSession hiveSession: hiveSessions) {
+ </section>
+ 
+ <section>
+-<h2>Queries</h2>
++<h2>Open Queries</h2>
+ <table id="attributes_table" class="table table-striped">
+     <tr>
+         <th>User Name</th>
+         <th>Query</th>
+         <th>Execution Engine</th>
+         <th>State</th>
+-        <th>Begin Time</th>
+-        <th>Elapsed Time (s)</th>
++        <th>Opened Timestamp</th>
++        <th>Opened (s)</th>
++        <th>Latency (s)</th>
+         <th>Drilldown Link</th>
+     </tr>
+     <%
+@@ -149,30 +150,32 @@ for (HiveSession hiveSession: hiveSessions) {
+         <td><%= operation.getState() %></td>
+         <td><%= new Date(operation.getBeginTime()) %></td>
+         <td><%= operation.getElapsedTime()/1000 %></td>
++        <td><%= operation.getRuntime() == null ? "Not finished" : operation.getRuntime()/1000 %></td>
+         <% String link = "/query_page?operationId=" + operation.getOperationId(); %>
+-        <td>  <a href= <%= link %>>Query Drilldown</a> </td>
++        <td>  <a href= <%= link %>>Drilldown</a> </td>
+     </tr>
+ 
+ <%
+   }
+ %>
+ <tr>
+-  <td colspan="7">Total number of queries: <%= queries %></td>
++  <td colspan="8">Total number of queries: <%= queries %></td>
+ </tr>
+ </table>
+ </section>
+ 
+ 
+ <section>
+-<h2>Last Max <%= conf.get(ConfVars.HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES.varname) %> Completed Queries</h2>
++<h2>Last Max <%= conf.get(ConfVars.HIVE_SERVER2_WEBUI_MAX_HISTORIC_QUERIES.varname) %> Closed Queries</h2>
+ <table id="attributes_table" class="table table-striped">
+     <tr>
+         <th>User Name</th>
+         <th>Query</th>
+         <th>Execution Engine</th>
+         <th>State</th>
+-        <th>Elapsed Time (s)</th>
+-        <th>End Time</th>
++        <th>Opened (s)</th>
++        <th>Closed Timestamp</th>
++        <th>Latency (s)</th>
+         <th>Drilldown Link</th>
+     </tr>
+     <%
+@@ -188,8 +191,9 @@ for (HiveSession hiveSession: hiveSessions) {
+         <td><%= operation.getState() %></td>
+         <td><%= operation.getElapsedTime()/1000 %></td>
+         <td><%= operation.getEndTime() == null ? "In Progress" : new Date(operation.getEndTime()) %></td>
++        <td><%= operation.getRuntime()/1000 %></td>
+         <% String link = "/query_page?operationId=" + operation.getOperationId(); %>
+-        <td>  <a href= <%= link %>>Query Drilldown</a> </td>
++        <td>  <a href= <%= link %>>Drilldown</a> </td>
+     </tr>
+ 
+ <%
+-- 
+1.7.9.5
+

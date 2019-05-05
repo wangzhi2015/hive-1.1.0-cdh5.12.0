@@ -1,0 +1,3733 @@
+From faec3007eb2a57be95bc2b617aa56b5236b55323 Mon Sep 17 00:00:00 2001
+From: Sushanth Sowmyan <khorgath@apache.org>
+Date: Sat, 18 Apr 2015 19:04:46 +0000
+Subject: [PATCH 0563/1164] CDH-39326 : HIVE-10228 : Changes to Hive
+ Export/Import/DropTable/DropPartition to support
+ replication semantics (Sushanth Sowmyan, reviewed
+ by Alan Gates)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1674557 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit ad77a051e1fde89c0a3745a62e383c855eff4b71)
+
+Change-Id: I7ce6a0f73f10694d9db69f21edc83905059b36e8
+---
+ .../apache/hadoop/hive/common/StatsSetupConst.java |    5 +
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    5 +
+ .../hive/hcatalog/api/repl/ReplicationUtils.java   |    3 +-
+ .../hadoop/hive/metastore/MetaStoreUtils.java      |   10 +
+ .../java/org/apache/hadoop/hive/ql/ErrorMsg.java   |    2 +
+ .../org/apache/hadoop/hive/ql/exec/DDLTask.java    |  154 +++-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   20 +-
+ .../org/apache/hadoop/hive/ql/metadata/Table.java  |   18 +-
+ .../hadoop/hive/ql/parse/BaseSemanticAnalyzer.java |   21 +-
+ .../hadoop/hive/ql/parse/DDLSemanticAnalyzer.java  |   31 +-
+ .../org/apache/hadoop/hive/ql/parse/EximUtil.java  |  173 ++++-
+ .../hive/ql/parse/ExportSemanticAnalyzer.java      |  124 +++-
+ .../org/apache/hadoop/hive/ql/parse/HiveLexer.g    |    2 +
+ .../org/apache/hadoop/hive/ql/parse/HiveParser.g   |   30 +-
+ .../hadoop/hive/ql/parse/IdentifiersParser.g       |    2 +-
+ .../hive/ql/parse/ImportSemanticAnalyzer.java      |  768 ++++++++++++++------
+ .../hive/ql/parse/MetaDataExportListener.java      |    2 +-
+ .../hadoop/hive/ql/parse/ReplicationSpec.java      |  314 ++++++++
+ .../hadoop/hive/ql/plan/AddPartitionDesc.java      |   15 +
+ .../hadoop/hive/ql/plan/CreateTableDesc.java       |   14 +
+ .../apache/hadoop/hive/ql/plan/DropTableDesc.java  |   22 +-
+ ql/src/test/queries/clientpositive/repl_1_drop.q   |   84 +++
+ .../queries/clientpositive/repl_2_exim_basic.q     |   79 ++
+ .../queries/clientpositive/repl_3_exim_metadata.q  |   40 +
+ .../clientnegative/alter_table_add_partition.q.out |    2 +-
+ .../clientnegative/alter_view_failure5.q.out       |    2 +-
+ .../clientnegative/alter_view_failure7.q.out       |    2 +-
+ .../clientnegative/truncate_partition_column.q.out |    2 +-
+ .../test/results/clientpositive/repl_1_drop.q.out  |  345 +++++++++
+ .../results/clientpositive/repl_2_exim_basic.q.out |  494 +++++++++++++
+ .../clientpositive/repl_3_exim_metadata.q.out      |  222 ++++++
+ 31 files changed, 2661 insertions(+), 346 deletions(-)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/parse/ReplicationSpec.java
+ create mode 100644 ql/src/test/queries/clientpositive/repl_1_drop.q
+ create mode 100644 ql/src/test/queries/clientpositive/repl_2_exim_basic.q
+ create mode 100644 ql/src/test/queries/clientpositive/repl_3_exim_metadata.q
+ create mode 100644 ql/src/test/results/clientpositive/repl_1_drop.q.out
+ create mode 100644 ql/src/test/results/clientpositive/repl_2_exim_basic.q.out
+ create mode 100644 ql/src/test/results/clientpositive/repl_3_exim_metadata.q.out
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java b/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java
+index 34865a8..c70cdfb 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java
++++ b/common/src/java/org/apache/hadoop/hive/common/StatsSetupConst.java
+@@ -135,6 +135,11 @@ public String getAggregator(Configuration conf) {
+   // alterPartition/alterTable is happening via statsTask.
+   public static final String STATS_GENERATED_VIA_STATS_TASK = "STATS_GENERATED_VIA_STATS_TASK";
+ 
++  // This string constant is used by AlterHandler to figure out that it should not attempt to
++  // update stats. It is set by any client-side task which wishes to signal that no stats
++  // update should take place, such as with replication.
++  public static final String DO_NOT_UPDATE_STATS = "DO_NOT_UPDATE_STATS";
++
+   // This string constant will be persisted in metastore to indicate whether corresponding
+   // table or partition's statistics are accurate or not.
+   public static final String COLUMN_STATS_ACCURATE = "COLUMN_STATS_ACCURATE";
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index c0aa474..a06be29 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1581,6 +1581,11 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     // temporary variable for testing. This is added just to turn off this feature in case of a bug in
+     // deployment. It has not been documented in hive-default.xml intentionally, this should be removed
+     // once the feature is stable
++    HIVE_EXIM_RESTRICT_IMPORTS_INTO_REPLICATED_TABLES("hive.exim.strict.repl.tables",true,
++        "Parameter that determines if 'regular' (non-replication) export dumps can be\n" +
++        "imported on to tables that are the target of replication. If this parameter is\n" +
++        "set, regular imports will check if the destination table(if it exists) has a " +
++        "'repl.last.id' set on it. If so, it will fail."),
+     HIVE_MAPPER_CANNOT_SPAN_MULTIPLE_PARTITIONS("hive.mapper.cannot.span.multiple.partitions", false, ""),
+     HIVE_REWORK_MAPREDWORK("hive.rework.mapredwork", false,
+         "should rework the mapred work or not.\n" +
+diff --git a/hcatalog/webhcat/java-client/src/main/java/org/apache/hive/hcatalog/api/repl/ReplicationUtils.java b/hcatalog/webhcat/java-client/src/main/java/org/apache/hive/hcatalog/api/repl/ReplicationUtils.java
+index 15b125d..299a25d 100644
+--- a/hcatalog/webhcat/java-client/src/main/java/org/apache/hive/hcatalog/api/repl/ReplicationUtils.java
++++ b/hcatalog/webhcat/java-client/src/main/java/org/apache/hive/hcatalog/api/repl/ReplicationUtils.java
+@@ -23,6 +23,7 @@
+ import com.google.common.base.Objects;
+ import org.apache.commons.codec.binary.Base64;
+ import org.apache.commons.io.IOExceptionWithCause;
++import org.apache.hadoop.hive.ql.parse.ReplicationSpec;
+ import org.apache.hive.hcatalog.api.HCatDatabase;
+ import org.apache.hive.hcatalog.api.HCatPartition;
+ import org.apache.hive.hcatalog.api.HCatTable;
+@@ -40,7 +41,7 @@
+ 
+ public class ReplicationUtils {
+ 
+-  private final static String REPL_STATE_ID = "repl.last.id"; // TODO : define in ReplicationSpec, and point this to that once that's patched in.
++  private final static String REPL_STATE_ID = ReplicationSpec.KEY.CURR_STATE_ID.toString();
+ 
+   private ReplicationUtils(){
+     // dummy private constructor, since this class is a collection of static utility methods.
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+index a1fea3d..eadc61c 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreUtils.java
+@@ -195,6 +195,16 @@ public static boolean updateUnpartitionedTableStatsFast(Table tbl,
+       FileStatus[] fileStatus, boolean newDir, boolean forceRecompute) throws MetaException {
+ 
+     Map<String,String> params = tbl.getParameters();
++
++    if ((params!=null) && params.containsKey(StatsSetupConst.DO_NOT_UPDATE_STATS)){
++      boolean doNotUpdateStats = Boolean.valueOf(params.get(StatsSetupConst.DO_NOT_UPDATE_STATS));
++      params.remove(StatsSetupConst.DO_NOT_UPDATE_STATS);
++      tbl.setParameters(params); // to make sure we remove this marker property
++      if (doNotUpdateStats){
++        return false;
++      }
++    }
++
+     boolean updated = false;
+     if (forceRecompute ||
+         params == null ||
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+index 419168b..8b34513 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+@@ -430,6 +430,8 @@
+ 
+   DROP_NATIVE_FUNCTION(10301, "Cannot drop native function"),
+   COMPILE_LOCK_TIMED_OUT(10308, "Attempt to acquire compile lock timed out.", true),
++  UPDATE_CANNOT_UPDATE_BUCKET_VALUE(10302, "Updating values of bucketing columns is not supported.  Column {0}.", true),
++  IMPORT_INTO_STRICT_REPL_TABLE(10303,"Non-repl import disallowed against table that is a destination of replication."),
+   //========================== 20000 range starts here ========================//
+   SCRIPT_INIT_ERROR(20000, "Unable to initialize custom script."),
+   SCRIPT_IO_ERROR(20001, "An error occurred while reading or writing to your custom script. "
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+index 2436f2d..f7dbb70 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/DDLTask.java
+@@ -18,6 +18,37 @@
+ 
+ package org.apache.hadoop.hive.ql.exec;
+ 
++import static org.apache.commons.lang.StringUtils.join;
++import static org.apache.hadoop.util.StringUtils.stringifyException;
++import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
++
++import java.io.BufferedWriter;
++import java.io.DataOutputStream;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.OutputStreamWriter;
++import java.io.Serializable;
++import java.io.Writer;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.sql.SQLException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Map.Entry;
++import java.util.Set;
++import java.util.SortedSet;
++import java.util.TreeMap;
++import java.util.TreeSet;
++
++import com.google.common.collect.Iterables;
+ import org.apache.commons.lang.StringEscapeUtils;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+@@ -84,12 +115,14 @@
+ import org.apache.hadoop.hive.ql.metadata.HiveUtils;
+ import org.apache.hadoop.hive.ql.metadata.InvalidTableException;
+ import org.apache.hadoop.hive.ql.metadata.Partition;
++import org.apache.hadoop.hive.ql.metadata.PartitionIterable;
+ import org.apache.hadoop.hive.ql.metadata.Table;
+ import org.apache.hadoop.hive.ql.metadata.formatting.MetaDataFormatUtils;
+ import org.apache.hadoop.hive.ql.metadata.formatting.MetaDataFormatter;
+ import org.apache.hadoop.hive.ql.parse.AlterTablePartMergeFilesDesc;
+ import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
+ import org.apache.hadoop.hive.ql.parse.DDLSemanticAnalyzer;
++import org.apache.hadoop.hive.ql.parse.ReplicationSpec;
+ import org.apache.hadoop.hive.ql.plan.AddPartitionDesc;
+ import org.apache.hadoop.hive.ql.plan.AlterDatabaseDesc;
+ import org.apache.hadoop.hive.ql.plan.AlterIndexDesc;
+@@ -180,36 +213,6 @@
+ import org.apache.hive.common.util.AnnotationUtils;
+ import org.stringtemplate.v4.ST;
+ 
+-import java.io.BufferedWriter;
+-import java.io.DataOutputStream;
+-import java.io.FileNotFoundException;
+-import java.io.IOException;
+-import java.io.OutputStreamWriter;
+-import java.io.Serializable;
+-import java.io.Writer;
+-import java.net.URI;
+-import java.net.URISyntaxException;
+-import java.sql.SQLException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.Comparator;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.Iterator;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Map.Entry;
+-import java.util.Set;
+-import java.util.SortedSet;
+-import java.util.TreeMap;
+-import java.util.TreeSet;
+-
+-import static org.apache.hadoop.hive.metastore.api.hive_metastoreConstants.META_TABLE_STORAGE;
+-import static org.apache.commons.lang.StringUtils.join;
+-import static org.apache.hadoop.util.StringUtils.stringifyException;
+-
+ /**
+  * DDLTask implementation.
+  *
+@@ -3637,6 +3640,39 @@ private void dropTableOrPartitions(Hive db, DropTableDesc dropTbl) throws HiveEx
+   }
+ 
+   private void dropPartitions(Hive db, Table tbl, DropTableDesc dropTbl) throws HiveException {
++
++    ReplicationSpec replicationSpec = dropTbl.getReplicationSpec();
++    if (replicationSpec.isInReplicationScope()){
++      /**
++       * ALTER TABLE DROP PARTITION ... FOR REPLICATION(x) behaves as a DROP PARTITION IF OLDER THAN x
++       *
++       * So, we check each partition that matches our DropTableDesc.getPartSpecs(), and drop it only
++       * if it's older than the event that spawned this replicated request to drop partition
++       */
++      // TODO: Current implementation of replication will result in DROP_PARTITION under replication
++      // scope being called per-partition instead of multiple partitions. However, to be robust, we
++      // must still handle the case of multiple partitions in case this assumption changes in the
++      // future. However, if this assumption changes, we will not be very performant if we fetch
++      // each partition one-by-one, and then decide on inspection whether or not this is a candidate
++      // for dropping. Thus, we need a way to push this filter (replicationSpec.allowEventReplacementInto)
++      // to the  metastore to allow it to do drop a partition or not, depending on a Predicate on the
++      // parameter key values.
++      for (DropTableDesc.PartSpec partSpec : dropTbl.getPartSpecs()){
++        try {
++          for (Partition p : Iterables.filter(
++              db.getPartitionsByFilter(tbl, partSpec.getPartSpec().getExprString()),
++              replicationSpec.allowEventReplacementInto())){
++            db.dropPartition(tbl.getDbName(),tbl.getTableName(),p.getValues(),true);
++          }
++        } catch (NoSuchObjectException e){
++          // ignore NSOE because that means there's nothing to drop.
++        } catch (Exception e) {
++          throw new HiveException(e.getMessage(), e);
++        }
++      }
++      return;
++    }
++
+     // ifExists is currently verified in DDLSemanticAnalyzer
+     List<Partition> droppedParts
+         = db.dropPartitions(dropTbl.getTableName(),
+@@ -3679,6 +3715,46 @@ private void dropTable(Hive db, Table tbl, DropTableDesc dropTbl) throws HiveExc
+           " is protected from being dropped");
+     }
+ 
++    ReplicationSpec replicationSpec = dropTbl.getReplicationSpec();
++    if ((tbl!= null) && replicationSpec.isInReplicationScope()){
++      /**
++       * DROP TABLE FOR REPLICATION behaves differently from DROP TABLE IF EXISTS - it more closely
++       * matches a DROP TABLE IF OLDER THAN(x) semantic.
++       *
++       * Ideally, commands executed under the scope of replication need to be idempotent and resilient
++       * to repeats. What can happen, sometimes, is that a drone processing a replication task can
++       * have been abandoned for not returning in time, but still execute its task after a while,
++       * which should not result in it mucking up data that has been impressed later on. So, for eg.,
++       * if we create partition P1, followed by droppping it, followed by creating it yet again,
++       * the replication of that drop should not drop the newer partition if it runs after the destination
++       * object is already in the newer state.
++       *
++       * Thus, we check the replicationSpec.allowEventReplacementInto to determine whether or not we can
++       * drop the object in question(will return false if object is newer than the event, true if not)
++       *
++       * In addition, since DROP TABLE FOR REPLICATION can result in a table not being dropped, while DROP
++       * TABLE will always drop the table, and the included partitions, DROP TABLE FOR REPLICATION must
++       * do one more thing - if it does not drop the table because the table is in a newer state, it must
++       * drop the partitions inside it that are older than this event. To wit, DROP TABLE FOR REPL
++       * acts like a recursive DROP TABLE IF OLDER.
++       */
++      if (!replicationSpec.allowEventReplacementInto(tbl)){
++        // Drop occured as part of replicating a drop, but the destination
++        // table was newer than the event being replicated. Ignore, but drop
++        // any partitions inside that are older.
++        if (tbl.isPartitioned()){
++
++          PartitionIterable partitions = new PartitionIterable(db,tbl,null,conf.getIntVar(
++              HiveConf.ConfVars.METASTORE_BATCH_RETRIEVE_MAX));
++
++          for (Partition p : Iterables.filter(partitions, replicationSpec.allowEventReplacementInto())){
++            db.dropPartition(tbl.getDbName(),tbl.getTableName(),p.getValues(),true);
++          }
++        }
++        return; // table is newer, leave it be.
++      }
++    }
++
+     int partitionBatchSize = HiveConf.getIntVar(conf,
+         ConfVars.METASTORE_BATCH_RETRIEVE_TABLE_PARTITION_MAX);
+ 
+@@ -3838,7 +3914,12 @@ private int switchDatabase(Hive db, SwitchDatabaseDesc switchDb)
+    */
+   private int createTable(Hive db, CreateTableDesc crtTbl) throws HiveException {
+     // create the table
+-    Table tbl = db.newTable(crtTbl.getTableName());
++    Table tbl;
++    if (crtTbl.getDatabaseName() == null || (crtTbl.getTableName().contains("."))){
++      tbl = db.newTable(crtTbl.getTableName());
++    }else {
++      tbl = new Table(crtTbl.getDatabaseName(),crtTbl.getTableName());
++    }
+ 
+     if (crtTbl.getTblProps() != null) {
+       tbl.getTTable().getParameters().putAll(crtTbl.getTblProps());
+@@ -3990,7 +4071,16 @@ private int createTable(Hive db, CreateTableDesc crtTbl) throws HiveException {
+     }
+ 
+     // create the table
+-    db.createTable(tbl, crtTbl.getIfNotExists());
++    if (crtTbl.getReplaceMode()){
++      // replace-mode creates are really alters using CreateTableDesc.
++      try {
++        db.alterTable(tbl.getDbName()+"."+tbl.getTableName(),tbl);
++      } catch (InvalidOperationException e) {
++        throw new HiveException("Unable to alter table. " + e.getMessage(), e);
++      }
++    } else {
++      db.createTable(tbl, crtTbl.getIfNotExists());
++    }
+     work.getOutputs().add(new WriteEntity(tbl, WriteEntity.WriteType.DDL_NO_LOCK));
+     return 0;
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 14d21fb..912017d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -1738,10 +1738,22 @@ public Partition createPartition(Table tbl, Map<String, String> partSpec) throws
+     }
+     List<Partition> out = new ArrayList<Partition>();
+     try {
+-      // TODO: normally, the result is not necessary; might make sense to pass false
+-      for (org.apache.hadoop.hive.metastore.api.Partition outPart
+-          : getMSC().add_partitions(in, addPartitionDesc.isIfNotExists(), true)) {
+-        out.add(new Partition(tbl, outPart));
++      if (!addPartitionDesc.getReplaceMode()){
++        // TODO: normally, the result is not necessary; might make sense to pass false
++        for (org.apache.hadoop.hive.metastore.api.Partition outPart
++            : getMSC().add_partitions(in, addPartitionDesc.isIfNotExists(), true)) {
++          out.add(new Partition(tbl, outPart));
++        }
++      } else {
++        getMSC().alter_partitions(addPartitionDesc.getDbName(), addPartitionDesc.getTableName(), in);
++        List<String> part_names = new ArrayList<String>();
++        for (org.apache.hadoop.hive.metastore.api.Partition p: in){
++          part_names.add(Warehouse.makePartName(tbl.getPartitionKeys(), p.getValues()));
++        }
++        for ( org.apache.hadoop.hive.metastore.api.Partition outPart :
++        getMSC().getPartitionsByNames(addPartitionDesc.getDbName(), addPartitionDesc.getTableName(),part_names)){
++          out.add(new Partition(tbl,outPart));
++        }
+       }
+     } catch (Exception e) {
+       LOG.error(StringUtils.stringifyException(e));
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+index 2e76cbf..806854f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+@@ -333,17 +333,27 @@ public HiveStorageHandler getStorageHandler() {
+     return outputFormatClass;
+   }
+ 
++  /**
++   * Marker SemanticException, so that processing that allows for table validation failures
++   * and appropriately handles them can recover from these types of SemanticExceptions
++   */
++  public class ValidationFailureSemanticException extends SemanticException{
++    public ValidationFailureSemanticException(String s) {
++      super(s);
++    }
++  };
++
+   final public void validatePartColumnNames(
+       Map<String, String> spec, boolean shouldBeFull) throws SemanticException {
+     List<FieldSchema> partCols = tTable.getPartitionKeys();
+     if (partCols == null || (partCols.size() == 0)) {
+       if (spec != null) {
+-        throw new SemanticException("table is not partitioned but partition spec exists: " + spec);
++        throw new ValidationFailureSemanticException("table is not partitioned but partition spec exists: " + spec);
+       }
+       return;
+     } else if (spec == null) {
+       if (shouldBeFull) {
+-        throw new SemanticException("table is partitioned but partition spec is not specified");
++        throw new ValidationFailureSemanticException("table is partitioned but partition spec is not specified");
+       }
+       return;
+     }
+@@ -355,10 +365,10 @@ final public void validatePartColumnNames(
+       if (columnsFound == spec.size()) break;
+     }
+     if (columnsFound < spec.size()) {
+-      throw new SemanticException("Partition spec " + spec + " contains non-partition columns");
++      throw new ValidationFailureSemanticException("Partition spec " + spec + " contains non-partition columns");
+     }
+     if (shouldBeFull && (spec.size() != partCols.size())) {
+-      throw new SemanticException("partition spec " + spec
++      throw new ValidationFailureSemanticException("partition spec " + spec
+           + " doesn't contain all (" + partCols.size() + ") partition columns");
+     }
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/BaseSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/BaseSemanticAnalyzer.java
+index a0459c4..ac46270 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/BaseSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/BaseSemanticAnalyzer.java
+@@ -37,6 +37,7 @@
+ import org.antlr.runtime.tree.CommonTree;
+ import org.antlr.runtime.tree.Tree;
+ import org.apache.commons.lang3.StringUtils;
++import org.apache.commons.lang3.tuple.Pair;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.fs.Path;
+@@ -302,16 +303,28 @@ public static String getUnescapedName(ASTNode tableOrColumnNode) {
+     return getUnescapedName(tableOrColumnNode, null);
+   }
+ 
++  public static Map.Entry<String,String> getDbTableNamePair(ASTNode tableNameNode) {
++    assert(tableNameNode.getToken().getType() == HiveParser.TOK_TABNAME);
++    if (tableNameNode.getChildCount() == 2) {
++      String dbName = unescapeIdentifier(tableNameNode.getChild(0).getText());
++      String tableName = unescapeIdentifier(tableNameNode.getChild(1).getText());
++      return Pair.of(dbName, tableName);
++    } else {
++      String tableName = unescapeIdentifier(tableNameNode.getChild(0).getText());
++      return Pair.of(null,tableName);
++    }
++  }
++
+   public static String getUnescapedName(ASTNode tableOrColumnNode, String currentDatabase) {
+     int tokenType = tableOrColumnNode.getToken().getType();
+     if (tokenType == HiveParser.TOK_TABNAME) {
+       // table node
+-      if (tableOrColumnNode.getChildCount() == 2) {
+-        String dbName = unescapeIdentifier(tableOrColumnNode.getChild(0).getText());
+-        String tableName = unescapeIdentifier(tableOrColumnNode.getChild(1).getText());
++      Map.Entry<String,String> dbTablePair = getDbTableNamePair(tableOrColumnNode);
++      String dbName = dbTablePair.getKey();
++      String tableName = dbTablePair.getValue();
++      if (dbName != null){
+         return dbName + "." + tableName;
+       }
+-      String tableName = unescapeIdentifier(tableOrColumnNode.getChild(0).getText());
+       if (currentDatabase != null) {
+         return currentDatabase + "." + tableName;
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
+index d96b677..9dcd5c4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/DDLSemanticAnalyzer.java
+@@ -827,6 +827,9 @@ private void analyzeDropTable(ASTNode ast, boolean expectView)
+     // configured not to fail silently
+     boolean throwException =
+         !ifExists && !HiveConf.getBoolVar(conf, ConfVars.DROPIGNORESNONEXISTENT);
++
++    ReplicationSpec replicationSpec = new ReplicationSpec(ast);
++
+     Table tab = getTable(tableName, throwException);
+     if (tab != null) {
+       inputs.add(new ReadEntity(tab));
+@@ -834,7 +837,7 @@ private void analyzeDropTable(ASTNode ast, boolean expectView)
+     }
+ 
+     boolean ifPurge = (ast.getFirstChildWithType(HiveParser.KW_PURGE) != null);
+-    DropTableDesc dropTblDesc = new DropTableDesc(tableName, expectView, ifExists, ifPurge);
++    DropTableDesc dropTblDesc = new DropTableDesc(tableName, expectView, ifExists, ifPurge, replicationSpec);
+     rootTasks.add(TaskFactory.get(new DDLWork(getInputs(), getOutputs(),
+         dropTblDesc), conf));
+   }
+@@ -2628,7 +2631,29 @@ private void analyzeAlterTableDropParts(String[] qualified, ASTNode ast, boolean
+     boolean canGroupExprs = ifExists;
+ 
+     boolean mustPurge = (ast.getFirstChildWithType(HiveParser.KW_PURGE) != null);
+-    Table tab = getTable(qualified);
++    ReplicationSpec replicationSpec = new ReplicationSpec(ast);
++
++    Table tab = null;
++    try {
++      tab = getTable(qualified);
++    } catch (SemanticException se){
++      if (replicationSpec.isInReplicationScope() &&
++            (
++                (se.getCause() instanceof InvalidTableException)
++                ||  (se.getMessage().contains(ErrorMsg.INVALID_TABLE.getMsg()))
++            )){
++        // If we're inside a replication scope, then the table not existing is not an error.
++        // We just return in that case, no drop needed.
++        return;
++        // TODO : the contains message check is fragile, we should refactor SemanticException to be
++        // queriable for error code, and not simply have a message
++        // NOTE : IF_EXISTS might also want to invoke this, but there's a good possibility
++        // that IF_EXISTS is stricter about table existence, and applies only to the ptn.
++        // Therefore, ignoring IF_EXISTS here.
++      } else {
++        throw se;
++      }
++    }
+     Map<Integer, List<ExprNodeGenericFuncDesc>> partSpecs =
+         getFullPartitionSpecs(ast, tab, canGroupExprs);
+     if (partSpecs.isEmpty()) return; // nothing to do
+@@ -2642,7 +2667,7 @@ private void analyzeAlterTableDropParts(String[] qualified, ASTNode ast, boolean
+     addTableDropPartsOutputs(tab, partSpecs.values(), !ifExists, ignoreProtection);
+ 
+     DropTableDesc dropTblDesc =
+-        new DropTableDesc(getDotName(qualified), partSpecs, expectView, ignoreProtection, mustPurge);
++        new DropTableDesc(getDotName(qualified), partSpecs, expectView, ignoreProtection, mustPurge, replicationSpec);
+     rootTasks.add(TaskFactory.get(new DDLWork(getInputs(), getOutputs(), dropTblDesc), conf));
+   }
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/EximUtil.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/EximUtil.java
+index fa890b2..a4c5d0e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/EximUtil.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/EximUtil.java
+@@ -32,6 +32,7 @@
+ import java.util.StringTokenizer;
+ import java.util.TreeMap;
+ 
++import com.google.common.base.Function;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -39,6 +40,7 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.Table;
+@@ -53,6 +55,8 @@
+ import org.json.JSONException;
+ import org.json.JSONObject;
+ 
++import javax.annotation.Nullable;
++
+ /**
+  *
+  * EximUtil. Utility methods for the export/import semantic
+@@ -169,8 +173,18 @@ public static String relativeToAbsolutePath(HiveConf conf, String location) thro
+   /* If null, then the major version number should match */
+   public static final String METADATA_FORMAT_FORWARD_COMPATIBLE_VERSION = null;
+ 
+-  public static void createExportDump(FileSystem fs, Path metadataPath, org.apache.hadoop.hive.ql.metadata.Table tableHandle,
+-      Iterable<org.apache.hadoop.hive.ql.metadata.Partition> partitions) throws SemanticException, IOException {
++  public static void createExportDump(FileSystem fs, Path metadataPath,
++      org.apache.hadoop.hive.ql.metadata.Table tableHandle,
++      Iterable<org.apache.hadoop.hive.ql.metadata.Partition> partitions,
++      ReplicationSpec replicationSpec) throws SemanticException, IOException {
++
++    if (replicationSpec == null){
++      replicationSpec = new ReplicationSpec(); // instantiate default values if not specified
++    }
++    if (tableHandle == null){
++      replicationSpec.setNoop(true);
++    }
++
+     OutputStream out = fs.create(metadataPath);
+     JsonGenerator jgen = (new JsonFactory()).createJsonGenerator(out);
+     jgen.writeStartObject();
+@@ -178,22 +192,63 @@ public static void createExportDump(FileSystem fs, Path metadataPath, org.apache
+     if (METADATA_FORMAT_FORWARD_COMPATIBLE_VERSION != null) {
+       jgen.writeStringField("fcversion",METADATA_FORMAT_FORWARD_COMPATIBLE_VERSION);
+     }
+-    TSerializer serializer = new TSerializer(new TJSONProtocol.Factory());
+-    try {
+-      jgen.writeStringField("table", serializer.toString(tableHandle.getTTable(), "UTF-8"));
+-      jgen.writeFieldName("partitions");
+-      jgen.writeStartArray();
+-      if (partitions != null) {
+-        for (org.apache.hadoop.hive.ql.metadata.Partition partition : partitions) {
+-          jgen.writeString(serializer.toString(partition.getTPartition(), "UTF-8"));
+-          jgen.flush();
++
++    if (replicationSpec.isInReplicationScope()){
++      for (ReplicationSpec.KEY key : ReplicationSpec.KEY.values()){
++        String value = replicationSpec.get(key);
++        if (value != null){
++          jgen.writeStringField(key.toString(), value);
+         }
+       }
+-      jgen.writeEndArray();
+-    } catch (TException e) {
+-      throw new SemanticException(
+-          ErrorMsg.GENERIC_ERROR
+-              .getMsg("Exception while serializing the metastore objects"), e);
++      if (tableHandle != null){
++        Table ttable = tableHandle.getTTable();
++        ttable.putToParameters(
++            ReplicationSpec.KEY.CURR_STATE_ID.toString(), replicationSpec.getCurrentReplicationState());
++        if ((ttable.getParameters().containsKey("EXTERNAL")) &&
++            (ttable.getParameters().get("EXTERNAL").equalsIgnoreCase("TRUE"))){
++          // Replication destination will not be external - override if set
++          ttable.putToParameters("EXTERNAL","FALSE");
++        }
++        if (ttable.isSetTableType() && ttable.getTableType().equalsIgnoreCase(TableType.EXTERNAL_TABLE.toString())){
++          // Replication dest will not be external - override if set
++          ttable.setTableType(TableType.MANAGED_TABLE.toString());
++        }
++      }
++    } else {
++      // ReplicationSpec.KEY scopeKey = ReplicationSpec.KEY.REPL_SCOPE;
++      // write(out, ",\""+ scopeKey.toString() +"\":\"" + replicationSpec.get(scopeKey) + "\"");
++      // TODO: if we want to be explicit about this dump not being a replication dump, we can
++      // uncomment this else section, but currently unnneeded. Will require a lot of golden file
++      // regen if we do so.
++    }
++    if ((tableHandle != null) && (!replicationSpec.isNoop())){
++      TSerializer serializer = new TSerializer(new TJSONProtocol.Factory());
++      try {
++        jgen.writeStringField("table", serializer.toString(tableHandle.getTTable(), "UTF-8"));
++        jgen.writeFieldName("partitions");
++        jgen.writeStartArray();
++        if (partitions != null) {
++          for (org.apache.hadoop.hive.ql.metadata.Partition partition : partitions) {
++            Partition tptn = partition.getTPartition();
++            if (replicationSpec.isInReplicationScope()){
++              tptn.putToParameters(
++                  ReplicationSpec.KEY.CURR_STATE_ID.toString(), replicationSpec.getCurrentReplicationState());
++              if ((tptn.getParameters().containsKey("EXTERNAL")) &&
++                  (tptn.getParameters().get("EXTERNAL").equalsIgnoreCase("TRUE"))){
++                // Replication destination will not be external
++                tptn.putToParameters("EXTERNAL", "FALSE");
++              }
++            }
++            jgen.writeString(serializer.toString(tptn, "UTF-8"));
++            jgen.flush();
++          }
++        }
++        jgen.writeEndArray();
++      } catch (TException e) {
++        throw new SemanticException(
++            ErrorMsg.GENERIC_ERROR
++                .getMsg("Exception while serializing the metastore objects"), e);
++      }
+     }
+     jgen.writeEndObject();
+     jgen.close(); // JsonGenerator owns the OutputStream, so it closes it when we call close.
+@@ -203,8 +258,37 @@ private static void write(OutputStream out, String s) throws IOException {
+     out.write(s.getBytes("UTF-8"));
+   }
+ 
+-  public static Map.Entry<Table, List<Partition>>
+-      readMetaData(FileSystem fs, Path metadataPath)
++  /**
++   * Utility class to help return complex value from readMetaData function
++   */
++  public static class ReadMetaData {
++    private final Table table;
++    private final Iterable<Partition> partitions;
++    private final ReplicationSpec replicationSpec;
++
++    public ReadMetaData(){
++      this(null,null,new ReplicationSpec());
++    }
++    public ReadMetaData(Table table, Iterable<Partition> partitions, ReplicationSpec replicationSpec){
++      this.table = table;
++      this.partitions = partitions;
++      this.replicationSpec = replicationSpec;
++    }
++
++    public Table getTable() {
++      return table;
++    }
++
++    public Iterable<Partition> getPartitions() {
++      return partitions;
++    }
++
++    public ReplicationSpec getReplicationSpec() {
++      return replicationSpec;
++    }
++  };
++
++  public static ReadMetaData readMetaData(FileSystem fs, Path metadataPath)
+       throws IOException, SemanticException {
+     FSDataInputStream mdstream = null;
+     try {
+@@ -219,24 +303,27 @@ private static void write(OutputStream out, String s) throws IOException {
+       String md = new String(sb.toByteArray(), "UTF-8");
+       JSONObject jsonContainer = new JSONObject(md);
+       String version = jsonContainer.getString("version");
+-      String fcversion = null;
+-      try {
+-        fcversion = jsonContainer.getString("fcversion");
+-      } catch (JSONException ignored) {}
++      String fcversion = getJSONStringEntry(jsonContainer, "fcversion");
+       checkCompatibility(version, fcversion);
+-      String tableDesc = jsonContainer.getString("table");
+-      Table table = new Table();
+-      TDeserializer deserializer = new TDeserializer(new TJSONProtocol.Factory());
+-      deserializer.deserialize(table, tableDesc, "UTF-8");
+-      JSONArray jsonPartitions = new JSONArray(jsonContainer.getString("partitions"));
+-      List<Partition> partitionsList = new ArrayList<Partition>(jsonPartitions.length());
+-      for (int i = 0; i < jsonPartitions.length(); ++i) {
+-        String partDesc = jsonPartitions.getString(i);
+-        Partition partition = new Partition();
+-        deserializer.deserialize(partition, partDesc, "UTF-8");
+-        partitionsList.add(partition);
++      String tableDesc = getJSONStringEntry(jsonContainer,"table");
++      Table table = null;
++      List<Partition> partitionsList = null;
++      if (tableDesc != null){
++        table = new Table();
++        TDeserializer deserializer = new TDeserializer(new TJSONProtocol.Factory());
++        deserializer.deserialize(table, tableDesc, "UTF-8");
++        // TODO : jackson-streaming-iterable-redo this
++        JSONArray jsonPartitions = new JSONArray(jsonContainer.getString("partitions"));
++        partitionsList = new ArrayList<Partition>(jsonPartitions.length());
++        for (int i = 0; i < jsonPartitions.length(); ++i) {
++          String partDesc = jsonPartitions.getString(i);
++          Partition partition = new Partition();
++          deserializer.deserialize(partition, partDesc, "UTF-8");
++          partitionsList.add(partition);
++        }
+       }
+-      return new AbstractMap.SimpleEntry<Table, List<Partition>>(table, partitionsList);
++
++      return new ReadMetaData(table, partitionsList,readReplicationSpec(jsonContainer));
+     } catch (JSONException e) {
+       throw new SemanticException(ErrorMsg.GENERIC_ERROR.getMsg("Error in serializing metadata"), e);
+     } catch (TException e) {
+@@ -248,6 +335,24 @@ private static void write(OutputStream out, String s) throws IOException {
+     }
+   }
+ 
++  private static ReplicationSpec readReplicationSpec(final JSONObject jsonContainer){
++    Function<String,String> keyFetcher = new Function<String, String>() {
++      @Override
++      public String apply(@Nullable String s) {
++        return getJSONStringEntry(jsonContainer,s);
++      }
++    };
++    return new ReplicationSpec(keyFetcher);
++  }
++
++  private static String getJSONStringEntry(JSONObject jsonContainer, String name) {
++    String retval = null;
++    try {
++      retval = jsonContainer.getString(name);
++    } catch (JSONException ignored) {}
++    return retval;
++  }
++
+   /* check the forward and backward compatibility */
+   private static void checkCompatibility(String version, String fcVersion) throws SemanticException {
+     doCheckCompatibility(
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ExportSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ExportSemanticAnalyzer.java
+index e5e6a55..6989783 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ExportSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ExportSemanticAnalyzer.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.hadoop.hive.ql.parse;
+ 
++import org.apache.hadoop.hive.ql.metadata.Hive;
+ import org.apache.hadoop.hive.ql.metadata.PartitionIterable;
+ 
+ import java.io.FileNotFoundException;
+@@ -36,8 +37,12 @@
+ import org.apache.hadoop.hive.ql.exec.Task;
+ import org.apache.hadoop.hive.ql.exec.TaskFactory;
+ import org.apache.hadoop.hive.ql.hooks.ReadEntity;
++import org.apache.hadoop.hive.ql.metadata.InvalidTableException;
+ import org.apache.hadoop.hive.ql.metadata.Partition;
++import org.apache.hadoop.hive.ql.metadata.PartitionIterable;
++import org.apache.hadoop.hive.ql.metadata.Table;
+ import org.apache.hadoop.hive.ql.plan.CopyWork;
++import scala.tools.nsc.dependencies.Changes;
+ 
+ /**
+  * ExportSemanticAnalyzer.
+@@ -45,6 +50,8 @@
+  */
+ public class ExportSemanticAnalyzer extends BaseSemanticAnalyzer {
+ 
++  private ReplicationSpec replicationSpec;
++
+   public ExportSemanticAnalyzer(HiveConf conf) throws SemanticException {
+     super(conf);
+   }
+@@ -54,13 +61,57 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+     Tree tableTree = ast.getChild(0);
+     Tree toTree = ast.getChild(1);
+ 
++    if (ast.getChildCount() > 2) {
++      replicationSpec = new ReplicationSpec((ASTNode) ast.getChild(2));
++    } else {
++      replicationSpec = new ReplicationSpec();
++    }
++
+     // initialize export path
+     String tmpPath = stripQuotes(toTree.getText());
+     URI toURI = EximUtil.getValidatedURI(conf, tmpPath);
+ 
+     // initialize source table/partition
+-    tableSpec ts = new tableSpec(db, conf, (ASTNode) tableTree, false, true);
+-    EximUtil.validateTable(ts.tableHandle);
++    tableSpec ts;
++
++    try {
++      ts = new tableSpec(db, conf, (ASTNode) tableTree, false, true);
++    } catch (SemanticException sme){
++      if ((replicationSpec.isInReplicationScope()) &&
++            ((sme.getCause() instanceof InvalidTableException)
++            || (sme instanceof Table.ValidationFailureSemanticException)
++            )
++          ){
++        // If we're in replication scope, it's possible that we're running the export long after
++        // the table was dropped, so the table not existing currently or being a different kind of
++        // table is not an error - it simply means we should no-op, and let a future export
++        // capture the appropriate state
++        ts = null;
++      } else {
++        throw sme;
++      }
++    }
++
++    if (ts != null) {
++      try {
++        EximUtil.validateTable(ts.tableHandle);
++        if (replicationSpec.isInReplicationScope()
++            && ts.tableHandle.isTemporary()){
++          // No replication for temporary tables either
++          ts = null;
++        }
++
++      } catch (SemanticException e) {
++        // table was a view, a non-native table or an offline table.
++        // ignore for replication, error if not.
++        if (replicationSpec.isInReplicationScope()){
++          ts = null; // null out ts so we can't use it.
++        } else {
++          throw e;
++        }
++      }
++    }
++
+     try {
+       FileSystem fs = FileSystem.get(toURI, conf);
+       Path toPath = new Path(toURI.getScheme(), toURI.getAuthority(), toURI.getPath());
+@@ -85,14 +136,34 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+ 
+     PartitionIterable partitions = null;
+     try {
+-      if (ts.tableHandle.isPartitioned()) {
+-        partitions = (ts.partitions != null) ?
+-            new PartitionIterable(ts.partitions) :
+-            new PartitionIterable(db,ts.tableHandle,null,conf.getIntVar(
++      replicationSpec.setCurrentReplicationState(String.valueOf(db.getMSC().getCurrentNotificationEventId().getEventId()));
++      if ( (ts != null) && (ts.tableHandle.isPartitioned())){
++        if (ts.specType == tableSpec.SpecType.TABLE_ONLY){
++          // TABLE-ONLY, fetch partitions if regular export, don't if metadata-only
++          if (replicationSpec.isMetadataOnly()){
++            partitions = null;
++          } else {
++            partitions = new PartitionIterable(db,ts.tableHandle,null,conf.getIntVar(
+                 HiveConf.ConfVars.METASTORE_BATCH_RETRIEVE_MAX));
++          }
++        } else {
++          // PARTITIONS specified - partitions inside tableSpec
++          partitions = new PartitionIterable(ts.partitions);
++        }
++      } else {
++        // Either tableHandle isn't partitioned => null, or repl-export after ts becomes null => null.
++        // or this is a noop-replication export, so we can skip looking at ptns.
++        partitions = null;
+       }
++
+       Path path = new Path(ctx.getLocalTmpPath(), "_metadata");
+-      EximUtil.createExportDump(FileSystem.getLocal(conf), path, ts.tableHandle, partitions);
++      EximUtil.createExportDump(
++          FileSystem.getLocal(conf),
++          path,
++          (ts != null ? ts.tableHandle: null),
++          partitions,
++          replicationSpec);
++
+       Task<? extends Serializable> rTask = TaskFactory.get(new CopyWork(
+           path, new Path(toURI), false), conf);
+       rootTasks.add(rTask);
+@@ -104,26 +175,29 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+               .getMsg("Exception while writing out the local file"), e);
+     }
+ 
+-    Path parentPath = new Path(toURI);
+-
+-    if (ts.tableHandle.isPartitioned()) {
+-      for (Partition partition : partitions) {
+-        Path fromPath = partition.getDataLocation();
+-        Path toPartPath = new Path(parentPath, partition.getName());
+-        Task<? extends Serializable> rTask = TaskFactory.get(
+-            new CopyWork(fromPath, toPartPath, false),
+-            conf);
++    if (!(replicationSpec.isMetadataOnly() || (ts == null))) {
++      Path parentPath = new Path(toURI);
++      if (ts.tableHandle.isPartitioned()) {
++        for (Partition partition : partitions) {
++          Path fromPath = partition.getDataLocation();
++          Path toPartPath = new Path(parentPath, partition.getName());
++          Task<? extends Serializable> rTask = TaskFactory.get(
++              new CopyWork(fromPath, toPartPath, false),
++              conf);
++          rootTasks.add(rTask);
++          inputs.add(new ReadEntity(partition));
++        }
++      } else {
++        Path fromPath = ts.tableHandle.getDataLocation();
++        Path toDataPath = new Path(parentPath, "data");
++        Task<? extends Serializable> rTask = TaskFactory.get(new CopyWork(
++            fromPath, toDataPath, false), conf);
+         rootTasks.add(rTask);
+-        inputs.add(new ReadEntity(partition));
++        inputs.add(new ReadEntity(ts.tableHandle));
+       }
+-    } else {
+-      Path fromPath = ts.tableHandle.getDataLocation();
+-      Path toDataPath = new Path(parentPath, "data");
+-      Task<? extends Serializable> rTask = TaskFactory.get(new CopyWork(
+-          fromPath, toDataPath, false), conf);
+-      rootTasks.add(rTask);
+-      inputs.add(new ReadEntity(ts.tableHandle));
++      outputs.add(toWriteEntity(parentPath));
+     }
+-    outputs.add(toWriteEntity(parentPath));
++
+   }
++
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
+index 90b84ac..f97f543 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveLexer.g
+@@ -95,6 +95,8 @@ KW_UNION: 'UNION';
+ KW_LOAD: 'LOAD';
+ KW_EXPORT: 'EXPORT';
+ KW_IMPORT: 'IMPORT';
++KW_REPLICATION: 'REPLICATION';
++KW_METADATA: 'METADATA';
+ KW_DATA: 'DATA';
+ KW_INPATH: 'INPATH';
+ KW_IS: 'IS';
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g
+index e633cdf..b85c7d3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/HiveParser.g
+@@ -94,6 +94,8 @@ TOK_CROSSJOIN;
+ TOK_LOAD;
+ TOK_EXPORT;
+ TOK_IMPORT;
++TOK_REPLICATION;
++TOK_METADATA;
+ TOK_NULL;
+ TOK_ISNULL;
+ TOK_ISNOTNULL;
+@@ -665,17 +667,30 @@ loadStatement
+     -> ^(TOK_LOAD $path $tab $islocal? $isoverwrite?)
+     ;
+ 
++replicationClause
++@init { pushMsg("replication clause", state); }
++@after { popMsg(state); }
++    : KW_FOR (isMetadataOnly=KW_METADATA)? KW_REPLICATION LPAREN (replId=StringLiteral) RPAREN
++    -> ^(TOK_REPLICATION $replId $isMetadataOnly?)
++    ;
++
+ exportStatement
+ @init { pushMsg("export statement", state); }
+ @after { popMsg(state); }
+-    : KW_EXPORT KW_TABLE (tab=tableOrPartition) KW_TO (path=StringLiteral)
+-    -> ^(TOK_EXPORT $tab $path)
++    : KW_EXPORT
++      KW_TABLE (tab=tableOrPartition)
++      KW_TO (path=StringLiteral)
++      replicationClause?
++    -> ^(TOK_EXPORT $tab $path replicationClause?)
+     ;
+ 
+ importStatement
+ @init { pushMsg("import statement", state); }
+ @after { popMsg(state); }
+-	: KW_IMPORT ((ext=KW_EXTERNAL)? KW_TABLE (tab=tableOrPartition))? KW_FROM (path=StringLiteral) tableLocation?
++       : KW_IMPORT
++         ((ext=KW_EXTERNAL)? KW_TABLE (tab=tableOrPartition))?
++         KW_FROM (path=StringLiteral)
++         tableLocation?
+     -> ^(TOK_IMPORT $path $tab? $ext? tableLocation?)
+     ;
+ 
+@@ -936,7 +951,8 @@ dropIndexStatement
+ dropTableStatement
+ @init { pushMsg("drop statement", state); }
+ @after { popMsg(state); }
+-    : KW_DROP KW_TABLE ifExists? tableName KW_PURGE? -> ^(TOK_DROPTABLE tableName ifExists? KW_PURGE?)
++    : KW_DROP KW_TABLE ifExists? tableName KW_PURGE? replicationClause?
++    -> ^(TOK_DROPTABLE tableName ifExists? KW_PURGE? replicationClause?)
+     ;
+ 
+ alterStatement
+@@ -1114,9 +1130,9 @@ partitionLocation
+ alterStatementSuffixDropPartitions[boolean table]
+ @init { pushMsg("drop partition statement", state); }
+ @after { popMsg(state); }
+-    : KW_DROP ifExists? dropPartitionSpec (COMMA dropPartitionSpec)* ignoreProtection? KW_PURGE?
+-    -> { table }? ^(TOK_ALTERTABLE_DROPPARTS dropPartitionSpec+ ifExists? ignoreProtection? KW_PURGE?)
+-    ->            ^(TOK_ALTERVIEW_DROPPARTS dropPartitionSpec+ ifExists? ignoreProtection?)
++    : KW_DROP ifExists? dropPartitionSpec (COMMA dropPartitionSpec)* ignoreProtection? replicationClause?
++    -> { table }? ^(TOK_ALTERTABLE_DROPPARTS dropPartitionSpec+ ifExists? ignoreProtection? replicationClause?)
++    ->            ^(TOK_ALTERVIEW_DROPPARTS dropPartitionSpec+ ifExists? ignoreProtection? replicationClause?)
+     ;
+ 
+ alterStatementSuffixProperties
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g b/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+index ec79837..262f8da 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/IdentifiersParser.g
+@@ -572,5 +572,5 @@ principalIdentifier
+ 
+ nonReserved
+     :
+-    KW_TRUE | KW_FALSE | KW_LIKE | KW_EXISTS | KW_ASC | KW_DESC | KW_ORDER | KW_GROUP | KW_BY | KW_AS | KW_INSERT | KW_OVERWRITE | KW_OUTER | KW_LEFT | KW_RIGHT | KW_FULL | KW_PARTITION | KW_PARTITIONS | KW_TABLE | KW_TABLES | KW_COLUMNS | KW_INDEX | KW_INDEXES | KW_REBUILD | KW_FUNCTIONS | KW_SHOW | KW_MSCK | KW_REPAIR | KW_DIRECTORY | KW_LOCAL | KW_USING | KW_CLUSTER | KW_DISTRIBUTE | KW_SORT | KW_UNION | KW_LOAD | KW_EXPORT | KW_IMPORT | KW_DATA | KW_INPATH | KW_IS | KW_NULL | KW_CREATE | KW_EXTERNAL | KW_ALTER | KW_CHANGE | KW_FIRST | KW_AFTER | KW_DESCRIBE | KW_DROP | KW_RENAME | KW_IGNORE | KW_PROTECTION | KW_TO | KW_COMMENT | KW_BOOLEAN | KW_TINYINT | KW_SMALLINT | KW_INT | KW_BIGINT | KW_FLOAT | KW_DOUBLE | KW_DATE | KW_DATETIME | KW_TIMESTAMP | KW_DECIMAL | KW_STRING | KW_ARRAY | KW_STRUCT | KW_UNIONTYPE | KW_PARTITIONED | KW_CLUSTERED | KW_SORTED | KW_INTO | KW_BUCKETS | KW_ROW | KW_ROWS | KW_FORMAT | KW_DELIMITED | KW_FIELDS | KW_TERMINATED | KW_ESCAPED | KW_COLLECTION | KW_ITEMS | KW_KEYS | KW_KEY_TYPE | KW_LINES | KW_STORED | KW_FILEFORMAT | KW_INPUTFORMAT | KW_OUTPUTFORMAT | KW_INPUTDRIVER | KW_OUTPUTDRIVER | KW_OFFLINE | KW_ENABLE | KW_DISABLE | KW_READONLY | KW_NO_DROP | KW_LOCATION | KW_BUCKET | KW_OUT | KW_OF | KW_PERCENT | KW_ADD | KW_REPLACE | KW_RLIKE | KW_REGEXP | KW_TEMPORARY | KW_EXPLAIN | KW_FORMATTED | KW_PRETTY | KW_DEPENDENCY | KW_LOGICAL | KW_SERDE | KW_WITH | KW_DEFERRED | KW_SERDEPROPERTIES | KW_DBPROPERTIES | KW_LIMIT | KW_SET | KW_UNSET | KW_TBLPROPERTIES | KW_IDXPROPERTIES | KW_VALUE_TYPE | KW_ELEM_TYPE | KW_MAPJOIN | KW_STREAMTABLE | KW_HOLD_DDLTIME | KW_CLUSTERSTATUS | KW_UTC | KW_UTCTIMESTAMP | KW_LONG | KW_DELETE | KW_PLUS | KW_MINUS | KW_FETCH | KW_INTERSECT | KW_VIEW | KW_IN | KW_DATABASES | KW_MATERIALIZED | KW_SCHEMA | KW_SCHEMAS | KW_GRANT | KW_REVOKE | KW_SSL | KW_UNDO | KW_LOCK | KW_LOCKS | KW_UNLOCK | KW_SHARED | KW_EXCLUSIVE | KW_PROCEDURE | KW_UNSIGNED | KW_WHILE | KW_READ | KW_READS | KW_PURGE | KW_RANGE | KW_ANALYZE | KW_BEFORE | KW_BETWEEN | KW_BOTH | KW_BINARY | KW_CONTINUE | KW_CURSOR | KW_TRIGGER | KW_RECORDREADER | KW_RECORDWRITER | KW_SEMI | KW_LATERAL | KW_TOUCH | KW_ARCHIVE | KW_UNARCHIVE | KW_COMPUTE | KW_STATISTICS | KW_USE | KW_OPTION | KW_CONCATENATE | KW_SHOW_DATABASE | KW_UPDATE | KW_RESTRICT | KW_CASCADE | KW_SKEWED | KW_ROLLUP | KW_CUBE | KW_DIRECTORIES | KW_FOR | KW_GROUPING | KW_SETS | KW_TRUNCATE | KW_NOSCAN | KW_USER | KW_ROLE | KW_ROLES | KW_INNER | KW_DEFINED | KW_ADMIN | KW_JAR | KW_FILE | KW_OWNER | KW_PRINCIPALS | KW_ALL | KW_DEFAULT | KW_NONE | KW_COMPACT | KW_COMPACTIONS | KW_TRANSACTIONS | KW_REWRITE | KW_AUTHORIZATION | KW_VALUES | KW_URI | KW_SERVER | KW_RELOAD
++    KW_TRUE | KW_FALSE | KW_LIKE | KW_EXISTS | KW_ASC | KW_DESC | KW_ORDER | KW_GROUP | KW_BY | KW_AS | KW_INSERT | KW_OVERWRITE | KW_OUTER | KW_LEFT | KW_RIGHT | KW_FULL | KW_PARTITION | KW_PARTITIONS | KW_TABLE | KW_TABLES | KW_COLUMNS | KW_INDEX | KW_INDEXES | KW_REBUILD | KW_FUNCTIONS | KW_SHOW | KW_MSCK | KW_REPAIR | KW_DIRECTORY | KW_LOCAL | KW_USING | KW_CLUSTER | KW_DISTRIBUTE | KW_SORT | KW_UNION | KW_LOAD | KW_EXPORT | KW_IMPORT | KW_DATA | KW_INPATH | KW_IS | KW_NULL | KW_CREATE | KW_EXTERNAL | KW_ALTER | KW_CHANGE | KW_FIRST | KW_AFTER | KW_DESCRIBE | KW_DROP | KW_RENAME | KW_IGNORE | KW_PROTECTION | KW_TO | KW_COMMENT | KW_BOOLEAN | KW_TINYINT | KW_SMALLINT | KW_INT | KW_BIGINT | KW_FLOAT | KW_DOUBLE | KW_DATE | KW_DATETIME | KW_TIMESTAMP | KW_DECIMAL | KW_STRING | KW_ARRAY | KW_STRUCT | KW_UNIONTYPE | KW_PARTITIONED | KW_CLUSTERED | KW_SORTED | KW_INTO | KW_BUCKETS | KW_ROW | KW_ROWS | KW_FORMAT | KW_DELIMITED | KW_FIELDS | KW_TERMINATED | KW_ESCAPED | KW_COLLECTION | KW_ITEMS | KW_KEYS | KW_KEY_TYPE | KW_LINES | KW_STORED | KW_FILEFORMAT | KW_INPUTFORMAT | KW_OUTPUTFORMAT | KW_INPUTDRIVER | KW_OUTPUTDRIVER | KW_OFFLINE | KW_ENABLE | KW_DISABLE | KW_READONLY | KW_NO_DROP | KW_LOCATION | KW_BUCKET | KW_OUT | KW_OF | KW_PERCENT | KW_ADD | KW_REPLACE | KW_REPLICATION | KW_RLIKE | KW_REGEXP | KW_TEMPORARY | KW_EXPLAIN | KW_FORMATTED | KW_PRETTY | KW_DEPENDENCY | KW_LOGICAL | KW_SERDE | KW_WITH | KW_DEFERRED | KW_SERDEPROPERTIES | KW_DBPROPERTIES | KW_LIMIT | KW_SET | KW_UNSET | KW_TBLPROPERTIES | KW_IDXPROPERTIES | KW_VALUE_TYPE | KW_ELEM_TYPE | KW_MAPJOIN | KW_STREAMTABLE | KW_HOLD_DDLTIME | KW_CLUSTERSTATUS | KW_UTC | KW_UTCTIMESTAMP | KW_LONG | KW_DELETE | KW_PLUS | KW_MINUS | KW_FETCH | KW_INTERSECT | KW_VIEW | KW_IN | KW_DATABASES | KW_MATERIALIZED | KW_METADATA | KW_SCHEMA | KW_SCHEMAS | KW_GRANT | KW_REVOKE | KW_SSL | KW_UNDO | KW_LOCK | KW_LOCKS | KW_UNLOCK | KW_SHARED | KW_EXCLUSIVE | KW_PROCEDURE | KW_UNSIGNED | KW_WHILE | KW_READ | KW_READS | KW_PURGE | KW_RANGE | KW_ANALYZE | KW_BEFORE | KW_BETWEEN | KW_BOTH | KW_BINARY | KW_CONTINUE | KW_CURSOR | KW_TRIGGER | KW_RECORDREADER | KW_RECORDWRITER | KW_SEMI | KW_LATERAL | KW_TOUCH | KW_ARCHIVE | KW_UNARCHIVE | KW_COMPUTE | KW_STATISTICS | KW_USE | KW_OPTION | KW_CONCATENATE | KW_SHOW_DATABASE | KW_UPDATE | KW_RESTRICT | KW_CASCADE | KW_SKEWED | KW_ROLLUP | KW_CUBE | KW_DIRECTORIES | KW_FOR | KW_GROUPING | KW_SETS | KW_TRUNCATE | KW_NOSCAN | KW_USER | KW_ROLE | KW_ROLES | KW_INNER | KW_DEFINED | KW_ADMIN | KW_JAR | KW_FILE | KW_OWNER | KW_PRINCIPALS | KW_ALL | KW_DEFAULT | KW_NONE | KW_COMPACT | KW_COMPACTIONS | KW_TRANSACTIONS | KW_REWRITE | KW_AUTHORIZATION | KW_VALUES | KW_URI | KW_SERVER | KW_RELOAD
+     ;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java
+index 04e0eea..1061cb0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ImportSemanticAnalyzer.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hive.ql.parse;
+ 
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.ArrayList;
+@@ -36,9 +37,11 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.FileUtils;
++import org.apache.hadoop.hive.common.StatsSetupConst;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.TableType;
+ import org.apache.hadoop.hive.metastore.Warehouse;
++import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.FieldSchema;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.api.Order;
+@@ -56,6 +59,7 @@
+ import org.apache.hadoop.hive.ql.plan.CopyWork;
+ import org.apache.hadoop.hive.ql.plan.CreateTableDesc;
+ import org.apache.hadoop.hive.ql.plan.DDLWork;
++import org.apache.hadoop.hive.ql.plan.DropTableDesc;
+ import org.apache.hadoop.hive.ql.plan.LoadTableDesc;
+ import org.apache.hadoop.hive.ql.plan.MoveWork;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+@@ -84,133 +88,124 @@ public boolean existsTable() {
+   public void analyzeInternal(ASTNode ast) throws SemanticException {
+     try {
+       Tree fromTree = ast.getChild(0);
+-      // initialize load path
+-      String tmpPath = stripQuotes(fromTree.getText());
+-      URI fromURI = EximUtil.getValidatedURI(conf, tmpPath);
+ 
++      boolean isLocationSet = false;
++      boolean isExternalSet = false;
++      boolean isTableSet = false;
++      boolean isDbNameSet = false;
++      boolean isPartSpecSet = false;
++      String parsedLocation = null;
++      String parsedTableName = null;
++      String parsedDbName = null;
++      LinkedHashMap<String, String> parsedPartSpec = new LinkedHashMap<String, String>();
++
++      for (int i = 1; i < ast.getChildCount(); ++i){
++        ASTNode child = (ASTNode) ast.getChild(i);
++        switch (child.getToken().getType()){
++          case HiveParser.KW_EXTERNAL:
++            isExternalSet = true;
++            break;
++          case HiveParser.TOK_TABLELOCATION:
++            isLocationSet = true;
++            parsedLocation = EximUtil.relativeToAbsolutePath(conf, unescapeSQLString(child.getChild(0).getText()));
++            break;
++          case HiveParser.TOK_TAB:
++            isTableSet = true;
++            ASTNode tableNameNode = (ASTNode) child.getChild(0);
++            Map.Entry<String,String> dbTablePair = getDbTableNamePair(tableNameNode);
++            parsedDbName = dbTablePair.getKey();
++            parsedTableName = dbTablePair.getValue();
++            if (parsedDbName != null){
++              isDbNameSet = true;
++            }
++            // get partition metadata if partition specified
++            if (child.getChildCount() == 2) {
++              ASTNode partspec = (ASTNode) child.getChild(1);
++              isPartSpecSet = true;
++              parsePartitionSpec(child, parsedPartSpec);
++            }
++            break;
++        }
++      }
++
++      // parsing statement is now done, on to logic.
++
++      // initialize load path
++      URI fromURI = EximUtil.getValidatedURI(conf, stripQuotes(fromTree.getText()));
+       FileSystem fs = FileSystem.get(fromURI, conf);
+-      String dbname = null;
+-      CreateTableDesc tblDesc = null;
+-      List<AddPartitionDesc> partitionDescs = new ArrayList<AddPartitionDesc>();
+-      Path fromPath = new Path(fromURI.getScheme(), fromURI.getAuthority(),
+-          fromURI.getPath());
++      Path fromPath = new Path(fromURI.getScheme(), fromURI.getAuthority(), fromURI.getPath());
+       inputs.add(toReadEntity(fromPath));
++
++      EximUtil.ReadMetaData rv = new EximUtil.ReadMetaData();
+       try {
+-        Path metadataPath = new Path(fromPath, METADATA_NAME);
+-        Map.Entry<org.apache.hadoop.hive.metastore.api.Table,
+-        List<Partition>> rv =  EximUtil.readMetaData(fs, metadataPath);
+-        dbname = SessionState.get().getCurrentDatabase();
+-        org.apache.hadoop.hive.metastore.api.Table table = rv.getKey();
+-        tblDesc =  new CreateTableDesc(
+-            table.getTableName(),
+-            false, // isExternal: set to false here, can be overwritten by the
+-                   // IMPORT stmt
+-            table.isTemporary(),
+-            table.getSd().getCols(),
+-            table.getPartitionKeys(),
+-            table.getSd().getBucketCols(),
+-            table.getSd().getSortCols(),
+-            table.getSd().getNumBuckets(),
+-            null, null, null, null, null, // these 5 delims passed as serde params
+-            null, // comment passed as table params
+-            table.getSd().getInputFormat(),
+-            table.getSd().getOutputFormat(),
+-            null, // location: set to null here, can be
+-                  // overwritten by the IMPORT stmt
+-            table.getSd().getSerdeInfo().getSerializationLib(),
+-            null, // storagehandler passed as table params
+-            table.getSd().getSerdeInfo().getParameters(),
+-            table.getParameters(), false,
+-            (null == table.getSd().getSkewedInfo()) ? null : table.getSd().getSkewedInfo()
+-                .getSkewedColNames(),
+-            (null == table.getSd().getSkewedInfo()) ? null : table.getSd().getSkewedInfo()
+-                .getSkewedColValues());
+-        tblDesc.setStoredAsSubDirectories(table.getSd().isStoredAsSubDirectories());
+-
+-        List<FieldSchema> partCols = tblDesc.getPartCols();
+-        List<String> partColNames = new ArrayList<String>(partCols.size());
+-        for (FieldSchema fsc : partCols) {
+-          partColNames.add(fsc.getName());
+-        }
+-        List<Partition> partitions = rv.getValue();
+-        for (Partition partition : partitions) {
+-          // TODO: this should not create AddPartitionDesc per partition
+-          AddPartitionDesc partsDesc = new AddPartitionDesc(dbname, tblDesc.getTableName(),
+-              EximUtil.makePartSpec(tblDesc.getPartCols(), partition.getValues()),
+-              partition.getSd().getLocation(), partition.getParameters());
+-          AddPartitionDesc.OnePartitionDesc partDesc = partsDesc.getPartition(0);
+-          partDesc.setInputFormat(partition.getSd().getInputFormat());
+-          partDesc.setOutputFormat(partition.getSd().getOutputFormat());
+-          partDesc.setNumBuckets(partition.getSd().getNumBuckets());
+-          partDesc.setCols(partition.getSd().getCols());
+-          partDesc.setSerializationLib(partition.getSd().getSerdeInfo().getSerializationLib());
+-          partDesc.setSerdeParams(partition.getSd().getSerdeInfo().getParameters());
+-          partDesc.setBucketCols(partition.getSd().getBucketCols());
+-          partDesc.setSortCols(partition.getSd().getSortCols());
+-          partDesc.setLocation(new Path(fromPath,
+-              Warehouse.makePartName(tblDesc.getPartCols(), partition.getValues())).toString());
+-          partitionDescs.add(partsDesc);
+-        }
++        rv =  EximUtil.readMetaData(fs, new Path(fromPath, METADATA_NAME));
+       } catch (IOException e) {
+         throw new SemanticException(ErrorMsg.INVALID_PATH.getMsg(), e);
+       }
+-      LOG.debug("metadata read and parsed");
+-      for (int i = 1; i < ast.getChildCount(); ++i) {
+-        ASTNode child = (ASTNode) ast.getChild(i);
+-        switch (child.getToken().getType()) {
+-        case HiveParser.KW_EXTERNAL:
+-          tblDesc.setExternal(true);
+-          break;
+-        case HiveParser.TOK_TABLELOCATION:
+-          String location = unescapeSQLString(child.getChild(0).getText());
+-          location = EximUtil.relativeToAbsolutePath(conf, location);
+-          inputs.add(toReadEntity(location));
+-          tblDesc.setLocation(location);
+-          break;
+-        case HiveParser.TOK_TAB:
+-          Tree tableTree = child.getChild(0);
+-          // initialize destination table/partition
+-          String tableName = getUnescapedName((ASTNode)tableTree);
+-          tblDesc.setTableName(tableName);
+-          // get partition metadata if partition specified
+-          LinkedHashMap<String, String> partSpec = new LinkedHashMap<String, String>();
+-          if (child.getChildCount() == 2) {
+-            ASTNode partspec = (ASTNode) child.getChild(1);
+-            // partSpec is a mapping from partition column name to its value.
+-            for (int j = 0; j < partspec.getChildCount(); ++j) {
+-              ASTNode partspec_val = (ASTNode) partspec.getChild(j);
+-              String val = null;
+-              String colName = unescapeIdentifier(partspec_val.getChild(0)
+-                    .getText().toLowerCase());
+-              if (partspec_val.getChildCount() < 2) { // DP in the form of T
+-                                                      // partition (ds, hr)
+-                throw new SemanticException(
+-                      ErrorMsg.INVALID_PARTITION
+-                          .getMsg(" - Dynamic partitions not allowed"));
+-              } else { // in the form of T partition (ds="2010-03-03")
+-                val = stripQuotes(partspec_val.getChild(1).getText());
+-              }
+-              partSpec.put(colName, val);
+-            }
+-            boolean found = false;
+-            for (Iterator<AddPartitionDesc> partnIter = partitionDescs
+-                  .listIterator(); partnIter.hasNext();) {
+-              AddPartitionDesc addPartitionDesc = partnIter.next();
+-              if (!found && addPartitionDesc.getPartition(0).getPartSpec().equals(partSpec)) {
+-                found = true;
+-              } else {
+-                partnIter.remove();
+-              }
+-            }
+-            if (!found) {
+-              throw new SemanticException(
+-                    ErrorMsg.INVALID_PARTITION
+-                        .getMsg(" - Specified partition not found in import directory"));
+-            }
++
++      ReplicationSpec replicationSpec = rv.getReplicationSpec();
++      if (replicationSpec.isNoop()){
++        // nothing to do here, silently return.
++        return;
++      }
++
++      String dbname = SessionState.get().getCurrentDatabase();
++      if (isDbNameSet){
++        // If the parsed statement contained a db.tablename specification, prefer that.
++        dbname = parsedDbName;
++      }
++
++      // Create table associated with the import
++      // Executed if relevant, and used to contain all the other details about the table if not.
++      CreateTableDesc tblDesc = getBaseCreateTableDescFromTable(dbname,rv.getTable());
++
++      if (isExternalSet){
++        tblDesc.setExternal(isExternalSet);
++        // This condition-check could have been avoided, but to honour the old
++        // default of not calling if it wasn't set, we retain that behaviour.
++        // TODO:cleanup after verification that the outer if isn't really needed here
++      }
++
++      if (isLocationSet){
++        tblDesc.setLocation(parsedLocation);
++        inputs.add(toReadEntity(parsedLocation));
++      }
++
++      if (isTableSet){
++        tblDesc.setTableName(parsedTableName);
++      }
++
++      List<AddPartitionDesc> partitionDescs = new ArrayList<AddPartitionDesc>();
++      Iterable<Partition> partitions = rv.getPartitions();
++      for (Partition partition : partitions) {
++        // TODO: this should ideally not create AddPartitionDesc per partition
++        AddPartitionDesc partsDesc = getBaseAddPartitionDescFromPartition(fromPath, dbname, tblDesc, partition);
++        partitionDescs.add(partsDesc);
++      }
++
++      if (isPartSpecSet){
++        // The import specification asked for only a particular partition to be loaded
++        // We load only that, and ignore all the others.
++        boolean found = false;
++        for (Iterator<AddPartitionDesc> partnIter = partitionDescs
++            .listIterator(); partnIter.hasNext();) {
++          AddPartitionDesc addPartitionDesc = partnIter.next();
++          if (!found && addPartitionDesc.getPartition(0).getPartSpec().equals(parsedPartSpec)) {
++            found = true;
++          } else {
++            partnIter.remove();
+           }
+         }
++        if (!found) {
++          throw new SemanticException(
++              ErrorMsg.INVALID_PARTITION
++                  .getMsg(" - Specified partition not found in import directory"));
++        }
+       }
++
+       if (tblDesc.getTableName() == null) {
++        // Either we got the tablename from the IMPORT statement (first priority)
++        // or from the export dump.
+         throw new SemanticException(ErrorMsg.NEED_TABLE_SPECIFICATION.getMsg());
+       } else {
+         conf.set("import.destination.table", tblDesc.getTableName());
+@@ -218,68 +213,26 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+           addPartitionDesc.setTableName(tblDesc.getTableName());
+         }
+       }
++
+       Warehouse wh = new Warehouse(conf);
+-      try {
+-        Table table = db.getTable(tblDesc.getTableName());
+-        checkTable(table, tblDesc);
+-        LOG.debug("table " + tblDesc.getTableName()
+-            + " exists: metadata checked");
++      Table table = tableIfExists(tblDesc);
++
++      if (table != null){
++        checkTable(table, tblDesc,replicationSpec);
++        LOG.debug("table " + tblDesc.getTableName() + " exists: metadata checked");
+         tableExists = true;
+-        conf.set("import.destination.dir", table.getDataLocation().toString());
+-        if (table.isPartitioned()) {
+-          LOG.debug("table partitioned");
+-          for (AddPartitionDesc addPartitionDesc : partitionDescs) {
+-            Map<String, String> partSpec = addPartitionDesc.getPartition(0).getPartSpec();
+-            if (db.getPartition(table, partSpec, false) == null) {
+-              rootTasks.add(addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc));
+-            } else {
+-              throw new SemanticException(
+-                  ErrorMsg.PARTITION_EXISTS.getMsg(partSpecToString(partSpec)));
+-            }
+-          }
+-        } else {
+-          LOG.debug("table non-partitioned");
+-          checkTargetLocationEmpty(fs, new Path(table.getDataLocation()
+-              .toString()));
+-          loadTable(fromURI, table);
+-        }
+-        // Set this to read because we can't overwrite any existing partitions
+-        outputs.add(new WriteEntity(table, WriteEntity.WriteType.DDL_NO_LOCK));
+-      } catch (InvalidTableException e) {
+-        LOG.debug("table " + tblDesc.getTableName() + " does not exist");
+-
+-        Task<?> t = TaskFactory.get(new DDLWork(getInputs(), getOutputs(),
+-            tblDesc), conf);
+-        Table table = new Table(dbname, tblDesc.getTableName());
+-        String currentDb = SessionState.get().getCurrentDatabase();
+-        conf.set("import.destination.dir",
+-            wh.getTablePath(db.getDatabaseCurrent(),
+-                tblDesc.getTableName()).toString());
+-        if ((tblDesc.getPartCols() != null) && (tblDesc.getPartCols().size() != 0)) {
+-          for (AddPartitionDesc addPartitionDesc : partitionDescs) {
+-            t.addDependentTask(
+-                addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc));
+-          }
+-        } else {
+-          LOG.debug("adding dependent CopyWork/MoveWork for table");
+-          if (tblDesc.isExternal() && (tblDesc.getLocation() == null)) {
+-            LOG.debug("Importing in place, no emptiness check, no copying/loading");
+-            Path dataPath = new Path(fromURI.toString(), "data");
+-            tblDesc.setLocation(dataPath.toString());
+-          } else {
+-            Path tablePath = null;
+-            if (tblDesc.getLocation() != null) {
+-              tablePath = new Path(tblDesc.getLocation());
+-            } else {
+-              tablePath = wh.getTablePath(db.getDatabaseCurrent(), tblDesc.getTableName());
+-            }
+-            checkTargetLocationEmpty(fs, tablePath);
+-            t.addDependentTask(loadTable(fromURI, table));
+-          }
+-        }
+-        rootTasks.add(t);
+-        //inputs.add(new ReadEntity(fromURI.toString(),
+-        //  fromURI.getScheme().equals("hdfs") ? true : false));
++      }
++
++      if (!replicationSpec.isInReplicationScope()){
++        createRegularImportTasks(
++            rootTasks, tblDesc, partitionDescs,
++            isPartSpecSet, replicationSpec, table,
++            fromURI, fs, wh);
++      } else {
++        createReplImportTasks(
++            rootTasks, tblDesc, partitionDescs,
++            isPartSpecSet, replicationSpec, table,
++            fromURI, fs, wh);
+       }
+     } catch (SemanticException e) {
+       throw e;
+@@ -288,14 +241,90 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+     }
+   }
+ 
+-  private Task<?> loadTable(URI fromURI, Table table) {
++  private void parsePartitionSpec(ASTNode tableNode, LinkedHashMap<String, String> partSpec) throws SemanticException {
++    // get partition metadata if partition specified
++    if (tableNode.getChildCount() == 2) {
++      ASTNode partspec = (ASTNode) tableNode.getChild(1);
++      // partSpec is a mapping from partition column name to its value.
++      for (int j = 0; j < partspec.getChildCount(); ++j) {
++        ASTNode partspec_val = (ASTNode) partspec.getChild(j);
++        String val = null;
++        String colName = unescapeIdentifier(partspec_val.getChild(0)
++            .getText().toLowerCase());
++        if (partspec_val.getChildCount() < 2) { // DP in the form of T
++          // partition (ds, hr)
++          throw new SemanticException(
++              ErrorMsg.INVALID_PARTITION
++                  .getMsg(" - Dynamic partitions not allowed"));
++        } else { // in the form of T partition (ds="2010-03-03")
++          val = stripQuotes(partspec_val.getChild(1).getText());
++        }
++        partSpec.put(colName, val);
++      }
++    }
++  }
++
++  private AddPartitionDesc getBaseAddPartitionDescFromPartition(
++      Path fromPath, String dbname, CreateTableDesc tblDesc, Partition partition) throws MetaException {
++    AddPartitionDesc partsDesc = new AddPartitionDesc(dbname, tblDesc.getTableName(),
++        EximUtil.makePartSpec(tblDesc.getPartCols(), partition.getValues()),
++        partition.getSd().getLocation(), partition.getParameters());
++    AddPartitionDesc.OnePartitionDesc partDesc = partsDesc.getPartition(0);
++    partDesc.setInputFormat(partition.getSd().getInputFormat());
++    partDesc.setOutputFormat(partition.getSd().getOutputFormat());
++    partDesc.setNumBuckets(partition.getSd().getNumBuckets());
++    partDesc.setCols(partition.getSd().getCols());
++    partDesc.setSerializationLib(partition.getSd().getSerdeInfo().getSerializationLib());
++    partDesc.setSerdeParams(partition.getSd().getSerdeInfo().getParameters());
++    partDesc.setBucketCols(partition.getSd().getBucketCols());
++    partDesc.setSortCols(partition.getSd().getSortCols());
++    partDesc.setLocation(new Path(fromPath,
++        Warehouse.makePartName(tblDesc.getPartCols(), partition.getValues())).toString());
++    return partsDesc;
++  }
++
++  private CreateTableDesc getBaseCreateTableDescFromTable(String dbName,
++      org.apache.hadoop.hive.metastore.api.Table table) {
++    if ((table.getPartitionKeys() == null) || (table.getPartitionKeys().size() == 0)){
++      table.putToParameters(StatsSetupConst.DO_NOT_UPDATE_STATS,"true");
++    }
++    CreateTableDesc tblDesc = new CreateTableDesc(
++        dbName,
++        table.getTableName(),
++        false, // isExternal: set to false here, can be overwritten by the
++               // IMPORT stmt
++        table.isTemporary(),
++        table.getSd().getCols(),
++        table.getPartitionKeys(),
++        table.getSd().getBucketCols(),
++        table.getSd().getSortCols(),
++        table.getSd().getNumBuckets(),
++        null, null, null, null, null, // these 5 delims passed as serde params
++        null, // comment passed as table params
++        table.getSd().getInputFormat(),
++        table.getSd().getOutputFormat(),
++        null, // location: set to null here, can be
++              // overwritten by the IMPORT stmt
++        table.getSd().getSerdeInfo().getSerializationLib(),
++        null, // storagehandler passed as table params
++        table.getSd().getSerdeInfo().getParameters(),
++        table.getParameters(), false,
++        (null == table.getSd().getSkewedInfo()) ? null : table.getSd().getSkewedInfo()
++            .getSkewedColNames(),
++        (null == table.getSd().getSkewedInfo()) ? null : table.getSd().getSkewedInfo()
++            .getSkewedColValues());
++    tblDesc.setStoredAsSubDirectories(table.getSd().isStoredAsSubDirectories());
++    return tblDesc;
++  }
++
++  private Task<?> loadTable(URI fromURI, Table table, boolean replace) {
+     Path dataPath = new Path(fromURI.toString(), "data");
+     Path tmpPath = ctx.getExternalTmpPath(new Path(fromURI));
+     Task<?> copyTask = TaskFactory.get(new CopyWork(dataPath,
+        tmpPath, false), conf);
+     LoadTableDesc loadTableWork = new LoadTableDesc(tmpPath,
+         Utilities.getTableDesc(table), new TreeMap<String, String>(),
+-        false);
++        replace);
+     Task<?> loadTableTask = TaskFactory.get(new MoveWork(getInputs(),
+         getOutputs(), loadTableWork, null, false), conf);
+     copyTask.addDependentTask(loadTableTask);
+@@ -303,9 +332,49 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+     return loadTableTask;
+   }
+ 
+-  private Task<?> addSinglePartition(URI fromURI, FileSystem fs, CreateTableDesc tblDesc,
++  private Task<?> createTableTask(CreateTableDesc tableDesc){
++    return TaskFactory.get(new DDLWork(
++        getInputs(),
++        getOutputs(),
++        tableDesc
++    ), conf);
++  }
++
++  private Task<?> dropTableTask(Table table){
++    return TaskFactory.get(new DDLWork(
++        getInputs(),
++        getOutputs(),
++        new DropTableDesc(table.getTableName(), false, true, true, null)
++    ), conf);
++  }
++
++  private Task<? extends Serializable> alterTableTask(CreateTableDesc tableDesc) {
++    tableDesc.setReplaceMode(true);
++    return TaskFactory.get(new DDLWork(
++        getInputs(),
++        getOutputs(),
++        tableDesc
++    ), conf);
++  }
++
++  private Task<? extends Serializable> alterSinglePartition(
++      URI fromURI, FileSystem fs, CreateTableDesc tblDesc,
++      Table table, Warehouse wh, AddPartitionDesc addPartitionDesc,
++      ReplicationSpec replicationSpec, org.apache.hadoop.hive.ql.metadata.Partition ptn) {
++    addPartitionDesc.setReplaceMode(true);
++    addPartitionDesc.getPartition(0).setLocation(ptn.getLocation()); // use existing location
++    return TaskFactory.get(new DDLWork(
++        getInputs(),
++        getOutputs(),
++        addPartitionDesc
++    ), conf);
++  }
++
++
++ private Task<?> addSinglePartition(URI fromURI, FileSystem fs, CreateTableDesc tblDesc,
+       Table table, Warehouse wh,
+-      AddPartitionDesc addPartitionDesc) throws MetaException, IOException, HiveException {
++      AddPartitionDesc addPartitionDesc, ReplicationSpec replicationSpec)
++      throws MetaException, IOException, HiveException {
+     AddPartitionDesc.OnePartitionDesc partSpec = addPartitionDesc.getPartition(0);
+     if (tblDesc.isExternal() && tblDesc.getLocation() == null) {
+       LOG.debug("Importing in-place: adding AddPart for partition "
+@@ -316,22 +385,7 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+       return addPartTask;
+     } else {
+       String srcLocation = partSpec.getLocation();
+-      Path tgtPath = null;
+-      if (tblDesc.getLocation() == null) {
+-        if (table.getDataLocation() != null) {
+-          tgtPath = new Path(table.getDataLocation().toString(),
+-              Warehouse.makePartPath(partSpec.getPartSpec()));
+-        } else {
+-          tgtPath = new Path(wh.getTablePath(
+-              db.getDatabaseCurrent(), tblDesc.getTableName()),
+-              Warehouse.makePartPath(partSpec.getPartSpec()));
+-        }
+-      } else {
+-        tgtPath = new Path(tblDesc.getLocation(),
+-            Warehouse.makePartPath(partSpec.getPartSpec()));
+-      }
+-      checkTargetLocationEmpty(fs, tgtPath);
+-      partSpec.setLocation(tgtPath.toString());
++      fixLocationInPartSpec(fs, tblDesc, table, wh, replicationSpec, partSpec);
+       LOG.debug("adding dependent CopyWork/AddPart/MoveWork for partition "
+           + partSpecToString(partSpec.getPartSpec())
+           + " with source location: " + srcLocation);
+@@ -354,8 +408,38 @@ public void analyzeInternal(ASTNode ast) throws SemanticException {
+     }
+   }
+ 
+-  private void checkTargetLocationEmpty(FileSystem fs, Path targetPath)
++  /**
++   * Helper method to set location properly in partSpec
++   */
++  private void fixLocationInPartSpec(
++      FileSystem fs, CreateTableDesc tblDesc, Table table,
++      Warehouse wh, ReplicationSpec replicationSpec,
++      AddPartitionDesc.OnePartitionDesc partSpec) throws MetaException, HiveException, IOException {
++    Path tgtPath = null;
++    if (tblDesc.getLocation() == null) {
++      if (table.getDataLocation() != null) {
++        tgtPath = new Path(table.getDataLocation().toString(),
++            Warehouse.makePartPath(partSpec.getPartSpec()));
++      } else {
++        Database parentDb = db.getDatabase(tblDesc.getDatabaseName());
++        tgtPath = new Path(
++            wh.getTablePath( parentDb, tblDesc.getTableName()),
++            Warehouse.makePartPath(partSpec.getPartSpec()));
++      }
++    } else {
++      tgtPath = new Path(tblDesc.getLocation(),
++          Warehouse.makePartPath(partSpec.getPartSpec()));
++    }
++    checkTargetLocationEmpty(fs, tgtPath, replicationSpec);
++    partSpec.setLocation(tgtPath.toString());
++  }
++
++  private void checkTargetLocationEmpty(FileSystem fs, Path targetPath, ReplicationSpec replicationSpec)
+       throws IOException, SemanticException {
++    if (replicationSpec.isInReplicationScope()){
++      // replication scope allows replacement, and does not require empty directories
++      return;
++    }
+     LOG.debug("checking emptiness of " + targetPath.toString());
+     if (fs.exists(targetPath)) {
+       FileStatus[] status = fs.listStatus(targetPath, FileUtils.HIDDEN_FILES_PATH_FILTER);
+@@ -382,38 +466,57 @@ private static String partSpecToString(Map<String, String> partSpec) {
+     return sb.toString();
+   }
+ 
+-  private static void checkTable(Table table, CreateTableDesc tableDesc)
++  private void checkTable(Table table, CreateTableDesc tableDesc, ReplicationSpec replicationSpec)
+       throws SemanticException, URISyntaxException {
++    // This method gets called only in the scope that a destination table already exists, so
++    // we're validating if the table is an appropriate destination to import into
++
++    if (replicationSpec.isInReplicationScope()){
++      // If this import is being done for replication, then this will be a managed table, and replacements
++      // are allowed irrespective of what the table currently looks like. So no more checks are necessary.
++      return;
++    } else {
++      // verify if table has been the target of replication, and if so, check HiveConf if we're allowed
++      // to override. If not, fail.
++      if (table.getParameters().containsKey(ReplicationSpec.KEY.CURR_STATE_ID.toString())
++          && conf.getBoolVar(HiveConf.ConfVars.HIVE_EXIM_RESTRICT_IMPORTS_INTO_REPLICATED_TABLES)){
++            throw new SemanticException(ErrorMsg.IMPORT_INTO_STRICT_REPL_TABLE.getMsg(
++                "Table "+table.getTableName()+" has repl.last.id parameter set." ));
++      }
++    }
++
++    // Next, we verify that the destination table is not offline, a view, or a non-native table
++    EximUtil.validateTable(table);
++
++    // If the import statement specified that we're importing to an external
++    // table, we seem to be doing the following:
++    //    a) We don't allow replacement in an unpartitioned pre-existing table
++    //    b) We don't allow replacement in a partitioned pre-existing table where that table is external
++    // TODO : Does this simply mean we don't allow replacement in external tables if they already exist?
++    //    If so(i.e. the check is superfluous and wrong), this can be a simpler check. If not, then
++    //    what we seem to be saying is that the only case we allow is to allow an IMPORT into an EXTERNAL
++    //    table in the statement, if a destination partitioned table exists, so long as it is actually
++    //    not external itself. Is that the case? Why?
+     {
+-      EximUtil.validateTable(table);
+-      if (!table.isPartitioned()) {
+-        if (tableDesc.isExternal()) { // the import statement specified external
+-          throw new SemanticException(
+-              ErrorMsg.INCOMPATIBLE_SCHEMA
+-                  .getMsg(" External table cannot overwrite existing table."
+-                      + " Drop existing table first."));
+-        }
+-      } else {
+-        if (tableDesc.isExternal()) { // the import statement specified external
+-          if (!table.getTableType().equals(TableType.EXTERNAL_TABLE)) {
+-            throw new SemanticException(
+-                ErrorMsg.INCOMPATIBLE_SCHEMA
+-                    .getMsg(" External table cannot overwrite existing table."
+-                        + " Drop existing table first."));
+-          }
+-        }
++      if ( (tableDesc.isExternal()) // IMPORT statement speicified EXTERNAL
++          && (!table.isPartitioned() || !table.getTableType().equals(TableType.EXTERNAL_TABLE))
++          ){
++        throw new SemanticException(ErrorMsg.INCOMPATIBLE_SCHEMA.getMsg(
++            " External table cannot overwrite existing table. Drop existing table first."));
+       }
+     }
++
++    // If a table import statement specified a location and the table(unpartitioned)
++    // already exists, ensure that the locations are the same.
++    // Partitioned tables not checked here, since the location provided would need
++    // checking against the partition in question instead.
+     {
+-      if (!table.isPartitioned()) {
+-        if (tableDesc.getLocation() != null) { // IMPORT statement specified
+-                                               // location
+-          if (!table.getDataLocation()
+-              .equals(new Path(tableDesc.getLocation()))) {
+-            throw new SemanticException(
+-                ErrorMsg.INCOMPATIBLE_SCHEMA.getMsg(" Location does not match"));
+-          }
+-        }
++      if ((tableDesc.getLocation() != null)
++          && (!table.isPartitioned())
++          && (!table.getDataLocation().equals(new Path(tableDesc.getLocation()))) ){
++        throw new SemanticException(
++            ErrorMsg.INCOMPATIBLE_SCHEMA.getMsg(" Location does not match"));
++
+       }
+     }
+     {
+@@ -572,4 +675,221 @@ private static String checkParams(Map<String, String> map1,
+     }
+     return null;
+   }
++
++  /**
++   * Create tasks for regular import, no repl complexity
++   */
++  private void createRegularImportTasks(
++      List<Task<? extends Serializable>> rootTasks,
++      CreateTableDesc tblDesc,
++      List<AddPartitionDesc> partitionDescs,
++      boolean isPartSpecSet,
++      ReplicationSpec replicationSpec,
++      Table table, URI fromURI, FileSystem fs, Warehouse wh)
++      throws HiveException, URISyntaxException, IOException, MetaException {
++
++    if (table != null){
++      if (table.isPartitioned()) {
++        LOG.debug("table partitioned");
++
++        for (AddPartitionDesc addPartitionDesc : partitionDescs) {
++          Map<String, String> partSpec = addPartitionDesc.getPartition(0).getPartSpec();
++          org.apache.hadoop.hive.ql.metadata.Partition ptn = null;
++          if ((ptn = db.getPartition(table, partSpec, false)) == null) {
++            rootTasks.add(addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc, replicationSpec));
++          } else {
++            throw new SemanticException(
++                ErrorMsg.PARTITION_EXISTS.getMsg(partSpecToString(partSpec)));
++          }
++        }
++
++      } else {
++        LOG.debug("table non-partitioned");
++        // ensure if destination is not empty only for regular import
++        checkTargetLocationEmpty(fs, new Path(table.getDataLocation().toString()), replicationSpec);
++        loadTable(fromURI, table, false);
++      }
++      // Set this to read because we can't overwrite any existing partitions
++      outputs.add(new WriteEntity(table, WriteEntity.WriteType.DDL_NO_LOCK));
++    } else {
++      LOG.debug("table " + tblDesc.getTableName() + " does not exist");
++
++      Task<?> t = TaskFactory.get(new DDLWork(getInputs(), getOutputs(), tblDesc), conf);
++      table = new Table(tblDesc.getDatabaseName(), tblDesc.getTableName());
++      Database parentDb = db.getDatabase(tblDesc.getDatabaseName());
++
++      if (isPartitioned(tblDesc)) {
++        for (AddPartitionDesc addPartitionDesc : partitionDescs) {
++          t.addDependentTask(
++              addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc, replicationSpec));
++        }
++      } else {
++        LOG.debug("adding dependent CopyWork/MoveWork for table");
++        if (tblDesc.isExternal() && (tblDesc.getLocation() == null)) {
++          LOG.debug("Importing in place, no emptiness check, no copying/loading");
++          Path dataPath = new Path(fromURI.toString(), "data");
++          tblDesc.setLocation(dataPath.toString());
++        } else {
++          Path tablePath = null;
++          if (tblDesc.getLocation() != null) {
++            tablePath = new Path(tblDesc.getLocation());
++          } else {
++            tablePath = wh.getTablePath(parentDb, tblDesc.getTableName());
++          }
++          checkTargetLocationEmpty(fs, tablePath, replicationSpec);
++          t.addDependentTask(loadTable(fromURI, table, false));
++        }
++      }
++      rootTasks.add(t);
++    }
++  }
++
++  /**
++   * Create tasks for repl import
++   */
++  private void createReplImportTasks(
++      List<Task<? extends Serializable>> rootTasks,
++      CreateTableDesc tblDesc,
++      List<AddPartitionDesc> partitionDescs,
++      boolean isPartSpecSet, ReplicationSpec replicationSpec, Table table, URI fromURI, FileSystem fs, Warehouse wh)
++      throws HiveException, URISyntaxException, IOException, MetaException {
++
++    Task dr = null;
++    WriteEntity.WriteType lockType = WriteEntity.WriteType.DDL_NO_LOCK;
++
++    if ((table != null) && (isPartitioned(tblDesc) != table.isPartitioned())){
++      // If destination table exists, but is partitioned, and we think we're writing to an unpartitioned
++      // or if destination table exists, but is unpartitioned and we think we're writing to a partitioned
++      // table, then this can only happen because there are drops in the queue that are yet to be processed.
++      // So, we check the repl.last.id of the destination, and if it's newer, we no-op. If it's older, we
++      // drop and re-create.
++      if (replicationSpec.allowReplacementInto(table)){
++        dr = dropTableTask(table);
++        lockType = WriteEntity.WriteType.DDL_EXCLUSIVE;
++        table = null; // null it out so we go into the table re-create flow.
++      } else {
++        return; // noop out of here.
++      }
++    }
++
++    Database parentDb = db.getDatabase(tblDesc.getDatabaseName());
++    if (parentDb == null){
++      throw new SemanticException(ErrorMsg.DATABASE_NOT_EXISTS.getMsg(tblDesc.getDatabaseName()));
++    }
++    if (tblDesc.getLocation() == null) {
++      tblDesc.setLocation(wh.getTablePath(parentDb, tblDesc.getTableName()).toString());
++    }
++
++     /* Note: In the following section, Metadata-only import handling logic is
++        interleaved with regular repl-import logic. The rule of thumb being
++        followed here is that MD-only imports are essentially ALTERs. They do
++        not load data, and should not be "creating" any metadata - they should
++        be replacing instead. The only place it makes sense for a MD-only import
++        to create is in the case of a table that's been dropped and recreated,
++        or in the case of an unpartitioned table. In all other cases, it should
++        behave like a noop or a pure MD alter.
++     */
++
++    if (table == null) {
++      // Either we're dropping and re-creating, or the table didn't exist, and we're creating.
++
++      if (lockType == WriteEntity.WriteType.DDL_NO_LOCK){
++        lockType = WriteEntity.WriteType.DDL_SHARED;
++      }
++
++      Task t = createTableTask(tblDesc);
++      table = new Table(tblDesc.getDatabaseName(), tblDesc.getTableName());
++
++      if (!replicationSpec.isMetadataOnly()) {
++        if (isPartitioned(tblDesc)) {
++          for (AddPartitionDesc addPartitionDesc : partitionDescs) {
++            t.addDependentTask(
++                addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc, replicationSpec));
++          }
++        } else {
++          LOG.debug("adding dependent CopyWork/MoveWork for table");
++          t.addDependentTask(loadTable(fromURI, table, true));
++        }
++      }
++      if (dr == null){
++        // Simply create
++        rootTasks.add(t);
++      } else {
++        // Drop and recreate
++        dr.addDependentTask(t);
++        rootTasks.add(dr);
++      }
++    } else {
++      // Table existed, and is okay to replicate into, not dropping and re-creating.
++      if (table.isPartitioned()) {
++        LOG.debug("table partitioned");
++        for (AddPartitionDesc addPartitionDesc : partitionDescs) {
++
++          Map<String, String> partSpec = addPartitionDesc.getPartition(0).getPartSpec();
++          org.apache.hadoop.hive.ql.metadata.Partition ptn = null;
++
++          if ((ptn = db.getPartition(table, partSpec, false)) == null) {
++            if (!replicationSpec.isMetadataOnly()){
++              rootTasks.add(addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc, replicationSpec));
++            }
++          } else {
++            // If replicating, then the partition already existing means we need to replace, maybe, if
++            // the destination ptn's repl.last.id is older than the replacement's.
++            if (replicationSpec.allowReplacementInto(ptn)){
++              if (!replicationSpec.isMetadataOnly()){
++                rootTasks.add(addSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc, replicationSpec));
++              } else {
++                rootTasks.add(alterSinglePartition(fromURI, fs, tblDesc, table, wh, addPartitionDesc, replicationSpec, ptn));
++              }
++              if (lockType == WriteEntity.WriteType.DDL_NO_LOCK){
++                lockType = WriteEntity.WriteType.DDL_SHARED;
++              }
++            } else {
++              // ignore this ptn, do nothing, not an error.
++            }
++          }
++
++        }
++        if (replicationSpec.isMetadataOnly() && partitionDescs.isEmpty()){
++          // MD-ONLY table alter
++          rootTasks.add(alterTableTask(tblDesc));
++          if (lockType == WriteEntity.WriteType.DDL_NO_LOCK){
++            lockType = WriteEntity.WriteType.DDL_SHARED;
++          }
++        }
++      } else {
++        LOG.debug("table non-partitioned");
++        if (!replicationSpec.allowReplacementInto(table)){
++          return; // silently return, table is newer than our replacement.
++        }
++        if (!replicationSpec.isMetadataOnly()) {
++          loadTable(fromURI, table, true); // repl-imports are replace-into
++        } else {
++          rootTasks.add(alterTableTask(tblDesc));
++        }
++        if (lockType == WriteEntity.WriteType.DDL_NO_LOCK){
++          lockType = WriteEntity.WriteType.DDL_SHARED;
++        }
++      }
++    }
++    outputs.add(new WriteEntity(table,lockType));
++
++  }
++
++  private boolean isPartitioned(CreateTableDesc tblDesc) {
++    return !(tblDesc.getPartCols() == null || tblDesc.getPartCols().isEmpty());
++  }
++
++  /**
++   * Utility method that returns a table if one corresponding to the destination
++   * tblDesc is found. Returns null if no such table is found.
++   */
++   private Table tableIfExists(CreateTableDesc tblDesc) throws HiveException {
++    try {
++      return db.getTable(tblDesc.getDatabaseName(),tblDesc.getTableName());
++    } catch (InvalidTableException e) {
++      return null;
++    }
++  }
++
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/MetaDataExportListener.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/MetaDataExportListener.java
+index a16c7dc..1739fd2 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/MetaDataExportListener.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/MetaDataExportListener.java
+@@ -86,7 +86,7 @@ private void export_meta_data(PreDropTableEvent tableEvent) throws MetaException
+     Path outFile = new Path(metaPath, name + ImportSemanticAnalyzer.METADATA_NAME);
+     try {
+       SessionState.getConsole().printInfo("Beginning metadata export");
+-      EximUtil.createExportDump(fs, outFile, mTbl, null);
++      EximUtil.createExportDump(fs, outFile, mTbl, null, null);
+       if (moveMetadataToTrash == true) {
+         wh.deleteDir(metaPath, true);
+       }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/ReplicationSpec.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/ReplicationSpec.java
+new file mode 100644
+index 0000000..5f80528
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/ReplicationSpec.java
+@@ -0,0 +1,314 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.parse;
++
++import com.google.common.base.Function;
++import com.google.common.base.Predicate;
++import org.apache.hadoop.hive.ql.metadata.Partition;
++import org.apache.hadoop.hive.ql.metadata.Table;
++import org.apache.hadoop.hive.ql.plan.PlanUtils;
++
++import javax.annotation.Nullable;
++import java.text.Collator;
++import java.util.Map;
++
++/**
++ * Statements executed to handle replication have some additional
++ * information relevant to the replication subsystem - this class
++ * captures those bits of information.
++ *
++ * Typically, this corresponds to the replicationClause definition
++ * in the parser.
++ */
++public class ReplicationSpec {
++
++  private boolean isInReplicationScope = false; // default is that it's not in a repl scope
++  private boolean isMetadataOnly = false; // default is full export/import, not metadata-only
++  private String eventId = null;
++  private String currStateId = null;
++  private boolean isNoop = false;
++
++
++  // Key definitions related to replication
++  public enum KEY {
++    REPL_SCOPE("repl.scope"),
++    EVENT_ID("repl.event.id"),
++    CURR_STATE_ID("repl.last.id"),
++    NOOP("repl.noop");
++
++    private final String keyName;
++
++    KEY(String s) {
++      this.keyName = s;
++    }
++
++    @Override
++    public String toString(){
++      return keyName;
++    }
++  }
++
++  public enum SCOPE { NO_REPL, MD_ONLY, REPL };
++
++  static private Collator collator = Collator.getInstance();
++
++  /**
++   * Constructor to construct spec based on either the ASTNode that
++   * corresponds to the replication clause itself, or corresponds to
++   * the parent node, and will scan through the children to instantiate
++   * itself.
++   * @param node replicationClause node, or parent of replicationClause node
++   */
++  public ReplicationSpec(ASTNode node){
++    if (node != null){
++      if (isApplicable(node)){
++        init(node);
++        return;
++      } else {
++        for (int i = 1; i < node.getChildCount(); ++i) {
++          ASTNode child = (ASTNode) node.getChild(i);
++          if (isApplicable(child)) {
++            init(child);
++            return;
++          }
++        }
++      }
++    }
++    // If we reached here, we did not find a replication
++    // spec in the node or its immediate children. Defaults
++    // are to pretend replication is not happening, and the
++    // statement above is running as-is.
++  }
++
++  /**
++   * Default ctor that is useful for determining default states
++   */
++  public ReplicationSpec(){
++    this((ASTNode)null);
++  }
++
++  public  ReplicationSpec(
++      boolean isInReplicationScope, boolean isMetadataOnly, String eventReplicationState,
++      String currentReplicationState, boolean isNoop){
++    this.isInReplicationScope = isInReplicationScope;
++    this.isMetadataOnly = isMetadataOnly;
++    this.eventId = eventReplicationState;
++    this.currStateId = currentReplicationState;
++    this.isNoop = isNoop;
++  }
++
++  public ReplicationSpec(Function<String, String> keyFetcher) {
++    String scope = keyFetcher.apply(ReplicationSpec.KEY.REPL_SCOPE.toString());
++    this.isMetadataOnly = false;
++    this.isInReplicationScope = false;
++    if (scope != null){
++      if (scope.equalsIgnoreCase("metadata")){
++        this.isMetadataOnly = true;
++        this.isInReplicationScope = true;
++      } else if (scope.equalsIgnoreCase("all")){
++        this.isInReplicationScope = true;
++      }
++    }
++    this.eventId = keyFetcher.apply(ReplicationSpec.KEY.EVENT_ID.toString());
++    this.currStateId = keyFetcher.apply(ReplicationSpec.KEY.CURR_STATE_ID.toString());
++    this.isNoop = Boolean.valueOf(keyFetcher.apply(ReplicationSpec.KEY.NOOP.toString())).booleanValue();
++  }
++
++  /**
++   * Tests if an ASTNode is a Replication Specification
++   */
++  public static boolean isApplicable(ASTNode node){
++    return (node.getToken().getType() == HiveParser.TOK_REPLICATION);
++  }
++
++  /**
++   * @param currReplState Current object state
++   * @param replacementReplState Replacement-candidate state
++   * @return whether or not a provided replacement candidate is newer(or equal) to the existing object state or not
++   */
++  public static boolean allowReplacement(String currReplState, String replacementReplState){
++    if ((currReplState == null) || (currReplState.isEmpty())) {
++      // if we have no replication state on record for the obj, allow replacement.
++      return true;
++    }
++    if ((replacementReplState == null) || (replacementReplState.isEmpty())) {
++      // if we reached this condition, we had replication state on record for the
++      // object, but its replacement has no state. Disallow replacement
++      return false;
++    }
++
++    // First try to extract a long value from the strings, and compare them.
++    // If oldReplState is less-than or equal to newReplState, allow.
++    long currReplStateLong = Long.parseLong(currReplState.replaceAll("\\D",""));
++    long replacementReplStateLong = Long.parseLong(replacementReplState.replaceAll("\\D",""));
++
++    if ((currReplStateLong != 0) || (replacementReplStateLong != 0)){
++      return ((currReplStateLong - replacementReplStateLong) <= 0);
++    }
++
++    // If the long value of both is 0, though, fall back to lexical comparison.
++
++    // Lexical comparison according to locale will suffice for now, future might add more logic
++    return (collator.compare(currReplState.toLowerCase(), replacementReplState.toLowerCase()) <= 0);
++  }
++
++ /**
++   * Determines if a current replication object(current state of dump) is allowed to
++   * replicate-replace-into a given partition
++   */
++  public boolean allowReplacementInto(Partition ptn){
++    return allowReplacement(getLastReplicatedStateFromParameters(ptn.getParameters()),this.getCurrentReplicationState());
++  }
++
++  /**
++   * Determines if a current replication event specification is allowed to
++   * replicate-replace-into a given partition
++   */
++  public boolean allowEventReplacementInto(Partition ptn){
++    return allowReplacement(getLastReplicatedStateFromParameters(ptn.getParameters()),this.getReplicationState());
++  }
++
++  /**
++   * Determines if a current replication object(current state of dump) is allowed to
++   * replicate-replace-into a given table
++   */
++  public boolean allowReplacementInto(Table table) {
++    return allowReplacement(getLastReplicatedStateFromParameters(table.getParameters()),this.getCurrentReplicationState());
++  }
++
++  /**
++   * Determines if a current replication event specification is allowed to
++   * replicate-replace-into a given table
++   */
++  public boolean allowEventReplacementInto(Table table) {
++    return allowReplacement(getLastReplicatedStateFromParameters(table.getParameters()),this.getReplicationState());
++  }
++
++  /**
++   * Returns a predicate filter to filter an Iterable<Partition> to return all partitions
++   * that the current replication event specification is allowed to replicate-replace-into
++   */
++  public Predicate<Partition> allowEventReplacementInto() {
++    return new Predicate<Partition>() {
++      @Override
++      public boolean apply(@Nullable Partition partition) {
++        if (partition == null){
++          return false;
++        }
++        return (allowEventReplacementInto(partition));
++      }
++    };
++  }
++
++  private static String getLastReplicatedStateFromParameters(Map<String, String> m) {
++    if ((m != null) && (m.containsKey(KEY.CURR_STATE_ID.toString()))){
++      return m.get(KEY.CURR_STATE_ID.toString());
++    }
++    return null;
++  }
++
++  private void init(ASTNode node){
++    // -> ^(TOK_REPLICATION $replId $isMetadataOnly)
++    isInReplicationScope = true;
++    eventId = PlanUtils.stripQuotes(node.getChild(0).getText());
++    if (node.getChildCount() > 1){
++      if (node.getChild(1).getText().toLowerCase().equals("metadata")) {
++        isMetadataOnly= true;
++      }
++    }
++  }
++
++  /**
++   * @return true if this statement is being run for the purposes of replication
++   */
++  public boolean isInReplicationScope(){
++    return isInReplicationScope;
++  }
++
++  /**
++   * @return true if this statement refers to metadata-only operation.
++   */
++  public boolean isMetadataOnly(){
++    return isMetadataOnly;
++  }
++
++  /**
++   * @return the replication state of the event that spawned this statement
++   */
++  public String getReplicationState() {
++    return eventId;
++  }
++
++  /**
++   * @return the current replication state of the wh
++   */
++  public String getCurrentReplicationState() {
++    return currStateId;
++  }
++
++  public void setCurrentReplicationState(String currStateId) {
++    this.currStateId = currStateId;
++  }
++
++  /**
++   * @return whether or not the current replication action should be a noop
++   */
++  public boolean isNoop() {
++    return isNoop;
++  }
++
++  /**
++   * @param isNoop whether or not the current replication action should be a noop
++   */
++  public void setNoop(boolean isNoop) {
++    this.isNoop = isNoop;
++  }
++
++  public String get(KEY key) {
++    switch (key){
++      case REPL_SCOPE:
++        switch (getScope()){
++          case MD_ONLY:
++            return "metadata";
++          case REPL:
++            return "all";
++          case NO_REPL:
++            return "none";
++        }
++      case EVENT_ID:
++        return getReplicationState();
++      case CURR_STATE_ID:
++        return getCurrentReplicationState();
++      case NOOP:
++        return String.valueOf(isNoop());
++    }
++    return null;
++  }
++
++  public SCOPE getScope(){
++    if (isInReplicationScope()){
++      if (isMetadataOnly()){
++        return SCOPE.MD_ONLY;
++      } else {
++        return SCOPE.REPL;
++      }
++    } else {
++      return SCOPE.NO_REPL;
++    }
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/AddPartitionDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/AddPartitionDesc.java
+index 09d65a7..7a583c3 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/AddPartitionDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/AddPartitionDesc.java
+@@ -151,6 +151,7 @@ public void setOutputFormat(String outputFormat) {
+   String dbName;
+   boolean ifNotExists;
+   List<OnePartitionDesc> partitions = null;
++  boolean replaceMode = false;
+ 
+ 
+   /**
+@@ -287,4 +288,18 @@ public int getPartitionCount() {
+   public OnePartitionDesc getPartition(int i) {
+     return this.partitions.get(i);
+   }
++
++  /**
++   * @param replaceMode Determine if this AddPartition should behave like a replace-into alter instead
++   */
++  public void setReplaceMode(boolean replaceMode){
++    this.replaceMode = replaceMode;
++  }
++
++  /**
++   * @return true if this AddPartition should behave like a replace-into alter instead
++   */
++  public boolean getReplaceMode() {
++    return this.replaceMode;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateTableDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateTableDesc.java
+index 8cadb96..d5179fa 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateTableDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/CreateTableDesc.java
+@@ -76,6 +76,7 @@
+   List<List<String>> skewedColValues;
+   boolean isStoredAsSubDirectories = false;
+   boolean isTemporary = false;
++  private boolean replaceMode = false;
+ 
+   public CreateTableDesc() {
+   }
+@@ -549,4 +550,17 @@ public void setTemporary(boolean isTemporary) {
+     this.isTemporary = isTemporary;
+   }
+ 
++  /**
++   * @param replaceMode Determine if this CreateTable should behave like a replace-into alter instead
++   */
++  public void setReplaceMode(boolean replaceMode) {
++    this.replaceMode = replaceMode;
++  }
++
++  /**
++   * @return true if this CreateTable should behave like a replace-into alter instead
++   */
++  public boolean getReplaceMode() {
++    return replaceMode;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/DropTableDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/DropTableDesc.java
+index c79710d..4749e47 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/DropTableDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/DropTableDesc.java
+@@ -22,6 +22,7 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
++import org.apache.hadoop.hive.ql.parse.ReplicationSpec;
+ 
+ /**
+  * DropTableDesc.
+@@ -54,6 +55,7 @@ public int getPrefixLength() {
+   boolean ifExists;
+   boolean ifPurge;
+   boolean ignoreProtection;
++  ReplicationSpec replicationSpec;
+ 
+   public DropTableDesc() {
+   }
+@@ -62,17 +64,21 @@ public DropTableDesc() {
+    * @param tableName
+    * @param ifPurge
+    */
+-  public DropTableDesc(String tableName, boolean expectView, boolean ifExists, boolean ifPurge) {
++  public DropTableDesc(
++      String tableName, boolean expectView, boolean ifExists,
++      boolean ifPurge, ReplicationSpec replicationSpec) {
+     this.tableName = tableName;
+     this.partSpecs = null;
+     this.expectView = expectView;
+     this.ifExists = ifExists;
+     this.ifPurge = ifPurge;
+     this.ignoreProtection = false;
++    this.replicationSpec = replicationSpec;
+   }
+ 
+   public DropTableDesc(String tableName, Map<Integer, List<ExprNodeGenericFuncDesc>> partSpecs,
+-      boolean expectView, boolean ignoreProtection, boolean ifPurge) {
++      boolean expectView, boolean ignoreProtection, boolean ifPurge,
++      ReplicationSpec replicationSpec) {
+     this.tableName = tableName;
+     this.partSpecs = new ArrayList<PartSpec>(partSpecs.size());
+     for (Map.Entry<Integer, List<ExprNodeGenericFuncDesc>> partSpec : partSpecs.entrySet()) {
+@@ -84,6 +90,7 @@ public DropTableDesc(String tableName, Map<Integer, List<ExprNodeGenericFuncDesc
+     this.ignoreProtection = ignoreProtection;
+     this.expectView = expectView;
+     this.ifPurge = ifPurge;
++    this.replicationSpec = replicationSpec;
+   }
+ 
+   /**
+@@ -168,4 +175,15 @@ public boolean getIfPurge() {
+   public void setIfPurge(boolean ifPurge) {
+       this.ifPurge = ifPurge;
+   }
++
++  /**
++   * @return what kind of replication scope this drop is running under.
++   * This can result in a "DROP IF OLDER THAN" kind of semantic
++   */
++  public ReplicationSpec getReplicationSpec(){
++    if (replicationSpec == null){
++      this.replicationSpec = new ReplicationSpec();
++    }
++    return this.replicationSpec;
++  }
+ }
+diff --git a/ql/src/test/queries/clientpositive/repl_1_drop.q b/ql/src/test/queries/clientpositive/repl_1_drop.q
+new file mode 100644
+index 0000000..5b7a86a
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/repl_1_drop.q
+@@ -0,0 +1,84 @@
++set hive.test.mode=true;
++set hive.test.mode.prefix=;
++
++create table repl_employee ( emp_id int comment "employee id")
++	comment "employee table"
++	partitioned by (emp_country string comment "two char iso code", emp_state string comment "free text")
++	stored as textfile
++	tblproperties("repl.last.id"="43");
++
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ca");
++
++show partitions repl_employee;
++show table extended like repl_employee;
++
++drop table repl_employee for replication('33');
++
++-- drop 33 => table does not get dropped, but ca will be
++
++show partitions repl_employee;
++show table extended like repl_employee;
++
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ak");
++
++show partitions repl_employee;
++
++drop table repl_employee for replication('');
++
++-- drop '' => ptns would be dropped, but not tables
++
++show partitions repl_employee;
++show table extended like repl_employee;
++
++drop table repl_employee for replication('49');
++
++-- table and ptns should have been dropped, so next create can succeed
++
++create table repl_employee ( emp_id int comment "employee id")
++	comment "employee table"
++	partitioned by (emp_country string comment "two char iso code", emp_state string comment "free text")
++	stored as textfile;
++
++-- created table without a repl.last.id
++
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ca");
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ak");
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="wa");
++
++show partitions repl_employee;
++show table extended like repl_employee;
++
++alter table repl_employee drop partition (emp_country="us", emp_state="ca");
++alter table repl_employee drop partition (emp_country="us", emp_state="wa") for replication('59');
++
++-- should have dropped ca, wa
++
++show partitions repl_employee;
++show table extended like repl_employee;
++
++alter table repl_employee set tblproperties ("repl.last.id" = "42");
++
++alter table repl_employee drop partition (emp_country="us", emp_state="ak");
++
++-- should have dropped ak
++
++show partitions repl_employee;
++show table extended like repl_employee;
++
++drop table repl_employee;
++
++-- should drop the whole table, and this can be verified by trying to create another table with the same name
++
++create table repl_employee( a string);
++
++show table extended like repl_employee;
++
++drop table repl_employee;
++
++
++
+diff --git a/ql/src/test/queries/clientpositive/repl_2_exim_basic.q b/ql/src/test/queries/clientpositive/repl_2_exim_basic.q
+new file mode 100644
+index 0000000..893d468
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/repl_2_exim_basic.q
+@@ -0,0 +1,79 @@
++set hive.test.mode=true;
++set hive.test.mode.prefix=;
++set hive.test.mode.nosamplelist=managed_t,ext_t,managed_t_imported,managed_t_r_imported,ext_t_imported,ext_t_r_imported;
++
++drop table if exists managed_t;
++drop table if exists ext_t;
++drop table if exists managed_t_imported;
++drop table if exists managed_t_r_imported;
++drop table if exists ext_t_imported;
++drop table if exists ext_t_r_imported;
++
++create table managed_t (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile;
++load data local inpath "../../data/files/test.dat"
++        into table managed_t partition (emp_country="us",emp_state="ca");
++
++create external table ext_t (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++        tblproperties("EXTERNAL"="true");
++load data local inpath "../../data/files/test.dat"
++        into table ext_t partition (emp_country="us",emp_state="ca");
++
++dfs ${system:test.dfs.mkdir} target/tmp/ql/test/data/exports/managed_t/temp;
++dfs -rmr target/tmp/ql/test/data/exports/managed_t;
++dfs ${system:test.dfs.mkdir} target/tmp/ql/test/data/exports/managed_t_r/temp;
++dfs -rmr target/tmp/ql/test/data/exports/managed_t_r;
++dfs ${system:test.dfs.mkdir} target/tmp/ql/test/data/exports/ext_t/temp;
++dfs -rmr target/tmp/ql/test/data/exports/ext_t;
++dfs ${system:test.dfs.mkdir} target/tmp/ql/test/data/exports/ext_t_r/temp;
++dfs -rmr target/tmp/ql/test/data/exports/ext_t_r;
++
++-- verifying difference between normal export of a external table
++-- and a replication export of an ext table
++-- the replication export will have squashed the "EXTERNAL" flag
++-- this is because the destination of all replication exports are
++-- managed tables. The managed tables should be similar except
++-- for the repl.last.id values
++
++export table managed_t to 'ql/test/data/exports/managed_t';
++export table managed_t to 'ql/test/data/exports/managed_t_r' for replication('managed_t_r');
++export table ext_t to 'ql/test/data/exports/ext_t';
++export table ext_t to 'ql/test/data/exports/ext_t_r' for replication('ext_t_r');
++
++drop table ext_t;
++drop table managed_t;
++
++import table managed_t_imported from 'ql/test/data/exports/managed_t';
++describe extended managed_t_imported;
++show table extended like managed_t_imported;
++show create table managed_t_imported;
++select * from managed_t_imported;
++
++-- should have repl.last.id
++import table managed_t_r_imported from 'ql/test/data/exports/managed_t_r';
++describe extended managed_t_r_imported;
++show table extended like managed_t_r_imported;
++show create table managed_t_r_imported;
++select * from managed_t_r_imported;
++
++import table ext_t_imported from 'ql/test/data/exports/ext_t';
++describe extended ext_t_imported;
++show table extended like ext_t_imported;
++show create table ext_t_imported;
++select * from ext_t_imported;
++
++-- should have repl.last.id
++-- also - importing an external table replication export would turn the new table into a managed table
++import table ext_t_r_imported from 'ql/test/data/exports/ext_t_r';
++describe extended ext_t_imported;
++show table extended like ext_t_r_imported;
++show create table ext_t_r_imported;
++select * from ext_t_r_imported;
++
++drop table managed_t_imported;
++drop table managed_t_r_imported;
++drop table ext_t_imported;
++drop table ext_t_r_imported;
+diff --git a/ql/src/test/queries/clientpositive/repl_3_exim_metadata.q b/ql/src/test/queries/clientpositive/repl_3_exim_metadata.q
+new file mode 100644
+index 0000000..6d24d39
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/repl_3_exim_metadata.q
+@@ -0,0 +1,40 @@
++set hive.test.mode=true;
++set hive.test.mode.prefix=;
++set hive.test.mode.nosamplelist=replsrc,repldst,repldst_md;
++
++drop table if exists replsrc;
++drop table if exists repldst;
++drop table if exists repldst_md;
++
++create table replsrc (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile;
++load data local inpath "../../data/files/test.dat"
++        into table replsrc partition (emp_country="us",emp_state="ca");
++
++dfs ${system:test.dfs.mkdir} target/tmp/ql/test/data/exports/repldst/temp;
++dfs -rmr target/tmp/ql/test/data/exports/repldst;
++dfs ${system:test.dfs.mkdir} target/tmp/ql/test/data/exports/repldst_md/temp;
++dfs -rmr target/tmp/ql/test/data/exports/repldst_md;
++
++export table replsrc to 'ql/test/data/exports/repldst' for replication('repldst');
++export table replsrc to 'ql/test/data/exports/repldst_md' for metadata replication('repldst md-only');
++
++drop table replsrc;
++
++import table repldst from 'ql/test/data/exports/repldst';
++describe extended repldst;
++show table extended like repldst;
++show create table repldst;
++select * from repldst;
++
++-- should be similar, except that select will return no results
++import table repldst_md from 'ql/test/data/exports/repldst_md';
++describe extended repldst_md;
++show table extended like repldst_md;
++show create table repldst_md;
++select * from repldst_md;
++
++drop table repldst;
++drop table repldst_md;
++
+diff --git a/ql/src/test/results/clientnegative/alter_table_add_partition.q.out b/ql/src/test/results/clientnegative/alter_table_add_partition.q.out
+index beb47c0..2cc2953 100644
+--- a/ql/src/test/results/clientnegative/alter_table_add_partition.q.out
++++ b/ql/src/test/results/clientnegative/alter_table_add_partition.q.out
+@@ -6,4 +6,4 @@ POSTHOOK: query: create table mp (a int) partitioned by (b int)
+ POSTHOOK: type: CREATETABLE
+ POSTHOOK: Output: database:default
+ POSTHOOK: Output: default@mp
+-FAILED: SemanticException Partition spec {b=1, c=1} contains non-partition columns
++FAILED: ValidationFailureSemanticException Partition spec {b=1, c=1} contains non-partition columns
+diff --git a/ql/src/test/results/clientnegative/alter_view_failure5.q.out b/ql/src/test/results/clientnegative/alter_view_failure5.q.out
+index d439037..2891fb0 100644
+--- a/ql/src/test/results/clientnegative/alter_view_failure5.q.out
++++ b/ql/src/test/results/clientnegative/alter_view_failure5.q.out
+@@ -18,4 +18,4 @@ POSTHOOK: type: CREATEVIEW
+ POSTHOOK: Input: default@src
+ POSTHOOK: Output: database:default
+ POSTHOOK: Output: default@xxx6
+-FAILED: SemanticException Partition spec {v=val_86} contains non-partition columns
++FAILED: ValidationFailureSemanticException Partition spec {v=val_86} contains non-partition columns
+diff --git a/ql/src/test/results/clientnegative/alter_view_failure7.q.out b/ql/src/test/results/clientnegative/alter_view_failure7.q.out
+index c28587f..97d2b83 100644
+--- a/ql/src/test/results/clientnegative/alter_view_failure7.q.out
++++ b/ql/src/test/results/clientnegative/alter_view_failure7.q.out
+@@ -18,4 +18,4 @@ POSTHOOK: type: CREATEVIEW
+ POSTHOOK: Input: default@srcpart
+ POSTHOOK: Output: database:default
+ POSTHOOK: Output: default@xxx8
+-FAILED: SemanticException partition spec {ds=2011-01-01} doesn't contain all (2) partition columns
++FAILED: ValidationFailureSemanticException partition spec {ds=2011-01-01} doesn't contain all (2) partition columns
+diff --git a/ql/src/test/results/clientnegative/truncate_partition_column.q.out b/ql/src/test/results/clientnegative/truncate_partition_column.q.out
+index 9197c71..32eccb1 100644
+--- a/ql/src/test/results/clientnegative/truncate_partition_column.q.out
++++ b/ql/src/test/results/clientnegative/truncate_partition_column.q.out
+@@ -20,4 +20,4 @@ POSTHOOK: Input: default@src
+ POSTHOOK: Output: default@test_tab@part=1
+ POSTHOOK: Lineage: test_tab PARTITION(part=1).key SIMPLE [(src)src.FieldSchema(name:key, type:string, comment:default), ]
+ POSTHOOK: Lineage: test_tab PARTITION(part=1).value SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
+-FAILED: SemanticException org.apache.hadoop.hive.ql.parse.SemanticException: table is partitioned but partition spec is not specified
++FAILED: SemanticException org.apache.hadoop.hive.ql.metadata.Table$ValidationFailureSemanticException: table is partitioned but partition spec is not specified
+diff --git a/ql/src/test/results/clientpositive/repl_1_drop.q.out b/ql/src/test/results/clientpositive/repl_1_drop.q.out
+new file mode 100644
+index 0000000..9fb65d1
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/repl_1_drop.q.out
+@@ -0,0 +1,345 @@
++PREHOOK: query: create table repl_employee ( emp_id int comment "employee id")
++	comment "employee table"
++	partitioned by (emp_country string comment "two char iso code", emp_state string comment "free text")
++	stored as textfile
++	tblproperties("repl.last.id"="43")
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: create table repl_employee ( emp_id int comment "employee id")
++	comment "employee table"
++	partitioned by (emp_country string comment "two char iso code", emp_state string comment "free text")
++	stored as textfile
++	tblproperties("repl.last.id"="43")
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ca")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ca")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=ca
++PREHOOK: query: show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++emp_country=us/emp_state=ca
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: drop table repl_employee for replication('33')
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: drop table repl_employee for replication('33')
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: -- drop 33 => table does not get dropped, but ca will be
++
++show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: -- drop 33 => table does not get dropped, but ca will be
++
++show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ak")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ak")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=ak
++PREHOOK: query: show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++emp_country=us/emp_state=ak
++PREHOOK: query: drop table repl_employee for replication('')
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: drop table repl_employee for replication('')
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: -- drop '' => ptns would be dropped, but not tables
++
++show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: -- drop '' => ptns would be dropped, but not tables
++
++show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++
++PREHOOK: query: drop table repl_employee for replication('49')
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: drop table repl_employee for replication('49')
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: -- table and ptns should have been dropped, so next create can succeed
++
++create table repl_employee ( emp_id int comment "employee id")
++	comment "employee table"
++	partitioned by (emp_country string comment "two char iso code", emp_state string comment "free text")
++	stored as textfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: -- table and ptns should have been dropped, so next create can succeed
++
++create table repl_employee ( emp_id int comment "employee id")
++	comment "employee table"
++	partitioned by (emp_country string comment "two char iso code", emp_state string comment "free text")
++	stored as textfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: -- created table without a repl.last.id
++
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ca")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: -- created table without a repl.last.id
++
++load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ca")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=ca
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ak")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="ak")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=ak
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="wa")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++	into table repl_employee partition (emp_country="us", emp_state="wa")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=wa
++PREHOOK: query: show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++emp_country=us/emp_state=ak
++emp_country=us/emp_state=ca
++emp_country=us/emp_state=wa
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:3
++totalFileSize:33
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: alter table repl_employee drop partition (emp_country="us", emp_state="ca")
++PREHOOK: type: ALTERTABLE_DROPPARTS
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee@emp_country=us/emp_state=ca
++POSTHOOK: query: alter table repl_employee drop partition (emp_country="us", emp_state="ca")
++POSTHOOK: type: ALTERTABLE_DROPPARTS
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=ca
++PREHOOK: query: alter table repl_employee drop partition (emp_country="us", emp_state="wa") for replication('59')
++PREHOOK: type: ALTERTABLE_DROPPARTS
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee@emp_country=us/emp_state=wa
++POSTHOOK: query: alter table repl_employee drop partition (emp_country="us", emp_state="wa") for replication('59')
++POSTHOOK: type: ALTERTABLE_DROPPARTS
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=wa
++PREHOOK: query: -- should have dropped ca, wa
++
++show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: -- should have dropped ca, wa
++
++show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++emp_country=us/emp_state=ak
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: alter table repl_employee set tblproperties ("repl.last.id" = "42")
++PREHOOK: type: ALTERTABLE_PROPERTIES
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: alter table repl_employee set tblproperties ("repl.last.id" = "42")
++POSTHOOK: type: ALTERTABLE_PROPERTIES
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: alter table repl_employee drop partition (emp_country="us", emp_state="ak")
++PREHOOK: type: ALTERTABLE_DROPPARTS
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee@emp_country=us/emp_state=ak
++POSTHOOK: query: alter table repl_employee drop partition (emp_country="us", emp_state="ak")
++POSTHOOK: type: ALTERTABLE_DROPPARTS
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee@emp_country=us/emp_state=ak
++PREHOOK: query: -- should have dropped ak
++
++show partitions repl_employee
++PREHOOK: type: SHOWPARTITIONS
++PREHOOK: Input: default@repl_employee
++POSTHOOK: query: -- should have dropped ak
++
++show partitions repl_employee
++POSTHOOK: type: SHOWPARTITIONS
++POSTHOOK: Input: default@repl_employee
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++
++PREHOOK: query: drop table repl_employee
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: drop table repl_employee
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: -- should drop the whole table, and this can be verified by trying to create another table with the same name
++
++create table repl_employee( a string)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: -- should drop the whole table, and this can be verified by trying to create another table with the same name
++
++create table repl_employee( a string)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@repl_employee
++PREHOOK: query: show table extended like repl_employee
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repl_employee
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repl_employee
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { string a}
++partitioned:false
++partitionColumns:
++totalNumberFiles:0
++totalFileSize:0
++maxFileSize:0
++minFileSize:0
++#### A masked pattern was here ####
++
++PREHOOK: query: drop table repl_employee
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repl_employee
++PREHOOK: Output: default@repl_employee
++POSTHOOK: query: drop table repl_employee
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repl_employee
++POSTHOOK: Output: default@repl_employee
+diff --git a/ql/src/test/results/clientpositive/repl_2_exim_basic.q.out b/ql/src/test/results/clientpositive/repl_2_exim_basic.q.out
+new file mode 100644
+index 0000000..8df0653
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/repl_2_exim_basic.q.out
+@@ -0,0 +1,494 @@
++PREHOOK: query: drop table if exists managed_t
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists managed_t
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists ext_t
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists ext_t
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists managed_t_imported
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists managed_t_imported
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists managed_t_r_imported
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists managed_t_r_imported
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists ext_t_imported
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists ext_t_imported
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists ext_t_r_imported
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists ext_t_r_imported
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: create table managed_t (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@managed_t
++POSTHOOK: query: create table managed_t (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@managed_t
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++        into table managed_t partition (emp_country="us",emp_state="ca")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@managed_t
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++        into table managed_t partition (emp_country="us",emp_state="ca")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@managed_t
++POSTHOOK: Output: default@managed_t@emp_country=us/emp_state=ca
++PREHOOK: query: create external table ext_t (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++        tblproperties("EXTERNAL"="true")
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@ext_t
++POSTHOOK: query: create external table ext_t (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++        tblproperties("EXTERNAL"="true")
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@ext_t
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++        into table ext_t partition (emp_country="us",emp_state="ca")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@ext_t
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++        into table ext_t partition (emp_country="us",emp_state="ca")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@ext_t
++POSTHOOK: Output: default@ext_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: -- verifying difference between normal export of a external table
++-- and a replication export of an ext table
++-- the replication export will have squashed the "EXTERNAL" flag
++-- this is because the destination of all replication exports are
++-- managed tables. The managed tables should be similar except
++-- for the repl.last.id values
++
++export table managed_t to 'ql/test/data/exports/managed_t'
++PREHOOK: type: EXPORT
++PREHOOK: Input: default@managed_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: -- verifying difference between normal export of a external table
++-- and a replication export of an ext table
++-- the replication export will have squashed the "EXTERNAL" flag
++-- this is because the destination of all replication exports are
++-- managed tables. The managed tables should be similar except
++-- for the repl.last.id values
++
++export table managed_t to 'ql/test/data/exports/managed_t'
++POSTHOOK: type: EXPORT
++POSTHOOK: Input: default@managed_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: export table managed_t to 'ql/test/data/exports/managed_t_r' for replication('managed_t_r')
++PREHOOK: type: EXPORT
++PREHOOK: Input: default@managed_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: export table managed_t to 'ql/test/data/exports/managed_t_r' for replication('managed_t_r')
++POSTHOOK: type: EXPORT
++POSTHOOK: Input: default@managed_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: export table ext_t to 'ql/test/data/exports/ext_t'
++PREHOOK: type: EXPORT
++PREHOOK: Input: default@ext_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: export table ext_t to 'ql/test/data/exports/ext_t'
++POSTHOOK: type: EXPORT
++POSTHOOK: Input: default@ext_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: export table ext_t to 'ql/test/data/exports/ext_t_r' for replication('ext_t_r')
++PREHOOK: type: EXPORT
++PREHOOK: Input: default@ext_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: export table ext_t to 'ql/test/data/exports/ext_t_r' for replication('ext_t_r')
++POSTHOOK: type: EXPORT
++POSTHOOK: Input: default@ext_t@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: drop table ext_t
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@ext_t
++PREHOOK: Output: default@ext_t
++POSTHOOK: query: drop table ext_t
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@ext_t
++POSTHOOK: Output: default@ext_t
++PREHOOK: query: drop table managed_t
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@managed_t
++PREHOOK: Output: default@managed_t
++POSTHOOK: query: drop table managed_t
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@managed_t
++POSTHOOK: Output: default@managed_t
++PREHOOK: query: import table managed_t_imported from 'ql/test/data/exports/managed_t'
++PREHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: query: import table managed_t_imported from 'ql/test/data/exports/managed_t'
++POSTHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: Output: default@managed_t_imported
++POSTHOOK: Output: default@managed_t_imported@emp_country=us/emp_state=ca
++PREHOOK: query: describe extended managed_t_imported
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@managed_t_imported
++POSTHOOK: query: describe extended managed_t_imported
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@managed_t_imported
++emp_id              	int                 	employee id         
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: show table extended like managed_t_imported
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like managed_t_imported
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:managed_t_imported
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: show create table managed_t_imported
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: default@managed_t_imported
++POSTHOOK: query: show create table managed_t_imported
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: default@managed_t_imported
++CREATE TABLE `managed_t_imported`(
++  `emp_id` int COMMENT 'employee id')
++PARTITIONED BY ( 
++  `emp_country` string, 
++  `emp_state` string)
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++#### A masked pattern was here ####
++PREHOOK: query: select * from managed_t_imported
++PREHOOK: type: QUERY
++PREHOOK: Input: default@managed_t_imported
++PREHOOK: Input: default@managed_t_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: select * from managed_t_imported
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@managed_t_imported
++POSTHOOK: Input: default@managed_t_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++1	us	ca
++2	us	ca
++3	us	ca
++4	us	ca
++5	us	ca
++6	us	ca
++PREHOOK: query: -- should have repl.last.id
++import table managed_t_r_imported from 'ql/test/data/exports/managed_t_r'
++PREHOOK: type: IMPORT
++#### A masked pattern was here ####
++PREHOOK: Output: default@managed_t_r_imported
++POSTHOOK: query: -- should have repl.last.id
++import table managed_t_r_imported from 'ql/test/data/exports/managed_t_r'
++POSTHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: Output: default@managed_t_r_imported
++POSTHOOK: Output: default@managed_t_r_imported@emp_country=us/emp_state=ca
++PREHOOK: query: describe extended managed_t_r_imported
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@managed_t_r_imported
++POSTHOOK: query: describe extended managed_t_r_imported
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@managed_t_r_imported
++emp_id              	int                 	employee id         
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: show table extended like managed_t_r_imported
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like managed_t_r_imported
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:managed_t_r_imported
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: show create table managed_t_r_imported
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: default@managed_t_r_imported
++POSTHOOK: query: show create table managed_t_r_imported
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: default@managed_t_r_imported
++CREATE TABLE `managed_t_r_imported`(
++  `emp_id` int COMMENT 'employee id')
++PARTITIONED BY ( 
++  `emp_country` string, 
++  `emp_state` string)
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++  'repl.last.id'='0', 
++#### A masked pattern was here ####
++PREHOOK: query: select * from managed_t_r_imported
++PREHOOK: type: QUERY
++PREHOOK: Input: default@managed_t_r_imported
++PREHOOK: Input: default@managed_t_r_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: select * from managed_t_r_imported
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@managed_t_r_imported
++POSTHOOK: Input: default@managed_t_r_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++1	us	ca
++2	us	ca
++3	us	ca
++4	us	ca
++5	us	ca
++6	us	ca
++PREHOOK: query: import table ext_t_imported from 'ql/test/data/exports/ext_t'
++PREHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: query: import table ext_t_imported from 'ql/test/data/exports/ext_t'
++POSTHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: Output: default@ext_t_imported
++POSTHOOK: Output: default@ext_t_imported@emp_country=us/emp_state=ca
++PREHOOK: query: describe extended ext_t_imported
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@ext_t_imported
++POSTHOOK: query: describe extended ext_t_imported
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@ext_t_imported
++emp_id              	int                 	employee id         
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: show table extended like ext_t_imported
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like ext_t_imported
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:ext_t_imported
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: show create table ext_t_imported
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: default@ext_t_imported
++POSTHOOK: query: show create table ext_t_imported
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: default@ext_t_imported
++CREATE EXTERNAL TABLE `ext_t_imported`(
++  `emp_id` int COMMENT 'employee id')
++PARTITIONED BY ( 
++  `emp_country` string, 
++  `emp_state` string)
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++#### A masked pattern was here ####
++PREHOOK: query: select * from ext_t_imported
++PREHOOK: type: QUERY
++PREHOOK: Input: default@ext_t_imported
++PREHOOK: Input: default@ext_t_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: select * from ext_t_imported
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@ext_t_imported
++POSTHOOK: Input: default@ext_t_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++1	us	ca
++2	us	ca
++3	us	ca
++4	us	ca
++5	us	ca
++6	us	ca
++PREHOOK: query: -- should have repl.last.id
++-- also - importing an external table replication export would turn the new table into a managed table
++import table ext_t_r_imported from 'ql/test/data/exports/ext_t_r'
++PREHOOK: type: IMPORT
++#### A masked pattern was here ####
++PREHOOK: Output: default@ext_t_r_imported
++POSTHOOK: query: -- should have repl.last.id
++-- also - importing an external table replication export would turn the new table into a managed table
++import table ext_t_r_imported from 'ql/test/data/exports/ext_t_r'
++POSTHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: Output: default@ext_t_r_imported
++POSTHOOK: Output: default@ext_t_r_imported@emp_country=us/emp_state=ca
++PREHOOK: query: describe extended ext_t_imported
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@ext_t_imported
++POSTHOOK: query: describe extended ext_t_imported
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@ext_t_imported
++emp_id              	int                 	employee id         
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: show table extended like ext_t_r_imported
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like ext_t_r_imported
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:ext_t_r_imported
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: show create table ext_t_r_imported
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: default@ext_t_r_imported
++POSTHOOK: query: show create table ext_t_r_imported
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: default@ext_t_r_imported
++CREATE TABLE `ext_t_r_imported`(
++  `emp_id` int COMMENT 'employee id')
++PARTITIONED BY ( 
++  `emp_country` string, 
++  `emp_state` string)
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++  'EXTERNAL'='FALSE', 
++  'repl.last.id'='0', 
++#### A masked pattern was here ####
++PREHOOK: query: select * from ext_t_r_imported
++PREHOOK: type: QUERY
++PREHOOK: Input: default@ext_t_r_imported
++PREHOOK: Input: default@ext_t_r_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: select * from ext_t_r_imported
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@ext_t_r_imported
++POSTHOOK: Input: default@ext_t_r_imported@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++1	us	ca
++2	us	ca
++3	us	ca
++4	us	ca
++5	us	ca
++6	us	ca
++PREHOOK: query: drop table managed_t_imported
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@managed_t_imported
++PREHOOK: Output: default@managed_t_imported
++POSTHOOK: query: drop table managed_t_imported
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@managed_t_imported
++POSTHOOK: Output: default@managed_t_imported
++PREHOOK: query: drop table managed_t_r_imported
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@managed_t_r_imported
++PREHOOK: Output: default@managed_t_r_imported
++POSTHOOK: query: drop table managed_t_r_imported
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@managed_t_r_imported
++POSTHOOK: Output: default@managed_t_r_imported
++PREHOOK: query: drop table ext_t_imported
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@ext_t_imported
++PREHOOK: Output: default@ext_t_imported
++POSTHOOK: query: drop table ext_t_imported
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@ext_t_imported
++POSTHOOK: Output: default@ext_t_imported
++PREHOOK: query: drop table ext_t_r_imported
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@ext_t_r_imported
++PREHOOK: Output: default@ext_t_r_imported
++POSTHOOK: query: drop table ext_t_r_imported
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@ext_t_r_imported
++POSTHOOK: Output: default@ext_t_r_imported
+diff --git a/ql/src/test/results/clientpositive/repl_3_exim_metadata.q.out b/ql/src/test/results/clientpositive/repl_3_exim_metadata.q.out
+new file mode 100644
+index 0000000..8387c02
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/repl_3_exim_metadata.q.out
+@@ -0,0 +1,222 @@
++PREHOOK: query: drop table if exists replsrc
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists replsrc
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists repldst
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists repldst
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: drop table if exists repldst_md
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: drop table if exists repldst_md
++POSTHOOK: type: DROPTABLE
++PREHOOK: query: create table replsrc (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@replsrc
++POSTHOOK: query: create table replsrc (emp_id int comment "employee id")
++        partitioned by (emp_country string, emp_state string)
++        stored as textfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@replsrc
++PREHOOK: query: load data local inpath "../../data/files/test.dat"
++        into table replsrc partition (emp_country="us",emp_state="ca")
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@replsrc
++POSTHOOK: query: load data local inpath "../../data/files/test.dat"
++        into table replsrc partition (emp_country="us",emp_state="ca")
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@replsrc
++POSTHOOK: Output: default@replsrc@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: export table replsrc to 'ql/test/data/exports/repldst' for replication('repldst')
++PREHOOK: type: EXPORT
++PREHOOK: Input: default@replsrc@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: export table replsrc to 'ql/test/data/exports/repldst' for replication('repldst')
++POSTHOOK: type: EXPORT
++POSTHOOK: Input: default@replsrc@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++PREHOOK: query: export table replsrc to 'ql/test/data/exports/repldst_md' for metadata replication('repldst md-only')
++PREHOOK: type: EXPORT
++POSTHOOK: query: export table replsrc to 'ql/test/data/exports/repldst_md' for metadata replication('repldst md-only')
++POSTHOOK: type: EXPORT
++PREHOOK: query: drop table replsrc
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@replsrc
++PREHOOK: Output: default@replsrc
++POSTHOOK: query: drop table replsrc
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@replsrc
++POSTHOOK: Output: default@replsrc
++PREHOOK: query: import table repldst from 'ql/test/data/exports/repldst'
++PREHOOK: type: IMPORT
++#### A masked pattern was here ####
++PREHOOK: Output: default@repldst
++POSTHOOK: query: import table repldst from 'ql/test/data/exports/repldst'
++POSTHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repldst
++POSTHOOK: Output: default@repldst@emp_country=us/emp_state=ca
++PREHOOK: query: describe extended repldst
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@repldst
++POSTHOOK: query: describe extended repldst
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@repldst
++emp_id              	int                 	employee id         
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: show table extended like repldst
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repldst
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repldst
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++totalNumberFiles:1
++totalFileSize:11
++maxFileSize:11
++minFileSize:11
++#### A masked pattern was here ####
++
++PREHOOK: query: show create table repldst
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: default@repldst
++POSTHOOK: query: show create table repldst
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: default@repldst
++CREATE TABLE `repldst`(
++  `emp_id` int COMMENT 'employee id')
++PARTITIONED BY ( 
++  `emp_country` string, 
++  `emp_state` string)
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++  'repl.last.id'='0', 
++#### A masked pattern was here ####
++PREHOOK: query: select * from repldst
++PREHOOK: type: QUERY
++PREHOOK: Input: default@repldst
++PREHOOK: Input: default@repldst@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++POSTHOOK: query: select * from repldst
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@repldst
++POSTHOOK: Input: default@repldst@emp_country=us/emp_state=ca
++#### A masked pattern was here ####
++1	us	ca
++2	us	ca
++3	us	ca
++4	us	ca
++5	us	ca
++6	us	ca
++PREHOOK: query: -- should be similar, except that select will return no results
++import table repldst_md from 'ql/test/data/exports/repldst_md'
++PREHOOK: type: IMPORT
++#### A masked pattern was here ####
++PREHOOK: Output: default@repldst_md
++POSTHOOK: query: -- should be similar, except that select will return no results
++import table repldst_md from 'ql/test/data/exports/repldst_md'
++POSTHOOK: type: IMPORT
++#### A masked pattern was here ####
++POSTHOOK: Output: default@repldst_md
++PREHOOK: query: describe extended repldst_md
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@repldst_md
++POSTHOOK: query: describe extended repldst_md
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@repldst_md
++emp_id              	int                 	employee id         
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++# Partition Information	 	 
++# col_name            	data_type           	comment             
++	 	 
++emp_country         	string              	                    
++emp_state           	string              	                    
++	 	 
++#### A masked pattern was here ####
++PREHOOK: query: show table extended like repldst_md
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like repldst_md
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:repldst_md
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.mapred.TextInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
++columns:struct columns { i32 emp_id}
++partitioned:true
++partitionColumns:struct partition_columns { string emp_country, string emp_state}
++
++PREHOOK: query: show create table repldst_md
++PREHOOK: type: SHOW_CREATETABLE
++PREHOOK: Input: default@repldst_md
++POSTHOOK: query: show create table repldst_md
++POSTHOOK: type: SHOW_CREATETABLE
++POSTHOOK: Input: default@repldst_md
++CREATE TABLE `repldst_md`(
++  `emp_id` int COMMENT 'employee id')
++PARTITIONED BY ( 
++  `emp_country` string, 
++  `emp_state` string)
++ROW FORMAT SERDE 
++  'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe' 
++STORED AS INPUTFORMAT 
++  'org.apache.hadoop.mapred.TextInputFormat' 
++OUTPUTFORMAT 
++  'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
++LOCATION
++#### A masked pattern was here ####
++TBLPROPERTIES (
++  'repl.last.id'='0', 
++#### A masked pattern was here ####
++PREHOOK: query: select * from repldst_md
++PREHOOK: type: QUERY
++PREHOOK: Input: default@repldst_md
++#### A masked pattern was here ####
++POSTHOOK: query: select * from repldst_md
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@repldst_md
++#### A masked pattern was here ####
++PREHOOK: query: drop table repldst
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repldst
++PREHOOK: Output: default@repldst
++POSTHOOK: query: drop table repldst
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repldst
++POSTHOOK: Output: default@repldst
++PREHOOK: query: drop table repldst_md
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@repldst_md
++PREHOOK: Output: default@repldst_md
++POSTHOOK: query: drop table repldst_md
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@repldst_md
++POSTHOOK: Output: default@repldst_md
+-- 
+1.7.9.5
+

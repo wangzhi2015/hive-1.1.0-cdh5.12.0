@@ -1,0 +1,1888 @@
+From b6cf85445ab311a4996c2ca5ea3171c9066d39f5 Mon Sep 17 00:00:00 2001
+From: Chao Sun <sunchao.chris@gmail.com>
+Date: Wed, 25 Feb 2015 15:10:09 -0800
+Subject: [PATCH 0048/1164] HIVE-9561 - SHUFFLE_SORT should only be used for
+ order by query [Spark Branch] (Rui Li via Xuefu)
+
+---
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   33 +++++----
+ .../hadoop/hive/ql/parse/spark/GenSparkUtils.java  |   33 ++++++---
+ .../apache/hadoop/hive/ql/plan/ReduceSinkDesc.java |   12 ++++
+ .../results/clientpositive/spark/auto_join0.q.out  |    2 +-
+ .../results/clientpositive/spark/auto_join15.q.out |    2 +-
+ .../results/clientpositive/spark/auto_join20.q.out |    4 +-
+ .../results/clientpositive/spark/auto_join21.q.out |    2 +-
+ .../results/clientpositive/spark/auto_join23.q.out |    2 +-
+ .../results/clientpositive/spark/auto_join28.q.out |    8 +--
+ .../results/clientpositive/spark/auto_join29.q.out |   18 ++---
+ .../results/clientpositive/spark/auto_join30.q.out |   42 ++++++------
+ .../results/clientpositive/spark/auto_join31.q.out |    6 +-
+ .../results/clientpositive/spark/bucket5.q.out     |    2 +-
+ .../test/results/clientpositive/spark/ctas.q.out   |   20 +++---
+ .../clientpositive/spark/escape_clusterby1.q.out   |    4 +-
+ .../clientpositive/spark/escape_sortby1.q.out      |    4 +-
+ .../results/clientpositive/spark/groupby10.q.out   |   12 ++--
+ .../results/clientpositive/spark/groupby11.q.out   |    4 +-
+ .../spark/groupby7_map_multi_single_reducer.q.out  |    2 +-
+ .../groupby7_noskew_multi_single_reducer.q.out     |    4 +-
+ .../results/clientpositive/spark/groupby8.q.out    |    8 +--
+ .../clientpositive/spark/groupby8_map.q.out        |    4 +-
+ .../clientpositive/spark/groupby8_map_skew.q.out   |    4 +-
+ .../clientpositive/spark/groupby8_noskew.q.out     |    4 +-
+ .../results/clientpositive/spark/groupby9.q.out    |   16 ++---
+ .../groupby_multi_insert_common_distinct.q.out     |    4 +-
+ .../spark/groupby_multi_single_reducer3.q.out      |   16 ++---
+ .../spark/identity_project_remove_skip.q.out       |    4 +-
+ .../results/clientpositive/spark/input14.q.out     |    2 +-
+ .../results/clientpositive/spark/input17.q.out     |    2 +-
+ .../results/clientpositive/spark/input18.q.out     |    2 +-
+ .../clientpositive/spark/join0.q.java1.7.out       |    2 +-
+ .../test/results/clientpositive/spark/join15.q.out |    2 +-
+ .../test/results/clientpositive/spark/join20.q.out |    4 +-
+ .../test/results/clientpositive/spark/join21.q.out |    2 +-
+ .../test/results/clientpositive/spark/join23.q.out |    2 +-
+ .../test/results/clientpositive/spark/join40.q.out |    4 +-
+ .../spark/mapjoin_filter_on_outerjoin.q.out        |    4 +-
+ .../clientpositive/spark/mapjoin_test_outer.q.out  |    4 +-
+ .../clientpositive/spark/multi_insert.q.out        |    8 +--
+ .../clientpositive/spark/multi_insert_gby.q.out    |    4 +-
+ .../clientpositive/spark/multi_insert_gby3.q.out   |    6 +-
+ .../spark/multi_insert_lateral_view.q.out          |    2 +-
+ ...ulti_insert_move_tasks_share_dependencies.q.out |   72 ++++++++++----------
+ .../spark/multigroupby_singlemr.q.out              |    2 +-
+ .../results/clientpositive/spark/parallel.q.out    |    2 +-
+ .../clientpositive/spark/parallel_join0.q.out      |    2 +-
+ .../results/clientpositive/spark/ppd_join4.q.out   |    2 +-
+ .../clientpositive/spark/ppd_transform.q.out       |    4 +-
+ .../clientpositive/spark/reduce_deduplicate.q.out  |    2 +-
+ .../spark/reduce_deduplicate_exclude_join.q.out    |    2 +-
+ .../results/clientpositive/spark/semijoin.q.out    |   40 +++++------
+ .../test/results/clientpositive/spark/sort.q.out   |    2 +-
+ .../clientpositive/spark/transform_ppr1.q.out      |    2 +-
+ .../clientpositive/spark/transform_ppr2.q.out      |    2 +-
+ .../test/results/clientpositive/spark/union3.q.out |    6 +-
+ .../results/clientpositive/spark/union_ppr.q.out   |    2 +-
+ 57 files changed, 251 insertions(+), 217 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 9423b5c..661669e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -6826,7 +6826,7 @@ private Operator genLimitMapRedPlan(String dest, QB qb, Operator input,
+     }
+ 
+     // Create a reduceSink operator followed by another limit
+-    curr = genReduceSinkPlan(dest, qb, curr, 1);
++    curr = genReduceSinkPlan(dest, qb, curr, 1, false);
+     return genLimitPlan(dest, qb, curr, limit);
+   }
+ 
+@@ -7030,10 +7030,9 @@ private Operator genReduceSinkPlanForSortingBucketing(Table tab, Operator input,
+   }
+ 
+   private Operator genReduceSinkPlan(String dest, QB qb, Operator<?> input,
+-      int numReducers) throws SemanticException {
+-    
++      int numReducers, boolean hasOrderBy) throws SemanticException {
+     RowResolver inputRR = opParseCtx.get(input).getRowResolver();
+-    
++
+     // First generate the expression for the partition and sort keys
+     // The cluster by clause / distribute by clause has the aliases for
+     // partition function
+@@ -7091,16 +7090,23 @@ private Operator genReduceSinkPlan(String dest, QB qb, Operator<?> input,
+         sortCols.add(exprNode);
+       }
+     }
+-    return genReduceSinkPlan(input, partCols, sortCols, order.toString(), numReducers);
++    Operator result = genReduceSinkPlan(
++        input, partCols, sortCols, order.toString(), numReducers);
++    if (result.getParentOperators().size() == 1 &&
++        result.getParentOperators().get(0) instanceof ReduceSinkOperator) {
++      ((ReduceSinkOperator) result.getParentOperators().get(0))
++          .getConf().setHasOrderBy(hasOrderBy);
++    }
++    return result;
+   }
+-  
++
+   @SuppressWarnings("nls")
+   private Operator genReduceSinkPlan(Operator<?> input,
+-      ArrayList<ExprNodeDesc> partitionCols, ArrayList<ExprNodeDesc> sortCols, 
++      ArrayList<ExprNodeDesc> partitionCols, ArrayList<ExprNodeDesc> sortCols,
+       String sortOrder, int numReducers) throws SemanticException {
+ 
+     RowResolver inputRR = opParseCtx.get(input).getRowResolver();
+-    
++
+     Operator dummy = Operator.createDummy();
+     dummy.setParentOperators(Arrays.asList(input));
+ 
+@@ -9011,6 +9017,7 @@ private Operator genPostGroupByBodyPlan(Operator curr, String dest, QB qb,
+     // Reduce sink is needed if the query contains a cluster by, distribute by,
+     // order by or a sort by clause.
+     boolean genReduceSink = false;
++    boolean hasOrderBy = false;
+ 
+     // Currently, expressions are not allowed in cluster by, distribute by,
+     // order by or a sort by clause. For each of the above clause types, check
+@@ -9025,6 +9032,7 @@ private Operator genPostGroupByBodyPlan(Operator curr, String dest, QB qb,
+ 
+     if (qbp.getOrderByForClause(dest) != null) {
+       genReduceSink = true;
++      hasOrderBy = true;
+     }
+ 
+     if (qbp.getSortByForClause(dest) != null) {
+@@ -9035,11 +9043,11 @@ private Operator genPostGroupByBodyPlan(Operator curr, String dest, QB qb,
+       int numReducers = -1;
+ 
+       // Use only 1 reducer if order by is present
+-      if (qbp.getOrderByForClause(dest) != null) {
++      if (hasOrderBy) {
+         numReducers = 1;
+       }
+ 
+-      curr = genReduceSinkPlan(dest, qb, curr, numReducers);
++      curr = genReduceSinkPlan(dest, qb, curr, numReducers, hasOrderBy);
+     }
+ 
+ 
+@@ -9047,15 +9055,14 @@ private Operator genPostGroupByBodyPlan(Operator curr, String dest, QB qb,
+       if (limit != null) {
+         // In case of order by, only 1 reducer is used, so no need of
+         // another shuffle
+-        curr = genLimitMapRedPlan(dest, qb, curr, limit.intValue(), qbp
+-            .getOrderByForClause(dest) != null ? false : true);
++        curr = genLimitMapRedPlan(dest, qb, curr, limit.intValue(), !hasOrderBy);
+       }
+     } else {
+       // exact limit can be taken care of by the fetch operator
+       if (limit != null) {
+         boolean extraMRStep = true;
+ 
+-        if (qbp.getOrderByForClause(dest) != null ||
++        if (hasOrderBy ||
+             qb.getIsQuery() && qbp.getClusterByForClause(dest) == null &&
+             qbp.getSortByForClause(dest) == null) {
+           extraMRStep = false;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/GenSparkUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/GenSparkUtils.java
+index c19bc21..c8a4c02 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/GenSparkUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/GenSparkUtils.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
+ import org.apache.hadoop.hive.ql.exec.FetchTask;
+ import org.apache.hadoop.hive.ql.exec.FileSinkOperator;
++import org.apache.hadoop.hive.ql.exec.ForwardOperator;
+ import org.apache.hadoop.hive.ql.exec.GroupByOperator;
+ import org.apache.hadoop.hive.ql.exec.HashTableDummyOperator;
+ import org.apache.hadoop.hive.ql.exec.JoinOperator;
+@@ -334,9 +335,7 @@ public static SparkEdgeProperty getEdgeProperty(ReduceSinkOperator reduceSink,
+     edgeProperty.setNumPartitions(reduceWork.getNumReduceTasks());
+     String sortOrder = Strings.nullToEmpty(reduceSink.getConf().getOrder()).trim();
+ 
+-    // test if we need group-by shuffle
+-    if (reduceSink.getChildOperators().size() == 1
+-      && reduceSink.getChildOperators().get(0) instanceof GroupByOperator) {
++    if (hasGBYOperator(reduceSink)) {
+       edgeProperty.setShuffleGroup();
+       // test if the group by needs partition level sort, if so, use the MR style shuffle
+       // SHUFFLE_SORT shouldn't be used for this purpose, see HIVE-8542
+@@ -361,13 +360,12 @@ public static SparkEdgeProperty getEdgeProperty(ReduceSinkOperator reduceSink,
+       }
+     }
+ 
+-    // test if we need total order, if so, we can either use MR shuffle + set #reducer to 1,
+-    // or we can use SHUFFLE_SORT
++    // test if we need partition/global order, SHUFFLE_SORT should only be used for global order
+     if (edgeProperty.isShuffleNone() && !sortOrder.isEmpty()) {
+-      if (reduceSink.getConf().getPartitionCols() == null
+-        || reduceSink.getConf().getPartitionCols().isEmpty()
+-        || isSame(reduceSink.getConf().getPartitionCols(),
+-              reduceSink.getConf().getKeyCols())) {
++      if ((reduceSink.getConf().getPartitionCols() == null
++          || reduceSink.getConf().getPartitionCols().isEmpty()
++          || isSame(reduceSink.getConf().getPartitionCols(), reduceSink.getConf().getKeyCols()))
++          && reduceSink.getConf().hasOrderBy()) {
+         edgeProperty.setShuffleSort();
+       } else {
+         edgeProperty.setMRShuffle();
+@@ -467,4 +465,21 @@ public void annotateMapWork(GenSparkProcContext context) throws SemanticExceptio
+   public synchronized int getNextSeqNumber() {
+     return ++sequenceNumber;
+   }
++
++  // test if we need group-by shuffle
++  private static boolean hasGBYOperator(ReduceSinkOperator rs) {
++    if (rs.getChildOperators().size() == 1) {
++      if (rs.getChildOperators().get(0) instanceof GroupByOperator) {
++        return true;
++      } else if (rs.getChildOperators().get(0) instanceof ForwardOperator) {
++        for (Operator grandChild : rs.getChildOperators().get(0).getChildOperators()) {
++          if (!(grandChild instanceof GroupByOperator)) {
++            return false;
++          }
++        }
++        return true;
++      }
++    }
++    return false;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/plan/ReduceSinkDesc.java b/ql/src/java/org/apache/hadoop/hive/ql/plan/ReduceSinkDesc.java
+index 43f8321..21e4308 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/plan/ReduceSinkDesc.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/plan/ReduceSinkDesc.java
+@@ -114,6 +114,9 @@ private ReducerTraits(int trait) {
+   // whether we'll enforce the sort order of the RS
+   private transient boolean enforceSort = false;
+ 
++  // used by spark mode to decide whether global order is needed
++  private transient boolean hasOrderBy = false;
++
+   private static transient Log LOG = LogFactory.getLog(ReduceSinkDesc.class);
+   public ReduceSinkDesc() {
+   }
+@@ -169,6 +172,7 @@ public Object clone() {
+     desc.setSkipTag(skipTag);
+     desc.reduceTraits = reduceTraits.clone();
+     desc.setEnforceSort(enforceSort);
++    desc.setHasOrderBy(hasOrderBy);
+     return desc;
+   }
+ 
+@@ -419,4 +423,12 @@ public boolean isEnforceSort() {
+   public void setEnforceSort(boolean isDeduplicated) {
+     this.enforceSort = isDeduplicated;
+   }
++
++  public boolean hasOrderBy() {
++    return hasOrderBy;
++  }
++
++  public void setHasOrderBy(boolean hasOrderBy) {
++    this.hasOrderBy = hasOrderBy;
++  }
+ }
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join0.q.out b/ql/src/test/results/clientpositive/spark/auto_join0.q.out
+index 7f8eb63..ce1b9d2 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join0.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join0.q.out
+@@ -53,7 +53,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join15.q.out b/ql/src/test/results/clientpositive/spark/auto_join15.q.out
+index 780540b..33836ab 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join15.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join15.q.out
+@@ -42,7 +42,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join20.q.out b/ql/src/test/results/clientpositive/spark/auto_join20.q.out
+index 9258f3b..050df08 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join20.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join20.q.out
+@@ -66,7 +66,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+         Reducer 5 <- Reducer 4 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -229,7 +229,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+         Reducer 5 <- Reducer 4 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join21.q.out b/ql/src/test/results/clientpositive/spark/auto_join21.q.out
+index aa8f6dd..1a73b9d 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join21.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join21.q.out
+@@ -57,7 +57,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join23.q.out b/ql/src/test/results/clientpositive/spark/auto_join23.q.out
+index a179d87..419cfbc 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join23.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join23.q.out
+@@ -37,7 +37,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join28.q.out b/ql/src/test/results/clientpositive/spark/auto_join28.q.out
+index d30133b..e5bc1bd 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join28.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join28.q.out
+@@ -53,7 +53,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+@@ -166,7 +166,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -279,7 +279,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 3 <- Map 2 (SORT, 2)
++        Reducer 3 <- Map 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 2 
+@@ -389,7 +389,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join29.q.out b/ql/src/test/results/clientpositive/spark/auto_join29.q.out
+index 780c6cb..41a98c1 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join29.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join29.q.out
+@@ -57,7 +57,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+@@ -678,7 +678,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1299,7 +1299,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 3 <- Map 2 (SORT, 2)
++        Reducer 3 <- Map 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 2 
+@@ -1929,7 +1929,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+@@ -2554,7 +2554,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2674,7 +2674,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+@@ -3295,7 +3295,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -3416,7 +3416,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 3 <- Map 2 (SORT, 2)
++        Reducer 3 <- Map 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 2 
+@@ -3554,7 +3554,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join30.q.out b/ql/src/test/results/clientpositive/spark/auto_join30.q.out
+index 4c832e2..07fa0f1 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join30.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join30.q.out
+@@ -23,7 +23,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 4 (SORT, 2)
++        Reducer 5 <- Map 4 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+@@ -59,7 +59,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -175,7 +175,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 4 (SORT, 2)
++        Reducer 5 <- Map 4 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+@@ -208,7 +208,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -321,7 +321,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -353,7 +353,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+         Reducer 5 <- Reducer 4 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -473,8 +473,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 4 (SORT, 2)
+-        Reducer 7 <- Map 6 (SORT, 2)
++        Reducer 5 <- Map 4 (PARTITION-LEVEL SORT, 2)
++        Reducer 7 <- Map 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+@@ -541,7 +541,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -672,8 +672,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 4 (SORT, 2)
+-        Reducer 7 <- Map 6 (SORT, 2)
++        Reducer 5 <- Map 4 (PARTITION-LEVEL SORT, 2)
++        Reducer 7 <- Map 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+@@ -734,7 +734,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -862,8 +862,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 4 (SORT, 2)
+-        Reducer 7 <- Map 6 (SORT, 2)
++        Reducer 5 <- Map 4 (PARTITION-LEVEL SORT, 2)
++        Reducer 7 <- Map 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+@@ -924,7 +924,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 2 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -1052,8 +1052,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1113,7 +1113,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 6 <- Map 5 (SORT, 2)
++        Reducer 6 <- Map 5 (PARTITION-LEVEL SORT, 2)
+         Reducer 7 <- Reducer 6 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+@@ -1242,8 +1242,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1303,7 +1303,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 6 <- Map 5 (SORT, 2)
++        Reducer 6 <- Map 5 (PARTITION-LEVEL SORT, 2)
+         Reducer 7 <- Reducer 6 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+diff --git a/ql/src/test/results/clientpositive/spark/auto_join31.q.out b/ql/src/test/results/clientpositive/spark/auto_join31.q.out
+index 5980814..0e2cfee 100644
+--- a/ql/src/test/results/clientpositive/spark/auto_join31.q.out
++++ b/ql/src/test/results/clientpositive/spark/auto_join31.q.out
+@@ -29,8 +29,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 7 <- Map 6 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 7 <- Map 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -90,7 +90,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+         Reducer 5 <- Reducer 4 (GROUP, 1)
+ #### A masked pattern was here ####
+       Vertices:
+diff --git a/ql/src/test/results/clientpositive/spark/bucket5.q.out b/ql/src/test/results/clientpositive/spark/bucket5.q.out
+index 53a3759..83314a0 100644
+--- a/ql/src/test/results/clientpositive/spark/bucket5.q.out
++++ b/ql/src/test/results/clientpositive/spark/bucket5.q.out
+@@ -78,7 +78,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Map 5 (SORT, 2)
++        Reducer 3 <- Map 5 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+diff --git a/ql/src/test/results/clientpositive/spark/ctas.q.out b/ql/src/test/results/clientpositive/spark/ctas.q.out
+index 80a0e3d..bcd663a 100644
+--- a/ql/src/test/results/clientpositive/spark/ctas.q.out
++++ b/ql/src/test/results/clientpositive/spark/ctas.q.out
+@@ -32,8 +32,8 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 1)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 1)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -176,8 +176,8 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 1)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 1)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -320,8 +320,8 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 1)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 1)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -529,8 +529,8 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 1)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 1)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -716,8 +716,8 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 1)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 1)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/escape_clusterby1.q.out b/ql/src/test/results/clientpositive/spark/escape_clusterby1.q.out
+index 2025add..c9f5d7e 100644
+--- a/ql/src/test/results/clientpositive/spark/escape_clusterby1.q.out
++++ b/ql/src/test/results/clientpositive/spark/escape_clusterby1.q.out
+@@ -14,7 +14,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -65,7 +65,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/escape_sortby1.q.out b/ql/src/test/results/clientpositive/spark/escape_sortby1.q.out
+index 52f3620..94ecec9 100644
+--- a/ql/src/test/results/clientpositive/spark/escape_sortby1.q.out
++++ b/ql/src/test/results/clientpositive/spark/escape_sortby1.q.out
+@@ -14,7 +14,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -64,7 +64,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/groupby10.q.out b/ql/src/test/results/clientpositive/spark/groupby10.q.out
+index 2bae6ae..853a059 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby10.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby10.q.out
+@@ -55,8 +55,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+@@ -268,8 +268,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+@@ -483,8 +483,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby11.q.out b/ql/src/test/results/clientpositive/spark/groupby11.q.out
+index 378c166..d6057e9 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby11.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby11.q.out
+@@ -43,8 +43,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby7_map_multi_single_reducer.q.out b/ql/src/test/results/clientpositive/spark/groupby7_map_multi_single_reducer.q.out
+index 41ac2ba..fad6864 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby7_map_multi_single_reducer.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby7_map_multi_single_reducer.q.out
+@@ -39,7 +39,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 31)
++        Reducer 2 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/groupby7_noskew_multi_single_reducer.q.out b/ql/src/test/results/clientpositive/spark/groupby7_noskew_multi_single_reducer.q.out
+index abca641..9d68fa7 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby7_noskew_multi_single_reducer.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby7_noskew_multi_single_reducer.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 31)
+-        Reducer 6 <- Map 1 (SORT, 31)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
+         Reducer 3 <- Reducer 5 (GROUP, 1)
+         Reducer 4 <- Reducer 6 (GROUP, 1)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby8.q.out b/ql/src/test/results/clientpositive/spark/groupby8.q.out
+index 53ecd96..ccfba15 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby8.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby8.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+@@ -828,8 +828,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby8_map.q.out b/ql/src/test/results/clientpositive/spark/groupby8_map.q.out
+index 0517b72..3cdfaaf 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby8_map.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby8_map.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 31)
+-        Reducer 6 <- Map 1 (SORT, 31)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
+         Reducer 3 <- Reducer 5 (GROUP, 31)
+         Reducer 4 <- Reducer 6 (GROUP, 31)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby8_map_skew.q.out b/ql/src/test/results/clientpositive/spark/groupby8_map_skew.q.out
+index 0517b72..3cdfaaf 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby8_map_skew.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby8_map_skew.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 31)
+-        Reducer 6 <- Map 1 (SORT, 31)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
+         Reducer 3 <- Reducer 5 (GROUP, 31)
+         Reducer 4 <- Reducer 6 (GROUP, 31)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby8_noskew.q.out b/ql/src/test/results/clientpositive/spark/groupby8_noskew.q.out
+index 0517b72..3cdfaaf 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby8_noskew.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby8_noskew.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 31)
+-        Reducer 6 <- Map 1 (SORT, 31)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 31)
+         Reducer 3 <- Reducer 5 (GROUP, 31)
+         Reducer 4 <- Reducer 6 (GROUP, 31)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby9.q.out b/ql/src/test/results/clientpositive/spark/groupby9.q.out
+index 9b5095a..276dd80 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby9.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby9.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+@@ -829,8 +829,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+@@ -1619,8 +1619,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+@@ -3196,8 +3196,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby_multi_insert_common_distinct.q.out b/ql/src/test/results/clientpositive/spark/groupby_multi_insert_common_distinct.q.out
+index c2766f8..35aca3b 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby_multi_insert_common_distinct.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby_multi_insert_common_distinct.q.out
+@@ -39,8 +39,8 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
++        Reducer 5 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Reducer 5 (GROUP, 2)
+         Reducer 4 <- Reducer 6 (GROUP, 2)
+ #### A masked pattern was here ####
+diff --git a/ql/src/test/results/clientpositive/spark/groupby_multi_single_reducer3.q.out b/ql/src/test/results/clientpositive/spark/groupby_multi_single_reducer3.q.out
+index b84a73c..a2a840e 100644
+--- a/ql/src/test/results/clientpositive/spark/groupby_multi_single_reducer3.q.out
++++ b/ql/src/test/results/clientpositive/spark/groupby_multi_single_reducer3.q.out
+@@ -49,7 +49,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -177,8 +177,8 @@ POSTHOOK: query: select * from e1
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@e1
+ #### A masked pattern was here ####
+-100	2
+ 200	2
++100	2
+ PREHOOK: query: select * from e2
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@e2
+@@ -221,7 +221,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -349,8 +349,8 @@ POSTHOOK: query: select * from e1
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@e1
+ #### A masked pattern was here ####
+-val_100	2
+ val_200	2
++val_100	2
+ PREHOOK: query: select * from e2
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@e2
+@@ -393,7 +393,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -521,8 +521,8 @@ POSTHOOK: query: select * from e1
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@e1
+ #### A masked pattern was here ####
+-100	2
+ 200	2
++100	2
+ PREHOOK: query: select * from e2
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@e2
+@@ -565,7 +565,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -693,8 +693,8 @@ POSTHOOK: query: select * from e1
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@e1
+ #### A masked pattern was here ####
+-val_100	2
+ val_200	2
++val_100	2
+ PREHOOK: query: select * from e2
+ PREHOOK: type: QUERY
+ PREHOOK: Input: default@e2
+diff --git a/ql/src/test/results/clientpositive/spark/identity_project_remove_skip.q.out b/ql/src/test/results/clientpositive/spark/identity_project_remove_skip.q.out
+index 7238009..654cb1b 100644
+--- a/ql/src/test/results/clientpositive/spark/identity_project_remove_skip.q.out
++++ b/ql/src/test/results/clientpositive/spark/identity_project_remove_skip.q.out
+@@ -25,7 +25,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -56,7 +56,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+diff --git a/ql/src/test/results/clientpositive/spark/input14.q.out b/ql/src/test/results/clientpositive/spark/input14.q.out
+index 6843167..3133cfe 100644
+--- a/ql/src/test/results/clientpositive/spark/input14.q.out
++++ b/ql/src/test/results/clientpositive/spark/input14.q.out
+@@ -33,7 +33,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/input17.q.out b/ql/src/test/results/clientpositive/spark/input17.q.out
+index f650ef3..44822e0 100644
+--- a/ql/src/test/results/clientpositive/spark/input17.q.out
++++ b/ql/src/test/results/clientpositive/spark/input17.q.out
+@@ -33,7 +33,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/input18.q.out b/ql/src/test/results/clientpositive/spark/input18.q.out
+index 30f08e5..af8707c 100644
+--- a/ql/src/test/results/clientpositive/spark/input18.q.out
++++ b/ql/src/test/results/clientpositive/spark/input18.q.out
+@@ -33,7 +33,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/join0.q.java1.7.out b/ql/src/test/results/clientpositive/spark/join0.q.java1.7.out
+index 726061b..7acd108 100644
+--- a/ql/src/test/results/clientpositive/spark/join0.q.java1.7.out
++++ b/ql/src/test/results/clientpositive/spark/join0.q.java1.7.out
+@@ -30,7 +30,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 1), Map 4 (PARTITION-LEVEL SORT, 1)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/join15.q.out b/ql/src/test/results/clientpositive/spark/join15.q.out
+index 8055004..d93ef60 100644
+--- a/ql/src/test/results/clientpositive/spark/join15.q.out
++++ b/ql/src/test/results/clientpositive/spark/join15.q.out
+@@ -17,7 +17,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/join20.q.out b/ql/src/test/results/clientpositive/spark/join20.q.out
+index b8576d4..55a456b 100644
+--- a/ql/src/test/results/clientpositive/spark/join20.q.out
++++ b/ql/src/test/results/clientpositive/spark/join20.q.out
+@@ -19,7 +19,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -680,7 +680,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/join21.q.out b/ql/src/test/results/clientpositive/spark/join21.q.out
+index cae55a4..92b752c 100644
+--- a/ql/src/test/results/clientpositive/spark/join21.q.out
++++ b/ql/src/test/results/clientpositive/spark/join21.q.out
+@@ -17,7 +17,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/join23.q.out b/ql/src/test/results/clientpositive/spark/join23.q.out
+index 8879827..cec1e19 100644
+--- a/ql/src/test/results/clientpositive/spark/join23.q.out
++++ b/ql/src/test/results/clientpositive/spark/join23.q.out
+@@ -18,7 +18,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 1), Map 4 (PARTITION-LEVEL SORT, 1)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/join40.q.out b/ql/src/test/results/clientpositive/spark/join40.q.out
+index 361c6a0..8f73f21 100644
+--- a/ql/src/test/results/clientpositive/spark/join40.q.out
++++ b/ql/src/test/results/clientpositive/spark/join40.q.out
+@@ -1779,7 +1779,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2440,7 +2440,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/mapjoin_filter_on_outerjoin.q.out b/ql/src/test/results/clientpositive/spark/mapjoin_filter_on_outerjoin.q.out
+index 0271f97..b68dfb4 100644
+--- a/ql/src/test/results/clientpositive/spark/mapjoin_filter_on_outerjoin.q.out
++++ b/ql/src/test/results/clientpositive/spark/mapjoin_filter_on_outerjoin.q.out
+@@ -108,7 +108,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+@@ -269,7 +269,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+diff --git a/ql/src/test/results/clientpositive/spark/mapjoin_test_outer.q.out b/ql/src/test/results/clientpositive/spark/mapjoin_test_outer.q.out
+index 7143348..6845b4c 100644
+--- a/ql/src/test/results/clientpositive/spark/mapjoin_test_outer.q.out
++++ b/ql/src/test/results/clientpositive/spark/mapjoin_test_outer.q.out
+@@ -285,7 +285,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 4 <- Map 3 (SORT, 2)
++        Reducer 4 <- Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 3 
+@@ -1115,7 +1115,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 3 <- Map 2 (SORT, 2)
++        Reducer 3 <- Map 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 2 
+diff --git a/ql/src/test/results/clientpositive/spark/multi_insert.q.out b/ql/src/test/results/clientpositive/spark/multi_insert.q.out
+index 32bc8c6..137082a 100644
+--- a/ql/src/test/results/clientpositive/spark/multi_insert.q.out
++++ b/ql/src/test/results/clientpositive/spark/multi_insert.q.out
+@@ -587,7 +587,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -733,7 +733,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -879,7 +879,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1025,7 +1025,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/multi_insert_gby.q.out b/ql/src/test/results/clientpositive/spark/multi_insert_gby.q.out
+index 82e2911..6eae46e 100644
+--- a/ql/src/test/results/clientpositive/spark/multi_insert_gby.q.out
++++ b/ql/src/test/results/clientpositive/spark/multi_insert_gby.q.out
+@@ -43,7 +43,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -230,7 +230,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/multi_insert_gby3.q.out b/ql/src/test/results/clientpositive/spark/multi_insert_gby3.q.out
+index 153afb0..588d54a 100644
+--- a/ql/src/test/results/clientpositive/spark/multi_insert_gby3.q.out
++++ b/ql/src/test/results/clientpositive/spark/multi_insert_gby3.q.out
+@@ -50,7 +50,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (SORT, 1)
+-        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (GROUP PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -172,7 +172,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (SORT, 1)
+-        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (GROUP PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1750,7 +1750,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (SORT, 1)
+-        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 2 (GROUP PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/multi_insert_lateral_view.q.out b/ql/src/test/results/clientpositive/spark/multi_insert_lateral_view.q.out
+index aac45fa..6dc5747 100644
+--- a/ql/src/test/results/clientpositive/spark/multi_insert_lateral_view.q.out
++++ b/ql/src/test/results/clientpositive/spark/multi_insert_lateral_view.q.out
+@@ -540,7 +540,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 4 (GROUP, 2)
+-        Reducer 3 <- Map 5 (SORT, 2)
++        Reducer 3 <- Map 5 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 4 
+diff --git a/ql/src/test/results/clientpositive/spark/multi_insert_move_tasks_share_dependencies.q.out b/ql/src/test/results/clientpositive/spark/multi_insert_move_tasks_share_dependencies.q.out
+index edeb401..4645a65 100644
+--- a/ql/src/test/results/clientpositive/spark/multi_insert_move_tasks_share_dependencies.q.out
++++ b/ql/src/test/results/clientpositive/spark/multi_insert_move_tasks_share_dependencies.q.out
+@@ -604,7 +604,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -754,7 +754,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -904,7 +904,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1054,7 +1054,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2305,10 +2305,10 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2432,10 +2432,10 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2559,10 +2559,10 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2686,10 +2686,10 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2821,10 +2821,10 @@ STAGE PLANS:
+   Stage: Stage-4
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -3059,10 +3059,10 @@ STAGE PLANS:
+   Stage: Stage-4
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -3297,10 +3297,10 @@ STAGE PLANS:
+   Stage: Stage-4
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -3535,10 +3535,10 @@ STAGE PLANS:
+   Stage: Stage-4
+     Spark
+       Edges:
+-        Reducer 5 <- Map 1 (SORT, 2)
+-        Reducer 6 <- Map 1 (SORT, 2)
+-        Reducer 3 <- Reducer 5 (SORT, 2)
+-        Reducer 4 <- Reducer 6 (SORT, 2)
++        Reducer 5 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Map 1 (PARTITION-LEVEL SORT, 2)
++        Reducer 3 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
++        Reducer 4 <- Reducer 6 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/multigroupby_singlemr.q.out b/ql/src/test/results/clientpositive/spark/multigroupby_singlemr.q.out
+index 15e5fa2..c1480e3 100644
+--- a/ql/src/test/results/clientpositive/spark/multigroupby_singlemr.q.out
++++ b/ql/src/test/results/clientpositive/spark/multigroupby_singlemr.q.out
+@@ -461,7 +461,7 @@ STAGE PLANS:
+   Stage: Stage-2
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (GROUP PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/parallel.q.out b/ql/src/test/results/clientpositive/spark/parallel.q.out
+index cdb3a77..4d05fac 100644
+--- a/ql/src/test/results/clientpositive/spark/parallel.q.out
++++ b/ql/src/test/results/clientpositive/spark/parallel.q.out
+@@ -40,7 +40,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (GROUP, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (GROUP PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/parallel_join0.q.out b/ql/src/test/results/clientpositive/spark/parallel_join0.q.out
+index 928975a..8d367dd 100644
+--- a/ql/src/test/results/clientpositive/spark/parallel_join0.q.out
++++ b/ql/src/test/results/clientpositive/spark/parallel_join0.q.out
+@@ -28,7 +28,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 1), Map 4 (PARTITION-LEVEL SORT, 1)
+-        Reducer 3 <- Reducer 2 (SORT, 4)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 4)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/ppd_join4.q.out b/ql/src/test/results/clientpositive/spark/ppd_join4.q.out
+index 7f14e3a..193311a 100644
+--- a/ql/src/test/results/clientpositive/spark/ppd_join4.q.out
++++ b/ql/src/test/results/clientpositive/spark/ppd_join4.q.out
+@@ -52,7 +52,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Map 4 (PARTITION-LEVEL SORT, 2), Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+diff --git a/ql/src/test/results/clientpositive/spark/ppd_transform.q.out b/ql/src/test/results/clientpositive/spark/ppd_transform.q.out
+index 7f3d6ed..52a847a 100644
+--- a/ql/src/test/results/clientpositive/spark/ppd_transform.q.out
++++ b/ql/src/test/results/clientpositive/spark/ppd_transform.q.out
+@@ -28,7 +28,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -208,7 +208,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/reduce_deduplicate.q.out b/ql/src/test/results/clientpositive/spark/reduce_deduplicate.q.out
+index 9c65350..8349d18 100644
+--- a/ql/src/test/results/clientpositive/spark/reduce_deduplicate.q.out
++++ b/ql/src/test/results/clientpositive/spark/reduce_deduplicate.q.out
+@@ -389,7 +389,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 1)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 1)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/reduce_deduplicate_exclude_join.q.out b/ql/src/test/results/clientpositive/spark/reduce_deduplicate_exclude_join.q.out
+index 19ab4c8..2ed2a19 100644
+--- a/ql/src/test/results/clientpositive/spark/reduce_deduplicate_exclude_join.q.out
++++ b/ql/src/test/results/clientpositive/spark/reduce_deduplicate_exclude_join.q.out
+@@ -30,7 +30,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/semijoin.q.out b/ql/src/test/results/clientpositive/spark/semijoin.q.out
+index 0f7dbb2..e69f598 100644
+--- a/ql/src/test/results/clientpositive/spark/semijoin.q.out
++++ b/ql/src/test/results/clientpositive/spark/semijoin.q.out
+@@ -131,7 +131,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -233,7 +233,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -337,7 +337,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -433,7 +433,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -540,7 +540,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -639,7 +639,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -742,7 +742,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -842,7 +842,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -971,7 +971,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1060,7 +1060,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1160,7 +1160,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1293,7 +1293,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1455,7 +1455,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1544,7 +1544,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1673,7 +1673,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1805,7 +1805,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -1937,7 +1937,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2069,7 +2069,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2203,7 +2203,7 @@ STAGE PLANS:
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 4 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -2349,7 +2349,7 @@ STAGE PLANS:
+       Edges:
+         Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 5 (PARTITION-LEVEL SORT, 2)
+         Reducer 3 <- Map 6 (PARTITION-LEVEL SORT, 2), Reducer 2 (PARTITION-LEVEL SORT, 2)
+-        Reducer 4 <- Reducer 3 (SORT, 2)
++        Reducer 4 <- Reducer 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/sort.q.out b/ql/src/test/results/clientpositive/spark/sort.q.out
+index 681ff7d..9708f7e 100644
+--- a/ql/src/test/results/clientpositive/spark/sort.q.out
++++ b/ql/src/test/results/clientpositive/spark/sort.q.out
+@@ -16,7 +16,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/transform_ppr1.q.out b/ql/src/test/results/clientpositive/spark/transform_ppr1.q.out
+index 0f5f115..cf538f6 100644
+--- a/ql/src/test/results/clientpositive/spark/transform_ppr1.q.out
++++ b/ql/src/test/results/clientpositive/spark/transform_ppr1.q.out
+@@ -103,7 +103,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/transform_ppr2.q.out b/ql/src/test/results/clientpositive/spark/transform_ppr2.q.out
+index 704b092..6ffd92a 100644
+--- a/ql/src/test/results/clientpositive/spark/transform_ppr2.q.out
++++ b/ql/src/test/results/clientpositive/spark/transform_ppr2.q.out
+@@ -105,7 +105,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+diff --git a/ql/src/test/results/clientpositive/spark/union3.q.out b/ql/src/test/results/clientpositive/spark/union3.q.out
+index a7c5386..f327e2e 100644
+--- a/ql/src/test/results/clientpositive/spark/union3.q.out
++++ b/ql/src/test/results/clientpositive/spark/union3.q.out
+@@ -50,8 +50,8 @@ STAGE PLANS:
+         Reducer 2 <- Map 1 (GROUP, 1)
+         Reducer 5 <- Map 4 (GROUP, 1)
+         Reducer 8 <- Map 7 (GROUP, 1)
+-        Reducer 3 <- Reducer 2 (SORT, 2)
+-        Reducer 6 <- Reducer 5 (SORT, 2)
++        Reducer 3 <- Reducer 2 (PARTITION-LEVEL SORT, 2)
++        Reducer 6 <- Reducer 5 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+@@ -250,7 +250,7 @@ POSTHOOK: query: select * from union_out cluster by id
+ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@union_out
+ #### A masked pattern was here ####
++2
+ 4
+ 1
+-2
+ 3
+diff --git a/ql/src/test/results/clientpositive/spark/union_ppr.q.out b/ql/src/test/results/clientpositive/spark/union_ppr.q.out
+index 61e557b..5cc4169 100644
+--- a/ql/src/test/results/clientpositive/spark/union_ppr.q.out
++++ b/ql/src/test/results/clientpositive/spark/union_ppr.q.out
+@@ -116,7 +116,7 @@ STAGE PLANS:
+   Stage: Stage-1
+     Spark
+       Edges:
+-        Reducer 2 <- Map 1 (SORT, 2), Map 3 (SORT, 2)
++        Reducer 2 <- Map 1 (PARTITION-LEVEL SORT, 2), Map 3 (PARTITION-LEVEL SORT, 2)
+ #### A masked pattern was here ####
+       Vertices:
+         Map 1 
+-- 
+1.7.9.5
+

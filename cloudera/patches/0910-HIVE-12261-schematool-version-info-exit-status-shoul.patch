@@ -1,0 +1,118 @@
+From 683683090d28beeea981745e7bb0f39162a8398d Mon Sep 17 00:00:00 2001
+From: Thejas Nair <thejas@hortonworks.com>
+Date: Sun, 25 Oct 2015 23:47:57 -0700
+Subject: [PATCH 0910/1164] HIVE-12261 : schematool version info exit status
+ should depend on compatibility, not equality
+ (Thejas Nair, reviewed by Sushanth Sowmyan)
+
+Change-Id: Ied0f0e28161ceea90f6ea6306c0defaf0996aef6
+---
+ .../org/apache/hive/beeline/HiveSchemaTool.java    |   22 +++++++---
+ .../hadoop/hive/metastore/MetaStoreSchemaInfo.java |   46 +++++++++++++++++++-
+ 2 files changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+index 2477e5f..c8c4e45 100644
+--- a/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
++++ b/beeline/src/java/org/apache/hive/beeline/HiveSchemaTool.java
+@@ -125,10 +125,12 @@ private NestedScriptParser getDbCommandParser(String dbType) {
+    */
+   public void showInfo() throws HiveMetaException {
+     Connection metastoreConn = getConnectionToMetastore(true);
+-    System.out.println("Hive distribution version:\t " +
+-        MetaStoreSchemaInfo.getHiveSchemaVersion());
+-    System.out.println("Metastore schema version:\t " +
+-        getMetaStoreSchemaVersion(metastoreConn));
++    String hiveVersion = MetaStoreSchemaInfo.getHiveSchemaVersion();
++    String dbVersion = getMetaStoreSchemaVersion(metastoreConn);
++    System.out.println("Hive distribution version:\t " + hiveVersion);
++    System.out.println("Metastore schema version:\t " + dbVersion);
++    assertCompatibleVersion(hiveVersion, dbVersion);
++
+   }
+ 
+   // read schema version from metastore
+@@ -177,9 +179,15 @@ public void verifySchemaVersion() throws HiveMetaException {
+     String newSchemaVersion = getMetaStoreSchemaVersion(
+         getConnectionToMetastore(false));
+     // verify that the new version is added to schema
+-    if (!MetaStoreSchemaInfo.getHiveSchemaVersion().equalsIgnoreCase(newSchemaVersion)) {
+-      throw new HiveMetaException("Expected schema version " + MetaStoreSchemaInfo.getHiveSchemaVersion() +
+-        ", found version " + newSchemaVersion);
++    assertCompatibleVersion(MetaStoreSchemaInfo.getHiveSchemaVersion(), newSchemaVersion);
++
++  }
++
++  private void assertCompatibleVersion(String hiveSchemaVersion, String dbSchemaVersion)
++      throws HiveMetaException {
++    if (!MetaStoreSchemaInfo.isVersionCompatible(hiveSchemaVersion, dbSchemaVersion)) {
++      throw new HiveMetaException("Metastore schema version is not compatible. Hive Version: "
++          + hiveSchemaVersion + ", Database Schema Version: " + dbSchemaVersion);
+     }
+   }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
+index a21b6d1..669704a 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreSchemaInfo.java
+@@ -147,6 +147,10 @@ public static String getPreUpgradeScriptName(int index, String upgradeScriptName
+ 
+   public static String getHiveSchemaVersion() {
+     String hiveVersion = HiveVersionInfo.getShortVersion();
++    return getEquivalentVersion(hiveVersion);
++  }
++
++  private static String getEquivalentVersion(String hiveVersion) {
+     // if there is an equivalent version, return that, else return this version
+     String equivalentVersion = EQUIVALENT_VERSIONS.get(hiveVersion);
+     if (equivalentVersion != null) {
+@@ -156,4 +160,44 @@ public static String getHiveSchemaVersion() {
+     }
+   }
+ 
+-}
+\ No newline at end of file
++  /**
++   * A dbVersion is compatible with hive version if it is greater or equal to
++   * the hive version. This is result of the db schema upgrade design principles
++   * followed in hive project.
++   *
++   * @param hiveVersion
++   *          version of hive software
++   * @param dbVersion
++   *          version of metastore rdbms schema
++   * @return true if versions are compatible
++   */
++  public static boolean isVersionCompatible(String hiveVersion, String dbVersion) {
++    hiveVersion = getEquivalentVersion(hiveVersion);
++    dbVersion = getEquivalentVersion(dbVersion);
++    if (hiveVersion.equals(dbVersion)) {
++      return true;
++    }
++    String[] hiveVerParts = hiveVersion.split("\\.");
++    String[] dbVerParts = dbVersion.split("\\.");
++    if (hiveVerParts.length != 3 || dbVerParts.length != 3) {
++      // these are non standard version numbers. can't perform the
++      // comparison on these, so assume that they are incompatible
++      return false;
++    }
++
++    for (int i = 0; i < dbVerParts.length; i++) {
++      Integer dbVerPart = Integer.valueOf(dbVerParts[i]);
++      Integer hiveVerPart = Integer.valueOf(hiveVerParts[i]);
++      if (dbVerPart > hiveVerPart) {
++        return true;
++      } else if (dbVerPart < hiveVerPart) {
++        return false;
++      } else {
++        continue; // compare next part
++      }
++    }
++
++    return true;
++  }
++
++}
+-- 
+1.7.9.5
+

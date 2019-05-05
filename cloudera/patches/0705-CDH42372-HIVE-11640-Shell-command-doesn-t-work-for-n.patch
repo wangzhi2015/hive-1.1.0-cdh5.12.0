@@ -1,0 +1,338 @@
+From 5161c994c6400d708fc3784aedaebfddaddde979 Mon Sep 17 00:00:00 2001
+From: Ferdinand Xu <cheng.a.xu@intel.com>
+Date: Mon, 7 Sep 2015 23:36:29 -0400
+Subject: [PATCH 0705/1164] CDH42372 : HIVE-11640: Shell command doesn't work
+ for new CLI[Beeline-cli branch](Ferdinand Xu,
+ reviewed by Xuefu Zhang)
+
+Change-Id: I26897605031e29ede1ec75e6a3dd907ae850e997
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |   82 ++++++++++++--------
+ .../src/java/org/apache/hive/beeline/Commands.java |   44 +++++------
+ .../org/apache/hive/beeline/cli/TestHiveCli.java   |   32 ++++++--
+ 3 files changed, 95 insertions(+), 63 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index 962729b..f0f9bf9 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -709,6 +709,7 @@ int initArgsFromCliVars(String[] args) {
+     if (!commands.isEmpty()) {
+       embeddedConnect();
+       connectDBInEmbededMode();
++      updateOptsForCli();
+       for (Iterator<String> i = commands.iterator(); i.hasNext(); ) {
+         String command = i.next().toString();
+         debug(loc("executing-command", command));
+@@ -856,6 +857,14 @@ private String obtainPasswordFromFile(String passwordFilePath) {
+     }
+   }
+ 
++  private void updateOptsForCli() {
++    getOpts().updateBeeLineOptsFromConf();
++    getOpts().setShowHeader(false);
++    getOpts().setOutputFormat("dsv");
++    getOpts().setDelimiterForDSV(' ');
++    getOpts().setNullEmptyString(true);
++  }
++
+   /**
+    * Start accepting input from stdin, and dispatch it
+    * to the appropriate {@link CommandHandler} until the
+@@ -881,10 +890,7 @@ public int begin(String[] args, InputStream inputStream) throws IOException {
+           return code;
+         }
+         defaultConnect(false);
+-        getOpts().updateBeeLineOptsFromConf();
+-        getOpts().setShowHeader(false);
+-        getOpts().setOutputFormat("dsv");
+-        getOpts().setDelimiterForDSV(' ');
++        updateOptsForCli();
+ 
+         processInitFiles(opts.getInitFiles());
+       }
+@@ -1006,6 +1012,7 @@ private int execute(ConsoleReader reader, boolean exitOnError) {
+ 
+         // trim line
+         line = (line == null) ? null : line.trim();
++
+         if (!dispatch(line) && exitOnError) {
+           return ERRNO_OTHER;
+         }
+@@ -1108,8 +1115,33 @@ void usage() {
+     output(loc("cmd-usage"));
+   }
+ 
+-  private String[] tokenizeCmd(String cmd) {
+-    return cmd.split("\\s+");
++  /**
++   * This method is used for executing commands beginning with !
++   * @param line
++   * @return
++   */
++  public boolean execCommandWithPrefix(String line) {
++    Map<String, CommandHandler> cmdMap = new TreeMap<String, CommandHandler>();
++    line = line.substring(1);
++    for (int i = 0; i < commandHandlers.length; i++) {
++      String match = commandHandlers[i].matches(line);
++      if (match != null) {
++        cmdMap.put(match, commandHandlers[i]);
++      }
++    }
++
++    if (cmdMap.size() == 0) {
++      return error(loc("unknown-command", line));
++    }
++    if (cmdMap.size() > 1) {
++      // any exact match?
++      CommandHandler handler = cmdMap.get(line);
++      if (handler == null) {
++        return error(loc("multiple-matches", cmdMap.keySet().toString()));
++      }
++      return handler.execute(line);
++    }
++    return cmdMap.values().iterator().next().execute(line);
+   }
+ 
+   /**
+@@ -1145,35 +1177,19 @@ boolean dispatch(String line) {
+       line = "!help";
+     }
+ 
+-    if (line.startsWith(COMMAND_PREFIX)) {
+-      Map<String, CommandHandler> cmdMap = new TreeMap<String, CommandHandler>();
+-      line = line.substring(1);
+-      for (int i = 0; i < commandHandlers.length; i++) {
+-        String match = commandHandlers[i].matches(line);
+-        if (match != null) {
+-          CommandHandler prev = cmdMap.put(match, commandHandlers[i]);
+-          if (prev != null) {
+-            return error(loc("multiple-matches",
+-                Arrays.asList(prev.getName(), commandHandlers[i].getName())));
+-          }
+-        }
+-      }
+-
+-      if (cmdMap.size() == 0) {
+-        return error(loc("unknown-command", line));
+-      }
+-      if (cmdMap.size() > 1) {
+-        // any exact match?
+-        CommandHandler handler = cmdMap.get(line);
+-        if (handler == null) {
+-          return error(loc("multiple-matches", cmdMap.keySet().toString()));
+-        }
+-        return handler.execute(line);
++    if (isBeeLine) {
++      if (line.startsWith(COMMAND_PREFIX) && !line.contains(";")) {
++        // handle the case "!cmd" for beeline
++        return execCommandWithPrefix(line);
++      } else {
++        return commands.sql(line, getOpts().getEntireLineAsCommand());
+       }
+-      return cmdMap.values().iterator().next()
+-          .execute(line);
+     } else {
+-      return commands.sql(line, getOpts().getEntireLineAsCommand());
++      if (line.toLowerCase().startsWith("!connect")) {
++        return execCommandWithPrefix(line);
++      } else {
++        return commands.sql(line, getOpts().getEntireLineAsCommand());
++      }
+     }
+   }
+ 
+diff --git a/beeline/src/java/org/apache/hive/beeline/Commands.java b/beeline/src/java/org/apache/hive/beeline/Commands.java
+index 36e808d..b7bc05f 100644
+--- a/beeline/src/java/org/apache/hive/beeline/Commands.java
++++ b/beeline/src/java/org/apache/hive/beeline/Commands.java
+@@ -826,7 +826,7 @@ private boolean isSourceCMD(String cmd) {
+     if (cmd == null || cmd.isEmpty())
+       return false;
+     String[] tokens = tokenizeCmd(cmd);
+-    return tokens[0].equalsIgnoreCase("!source");
++    return tokens[0].equalsIgnoreCase("source");
+   }
+ 
+   private boolean sourceFile(String cmd) {
+@@ -868,6 +868,7 @@ private boolean sourceFileInternal(File sourceFile) throws IOException {
+       }
+       String[] cmds = lines.split(";");
+       for (String c : cmds) {
++        c = c.trim();
+         if (!executeInternal(c, false)) {
+           return false;
+         }
+@@ -880,11 +881,10 @@ private boolean sourceFileInternal(File sourceFile) throws IOException {
+     return true;
+   }
+ 
+-  private String cliToBeelineCmd(String cmd) {
++  public String cliToBeelineCmd(String cmd) {
+     if (cmd == null)
+       return null;
+-    String[] tokens = tokenizeCmd(cmd);
+-    if (tokens[0].equalsIgnoreCase("source")) {
++    if (cmd.toLowerCase().equals("quit") || cmd.toLowerCase().equals("exit")) {
+       return BeeLine.COMMAND_PREFIX + cmd;
+     } else if (cmd.startsWith("!")) {
+       String shell_cmd = cmd.substring(1);
+@@ -898,6 +898,10 @@ private String cliToBeelineCmd(String cmd) {
+   // Return false only occurred error when execution the sql and the sql should follow the rules
+   // of beeline.
+   private boolean executeInternal(String sql, boolean call) {
++    if (!beeLine.isBeeLine()) {
++      sql = cliToBeelineCmd(sql);
++    }
++
+     if (sql == null || sql.length() == 0) {
+       return true;
+     }
+@@ -907,8 +911,13 @@ private boolean executeInternal(String sql, boolean call) {
+       return true;
+     }
+ 
++    // is source CMD
++    if (isSourceCMD(sql)) {
++      return sourceFile(sql);
++    }
++
+     if (sql.startsWith(BeeLine.COMMAND_PREFIX)) {
+-      sql = sql.substring(1);
++      return beeLine.execCommandWithPrefix(sql);
+     }
+ 
+     String prefix = call ? "call" : "sql";
+@@ -923,6 +932,10 @@ private boolean executeInternal(String sql, boolean call) {
+       return true;
+     }
+ 
++    if (!(beeLine.assertConnection())) {
++      return false;
++    }
++
+     ClientHook hook = null;
+     if (!beeLine.isBeeLine()) {
+       hook = ClientCommandHookFactory.get().getHook(sql);
+@@ -1098,29 +1111,11 @@ private boolean execute(String line, boolean call, boolean entireLineAsCommand)
+       beeLine.handleException(e);
+     }
+ 
+-    if (!(beeLine.assertConnection())) {
+-      return false;
+-    }
+-
+     line = line.trim();
+     List<String> cmdList = getCmdList(line, entireLineAsCommand);
+     for (int i = 0; i < cmdList.size(); i++) {
+       String sql = cmdList.get(i).trim();
+       if (sql.length() != 0) {
+-        if (!beeLine.isBeeLine()) {
+-          sql = cliToBeelineCmd(sql);
+-          if (sql.equalsIgnoreCase("quit") || sql.equalsIgnoreCase("exit")) {
+-            beeLine.setExit(true);
+-            return true;
+-          }
+-        }
+-
+-        // is source CMD
+-        if (isSourceCMD(sql)) {
+-          sourceFile(sql);
+-          continue;
+-        }
+-
+         if (!executeInternal(sql, call)) {
+           return false;
+         }
+@@ -1265,6 +1260,9 @@ public boolean quit(String line) {
+     return true;
+   }
+ 
++  public boolean exit(String line) {
++    return quit(line);
++  }
+ 
+   /**
+    * Close all connections.
+diff --git a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+index 9c176f1..275bde5 100644
+--- a/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
++++ b/beeline/src/test/org/apache/hive/beeline/cli/TestHiveCli.java
+@@ -46,6 +46,7 @@
+       "create table if not exists test.testSrcTbl2(sc2 string);";
+   private final static String SOURCE_CONTEXT3 =
+       "create table if not exists test.testSrcTbl3(sc3 string);";
++  private final static String SOURCE_CONTEXT4 = "show tables;!ls;show tables;\nquit;";
+   final static String CMD =
+       "create database if not exists test;\ncreate table if not exists test.testTbl(a string, b "
+           + "string);\n";
+@@ -90,19 +91,23 @@ private void verifyCMD(String CMD, String keywords, OutputStream os, String[] op
+     String output = os.toString();
+     LOG.debug(output);
+     if (contains) {
+-      Assert.assertTrue(
+-          "The expected keyword \"" + keywords + "\" doesn't occur in the output: " + output,
++      Assert.assertTrue("The expected keyword \"" + keywords + "\" occur in the output: " + output,
+           output.contains(keywords));
+     } else {
+       Assert.assertFalse(
+-          "The expected keyword \"" + keywords + "\" doesn't occur in the output: " + output,
+-          output.contains(keywords));
++          "The expected keyword \"" + keywords + "\" should be excluded occurred in the output: "
++              + output, output.contains(keywords));
+     }
+   }
+ 
+   @Test
+   public void testInValidCmd() {
+-    verifyCMD("!lss\n", "Unknown command: lss", errS, null, ERRNO_OK, true);
++    verifyCMD("!lss\n", "Failed to execute lss", errS, null, ERRNO_OK, true);
++  }
++
++  @Test
++  public void testCmd() {
++    verifyCMD("show tables;!ls;show tables;\n", "src", os, null, ERRNO_OK, true);
+   }
+ 
+   @Test
+@@ -152,6 +157,14 @@ public void testSourceCmd2() {
+   }
+ 
+   @Test
++  public void testSourceCmd3() {
++    File f = generateTmpFile(SOURCE_CONTEXT4);
++    verifyCMD("source " + f.getPath() + ";" + "desc testSrcTbl4;\nquit;\n", "src", os,
++        new String[] { "--database", "test" }, ERRNO_OK, true);
++    f.delete();
++  }
++
++  @Test
+   public void testSqlFromCmd() {
+     verifyCMD(null, "", os, new String[] { "-e", "show databases;" }, ERRNO_OK, true);
+   }
+@@ -192,8 +205,7 @@ public void testVariablesForSource() {
+ 
+   @Test
+   public void testErrOutput() {
+-    verifyCMD(
+-        "show tables;set system:xxx=5;set system:yyy=${system:xxx};\nlss;",
++    verifyCMD("show tables;set system:xxx=5;set system:yyy=${system:xxx};\nlss;",
+         "cannot recognize input near 'lss' '<EOF>' '<EOF>'", errS, null, ERRNO_OK, true);
+   }
+ 
+@@ -224,6 +236,12 @@ public void testUseInvalidDB() {
+         "hive (invalidDB)>", os, null, ERRNO_OK, false);
+   }
+ 
++  @Test
++  public void testNoErrorDB() {
++    verifyCMD(null, "Error: Method not supported (state=,code=0)", errS, new String[] { "-e", "show tables;" },
++        ERRNO_OK, false);
++  }
++
+   private void redirectOutputStream() {
+     // Setup output stream to redirect output to
+     os = new ByteArrayOutputStream();
+-- 
+1.7.9.5
+

@@ -1,0 +1,110 @@
+From ece90bfa353bc4fd2f15d7959173e2f7caa49598 Mon Sep 17 00:00:00 2001
+From: Chengbing Liu <liuchengbing at qiyi dot com>
+Date: Thu, 22 Oct 2015 23:42:50 -0700
+Subject: [PATCH 0754/1164] CDH-43893: HIVE-11901 :
+ StorageBasedAuthorizationProvider requires write
+ permission on table for SELECT statements
+ (Chengbing Liu via Thejas Nair)
+
+Change-Id: I5a5b2a6beeded15a3ee6d508dc49c41bc96c137f
+Signed-off-by: Thejas Nair <thejas@hortonworks.com>
+---
+ .../TestClientSideAuthorizationProvider.java       |    9 +++++++++
+ ...torageBasedClientSideAuthorizationProvider.java |    6 ++++++
+ ...estStorageBasedMetastoreAuthorizationReads.java |    7 ++++++-
+ .../StorageBasedAuthorizationProvider.java         |   10 +++++++---
+ 4 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestClientSideAuthorizationProvider.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestClientSideAuthorizationProvider.java
+index eedfbca..9040b1c 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestClientSideAuthorizationProvider.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestClientSideAuthorizationProvider.java
+@@ -157,6 +157,10 @@ public void testSimplePrivileges() throws Exception {
+     InjectableDummyAuthenticator.injectGroupNames(fakeGroupNames);
+     InjectableDummyAuthenticator.injectMode(true);
+ 
++    allowSelectOnTable(tbl.getTableName(), fakeUser, tbl.getSd().getLocation());
++    ret = driver.run(String.format("select * from %s limit 10", tblName));
++    assertEquals(0,ret.getResponseCode());
++
+     ret = driver.run(
+         String.format("create table %s (a string) partitioned by (b string)", tblName+"mal"));
+ 
+@@ -218,6 +222,11 @@ protected void allowDropOnDb(String dbName, String userName, String location)
+     driver.run("grant drop on database "+dbName+" to user "+userName);
+   }
+ 
++  protected void allowSelectOnTable(String tblName, String userName, String location)
++      throws Exception {
++    driver.run("grant select on table "+tblName+" to user "+userName);
++  }
++
+   protected void assertNoPrivileges(CommandProcessorResponse ret){
+     assertNotNull(ret);
+     assertFalse(0 == ret.getResponseCode());
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedClientSideAuthorizationProvider.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedClientSideAuthorizationProvider.java
+index 0da2660..e22ca9f 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedClientSideAuthorizationProvider.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedClientSideAuthorizationProvider.java
+@@ -76,6 +76,12 @@ protected void allowDropOnDb(String dbName, String userName, String location)
+     setPermissions(location,"-rwxr--r--");
+   }
+ 
++  @Override
++  protected void allowSelectOnTable(String tblName, String userName, String location)
++      throws Exception {
++    setPermissions(location,"-r--r--r--");
++  }
++
+   private void setPermissions(String locn, String permissions) throws Exception {
+     FileSystem fs = FileSystem.get(new URI(locn), clientHiveConf);
+     fs.setPermission(new Path(locn), FsPermission.valueOf(permissions));
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedMetastoreAuthorizationReads.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedMetastoreAuthorizationReads.java
+index 6f45a59..308036e 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedMetastoreAuthorizationReads.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/security/TestStorageBasedMetastoreAuthorizationReads.java
+@@ -28,7 +28,7 @@
+ import org.junit.Test;
+ 
+ /**
+- * Test cases focusing on drop table permission checks
++ * Test cases focusing on read table permission checks
+  */
+ public class TestStorageBasedMetastoreAuthorizationReads extends StorageBasedMetastoreTestBase {
+ 
+@@ -38,6 +38,11 @@ public void testReadTableSuccess() throws Exception {
+   }
+ 
+   @Test
++  public void testReadTableSuccessWithReadOnly() throws Exception {
++    readTableByOtherUser("-r--r--r--", true);
++  }
++
++  @Test
+   public void testReadTableFailure() throws Exception {
+     readTableByOtherUser("-rwxrwx---", false);
+   }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/security/authorization/StorageBasedAuthorizationProvider.java b/ql/src/java/org/apache/hadoop/hive/ql/security/authorization/StorageBasedAuthorizationProvider.java
+index 5786277..9bdea18 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/security/authorization/StorageBasedAuthorizationProvider.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/security/authorization/StorageBasedAuthorizationProvider.java
+@@ -234,9 +234,13 @@ private void authorize(Table table, Partition part, Privilege[] readRequiredPriv
+     // Partition itself can also be null, in cases where this gets called as a generic
+     // catch-all call in cases like those with CTAS onto an unpartitioned table (see HIVE-1887)
+     if ((part == null) || (part.getLocation() == null)) {
+-      // this should be the case only if this is a create partition.
+-      // The privilege needed on the table should be ALTER_DATA, and not CREATE
+-      authorize(table, new Privilege[]{}, new Privilege[]{Privilege.ALTER_DATA});
++      if (requireCreatePrivilege(readRequiredPriv) || requireCreatePrivilege(writeRequiredPriv)) {
++        // this should be the case only if this is a create partition.
++        // The privilege needed on the table should be ALTER_DATA, and not CREATE
++        authorize(table, new Privilege[]{}, new Privilege[]{Privilege.ALTER_DATA});
++      } else {
++        authorize(table, readRequiredPriv, writeRequiredPriv);
++      }
+     } else {
+       authorize(part.getDataLocation(), readRequiredPriv, writeRequiredPriv);
+     }
+-- 
+1.7.9.5
+

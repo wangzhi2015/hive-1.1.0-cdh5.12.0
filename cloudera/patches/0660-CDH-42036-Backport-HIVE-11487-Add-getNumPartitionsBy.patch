@@ -1,0 +1,423 @@
+From 7b235b73be95907bea4f30d2218dc7d017832a3e Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Wed, 6 Jul 2016 14:36:52 -0500
+Subject: [PATCH 0660/1164] CDH-42036: Backport HIVE-11487: Add
+ getNumPartitionsByFilter api in metastore api
+
+This backport is not bringing any new Thrift API change, but only the public methods needed
+by HIVE-13884 to work.
+
+Also, there was another single file that it is brought on this change, PartFilterExprUtil.java. The
+rest of the patch containing it it is for HBASE changes, and we do not support it yet.
+
+Change-Id: Ia577dd456f0404f9a830c62100d38e2850dd9709
+---
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   18 +++
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |   47 ++++++
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |   37 +++++
+ .../hadoop/hive/metastore/PartFilterExprUtil.java  |  149 ++++++++++++++++++++
+ .../org/apache/hadoop/hive/metastore/RawStore.java |    3 +
+ .../metastore/DummyRawStoreControlledCommit.java   |    6 +
+ .../metastore/DummyRawStoreForJdoConnection.java   |    6 +
+ .../hadoop/hive/metastore/TestObjectStore.java     |   11 +-
+ 8 files changed, 275 insertions(+), 2 deletions(-)
+ create mode 100644 metastore/src/java/org/apache/hadoop/hive/metastore/PartFilterExprUtil.java
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 4c35139..e608779 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -4654,6 +4654,24 @@ private void rethrowException(Exception e)
+         throw newMetaException(e);
+       }
+     }
++    
++    public int get_num_partitions_by_filter(final String dbName,
++                                            final String tblName, final String filter)
++            throws MetaException, NoSuchObjectException, TException {
++      startTableFunction("get_num_partitions_by_filter", dbName, tblName);
++
++      int ret = -1;
++      Exception ex = null;
++      try {
++        ret = getMS().getNumPartitionsByFilter(dbName, tblName, filter);
++      } catch (Exception e) {
++        ex = e;
++        rethrowException(e);
++      } finally {
++        endFunction("get_num_partitions_by_filter", ret != -1, ex, tblName);
++      }
++      return ret;
++    }
+ 
+     @Override
+     public List<Partition> get_partitions_by_names(final String dbName,
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index a7e99be..04abc7e 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -393,6 +393,20 @@ public Database getDatabase(String dbName) throws MetaException{
+         isViewTable, sqlFilter, params, joins, max);
+   }
+ 
++  public int getNumPartitionsViaSqlFilter(Table table, ExpressionTree tree) throws MetaException {
++    List<Object> params = new ArrayList<Object>();
++    List<String>joins = new ArrayList<String>();
++    // Derby and Oracle do not interpret filters ANSI-properly in some cases and need a workaround.
++    boolean dbHasJoinCastBug = (dbType == DB.DERBY || dbType == DB.ORACLE);
++    String sqlFilter = PartitionFilterGenerator.generateSqlFilter(
++        table, tree, params, joins, dbHasJoinCastBug, defaultPartName, dbType);
++    if (sqlFilter == null) {
++      return 0; // Cannot make SQL filter to push down.
++    }
++    return getNumPartitionsViaSqlFilterInternal(table.getDbName(), table.getTableName(), sqlFilter, params, joins);
++  }
++
++
+   /**
+    * Gets all partitions of a table by using direct SQL queries.
+    * @param dbName Metastore db name.
+@@ -809,6 +823,39 @@ public void apply(SerDeInfo t, Object[] fields) {
+     return orderedResult;
+   }
+ 
++  private int getNumPartitionsViaSqlFilterInternal(String dbName, String tblName,
++                                                   String sqlFilter, List<Object> paramsForFilter,
++                                                   List<String> joinsForFilter) throws MetaException {
++    boolean doTrace = LOG.isDebugEnabled();
++    dbName = dbName.toLowerCase();
++    tblName = tblName.toLowerCase();
++
++    // Get number of partitions by doing count on PART_ID.
++    String queryText = "select count(\"PARTITIONS\".\"PART_ID\") from \"PARTITIONS\""
++      + "  inner join \"TBLS\" on \"PARTITIONS\".\"TBL_ID\" = \"TBLS\".\"TBL_ID\" "
++      + "    and \"TBLS\".\"TBL_NAME\" = ? "
++      + "  inner join \"DBS\" on \"TBLS\".\"DB_ID\" = \"DBS\".\"DB_ID\" "
++      + "     and \"DBS\".\"NAME\" = ? "
++      + join(joinsForFilter, ' ')
++      + (sqlFilter == null ? "" : (" where " + sqlFilter));
++
++    Object[] params = new Object[paramsForFilter.size() + 2];
++    params[0] = tblName;
++    params[1] = dbName;
++    for (int i = 0; i < paramsForFilter.size(); ++i) {
++      params[i + 2] = paramsForFilter.get(i);
++    }
++
++    long start = doTrace ? System.nanoTime() : 0;
++    Query query = pm.newQuery("javax.jdo.query.SQL", queryText);
++    @SuppressWarnings("unchecked")
++    int sqlResult = extractSqlInt(query.executeWithArray(params));
++    long queryTime = doTrace ? System.nanoTime() : 0;
++    timingTrace(doTrace, queryText, start, queryTime);
++    return sqlResult;
++  }
++
++
+   private void timingTrace(boolean doTrace, String queryText, long start, long queryTime) {
+     if (!doTrace) return;
+     LOG.debug("Direct SQL query in " + (queryTime - start) / 1000000.0 + "ms + " +
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index f4bc58f..5340286 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -2313,6 +2313,7 @@ protected boolean getPartitionsByExprInternal(String dbName, String tblName, fin
+         }
+         return result;
+       }
++
+       @Override
+       protected List<Partition> getJdoResult(
+           GetHelper<List<Partition>> ctx) throws MetaException, NoSuchObjectException {
+@@ -2442,6 +2443,12 @@ private boolean getPartitionNamesPrunedByExprNoTxn(Table table, byte[] expr,
+     return results;
+   }
+ 
++
++  private Integer getNumPartitionsViaOrmFilter(Table table, ExpressionTree tree, boolean isValidatedFilter)
++    throws MetaException {
++    return getPartitionsViaOrmFilter(table, tree, (short) -1, isValidatedFilter).size();
++  }
++
+   /**
+    * Gets partition names from the table via ORM (JDOQL) name filter.
+    * @param dbName Database name.
+@@ -2721,6 +2728,36 @@ protected String describeResult() {
+     }
+   }
+ 
++  @Override
++  public int getNumPartitionsByFilter(String dbName, String tblName,
++                                      String filter) throws MetaException, NoSuchObjectException {
++    return getNumPartitionsByFilterInternal(dbName, tblName, filter,
++      true, true);
++  }
++
++  protected int getNumPartitionsByFilterInternal(String dbName, String tblName,
++                                                 String filter, boolean allowSql, boolean allowJdo)
++    throws MetaException, NoSuchObjectException {
++    final ExpressionTree tree = (filter != null && !filter.isEmpty())
++      ? PartFilterExprUtil.getFilterParser(filter).tree : ExpressionTree.EMPTY_TREE;
++    return new GetHelper<Integer>(dbName, tblName, allowSql, allowJdo) {
++      @Override
++      protected String describeResult() {
++        return null;
++      }
++
++      @Override
++      protected Integer getSqlResult(GetHelper<Integer> ctx) throws MetaException {
++        return directSql.getNumPartitionsViaSqlFilter(ctx.getTable(), tree);
++      }
++      @Override
++      protected Integer getJdoResult(
++        GetHelper<Integer> ctx) throws MetaException, NoSuchObjectException {
++        return getNumPartitionsViaOrmFilter(ctx.getTable(), tree, true);
++      }
++    }.run(true);
++  }
++
+   protected List<Partition> getPartitionsByFilterInternal(String dbName, String tblName,
+       String filter, final short maxParts, boolean allowSql, boolean allowJdo)
+       throws MetaException, NoSuchObjectException {
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/PartFilterExprUtil.java b/metastore/src/java/org/apache/hadoop/hive/metastore/PartFilterExprUtil.java
+new file mode 100644
+index 0000000..e38e8dd
+--- /dev/null
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/PartFilterExprUtil.java
+@@ -0,0 +1,149 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.metastore;
++
++import org.antlr.runtime.CommonTokenStream;
++import org.antlr.runtime.RecognitionException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.hive.metastore.parser.ExpressionTree;
++import org.apache.hadoop.hive.metastore.parser.FilterLexer;
++import org.apache.hadoop.hive.metastore.parser.FilterParser;
++import org.apache.hadoop.hive.metastore.parser.ExpressionTree.ANTLRNoCaseStringStream;
++import org.apache.hadoop.hive.metastore.parser.ExpressionTree.LeafNode;
++import org.apache.hadoop.hive.metastore.parser.ExpressionTree.Operator;
++
++/**
++ * Utility functions for working with partition filter expressions
++ */
++public class PartFilterExprUtil {
++  private static final Logger LOG = LoggerFactory.getLogger(PartFilterExprUtil.class.getName());
++
++
++  public static ExpressionTree makeExpressionTree(PartitionExpressionProxy expressionProxy,
++      byte[] expr) throws MetaException {
++    // We will try pushdown first, so make the filter. This will also validate the expression,
++    // if serialization fails we will throw incompatible metastore error to the client.
++    String filter = null;
++    try {
++      filter = expressionProxy.convertExprToFilter(expr);
++    } catch (MetaException ex) {
++      throw new IMetaStoreClient.IncompatibleMetastoreException(ex.getMessage());
++    }
++
++    // Make a tree out of the filter.
++    // TODO: this is all pretty ugly. The only reason we need all these transformations
++    //       is to maintain support for simple filters for HCat users that query metastore.
++    //       If forcing everyone to use thick client is out of the question, maybe we could
++    //       parse the filter into standard hive expressions and not all this separate tree
++    //       Filter.g stuff. That way this method and ...ByFilter would just be merged.
++    return PartFilterExprUtil.makeExpressionTree(filter);
++  }
++
++
++  /**
++   * Creates the proxy used to evaluate expressions. This is here to prevent circular
++   * dependency - ql -&gt; metastore client &lt;-&gt metastore server -&gt ql. If server and
++   * client are split, this can be removed.
++   * @param conf Configuration.
++   * @return The partition expression proxy.
++   */
++  public static PartitionExpressionProxy createExpressionProxy(Configuration conf) {
++    String className = HiveConf.getVar(conf, HiveConf.ConfVars.METASTORE_EXPRESSION_PROXY_CLASS);
++    try {
++      @SuppressWarnings("unchecked")
++      Class<? extends PartitionExpressionProxy> clazz =
++          (Class<? extends PartitionExpressionProxy>)MetaStoreUtils.getClass(className);
++      return MetaStoreUtils.newInstance(
++          clazz, new Class<?>[0], new Object[0]);
++    } catch (MetaException e) {
++      LOG.error("Error loading PartitionExpressionProxy", e);
++      throw new RuntimeException("Error loading PartitionExpressionProxy: " + e.getMessage());
++    }
++  }
++
++  /**
++   * Makes expression tree out of expr.
++   * @param filter Filter.
++   * @return Expression tree. Null if there was an error.
++   */
++  private static ExpressionTree makeExpressionTree(String filter) throws MetaException {
++    // TODO: ExprNodeDesc is an expression tree, we could just use that and be rid of Filter.g.
++    if (filter == null || filter.isEmpty()) {
++      return ExpressionTree.EMPTY_TREE;
++    }
++    LOG.debug("Filter specified is " + filter);
++    ExpressionTree tree = null;
++    try {
++      tree = getFilterParser(filter).tree;
++    } catch (MetaException ex) {
++      LOG.info("Unable to make the expression tree from expression string ["
++          + filter + "]" + ex.getMessage()); // Don't log the stack, this is normal.
++    }
++    if (tree == null) {
++      return null;
++    }
++    // We suspect that LIKE pushdown into JDO is invalid; see HIVE-5134. Check for like here.
++    LikeChecker lc = new LikeChecker();
++    tree.accept(lc);
++    return lc.hasLike() ? null : tree;
++  }
++
++
++  private static class LikeChecker extends ExpressionTree.TreeVisitor {
++    private boolean hasLike;
++
++    public boolean hasLike() {
++      return hasLike;
++    }
++
++    @Override
++    protected boolean shouldStop() {
++      return hasLike;
++    }
++
++    @Override
++    protected void visit(LeafNode node) throws MetaException {
++      hasLike = hasLike || (node.operator == Operator.LIKE);
++    }
++  }
++
++  public static FilterParser getFilterParser(String filter) throws MetaException {
++    FilterLexer lexer = new FilterLexer(new ANTLRNoCaseStringStream(filter));
++    CommonTokenStream tokens = new CommonTokenStream(lexer);
++
++    FilterParser parser = new FilterParser(tokens);
++    try {
++      parser.filter();
++    } catch(RecognitionException re) {
++      throw new MetaException("Error parsing partition filter; lexer error: "
++          + lexer.errorMsg + "; exception " + re);
++    }
++
++    if (lexer.errorMsg != null) {
++      throw new MetaException("Error parsing partition filter : " + lexer.errorMsg);
++    }
++    return parser;
++  }
++
++
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java
+index cbe8fa4..2fcd122 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/RawStore.java
+@@ -230,6 +230,9 @@ public abstract boolean getPartitionsByExpr(String dbName, String tblName,
+       byte[] expr, String defaultPartitionName, short maxParts, List<Partition> result)
+       throws TException;
+ 
++  public abstract int getNumPartitionsByFilter(String dbName, String tblName, String filter)
++    throws MetaException, NoSuchObjectException;
++
+   public abstract List<Partition> getPartitionsByNames(
+       String dbName, String tblName, List<String> partNames)
+       throws MetaException, NoSuchObjectException;
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java
+index 52707cb..07f840d 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreControlledCommit.java
+@@ -318,6 +318,12 @@ public void alterIndex(String dbName, String baseTblName, String name, Index new
+   }
+ 
+   @Override
++  public int getNumPartitionsByFilter(String dbName, String tblName,
++                                      String filter) throws MetaException, NoSuchObjectException {
++    return objectStore.getNumPartitionsByFilter(dbName, tblName, filter);
++  }
++
++  @Override
+   public List<Partition> getPartitionsByNames(String dbName, String tblName,
+       List<String> partNames) throws MetaException, NoSuchObjectException {
+     return objectStore.getPartitionsByNames(dbName, tblName, partNames);
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
+index f6a22af..70e27e3 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/DummyRawStoreForJdoConnection.java
+@@ -345,6 +345,12 @@ public boolean getPartitionsByExpr(String dbName, String tblName, byte[] expr,
+   }
+ 
+   @Override
++  public int getNumPartitionsByFilter(String dbName, String tblName, String filter)
++    throws MetaException, NoSuchObjectException {
++    return -1;
++  }
++
++  @Override
+   public Table markPartitionForEvent(String dbName, String tblName, Map<String, String> partVals,
+       PartitionEventType evtType) throws MetaException, UnknownTableException,
+       InvalidPartitionException, UnknownPartitionException {
+diff --git a/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java b/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java
+index d8dbd0f..a39df06 100644
+--- a/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java
++++ b/metastore/src/test/org/apache/hadoop/hive/metastore/TestObjectStore.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.hive.metastore.api.SerDeInfo;
+ import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
+ import org.apache.hadoop.hive.metastore.api.Table;
++import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
+ import org.junit.After;
+ import org.junit.Assert;
+@@ -152,8 +153,8 @@ public void testPartitionOps() throws MetaException, InvalidObjectException, NoS
+     StorageDescriptor sd = new StorageDescriptor(null, "location", null, null, false, 0, new SerDeInfo("SerDeName", "serializationLib", null), null, null, null);
+     HashMap<String,String> tableParams = new HashMap<String,String>();
+     tableParams.put("EXTERNAL", "false");
+-    FieldSchema partitionKey1 = new FieldSchema("Country", "String", "");
+-    FieldSchema partitionKey2 = new FieldSchema("State", "String", "");
++    FieldSchema partitionKey1 = new FieldSchema("Country", serdeConstants.STRING_TYPE_NAME, "");
++    FieldSchema partitionKey2 = new FieldSchema("State", serdeConstants.STRING_TYPE_NAME, "");
+     Table tbl1 = new Table(TABLE1, DB1, "owner", 1, 2, 3, sd, Arrays.asList(partitionKey1, partitionKey2), tableParams, "viewOriginalText", "viewExpandedText", "MANAGED_TABLE");
+     objectStore.createTable(tbl1);
+     HashMap<String, String> partitionParams = new HashMap<String, String>();
+@@ -171,6 +172,12 @@ public void testPartitionOps() throws MetaException, InvalidObjectException, NoS
+     Assert.assertEquals(111, partitions.get(0).getCreateTime());
+     Assert.assertEquals(222, partitions.get(1).getCreateTime());
+ 
++    int numPartitions  = objectStore.getNumPartitionsByFilter(DB1, TABLE1, "");
++    Assert.assertEquals(partitions.size(), numPartitions);
++
++    numPartitions  = objectStore.getNumPartitionsByFilter(DB1, TABLE1, "country = \"US\"");
++    Assert.assertEquals(2, numPartitions);
++
+     objectStore.dropPartition(DB1, TABLE1, value1);
+     partitions = objectStore.getPartitions(DB1, TABLE1, 10);
+     Assert.assertEquals(1, partitions.size());
+-- 
+1.7.9.5
+

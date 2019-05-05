@@ -1,0 +1,89 @@
+From 6f80d78dc708e0369b6f38a88e144450fb165e85 Mon Sep 17 00:00:00 2001
+From: Sushanth Sowmyan <khorgath@apache.org>
+Date: Fri, 10 Apr 2015 03:56:55 +0000
+Subject: [PATCH 0562/1164] CDH-39394 : HIVE-10074 : Ability to run HCat
+ Client Unit tests in a system test setting
+ (Deepesh Khandelwal via Sushanth Sowmyan)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1672536 13f79535-47bb-0310-9956-ffa450edef68
+(cherry picked from commit d9560b34474bcc9b4edc11a79d141eb8e16f2d9d)
+
+Change-Id: Ia4640edad80a8fd364e368ae54b0cbd209548b68
+---
+ .../apache/hive/hcatalog/api/TestHCatClient.java   |   26 +++++++++++++++-----
+ 1 file changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
+index 30b07b1..eb21a0f 100644
+--- a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
++++ b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
+@@ -84,6 +84,8 @@
+   private static final String replicationTargetHCatPort = "20102";
+   private static HiveConf replicationTargetHCatConf;
+   private static SecurityManager securityManager;
++  private static boolean useExternalMS = false;
++  private static boolean useExternalMSForReplication = false;
+ 
+   private static class RunMS implements Runnable {
+ 
+@@ -114,14 +116,22 @@ public void run() {
+ 
+   @AfterClass
+   public static void tearDown() throws Exception {
+-    LOG.info("Shutting down metastore.");
+-    System.setSecurityManager(securityManager);
++    if (!useExternalMS) {
++      LOG.info("Shutting down metastore.");
++      System.setSecurityManager(securityManager);
++    }
+   }
+ 
+   @BeforeClass
+   public static void startMetaStoreServer() throws Exception {
+ 
+     hcatConf = new HiveConf(TestHCatClient.class);
++    String metastoreUri = System.getProperty(HiveConf.ConfVars.METASTOREURIS.varname);
++    if (metastoreUri != null) {
++      hcatConf.setVar(HiveConf.ConfVars.METASTOREURIS, metastoreUri);
++      useExternalMS = true;
++      return;
++    }
+     if (Shell.WINDOWS) {
+       WindowsPathUtil.convertPathsFromWindowsToHdfs(hcatConf);
+     }
+@@ -177,8 +187,12 @@ public void testBasicDDLCommands() throws Exception {
+     assertTrue(testDb.getProperties().size() == 0);
+     String warehouseDir = System
+       .getProperty("test.warehouse.dir", "/user/hive/warehouse");
+-    String expectedDir = warehouseDir.replaceFirst("pfile:///", "pfile:/");
+-    assertEquals(expectedDir + "/" + db + ".db", testDb.getLocation());
++    if (useExternalMS) {
++      assertTrue(testDb.getLocation().matches(".*" + "/" + db + ".db"));
++    } else {
++      String expectedDir = warehouseDir.replaceFirst("pfile:///", "pfile:/");
++      assertEquals(expectedDir + "/" + db + ".db", testDb.getLocation());
++    }
+     ArrayList<HCatFieldSchema> cols = new ArrayList<HCatFieldSchema>();
+     cols.add(new HCatFieldSchema("id", Type.INT, "id comment"));
+     cols.add(new HCatFieldSchema("value", Type.STRING, "value comment"));
+@@ -228,7 +242,7 @@ public void testBasicDDLCommands() throws Exception {
+     assertEquals("checking " + serdeConstants.SERIALIZATION_NULL_FORMAT, Character.toString('\006'),
+       table2.getSerdeParams().get(serdeConstants.SERIALIZATION_NULL_FORMAT));
+     
+-    assertEquals((expectedDir + "/" + db + ".db/" + tableTwo).toLowerCase(), table2.getLocation().toLowerCase());
++    assertTrue(table2.getLocation().toLowerCase().matches(".*" + ("/" + db + ".db/" + tableTwo).toLowerCase()));
+ 
+     HCatCreateTableDesc tableDesc3 = HCatCreateTableDesc.create(db,
+       tableThree, cols).fileFormat("orcfile").build();
+@@ -387,7 +401,7 @@ public void testDatabaseLocation() throws Exception {
+       .ifNotExists(true).location("/tmp/" + dbName).build();
+     client.createDatabase(dbDesc);
+     HCatDatabase newDB = client.getDatabase(dbName);
+-    assertTrue(newDB.getLocation().equalsIgnoreCase("file:/tmp/" + dbName));
++    assertTrue(newDB.getLocation().matches(".*/tmp/" + dbName));
+     client.close();
+   }
+ 
+-- 
+1.7.9.5
+

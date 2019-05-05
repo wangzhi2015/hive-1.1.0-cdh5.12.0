@@ -1,0 +1,766 @@
+From 1d84c5f69758702d694f4c6a2ec249612eaa7f57 Mon Sep 17 00:00:00 2001
+From: Eugene Koifman <ekoifman@hortonworks.com>
+Date: Wed, 20 May 2015 10:05:31 -0700
+Subject: [PATCH 0161/1164] HIVE-10629 Dropping table in an encrypted zone
+ does not drop warehouse directory(Eugene Koifman,
+ reviewed by Sergio Pena)
+
+Conflicts:
+	metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+	ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_static.q.out
+---
+ data/scripts/q_test_cleanup_for_encryption.sql     |    2 +-
+ data/scripts/q_test_init_for_encryption.sql        |    2 +-
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |    3 +-
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   30 ++++++++++-
+ .../queries/clientpositive/encryption_drop_table.q |   18 +++++++
+ .../encryption_insert_partition_dynamic.q          |    8 +--
+ .../encryption_insert_partition_static.q           |    8 +--
+ .../encryption_join_unencrypted_tbl.q              |    4 +-
+ ...ncryption_join_with_different_encryption_keys.q |    8 +--
+ .../encryption_load_data_to_encrypted_tables.q     |    4 +-
+ .../queries/clientpositive/encryption_move_tbl.q   |    4 +-
+ .../encryption_select_read_only_encrypted_tbl.q    |    4 +-
+ .../encrypted/encryption_drop_table.q.out          |   56 ++++++++++++++++++++
+ .../encryption_insert_partition_dynamic.q.out      |   16 +++---
+ .../encryption_insert_partition_static.q.out       |   30 +++++------
+ .../encryption_join_unencrypted_tbl.q.out          |    8 +--
+ ...ption_join_with_different_encryption_keys.q.out |   16 +++---
+ .../encryption_load_data_to_encrypted_tables.q.out |    8 +--
+ .../encrypted/encryption_move_tbl.q.out            |   16 ++++--
+ ...encryption_select_read_only_encrypted_tbl.q.out |    8 +--
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |    3 ++
+ 22 files changed, 187 insertions(+), 72 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/encryption_drop_table.q
+ create mode 100644 ql/src/test/results/clientpositive/encrypted/encryption_drop_table.q.out
+
+diff --git a/data/scripts/q_test_cleanup_for_encryption.sql b/data/scripts/q_test_cleanup_for_encryption.sql
+index 08264ee..070cdbe 100644
+--- a/data/scripts/q_test_cleanup_for_encryption.sql
++++ b/data/scripts/q_test_cleanup_for_encryption.sql
+@@ -1 +1 @@
+-DROP TABLE IF EXISTS src;
++DROP TABLE IF EXISTS src PURGE;
+diff --git a/data/scripts/q_test_init_for_encryption.sql b/data/scripts/q_test_init_for_encryption.sql
+index 1822ebb..56b44e0 100644
+--- a/data/scripts/q_test_init_for_encryption.sql
++++ b/data/scripts/q_test_init_for_encryption.sql
+@@ -1,4 +1,4 @@
+-DROP TABLE IF EXISTS src;
++DROP TABLE IF EXISTS src PURGE;
+ 
+ CREATE TABLE src(key STRING COMMENT 'default', value STRING COMMENT 'default') STORED AS TEXTFILE;
+ 
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index 45321d3..dc098cf 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -312,7 +312,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_select_read_only_unencrypted_tbl.q,\
+   encryption_load_data_to_encrypted_tables.q, \
+   encryption_unencrypted_nonhdfs_external_tables.q \
+-  encryption_move_tbl.q
++  encryption_move_tbl.q \
++  encryption_drop_table.q
+ 
+ beeline.positive.exclude=add_part_exist.q,\
+   alter1.q,\
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index e8fe79a..2f4f403 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -367,6 +367,7 @@ public QTestUtil(String outDir, String logDir, MiniClusterType clusterType,
+         // Set the security key provider so that the MiniDFS cluster is initialized
+         // with encryption
+         conf.set(SECURITY_KEY_PROVIDER_URI_NAME, getKeyProviderURI());
++        conf.setInt("fs.trash.interval", 50);
+ 
+         dfs = shims.getMiniDfs(conf, numberOfDataNodes, true, null);
+         fs = dfs.getFileSystem();
+@@ -680,7 +681,7 @@ public void clearTablesCreatedDuringTests() throws Exception {
+           if(tblObj.isIndexTable()) {
+             continue;
+           }
+-          db.dropTable(dbName, tblName);
++          db.dropTable(dbName, tblName, true, true, clusterType == MiniClusterType.encrypted);
+         } else {
+           // this table is defined in srcTables, drop all indexes on it
+          List<Index> indexes = db.getIndexes(dbName, tblName, (short)-1);
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index fbe0cf9..9c0d807 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -30,6 +30,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.common.JvmPauseMonitor;
+@@ -170,6 +171,7 @@
+ import org.apache.hadoop.hive.metastore.txn.TxnHandler;
+ import org.apache.hadoop.hive.serde2.Deserializer;
+ import org.apache.hadoop.hive.serde2.SerDeException;
++import org.apache.hadoop.hive.shims.HadoopShims;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.hive.shims.Utils;
+ import org.apache.hadoop.hive.thrift.HadoopThriftAuthBridge;
+@@ -1476,6 +1478,7 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+       Path tblPath = null;
+       List<Path> partPaths = null;
+       Table tbl = null;
++      boolean ifPurge = false;
+       try {
+         ms.openTransaction();
+         // drop any partitions
+@@ -1487,6 +1490,17 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+           throw new MetaException("Table metadata is corrupted");
+         }
+ 
++        /**
++         * Trash may be skipped iff:
++         * 1. deleteData == true, obviously.
++         * 2. tbl is external.
++         * 3. Either
++         *  3.1. User has specified PURGE from the commandline, and if not,
++         *  3.2. User has set the table to auto-purge.
++         */
++        ifPurge = ((envContext != null) && Boolean.parseBoolean(envContext.getProperties().get("ifPurge")))
++          || (tbl.isSetParameters() && "true".equalsIgnoreCase(tbl.getParameters().get("auto.purge")));
++
+         firePreEvent(new PreDropTableEvent(tbl, deleteData, this));
+ 
+         boolean isIndexTable = isIndexTable(tbl);
+@@ -1519,6 +1533,19 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+           }
+         }
+ 
++        if(!ifPurge) {
++          String trashInterval = hiveConf.get("fs.trash.interval");
++          boolean trashEnabled = trashInterval != null && trashInterval.length() > 0
++            && Float.parseFloat(trashInterval) > 0;
++          if (trashEnabled) {
++            HadoopShims.HdfsEncryptionShim shim =
++              ShimLoader.getHadoopShims().createHdfsEncryptionShim(FileSystem.get(hiveConf), hiveConf);
++            if (shim.isPathEncrypted(tblPath)) {
++              throw new MetaException("Unable to drop table because it is in an encryption zone" +
++                " and trash is enabled.  Use PURGE option to skip trash.");
++            }
++          }
++        }
+         // Drop the partitions and get a list of locations which need to be deleted
+         partPaths = dropPartitionsAndGetLocations(ms, dbname, name, tblPath,
+             tbl.getPartitionKeys(), deleteData && !isExternal);
+@@ -1533,8 +1560,7 @@ private boolean drop_table_core(final RawStore ms, final String dbname, final St
+         if (!success) {
+           ms.rollbackTransaction();
+         } else if (deleteData && !isExternal) {
+-          boolean ifPurge = envContext != null &&
+-              Boolean.parseBoolean(envContext.getProperties().get("ifPurge"));
++          // Data needs deletion. Check if trash may be skipped.
+           // Delete the data in the partitions which have other locations
+           deletePartitionData(partPaths, ifPurge);
+           // Delete the data in the table
+diff --git a/ql/src/test/queries/clientpositive/encryption_drop_table.q b/ql/src/test/queries/clientpositive/encryption_drop_table.q
+new file mode 100644
+index 0000000..193beea
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/encryption_drop_table.q
+@@ -0,0 +1,18 @@
++-- SORT_QUERY_RESULTS;
++
++-- we're setting this so that TestNegaiveCliDriver.vm doesn't stop processing after DROP TABLE fails;
++
++set hive.cli.errors.ignore=true;
++
++DROP TABLE IF EXISTS encrypted_table PURGE;
++CREATE TABLE encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table';
++CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
++CRYPTO CREATE_ZONE --keyName key_128 --path ${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table;
++
++INSERT OVERWRITE TABLE encrypted_table SELECT * FROM src;
++SHOW TABLES;
++DROP TABLE default.encrypted_table;
++SHOW TABLES;
++DROP TABLE default.encrypted_table PURGE;
++SHOW TABLES;
++CRYPTO DELETE_KEY --keyName key_128;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/encryption_insert_partition_dynamic.q b/ql/src/test/queries/clientpositive/encryption_insert_partition_dynamic.q
+index 8674972..9556eed 100644
+--- a/ql/src/test/queries/clientpositive/encryption_insert_partition_dynamic.q
++++ b/ql/src/test/queries/clientpositive/encryption_insert_partition_dynamic.q
+@@ -6,8 +6,8 @@ set hive.enforce.bucketing=true;
+ -- SORT_QUERY_RESULTS
+ 
+ -- init
+-drop table IF EXISTS encryptedTable;
+-drop table IF EXISTS unencryptedTable;
++drop table IF EXISTS encryptedTable PURGE;
++drop table IF EXISTS unencryptedTable PURGE;
+ 
+ create table encryptedTable(value string)
+     partitioned by (key string) clustered by (value) into 2 buckets stored as orc
+@@ -52,6 +52,6 @@ insert into table unencryptedTable partition (key)
+ select * from unencryptedTable order by key;
+ 
+ -- clean up
+-drop table encryptedTable;
++drop table encryptedTable PURGE;
+ CRYPTO DELETE_KEY --keyName key_1;
+-drop table unencryptedTable;
+\ No newline at end of file
++drop table unencryptedTable PURGE;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/encryption_insert_partition_static.q b/ql/src/test/queries/clientpositive/encryption_insert_partition_static.q
+index 10fb965..9bff0bd 100644
+--- a/ql/src/test/queries/clientpositive/encryption_insert_partition_static.q
++++ b/ql/src/test/queries/clientpositive/encryption_insert_partition_static.q
+@@ -5,8 +5,8 @@ set hive.enforce.bucketing=true;
+ -- SORT_QUERY_RESULTS
+ 
+ -- init
+-drop table IF EXISTS encryptedTable;
+-drop table IF EXISTS unencryptedTable;
++drop table IF EXISTS encryptedTable PURGE;
++drop table IF EXISTS unencryptedTable PURGE;
+ 
+ create table encryptedTable(key string,
+     value string) partitioned by (ds string) clustered by (key) into 2 buckets stored as orc
+@@ -57,6 +57,6 @@ insert into table unencryptedTable partition
+ select * from unencryptedTable order by key;
+ 
+ -- clean up
+-drop table encryptedTable;
++drop table encryptedTable PURGE;
+ CRYPTO DELETE_KEY --keyName key_1;
+-drop table unencryptedTable;
+\ No newline at end of file
++drop table unencryptedTable PURGE;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/encryption_join_unencrypted_tbl.q b/ql/src/test/queries/clientpositive/encryption_join_unencrypted_tbl.q
+index adf82de..cf4d040 100644
+--- a/ql/src/test/queries/clientpositive/encryption_join_unencrypted_tbl.q
++++ b/ql/src/test/queries/clientpositive/encryption_join_unencrypted_tbl.q
+@@ -1,6 +1,6 @@
+ --SORT_QUERY_RESULTS
+ 
+-DROP TABLE IF EXISTS encrypted_table;
++DROP TABLE IF EXISTS encrypted_table PURGE;
+ CREATE TABLE encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table';
+ CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
+ CRYPTO CREATE_ZONE --keyName key_128 --path ${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table;
+@@ -11,5 +11,5 @@ SELECT * FROM encrypted_table;
+ 
+ EXPLAIN EXTENDED SELECT * FROM src t1 JOIN encrypted_table t2 WHERE t1.key = t2.key;
+ 
+-drop table encrypted_table;
++drop table encrypted_table PURGE;
+ CRYPTO DELETE_KEY --keyName key_128;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/encryption_join_with_different_encryption_keys.q b/ql/src/test/queries/clientpositive/encryption_join_with_different_encryption_keys.q
+index c830247..dfd3406 100644
+--- a/ql/src/test/queries/clientpositive/encryption_join_with_different_encryption_keys.q
++++ b/ql/src/test/queries/clientpositive/encryption_join_with_different_encryption_keys.q
+@@ -1,12 +1,12 @@
+ --SORT_QUERY_RESULTS
+ 
+ -- Java JCE must be installed in order to hava a key length of 256 bits
+-DROP TABLE IF EXISTS table_key_1;
++DROP TABLE IF EXISTS table_key_1 PURGE;
+ CREATE TABLE table_key_1 (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/table_key_1';
+ CRYPTO CREATE_KEY --keyName key_1 --bitLength 128;
+ CRYPTO CREATE_ZONE --keyName key_1 --path ${hiveconf:hive.metastore.warehouse.dir}/table_key_1;
+ 
+-DROP TABLE IF EXISTS table_key_2;
++DROP TABLE IF EXISTS table_key_2 PURGE;
+ CREATE TABLE table_key_2 (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/table_key_2';
+ CRYPTO CREATE_KEY --keyName key_2 --bitLength 256;
+ CRYPTO CREATE_ZONE --keyName key_2 --path ${hiveconf:hive.metastore.warehouse.dir}/table_key_2;
+@@ -17,8 +17,8 @@ INSERT OVERWRITE TABLE table_key_2 SELECT * FROM src;
+ EXPLAIN EXTENDED SELECT * FROM table_key_1 t1 JOIN table_key_2 t2 WHERE (t1.key = t2.key);
+ SELECT * FROM table_key_1 t1 JOIN table_key_2 t2 WHERE (t1.key = t2.key);
+ 
+-DROP TABLE table_key_1;
+-DROP TABLE table_key_2;
++DROP TABLE table_key_1 PURGE;
++DROP TABLE table_key_2 PURGE;
+ 
+ CRYPTO DELETE_KEY --keyName key_1;
+ CRYPTO DELETE_KEY --keyName key_2;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/encryption_load_data_to_encrypted_tables.q b/ql/src/test/queries/clientpositive/encryption_load_data_to_encrypted_tables.q
+index e4d3a4c..a96807e 100644
+--- a/ql/src/test/queries/clientpositive/encryption_load_data_to_encrypted_tables.q
++++ b/ql/src/test/queries/clientpositive/encryption_load_data_to_encrypted_tables.q
+@@ -1,4 +1,4 @@
+-DROP TABLE IF EXISTS encrypted_table;
++DROP TABLE IF EXISTS encrypted_table PURGE;
+ 
+ CREATE TABLE encrypted_table (key STRING, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/encrypted_table';
+ 
+@@ -15,6 +15,6 @@ dfs -copyFromLocal ../../data/files/kv1.txt hdfs:///tmp/kv1.txt;
+ LOAD DATA INPATH '/tmp/kv1.txt' OVERWRITE INTO TABLE encrypted_table;
+ SELECT * FROM encrypted_table;
+ 
+-DROP TABLE encrypted_table;
++DROP TABLE encrypted_table PURGE;
+ 
+ crypto delete_key --keyName key1;
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/encryption_move_tbl.q b/ql/src/test/queries/clientpositive/encryption_move_tbl.q
+index 1168c6c..5a8c036 100644
+--- a/ql/src/test/queries/clientpositive/encryption_move_tbl.q
++++ b/ql/src/test/queries/clientpositive/encryption_move_tbl.q
+@@ -4,7 +4,7 @@
+ 
+ set hive.cli.errors.ignore=true;
+ 
+-DROP TABLE IF EXISTS encrypted_table;
++DROP TABLE IF EXISTS encrypted_table PURGE;
+ CREATE TABLE encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table';
+ CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
+ CRYPTO CREATE_ZONE --keyName key_128 --path ${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table;
+@@ -14,5 +14,7 @@ SHOW TABLES;
+ ALTER TABLE default.encrypted_table RENAME TO default.plain_table;
+ SHOW TABLES;
+ 
++DROP TABLE encrypted_table PURGE;
++
+ CRYPTO DELETE_KEY --keyName key_128;
+ 
+diff --git a/ql/src/test/queries/clientpositive/encryption_select_read_only_encrypted_tbl.q b/ql/src/test/queries/clientpositive/encryption_select_read_only_encrypted_tbl.q
+index c013425..c9ac035 100644
+--- a/ql/src/test/queries/clientpositive/encryption_select_read_only_encrypted_tbl.q
++++ b/ql/src/test/queries/clientpositive/encryption_select_read_only_encrypted_tbl.q
+@@ -1,6 +1,6 @@
+ -- SORT_QUERY_RESULTS
+ 
+-DROP TABLE IF EXISTS encrypted_table;
++DROP TABLE IF EXISTS encrypted_table PURGE;
+ CREATE TABLE encrypted_table (key INT, value STRING) LOCATION '${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_table';
+ 
+ CRYPTO CREATE_KEY --keyName key_128 --bitLength 128;
+@@ -12,5 +12,5 @@ dfs -chmod -R 555 ${hiveconf:hive.metastore.warehouse.dir}/default/encrypted_tab
+ 
+ SELECT count(*) FROM encrypted_table;
+ 
+-drop table encrypted_table;
++drop table encrypted_table PURGE;
+ CRYPTO DELETE_KEY --keyName key_128;
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_drop_table.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_drop_table.q.out
+new file mode 100644
+index 0000000..8f51fb9
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_drop_table.q.out
+@@ -0,0 +1,56 @@
++PREHOOK: query: DROP TABLE IF EXISTS encrypted_table PURGE
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE IF EXISTS encrypted_table PURGE
++POSTHOOK: type: DROPTABLE
++#### A masked pattern was here ####
++PREHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++PREHOOK: Output: database:default
++PREHOOK: Output: default@encrypted_table
++#### A masked pattern was here ####
++POSTHOOK: type: CREATETABLE
++#### A masked pattern was here ####
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@encrypted_table
++Encryption key created: 'key_128'
++Encryption zone created: '/build/ql/test/data/warehouse/default/encrypted_table' using key: 'key_128'
++PREHOOK: query: INSERT OVERWRITE TABLE encrypted_table SELECT * FROM src
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@encrypted_table
++POSTHOOK: query: INSERT OVERWRITE TABLE encrypted_table SELECT * FROM src
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@encrypted_table
++POSTHOOK: Lineage: encrypted_table.key EXPRESSION [(src)src.FieldSchema(name:key, type:string, comment:default), ]
++POSTHOOK: Lineage: encrypted_table.value SIMPLE [(src)src.FieldSchema(name:value, type:string, comment:default), ]
++PREHOOK: query: SHOW TABLES
++PREHOOK: type: SHOWTABLES
++POSTHOOK: query: SHOW TABLES
++POSTHOOK: type: SHOWTABLES
++encrypted_table
++src
++PREHOOK: query: DROP TABLE default.encrypted_table
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@encrypted_table
++PREHOOK: Output: default@encrypted_table
++FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. MetaException(message:Unable to drop table because it is in an encryption zone and trash is enabled.  Use PURGE option to skip trash.)
++PREHOOK: query: SHOW TABLES
++PREHOOK: type: SHOWTABLES
++POSTHOOK: query: SHOW TABLES
++POSTHOOK: type: SHOWTABLES
++encrypted_table
++src
++PREHOOK: query: DROP TABLE default.encrypted_table PURGE
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@encrypted_table
++PREHOOK: Output: default@encrypted_table
++POSTHOOK: query: DROP TABLE default.encrypted_table PURGE
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@encrypted_table
++POSTHOOK: Output: default@encrypted_table
++PREHOOK: query: SHOW TABLES
++PREHOOK: type: SHOWTABLES
++POSTHOOK: query: SHOW TABLES
++POSTHOOK: type: SHOWTABLES
++src
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out
+index b6e7b88..c37123b 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_dynamic.q.out
+@@ -1,16 +1,16 @@
+ PREHOOK: query: -- SORT_QUERY_RESULTS
+ 
+ -- init
+-drop table IF EXISTS encryptedTable
++drop table IF EXISTS encryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+ POSTHOOK: query: -- SORT_QUERY_RESULTS
+ 
+ -- init
+-drop table IF EXISTS encryptedTable
++drop table IF EXISTS encryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+-PREHOOK: query: drop table IF EXISTS unencryptedTable
++PREHOOK: query: drop table IF EXISTS unencryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+-POSTHOOK: query: drop table IF EXISTS unencryptedTable
++POSTHOOK: query: drop table IF EXISTS unencryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+ PREHOOK: query: create table encryptedTable(value string)
+     partitioned by (key string) clustered by (value) into 2 buckets stored as orc
+@@ -876,21 +876,21 @@ val_501	501
+ val_502	502
+ val_86	86
+ PREHOOK: query: -- clean up
+-drop table encryptedTable
++drop table encryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@encryptedtable
+ PREHOOK: Output: default@encryptedtable
+ POSTHOOK: query: -- clean up
+-drop table encryptedTable
++drop table encryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@encryptedtable
+ POSTHOOK: Output: default@encryptedtable
+ Encryption key deleted: 'key_1'
+-PREHOOK: query: drop table unencryptedTable
++PREHOOK: query: drop table unencryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@unencryptedtable
+ PREHOOK: Output: default@unencryptedtable
+-POSTHOOK: query: drop table unencryptedTable
++POSTHOOK: query: drop table unencryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@unencryptedtable
+ POSTHOOK: Output: default@unencryptedtable
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_static.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_static.q.out
+index fc6d2ae..1cc45a9 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_static.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_insert_partition_static.q.out
+@@ -1,16 +1,16 @@
+ PREHOOK: query: -- SORT_QUERY_RESULTS
+ 
+ -- init
+-drop table IF EXISTS encryptedTable
++drop table IF EXISTS encryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+ POSTHOOK: query: -- SORT_QUERY_RESULTS
+ 
+ -- init
+-drop table IF EXISTS encryptedTable
++drop table IF EXISTS encryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+-PREHOOK: query: drop table IF EXISTS unencryptedTable
++PREHOOK: query: drop table IF EXISTS unencryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+-POSTHOOK: query: drop table IF EXISTS unencryptedTable
++POSTHOOK: query: drop table IF EXISTS unencryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+ PREHOOK: query: create table encryptedTable(key string,
+     value string) partitioned by (ds string) clustered by (key) into 2 buckets stored as orc
+@@ -551,16 +551,16 @@ STAGE PLANS:
+       Map Operator Tree:
+           TableScan
+             alias: encryptedtable
+-            Statistics: Num rows: 12 Data size: 2695 Basic stats: COMPLETE Column stats: NONE
++            Statistics: Num rows: 12 Data size: 2685 Basic stats: COMPLETE Column stats: NONE
+             GatherStats: false
+             Select Operator
+               expressions: key (type: string), value (type: string)
+               outputColumnNames: _col0, _col1
+-              Statistics: Num rows: 12 Data size: 2695 Basic stats: COMPLETE Column stats: NONE
++              Statistics: Num rows: 12 Data size: 2685 Basic stats: COMPLETE Column stats: NONE
+               Reduce Output Operator
+                 sort order: 
+                 Map-reduce partition columns: _col0 (type: string)
+-                Statistics: Num rows: 12 Data size: 2695 Basic stats: COMPLETE Column stats: NONE
++                Statistics: Num rows: 12 Data size: 2685 Basic stats: COMPLETE Column stats: NONE
+                 tag: -1
+                 value expressions: _col0 (type: string), _col1 (type: string)
+                 auto parallelism: false
+@@ -591,7 +591,7 @@ STAGE PLANS:
+               serialization.ddl struct encryptedtable { string key, string value}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.ql.io.orc.OrcSerde
+-              totalSize 1351
++              totalSize 1343
+ #### A masked pattern was here ####
+             serde: org.apache.hadoop.hive.ql.io.orc.OrcSerde
+           
+@@ -639,7 +639,7 @@ STAGE PLANS:
+               serialization.ddl struct encryptedtable { string key, string value}
+               serialization.format 1
+               serialization.lib org.apache.hadoop.hive.ql.io.orc.OrcSerde
+-              totalSize 1344
++              totalSize 1342
+ #### A masked pattern was here ####
+             serde: org.apache.hadoop.hive.ql.io.orc.OrcSerde
+           
+@@ -669,14 +669,14 @@ STAGE PLANS:
+       Needs Tagging: false
+       Reduce Operator Tree:
+         Extract
+-          Statistics: Num rows: 12 Data size: 2695 Basic stats: COMPLETE Column stats: NONE
++          Statistics: Num rows: 12 Data size: 2685 Basic stats: COMPLETE Column stats: NONE
+           File Output Operator
+             compressed: false
+             GlobalTableId: 1
+ #### A PARTIAL masked pattern was here #### data/warehouse/unencryptedtable/ds=today/.hive-staging
+             NumFilesPerFileSink: 1
+             Static Partition Specification: ds=today/
+-            Statistics: Num rows: 12 Data size: 2695 Basic stats: COMPLETE Column stats: NONE
++            Statistics: Num rows: 12 Data size: 2685 Basic stats: COMPLETE Column stats: NONE
+ #### A PARTIAL masked pattern was here #### data/warehouse/unencryptedtable/ds=today/.hive-staging
+             table:
+                 input format: org.apache.hadoop.hive.ql.io.orc.OrcInputFormat
+@@ -769,21 +769,21 @@ POSTHOOK: Input: default@unencryptedtable@ds=today
+ 502	val_502	today
+ 86	val_86	today
+ PREHOOK: query: -- clean up
+-drop table encryptedTable
++drop table encryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@encryptedtable
+ PREHOOK: Output: default@encryptedtable
+ POSTHOOK: query: -- clean up
+-drop table encryptedTable
++drop table encryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@encryptedtable
+ POSTHOOK: Output: default@encryptedtable
+ Encryption key deleted: 'key_1'
+-PREHOOK: query: drop table unencryptedTable
++PREHOOK: query: drop table unencryptedTable PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@unencryptedtable
+ PREHOOK: Output: default@unencryptedtable
+-POSTHOOK: query: drop table unencryptedTable
++POSTHOOK: query: drop table unencryptedTable PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@unencryptedtable
+ POSTHOOK: Output: default@unencryptedtable
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_join_unencrypted_tbl.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_join_unencrypted_tbl.q.out
+index 99f4c17..eb27e67 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_join_unencrypted_tbl.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_join_unencrypted_tbl.q.out
+@@ -1,10 +1,10 @@
+ PREHOOK: query: --SORT_QUERY_RESULTS
+ 
+-DROP TABLE IF EXISTS encrypted_table
++DROP TABLE IF EXISTS encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+ POSTHOOK: query: --SORT_QUERY_RESULTS
+ 
+-DROP TABLE IF EXISTS encrypted_table
++DROP TABLE IF EXISTS encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ #### A masked pattern was here ####
+ PREHOOK: type: CREATETABLE
+@@ -752,11 +752,11 @@ STAGE PLANS:
+       Processor Tree:
+         ListSink
+ 
+-PREHOOK: query: drop table encrypted_table
++PREHOOK: query: drop table encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@encrypted_table
+ PREHOOK: Output: default@encrypted_table
+-POSTHOOK: query: drop table encrypted_table
++POSTHOOK: query: drop table encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@encrypted_table
+ POSTHOOK: Output: default@encrypted_table
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_join_with_different_encryption_keys.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_join_with_different_encryption_keys.q.out
+index c66aacb..98570ed 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_join_with_different_encryption_keys.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_join_with_different_encryption_keys.q.out
+@@ -1,12 +1,12 @@
+ PREHOOK: query: --SORT_QUERY_RESULTS
+ 
+ -- Java JCE must be installed in order to hava a key length of 256 bits
+-DROP TABLE IF EXISTS table_key_1
++DROP TABLE IF EXISTS table_key_1 PURGE
+ PREHOOK: type: DROPTABLE
+ POSTHOOK: query: --SORT_QUERY_RESULTS
+ 
+ -- Java JCE must be installed in order to hava a key length of 256 bits
+-DROP TABLE IF EXISTS table_key_1
++DROP TABLE IF EXISTS table_key_1 PURGE
+ POSTHOOK: type: DROPTABLE
+ #### A masked pattern was here ####
+ PREHOOK: type: CREATETABLE
+@@ -20,9 +20,9 @@ POSTHOOK: Output: database:default
+ POSTHOOK: Output: default@table_key_1
+ Encryption key created: 'key_1'
+ Encryption zone created: '/build/ql/test/data/warehouse/table_key_1' using key: 'key_1'
+-PREHOOK: query: DROP TABLE IF EXISTS table_key_2
++PREHOOK: query: DROP TABLE IF EXISTS table_key_2 PURGE
+ PREHOOK: type: DROPTABLE
+-POSTHOOK: query: DROP TABLE IF EXISTS table_key_2
++POSTHOOK: query: DROP TABLE IF EXISTS table_key_2 PURGE
+ POSTHOOK: type: DROPTABLE
+ #### A masked pattern was here ####
+ PREHOOK: type: CREATETABLE
+@@ -1310,19 +1310,19 @@ POSTHOOK: Input: default@table_key_2
+ 498	val_498	498	val_498
+ 498	val_498	498	val_498
+ 498	val_498	498	val_498
+-PREHOOK: query: DROP TABLE table_key_1
++PREHOOK: query: DROP TABLE table_key_1 PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@table_key_1
+ PREHOOK: Output: default@table_key_1
+-POSTHOOK: query: DROP TABLE table_key_1
++POSTHOOK: query: DROP TABLE table_key_1 PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@table_key_1
+ POSTHOOK: Output: default@table_key_1
+-PREHOOK: query: DROP TABLE table_key_2
++PREHOOK: query: DROP TABLE table_key_2 PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@table_key_2
+ PREHOOK: Output: default@table_key_2
+-POSTHOOK: query: DROP TABLE table_key_2
++POSTHOOK: query: DROP TABLE table_key_2 PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@table_key_2
+ POSTHOOK: Output: default@table_key_2
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_load_data_to_encrypted_tables.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_load_data_to_encrypted_tables.q.out
+index 46f36d8..35de14f 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_load_data_to_encrypted_tables.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_load_data_to_encrypted_tables.q.out
+@@ -1,6 +1,6 @@
+-PREHOOK: query: DROP TABLE IF EXISTS encrypted_table
++PREHOOK: query: DROP TABLE IF EXISTS encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+-POSTHOOK: query: DROP TABLE IF EXISTS encrypted_table
++POSTHOOK: query: DROP TABLE IF EXISTS encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ #### A masked pattern was here ####
+ PREHOOK: type: CREATETABLE
+@@ -1048,11 +1048,11 @@ POSTHOOK: Input: default@encrypted_table
+ 400	val_400
+ 200	val_200
+ 97	val_97
+-PREHOOK: query: DROP TABLE encrypted_table
++PREHOOK: query: DROP TABLE encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@encrypted_table
+ PREHOOK: Output: default@encrypted_table
+-POSTHOOK: query: DROP TABLE encrypted_table
++POSTHOOK: query: DROP TABLE encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@encrypted_table
+ POSTHOOK: Output: default@encrypted_table
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out
+index d18827e..349d649 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_move_tbl.q.out
+@@ -1,6 +1,6 @@
+-PREHOOK: query: DROP TABLE IF EXISTS encrypted_table
++PREHOOK: query: DROP TABLE IF EXISTS encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+-POSTHOOK: query: DROP TABLE IF EXISTS encrypted_table
++POSTHOOK: query: DROP TABLE IF EXISTS encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ #### A masked pattern was here ####
+ PREHOOK: type: CREATETABLE
+@@ -34,10 +34,18 @@ PREHOOK: query: ALTER TABLE default.encrypted_table RENAME TO default.plain_tabl
+ PREHOOK: type: ALTERTABLE_RENAME
+ PREHOOK: Input: default@encrypted_table
+ PREHOOK: Output: default@encrypted_table
+-FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.DDLTask. Unable to alter table. Alter Table operation for default.encrypted_table failed to move data due to: '/build/ql/test/data/warehouse/default/encrypted_table can't be moved from an encryption zone.' See hive log file for details.
++POSTHOOK: query: ALTER TABLE default.encrypted_table RENAME TO default.plain_table
++POSTHOOK: type: ALTERTABLE_RENAME
++POSTHOOK: Input: default@encrypted_table
++POSTHOOK: Output: default@encrypted_table
++POSTHOOK: Output: default@plain_table
+ PREHOOK: query: SHOW TABLES
+ PREHOOK: type: SHOWTABLES
+ POSTHOOK: query: SHOW TABLES
+ POSTHOOK: type: SHOWTABLES
+-encrypted_table
++plain_table
+ src
++PREHOOK: query: DROP TABLE encrypted_table PURGE
++PREHOOK: type: DROPTABLE
++POSTHOOK: query: DROP TABLE encrypted_table PURGE
++POSTHOOK: type: DROPTABLE
+diff --git a/ql/src/test/results/clientpositive/encrypted/encryption_select_read_only_encrypted_tbl.q.out b/ql/src/test/results/clientpositive/encrypted/encryption_select_read_only_encrypted_tbl.q.out
+index c4c0dde..5d4d2af 100644
+--- a/ql/src/test/results/clientpositive/encrypted/encryption_select_read_only_encrypted_tbl.q.out
++++ b/ql/src/test/results/clientpositive/encrypted/encryption_select_read_only_encrypted_tbl.q.out
+@@ -1,10 +1,10 @@
+ PREHOOK: query: -- SORT_QUERY_RESULTS
+ 
+-DROP TABLE IF EXISTS encrypted_table
++DROP TABLE IF EXISTS encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+ POSTHOOK: query: -- SORT_QUERY_RESULTS
+ 
+-DROP TABLE IF EXISTS encrypted_table
++DROP TABLE IF EXISTS encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ #### A masked pattern was here ####
+ PREHOOK: type: CREATETABLE
+@@ -35,11 +35,11 @@ POSTHOOK: type: QUERY
+ POSTHOOK: Input: default@encrypted_table
+ #### A masked pattern was here ####
+ 500
+-PREHOOK: query: drop table encrypted_table
++PREHOOK: query: drop table encrypted_table PURGE
+ PREHOOK: type: DROPTABLE
+ PREHOOK: Input: default@encrypted_table
+ PREHOOK: Output: default@encrypted_table
+-POSTHOOK: query: drop table encrypted_table
++POSTHOOK: query: drop table encrypted_table PURGE
+ POSTHOOK: type: DROPTABLE
+ POSTHOOK: Input: default@encrypted_table
+ POSTHOOK: Output: default@encrypted_table
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index 75323d6..bf6d8f3 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -1192,6 +1192,9 @@ public boolean isPathEncrypted(Path path) throws IOException {
+       } else {
+         fullPath = path.getFileSystem(conf).makeQualified(path);
+       }
++      if(!"hdfs".equalsIgnoreCase(path.toUri().getScheme())) {
++        return false;
++      }
+       return (hdfsAdmin.getEncryptionZoneForPath(fullPath) != null);
+     }
+ 
+-- 
+1.7.9.5
+

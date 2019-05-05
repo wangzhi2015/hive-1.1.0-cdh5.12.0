@@ -1,0 +1,166 @@
+From 53221f3754a0b55b53501648d1e873ef7cbadc66 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Fri, 4 Dec 2015 15:09:48 -0800
+Subject: [PATCH 0445/1164] HIVE-12485: Secure HS2 web UI with kerberos(Jimmy,
+ reviewed by Szehon)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+
+Change-Id: Ibd0f11b079cbcabbb90c5a82b9d1833c1d2b744a
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |   10 ++++-
+ .../src/java/org/apache/hive/http/HttpServer.java  |   47 ++++++++++++++++++++
+ .../apache/hive/service/server/HiveServer2.java    |   15 +++++++
+ 3 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 98476a3..8e32a21 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1756,12 +1756,20 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+     HIVE_SERVER2_WEBUI_BIND_HOST("hive.server2.webui.host", "0.0.0.0", "The host address the HiveServer2 WebUI will listen on"),
+     HIVE_SERVER2_WEBUI_PORT("hive.server2.webui.port", 10002, "The port the HiveServer2 WebUI will listen on"),
+     HIVE_SERVER2_WEBUI_MAX_THREADS("hive.server2.webui.max.threads", 50, "The max HiveServer2 WebUI threads"),
+-    HIVE_SERVER2_WEBUI_USE_SSL("hive.server2.webui.use.SSL", false,
++    HIVE_SERVER2_WEBUI_USE_SSL("hive.server2.webui.use.ssl", false,
+       "Set this to true for using SSL encryption for HiveServer2 WebUI."),
+     HIVE_SERVER2_WEBUI_SSL_KEYSTORE_PATH("hive.server2.webui.keystore.path", "",
+       "SSL certificate keystore location for HiveServer2 WebUI."),
+     HIVE_SERVER2_WEBUI_SSL_KEYSTORE_PASSWORD("hive.server2.webui.keystore.password", "",
+       "SSL certificate keystore password for HiveServer2 WebUI."),
++    HIVE_SERVER2_WEBUI_USE_SPNEGO("hive.server2.webui.use.spnego", false,
++      "If true, the HiveServer2 WebUI will be secured with SPNEGO. Clients must authenticate with Kerberos."),
++    HIVE_SERVER2_WEBUI_SPNEGO_KEYTAB("hive.server2.webui.spnego.keytab", "",
++      "The path to the Kerberos Keytab file containing the HiveServer2 WebUI SPNEGO service principal."),
++    HIVE_SERVER2_WEBUI_SPNEGO_PRINCIPAL("hive.server2.webui.spnego.principal",
++      "HTTP/_HOST@EXAMPLE.COM", "The HiveServer2 WebUI SPNEGO service principal.\n" +
++      "The special string _HOST will be replaced automatically with \n" +
++      "the value of hive.server2.webui.host or the correct host name."),
+ 
+     // Configuration for async thread pool in SessionManager
+     HIVE_SERVER2_ASYNC_EXEC_THREADS("hive.server2.async.exec.threads", 100,
+diff --git a/common/src/java/org/apache/hive/http/HttpServer.java b/common/src/java/org/apache/hive/http/HttpServer.java
+index c5ed6cb..4276692 100644
+--- a/common/src/java/org/apache/hive/http/HttpServer.java
++++ b/common/src/java/org/apache/hive/http/HttpServer.java
+@@ -24,7 +24,9 @@
+ import org.apache.hadoop.fs.CommonConfigurationKeys;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
++import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
++import org.apache.hadoop.security.authentication.server.AuthenticationFilter;
+ import org.apache.hadoop.security.authorize.AccessControlList;
+ import org.apache.hadoop.util.Shell;
+ import org.apache.log4j.Appender;
+@@ -37,7 +39,10 @@
+ import org.eclipse.jetty.server.nio.SelectChannelConnector;
+ import org.eclipse.jetty.server.ssl.SslSelectChannelConnector;
+ import org.eclipse.jetty.servlet.DefaultServlet;
++import org.eclipse.jetty.servlet.FilterHolder;
++import org.eclipse.jetty.servlet.FilterMapping;
+ import org.eclipse.jetty.servlet.ServletContextHandler;
++import org.eclipse.jetty.servlet.ServletHandler;
+ import org.eclipse.jetty.servlet.ServletHolder;
+ import org.eclipse.jetty.util.ssl.SslContextFactory;
+ import org.eclipse.jetty.util.thread.QueuedThreadPool;
+@@ -80,6 +85,12 @@ private HttpServer(final Builder b) throws IOException {
+     webServer = new Server();
+     appDir = getWebAppsPath(b.name);
+     webAppContext = createWebAppContext(b);
++
++    if (b.useSPNEGO) {
++      // Secure the web server with kerberos
++      setupSpnegoFilter(b);
++    }
++
+     initializeWebServer(b);
+   }
+ 
+@@ -92,6 +103,9 @@ private HttpServer(final Builder b) throws IOException {
+     private Map<String, Object> contextAttrs = new HashMap<String, Object>();
+     private String keyStorePassword;
+     private String keyStorePath;
++    private String spnegoPrincipal;
++    private String spnegoKeytab;
++    private boolean useSPNEGO;
+     private boolean useSSL;
+ 
+     public HttpServer build() throws IOException {
+@@ -146,6 +160,21 @@ public Builder setUseSSL(boolean useSSL) {
+       return this;
+     }
+ 
++    public Builder setUseSPNEGO(boolean useSPNEGO) {
++      this.useSPNEGO = useSPNEGO;
++      return this;
++    }
++
++    public Builder setSPNEGOPrincipal(String principal) {
++      this.spnegoPrincipal = principal;
++      return this;
++    }
++
++    public Builder setSPNEGOKeytab(String keytab) {
++      this.spnegoKeytab = keytab;
++      return this;
++    }
++
+     public Builder setContextAttribute(String name, Object value) {
+       contextAttrs.put(name, value);
+       return this;
+@@ -265,6 +294,24 @@ WebAppContext createWebAppContext(Builder b) {
+   }
+ 
+   /**
++   * Secure the web server with kerberos (AuthenticationFilter).
++   */
++  void setupSpnegoFilter(Builder b) throws IOException {
++    Map<String, String> params = new HashMap<String, String>();
++    params.put("kerberos.principal",
++      SecurityUtil.getServerPrincipal(b.spnegoPrincipal, b.host));
++    params.put("kerberos.keytab", b.spnegoKeytab);
++    params.put(AuthenticationFilter.AUTH_TYPE, "kerberos");
++    FilterHolder holder = new FilterHolder();
++    holder.setClassName(AuthenticationFilter.class.getName());
++    holder.setInitParameters(params);
++
++    ServletHandler handler = webAppContext.getServletHandler();
++    handler.addFilterWithMapping(
++      holder, "/*", FilterMapping.ALL);
++  }
++
++  /**
+    * Create a channel connector for "http/https" requests
+    */
+   Connector createChannelConnector(int queueSize, Builder b) {
+diff --git a/service/src/java/org/apache/hive/service/server/HiveServer2.java b/service/src/java/org/apache/hive/service/server/HiveServer2.java
+index 4bfc1f3..531d963 100644
+--- a/service/src/java/org/apache/hive/service/server/HiveServer2.java
++++ b/service/src/java/org/apache/hive/service/server/HiveServer2.java
+@@ -151,6 +151,21 @@ public synchronized void init(HiveConf hiveConf) {
+             builder.setKeyStorePath(keyStorePath);
+             builder.setUseSSL(true);
+           }
++          if (hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_WEBUI_USE_SPNEGO)) {
++            String spnegoPrincipal = hiveConf.getVar(
++                ConfVars.HIVE_SERVER2_WEBUI_SPNEGO_PRINCIPAL);
++            String spnegoKeytab = hiveConf.getVar(
++                ConfVars.HIVE_SERVER2_WEBUI_SPNEGO_KEYTAB);
++            if (Strings.isBlank(spnegoPrincipal) || Strings.isBlank(spnegoKeytab)) {
++              throw new IllegalArgumentException(
++                ConfVars.HIVE_SERVER2_WEBUI_SPNEGO_PRINCIPAL.varname
++                  + "/" + ConfVars.HIVE_SERVER2_WEBUI_SPNEGO_KEYTAB.varname
++                  + " Not configured for SPNEGO authentication");
++            }
++            builder.setSPNEGOPrincipal(spnegoPrincipal);
++            builder.setSPNEGOKeytab(spnegoKeytab);
++            builder.setUseSPNEGO(true);
++          }
+           webServer = builder.build();
+         }
+       }
+-- 
+1.7.9.5
+

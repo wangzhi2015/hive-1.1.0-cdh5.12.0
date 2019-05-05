@@ -1,0 +1,81 @@
+From 4a0b21bf5584f819cfb4a10bc01c1ea5f8d5f368 Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Thu, 21 Jan 2016 17:39:27 -0800
+Subject: [PATCH 0827/1164] HIVE-12908 : Improve dynamic partition loading III
+ (Ashutosh Chauhan via Prasanth J)
+
+(cherry picked from commit 26268deb4844d3f3c530769c6276b17b0c6caaa0)
+
+Change-Id: I796193ce71ca1f3fb47e16c8b33cc6ae09eac666
+---
+ .../org/apache/hadoop/hive/common/FileUtils.java   |   14 --------------
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   11 +++++++----
+ 2 files changed, 7 insertions(+), 18 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+index 5d33b93..dac7380 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
++++ b/common/src/java/org/apache/hadoop/hive/common/FileUtils.java
+@@ -590,20 +590,6 @@ public static boolean copy(FileSystem srcFS, Path src,
+    * @param fs FileSystem to use
+    * @param f path of directory
+    * @param conf hive configuration
+-   * @return true if deletion successful
+-   * @throws FileNotFoundException
+-   * @throws IOException
+-   */
+-  public static boolean trashFilesUnderDir(FileSystem fs, Path f, Configuration conf)
+-      throws FileNotFoundException, IOException {
+-    return trashFilesUnderDir(fs, f, conf, true);
+-  }
+-
+-  /**
+-   * Trashes or deletes all files under a directory. Leaves the directory as is.
+-   * @param fs FileSystem to use
+-   * @param f path of directory
+-   * @param conf hive configuration
+    * @param forceDelete whether to force delete files if trashing does not succeed
+    * @return true if deletion successful
+    * @throws FileNotFoundException
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index cf894f3..91ec8d4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -1456,11 +1456,14 @@ public Partition loadPartition(Path loadPath, Table tbl,
+       }
+ 
+       List<Path> newFiles = null;
+-      if (replace) {
++      if (replace || (oldPart == null && !isAcid)) {
+         Hive.replaceFiles(tbl.getPath(), loadPath, newPartPath, oldPartPath, getConf(),
+             isSrcLocal);
+       } else {
+-        newFiles = Collections.synchronizedList(new ArrayList<Path>());
++        if (conf.getBoolVar(ConfVars.FIRE_EVENTS_FOR_DML) && !tbl.isTemporary() && oldPart != null) {
++          Collections.synchronizedList(new ArrayList<Path>());
++        }
++
+         FileSystem fs = tbl.getDataLocation().getFileSystem(conf);
+         Hive.copyFiles(conf, loadPath, newPartPath, fs, isSrcLocal, isAcid, newFiles);
+       }
+@@ -2736,7 +2739,7 @@ public static boolean moveFile(final HiveConf conf, Path srcf, final Path destf,
+     try {
+       if (inheritPerms || replace) {
+         try{
+-          destStatus = shims.getFullFileStatus(conf, destFs, destf.getParent());
++          destStatus = shims.getFullFileStatus(conf, destFs, destf);
+           //if destf is an existing directory:
+           //if replace is true, delete followed by rename(mv) is equivalent to replace
+           //if replace is false, rename (mv) actually move the src under dest dir
+@@ -3045,7 +3048,7 @@ protected static void replaceFiles(Path tablePath, Path srcf, Path destf, Path o
+               // existing content might result in incorrect (extra) data.
+               // But not sure why we changed not to delete the oldPath in HIVE-8750 if it is
+               // not the destf or its subdir?
+-              oldPathDeleted = FileUtils.trashFilesUnderDir(fs2, oldPath, conf);
++              oldPathDeleted = FileUtils.trashFilesUnderDir(fs2, oldPath, conf, true);
+             }
+           }
+         } catch (IOException e) {
+-- 
+1.7.9.5
+

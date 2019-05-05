@@ -1,0 +1,56 @@
+From 79643bfb96aa7a9cad275ebef08abc1b8701eb81 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Mon, 28 Sep 2015 09:58:08 -0500
+Subject: [PATCH 0307/1164] HIVE-11940: "INSERT OVERWRITE" query is very slow
+ because it creates one "distcp" per file to copy
+ data from staging directory to target directory
+ (Sergio Pena, reviewd by Ferdinand Xu)
+
+---
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   25 ++++++++++++++++----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index 2284f0e6..726e7cf 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -2575,16 +2575,31 @@ public static boolean moveFile(HiveConf conf, Path srcf, Path destf,
+             if (srcs.length == 0) {
+               success = true; // Nothing to move.
+             }
++
++            /* Move files one by one because source is a subdirectory of destination */
+             for (FileStatus status : srcs) {
+-              success = FileUtils.copy(srcf.getFileSystem(conf), status.getPath(), destf.getFileSystem(conf), destf,
+-                  true,     // delete source
+-                  replace,  // overwrite destination
+-                  conf);
++              Path destFile;
+ 
+-              if (!success) {
++              /* Append the source filename to the destination directory */
++              if (destFs.isDirectory(destf)) {
++                destFile = new Path(destf, status.getPath().getName());
++              } else {
++                destFile = destf;
++              }
++
++              // Destination should be replaced, so we delete it first
++              if (destFs.exists(destFile)) {
++                if (!destFs.delete(destFile, true)) {
++                  throw new HiveException(String.format("File to replace could not be deleted: %s", destFile));
++                }
++              }
++
++              if (!(destFs.rename(status.getPath(), destFile))) {
+                 throw new HiveException("Unable to move source " + status.getPath() + " to destination " + destf);
+               }
+             }
++
++            success = true;
+           } else {
+             success = destFs.rename(srcf, destf);
+           }
+-- 
+1.7.9.5
+

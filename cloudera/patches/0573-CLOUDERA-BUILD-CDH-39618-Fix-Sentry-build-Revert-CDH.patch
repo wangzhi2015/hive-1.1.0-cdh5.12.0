@@ -1,0 +1,321 @@
+From cab4a052be07409674fb44b980a32dbe297287c4 Mon Sep 17 00:00:00 2001
+From: Mohit Sabharwal <mohit@cloudera.com>
+Date: Mon, 25 Apr 2016 12:55:35 -0700
+Subject: [PATCH 0573/1164] CLOUDERA-BUILD: CDH-39618 : Fix Sentry build -
+ Revert "CDH-39320 : HIVE-9609 :
+ AddPartitionMessage.getPartitions() can return
+ null. Also Revert part of CDH-39327."
+
+This reverts commit 3a32850ec07fd49f908216d96d70acec7abf539d.
+
+Change-Id: Ifc5d808f59ef66e86afce246e7ff0b8417c78967
+---
+ .../hcatalog/listener/DbNotificationListener.java  |    3 +-
+ .../hcatalog/listener/NotificationListener.java    |    9 ++--
+ .../hive/hcatalog/messaging/MessageFactory.java    |   18 +++++--
+ .../messaging/json/JSONMessageFactory.java         |   49 +++++++++++++-------
+ .../apache/hive/hcatalog/api/TestHCatClient.java   |    2 +
+ .../api/repl/exim/TestEximReplicationTasks.java    |    2 +-
+ .../hive/metastore/TestMetaStoreEventListener.java |   16 +++----
+ .../hive/metastore/events/AddPartitionEvent.java   |   14 +++---
+ 8 files changed, 70 insertions(+), 43 deletions(-)
+
+diff --git a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
+index 5f1d00b..f2e70ed 100644
+--- a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
++++ b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
+@@ -44,6 +44,7 @@
+ import org.apache.hive.hcatalog.common.HCatConstants;
+ import org.apache.hive.hcatalog.messaging.MessageFactory;
+ 
++import java.util.Map;
+ import java.util.concurrent.TimeUnit;
+ 
+ /**
+@@ -161,7 +162,7 @@ public void onAddPartition (AddPartitionEvent partitionEvent)
+     Table t = partitionEvent.getTable();
+     NotificationEvent event = new NotificationEvent(0, now(),
+         HCatConstants.HCAT_ADD_PARTITION_EVENT,
+-        msgFactory.buildAddPartitionMessage(t, partitionEvent.getPartitionIterator()).toString());
++        msgFactory.buildAddPartitionMessage(t, partitionEvent.getPartitions()).toString());
+     event.setDbName(t.getDbName());
+     event.setTableName(t.getTableName());
+     enqueue(event);
+diff --git a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/NotificationListener.java b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/NotificationListener.java
+index da3d4da..d4ecf23 100644
+--- a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/NotificationListener.java
++++ b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/NotificationListener.java
+@@ -21,6 +21,8 @@
+ 
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
+ 
+ import javax.jms.Connection;
+ import javax.jms.ConnectionFactory;
+@@ -125,14 +127,15 @@ public void onAddPartition(AddPartitionEvent partitionEvent)
+     // and message selector string as "HCAT_EVENT = HCAT_ADD_PARTITION"
+     if (partitionEvent.getStatus()) {
+       Table table = partitionEvent.getTable();
++      List<Partition> partitions = partitionEvent.getPartitions();
+       String topicName = getTopicName(table);
+       if (topicName != null && !topicName.equals("")) {
+-        send(messageFactory.buildAddPartitionMessage(table, partitionEvent.getPartitionIterator()), topicName);
++        send(messageFactory.buildAddPartitionMessage(table, partitions), topicName);
+       } else {
+         LOG.info("Topic name not found in metastore. Suppressing HCatalog notification for "
+-            + partitionEvent.getTable().getDbName()
++            + partitions.get(0).getDbName()
+             + "."
+-            + partitionEvent.getTable().getTableName()
++            + partitions.get(0).getTableName()
+             + " To enable notifications for this table, please do alter table set properties ("
+             + HCatConstants.HCAT_MSGBUS_TOPIC_NAME
+             + "=<dbname>.<tablename>) or whatever you want topic name to be.");
+diff --git a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/MessageFactory.java b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/MessageFactory.java
+index 8583b18..8937745 100644
+--- a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/MessageFactory.java
++++ b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/MessageFactory.java
+@@ -19,14 +19,16 @@
+ 
+ package org.apache.hive.hcatalog.messaging;
+ 
++import org.apache.hadoop.hive.common.classification.InterfaceAudience;
++import org.apache.hadoop.hive.common.classification.InterfaceStability;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.Table;
++import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hive.hcatalog.messaging.json.JSONMessageFactory;
+ 
+-import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -138,10 +140,20 @@ public static MessageDeserializer getDeserializer(String format,
+     /**
+      * Factory method for AddPartitionMessage.
+      * @param table The Table to which the partitions are added.
+-     * @param partitions The iterator to set of Partitions being added.
++     * @param partitions The set of Partitions being added.
+      * @return AddPartitionMessage instance.
+      */
+-  public abstract AddPartitionMessage buildAddPartitionMessage(Table table, Iterator<Partition> partitions);
++    public abstract AddPartitionMessage buildAddPartitionMessage(Table table, List<Partition> partitions);
++
++  /**
++   * Factory method for AddPartitionMessage.
++   * @param table The Table to which the partitions are added.
++   * @param partitionSpec The set of Partitions being added.
++   * @return AddPartitionMessage instance.
++   */
++  @InterfaceAudience.LimitedPrivate({"Hive"})
++  @InterfaceStability.Evolving
++  public abstract AddPartitionMessage buildAddPartitionMessage(Table table, PartitionSpecProxy partitionSpec);
+ 
+   /**
+    * Factory method for building AlterPartitionMessage
+diff --git a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/json/JSONMessageFactory.java b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/json/JSONMessageFactory.java
+index 954cd3a..ac688f5 100644
+--- a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/json/JSONMessageFactory.java
++++ b/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/messaging/json/JSONMessageFactory.java
+@@ -19,14 +19,14 @@
+ 
+ package org.apache.hive.hcatalog.messaging.json;
+ 
+-import com.google.common.base.Function;
+-import com.google.common.collect.Iterators;
+-import com.google.common.collect.Lists;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.common.classification.InterfaceAudience;
++import org.apache.hadoop.hive.common.classification.InterfaceStability;
+ import org.apache.hadoop.hive.metastore.api.Database;
+ import org.apache.hadoop.hive.metastore.api.Partition;
+ import org.apache.hadoop.hive.metastore.api.Table;
++import org.apache.hadoop.hive.metastore.partition.spec.PartitionSpecProxy;
+ import org.apache.hive.hcatalog.messaging.AddPartitionMessage;
+ import org.apache.hive.hcatalog.messaging.AlterPartitionMessage;
+ import org.apache.hive.hcatalog.messaging.AlterTableMessage;
+@@ -39,12 +39,7 @@
+ import org.apache.hive.hcatalog.messaging.MessageDeserializer;
+ import org.apache.hive.hcatalog.messaging.MessageFactory;
+ 
+-import javax.annotation.Nullable;
+-import java.util.Arrays;
+-import java.util.Iterator;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.Map;
++import java.util.*;
+ 
+ /**
+  * The JSON implementation of the MessageFactory. Constructs JSON implementations of
+@@ -103,9 +98,17 @@ public DropTableMessage buildDropTableMessage(Table table) {
+   }
+ 
+   @Override
+-  public AddPartitionMessage buildAddPartitionMessage(Table table, Iterator<Partition> partitionsIterator) {
++  public AddPartitionMessage buildAddPartitionMessage(Table table, List<Partition> partitions) {
+     return new JSONAddPartitionMessage(HCAT_SERVER_URL, HCAT_SERVICE_PRINCIPAL, table.getDbName(),
+-        table.getTableName(), getPartitionKeyValues(table, partitionsIterator), now());
++        table.getTableName(), getPartitionKeyValues(table, partitions), now());
++  }
++
++  @Override
++  @InterfaceAudience.LimitedPrivate({"Hive"})
++  @InterfaceStability.Evolving
++  public AddPartitionMessage buildAddPartitionMessage(Table table, PartitionSpecProxy partitionSpec) {
++    return new JSONAddPartitionMessage(HCAT_SERVER_URL, HCAT_SERVICE_PRINCIPAL, table.getDbName(),
++        table.getTableName(), getPartitionKeyValues(table, partitionSpec), now());
+   }
+ 
+   @Override
+@@ -139,12 +142,22 @@ private long now() {
+     return partitionKeys;
+   }
+ 
+-  private static List<Map<String, String>> getPartitionKeyValues(final Table table, Iterator<Partition> iterator) {
+-    return Lists.newArrayList(Iterators.transform(iterator, new Function<Partition, Map<String, String>>() {
+-      @Override
+-      public Map<String, String> apply(@Nullable Partition partition) {
+-        return getPartitionKeyValues(table, partition);
+-      }
+-    }));
++  private static List<Map<String, String>> getPartitionKeyValues(Table table, List<Partition> partitions) {
++    List<Map<String, String>> partitionList = new ArrayList<Map<String, String>>(partitions.size());
++    for (Partition partition : partitions)
++      partitionList.add(getPartitionKeyValues(table, partition));
++    return partitionList;
++  }
++
++  @InterfaceAudience.LimitedPrivate({"Hive"})
++  @InterfaceStability.Evolving
++  private static List<Map<String, String>> getPartitionKeyValues(Table table, PartitionSpecProxy partitionSpec) {
++    List<Map<String, String>> partitionList = new ArrayList<Map<String, String>>();
++    PartitionSpecProxy.PartitionIterator iterator = partitionSpec.getPartitionIterator();
++    while (iterator.hasNext()) {
++      Partition partition = iterator.next();
++      partitionList.add(getPartitionKeyValues(table, partition));
++    }
++    return partitionList;
+   }
+ }
+diff --git a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
+index f944157..032c3ac 100644
+--- a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
++++ b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/TestHCatClient.java
+@@ -63,6 +63,7 @@
+ import org.apache.hive.hcatalog.listener.DbNotificationListener;
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
++import org.junit.Ignore;
+ import org.junit.Test;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -1225,6 +1226,7 @@ public void testPartitionRegistrationWithCustomSchema() throws Exception {
+    * @throws Exception
+    */
+   @Test
++  @Ignore 
+   public void testPartitionSpecRegistrationWithCustomSchema() throws Exception {
+     try {
+       startReplicationTargetMetaStoreIfRequired();
+diff --git a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/repl/exim/TestEximReplicationTasks.java b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/repl/exim/TestEximReplicationTasks.java
+index 861ebc8..5a5a2b9 100644
+--- a/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/repl/exim/TestEximReplicationTasks.java
++++ b/hcatalog/webhcat/java-client/src/test/java/org/apache/hive/hcatalog/api/repl/exim/TestEximReplicationTasks.java
+@@ -322,7 +322,7 @@ public void testAddPartition() throws IOException {
+     addedPtns.add(createPtn(t, Arrays.asList("201", "xyz")));
+ 
+     NotificationEvent event = new NotificationEvent(getEventId(), getTime(),
+-        HCatConstants.HCAT_ADD_PARTITION_EVENT, msgFactory.buildAddPartitionMessage(t, addedPtns.iterator()).toString());
++        HCatConstants.HCAT_ADD_PARTITION_EVENT, msgFactory.buildAddPartitionMessage(t, addedPtns).toString());
+     event.setDbName(t.getDbName());
+     event.setTableName(t.getTableName());
+ 
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreEventListener.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreEventListener.java
+index ead5a19..4dbd26a 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreEventListener.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetaStoreEventListener.java
+@@ -24,7 +24,6 @@
+ import java.util.List;
+ import java.util.Map;
+ 
+-import com.google.common.collect.Lists;
+ import junit.framework.TestCase;
+ 
+ import org.apache.hadoop.hive.cli.CliSessionState;
+@@ -297,8 +296,7 @@ public void testListener() throws Exception {
+     AddPartitionEvent partEvent = (AddPartitionEvent)(notifyList.get(listSize-1));
+     assert partEvent.getStatus();
+     Partition part = msc.getPartition("hive2038", "tmptbl", "b=2011");
+-    Partition partAdded = partEvent.getPartitionIterator().next();
+-    validateAddPartition(part, partAdded);
++    validateAddPartition(part, partEvent.getPartitions().get(0));
+     validateTableInAddPartition(tbl, partEvent.getTable());
+     validateAddPartition(part, prePartEvent.getPartitions().get(0));
+ 
+@@ -315,12 +313,11 @@ public void testListener() throws Exception {
+     hmsClient.add_partitions(Arrays.asList(partition1, partition2, partition3));
+     ++listSize;
+     AddPartitionEvent multiplePartitionEvent = (AddPartitionEvent)(notifyList.get(listSize-1));
++    assertEquals("Unexpected number of partitions in event!", 3, multiplePartitionEvent.getPartitions().size());
+     assertEquals("Unexpected table value.", table, multiplePartitionEvent.getTable());
+-    List<Partition> multiParts = Lists.newArrayList(multiplePartitionEvent.getPartitionIterator());
+-    assertEquals("Unexpected number of partitions in event!", 3, multiParts.size());
+-    assertEquals("Unexpected partition value.", partition1.getValues(), multiParts.get(0).getValues());
+-    assertEquals("Unexpected partition value.", partition2.getValues(), multiParts.get(1).getValues());
+-    assertEquals("Unexpected partition value.", partition3.getValues(), multiParts.get(2).getValues());
++    assertEquals("Unexpected partition value.", partition1.getValues(), multiplePartitionEvent.getPartitions().get(0).getValues());
++    assertEquals("Unexpected partition value.", partition2.getValues(), multiplePartitionEvent.getPartitions().get(1).getValues());
++    assertEquals("Unexpected partition value.", partition3.getValues(), multiplePartitionEvent.getPartitions().get(2).getValues());
+ 
+     driver.run(String.format("alter table %s touch partition (%s)", tblName, "b='2011'"));
+     listSize++;
+@@ -355,8 +352,7 @@ public void testListener() throws Exception {
+ 
+     AddPartitionEvent appendPartEvent =
+         (AddPartitionEvent)(notifyList.get(listSize-1));
+-    Partition partAppended = appendPartEvent.getPartitionIterator().next();
+-    validateAddPartition(newPart, partAppended);
++    validateAddPartition(newPart, appendPartEvent.getPartitions().get(0));
+ 
+     PreAddPartitionEvent preAppendPartEvent =
+         (PreAddPartitionEvent)(preNotifyList.get(preNotifyList.size() - 1));
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java b/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java
+index 049cf71..5b9c350 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/events/AddPartitionEvent.java
+@@ -61,18 +61,18 @@ public Table getTable() {
+     return table;
+   }
+ 
+-
+-  // Note : List<Partition> getPartitions() removed with HIVE-9609 because it will result in OOM errors with large add_partitions.
++  /**
++   * @return List of partitions.
++   */
++  public List<Partition> getPartitions() {
++    return partitions;
++  }
+ 
+   /**
+    * @return Iterator for partitions.
+    */
+   public Iterator<Partition> getPartitionIterator() {
+-    if (partitions != null){
+-      return partitions.iterator();
+-    } else {
+-      return partitionSpecProxy == null ? null : partitionSpecProxy.getPartitionIterator();
+-    }
++    return partitionSpecProxy == null ? null : partitionSpecProxy.getPartitionIterator();
+   }
+ 
+ }
+-- 
+1.7.9.5
+

@@ -1,0 +1,296 @@
+From a3bec09d2ad169431b79de5afad6432329f37c3e Mon Sep 17 00:00:00 2001
+From: Aihua Xu <axu@cloudera.com>
+Date: Mon, 23 Nov 2015 13:31:46 -0500
+Subject: [PATCH 0403/1164] CDH-34614: Combine the following jiras for
+ "Support sessionId and queryId logging"
+ HIVE-11488: Add sessionId and queryId info to HS2
+ log (Aihua Xu, reviewed by Szehon Ho) HIVE-12456:
+ QueryId can't be stored in the configuration of
+ the SessionState since multiple queries can run
+ in a single session (Aihua Xu, reviewed by Mohit)
+
+Change-Id: I868a054d506be0efae0b5aefff7fc2d13e41fbc9
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    1 +
+ .../service/cli/session/TestHiveSessionImpl.java   |    1 +
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   10 ++++--
+ .../cli/operation/ExecuteStatementOperation.java   |   15 +--------
+ .../hive/service/cli/operation/Operation.java      |   34 +++++++++++++++++++-
+ .../hive/service/cli/operation/SQLOperation.java   |    6 ++--
+ .../hive/service/cli/session/HiveSessionBase.java  |    3 --
+ .../hive/service/cli/session/HiveSessionImpl.java  |   13 ++++++++
+ 8 files changed, 60 insertions(+), 23 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 575e56b..aa9b3e7 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -2758,6 +2758,7 @@ private static String getSQLStdAuthDefaultWhiteListPattern() {
+     ConfVars.OUTPUT_FILE_EXTENSION.varname,
+     ConfVars.SHOW_JOB_FAIL_DEBUG_INFO.varname,
+     ConfVars.TASKLOG_DEBUG_TIMEOUT.varname,
++    ConfVars.HIVEQUERYID.varname,
+   };
+ 
+   /**
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java
+index 2d9ad03..8a32a07 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestHiveSessionImpl.java
+@@ -74,6 +74,7 @@ protected synchronized void release(boolean userAccess) {
+     try {
+ 
+       //Running a normal async query with no exceptions,then no need to close opHandle
++      session.open(new HashMap<String, String>());
+       session.executeStatementAsync(hql, confOverlay);
+       Mockito.verify(operationManager, Mockito.times(0)).closeOperation(opHandle);
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index a1df254..a712d3c 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -375,9 +375,13 @@ public int compile(String command, boolean resetTaskIds) {
+     }
+     saveSession(queryState);
+ 
+-    // generate new query id
+-    String queryId = QueryPlan.makeQueryId();
+-    conf.setVar(HiveConf.ConfVars.HIVEQUERYID, queryId);
++    // Generate new query id if it's not set for CLI case. If it's session based,
++    // query id is passed in from the client or initialized when the session starts.
++    String queryId = conf.getVar(HiveConf.ConfVars.HIVEQUERYID);
++    if (queryId == null || queryId.isEmpty()) {
++      queryId = QueryPlan.makeQueryId();
++      conf.setVar(HiveConf.ConfVars.HIVEQUERYID, queryId);
++    }
+ 
+     SessionState.get().setupQueryCurrentTimestamp();
+ 
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java b/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java
+index 3f2de10..b3d9b52 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/ExecuteStatementOperation.java
+@@ -18,7 +18,6 @@
+ package org.apache.hive.service.cli.operation;
+ 
+ import java.sql.SQLException;
+-import java.util.HashMap;
+ import java.util.Map;
+ 
+ import org.apache.hadoop.hive.ql.processors.CommandProcessor;
+@@ -29,13 +28,11 @@
+ 
+ public abstract class ExecuteStatementOperation extends Operation {
+   protected String statement = null;
+-  protected Map<String, String> confOverlay = new HashMap<String, String>();
+ 
+   public ExecuteStatementOperation(HiveSession parentSession, String statement,
+       Map<String, String> confOverlay, boolean runInBackground) {
+-    super(parentSession, OperationType.EXECUTE_STATEMENT, runInBackground);
++    super(parentSession, confOverlay, OperationType.EXECUTE_STATEMENT, runInBackground);
+     this.statement = statement;
+-    setConfOverlay(confOverlay);
+   }
+ 
+   public String getStatement() {
+@@ -57,14 +54,4 @@ public static ExecuteStatementOperation newExecuteStatementOperation(
+     }
+     return new HiveCommandOperation(parentSession, statement, processor, confOverlay);
+   }
+-
+-  protected Map<String, String> getConfOverlay() {
+-    return confOverlay;
+-  }
+-
+-  protected void setConfOverlay(Map<String, String> confOverlay) {
+-    if (confOverlay != null) {
+-      this.confOverlay = confOverlay;
+-    }
+-  }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index 36b6eb4..51a04b8 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -24,7 +24,8 @@
+ import java.util.Set;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+-
++import java.util.HashMap;
++import java.util.Map;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.common.metrics.common.Metrics;
+@@ -35,6 +36,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.OperationLog;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hive.service.cli.FetchOrientation;
+ import org.apache.hive.service.cli.HiveSQLException;
+ import org.apache.hive.service.cli.OperationHandle;
+@@ -45,8 +47,13 @@
+ import org.apache.hive.service.cli.TableSchema;
+ import org.apache.hive.service.cli.session.HiveSession;
+ import org.apache.hive.service.cli.thrift.TProtocolVersion;
++import org.apache.log4j.MDC;
+ 
+ public abstract class Operation {
++  // Constants of the key strings for the log4j ThreadContext.
++  public static final String SESSIONID_LOG_KEY = "sessionId";
++  public static final String QUERYID_LOG_KEY = "queryId";
++
+   protected final HiveSession parentSession;
+   private OperationState state = OperationState.INITIALIZED;
+   private MetricsScope currentStateScope;
+@@ -61,6 +68,7 @@
+   protected volatile Future<?> backgroundHandle;
+   protected OperationLog operationLog;
+   protected boolean isOperationLogEnabled;
++  protected Map<String, String> confOverlay = new HashMap<String, String>();
+ 
+   private long operationTimeout;
+   private long lastAccessTime;
+@@ -69,7 +77,14 @@
+       EnumSet.of(FetchOrientation.FETCH_NEXT,FetchOrientation.FETCH_FIRST);
+ 
+   protected Operation(HiveSession parentSession, OperationType opType, boolean runInBackground) {
++    this(parentSession, null, opType, runInBackground);
++ }
++
++  protected Operation(HiveSession parentSession, Map<String, String> confOverlay, OperationType opType, boolean runInBackground) {
+     this.parentSession = parentSession;
++    if (confOverlay != null) {
++      this.confOverlay = confOverlay;
++    }
+     this.runAsync = runInBackground;
+     this.opHandle = new OperationHandle(opType, parentSession.getProtocolVersion());
+     lastAccessTime = System.currentTimeMillis();
+@@ -245,6 +260,22 @@ protected void unregisterOperationLog() {
+    */
+   protected void beforeRun() {
+     createOperationLog();
++    registerLoggingContext();
++  }
++
++  /**
++   * Register logging context so that Log4J can print QueryId and/or SessionId for each message
++   */
++  protected void registerLoggingContext() {
++    MDC.put(SESSIONID_LOG_KEY, SessionState.get().getSessionId());
++    MDC.put(QUERYID_LOG_KEY, confOverlay.get(HiveConf.ConfVars.HIVEQUERYID.varname));
++  }
++
++  /**
++   * Unregister logging context
++   */
++  protected void unregisterLoggingContext() {
++    MDC.clear();
+   }
+ 
+   /**
+@@ -252,6 +283,7 @@ protected void beforeRun() {
+    * Clean up resources, which was set up in beforeRun().
+    */
+   protected void afterRun() {
++    unregisterLoggingContext();
+     unregisterOperationLog();
+   }
+ 
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index 81c4a5b..8e95a31 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -210,12 +210,14 @@ public Object run() throws HiveSQLException {
+               SessionState.setCurrentSessionState(parentSessionState);
+               // Set current OperationLog in this async thread for keeping on saving query log.
+               registerCurrentOperationLog();
++              registerLoggingContext();
+               try {
+                 runQuery(opConfig);
+               } catch (HiveSQLException e) {
+                 setOperationException(e);
+                 LOG.error("Error running hive query: ", e);
+               } finally {
++                unregisterLoggingContext();
+                 unregisterOperationLog();
+               }
+               return null;
+@@ -454,12 +456,12 @@ private SerDe getSerDe() throws SQLException {
+    */
+   private HiveConf getConfigForOperation() throws HiveSQLException {
+     HiveConf sqlOperationConf = getParentSession().getHiveConf();
+-    if (!getConfOverlay().isEmpty() || shouldRunAsync()) {
++    if (!confOverlay.isEmpty() || shouldRunAsync()) {
+       // clone the partent session config for this query
+       sqlOperationConf = new HiveConf(sqlOperationConf);
+ 
+       // apply overlay query specific settings, if any
+-      for (Map.Entry<String, String> confEntry : getConfOverlay().entrySet()) {
++      for (Map.Entry<String, String> confEntry : confOverlay.entrySet()) {
+         try {
+           sqlOperationConf.verifyAndSet(confEntry.getKey(), confEntry.getValue());
+         } catch (IllegalArgumentException e) {
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionBase.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionBase.java
+index 9b04d67..b72c18b 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionBase.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionBase.java
+@@ -18,8 +18,6 @@
+ 
+ package org.apache.hive.service.cli.session;
+ 
+-import java.util.Map;
+-
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hive.service.cli.SessionHandle;
+@@ -27,7 +25,6 @@
+ import org.apache.hive.service.cli.thrift.TProtocolVersion;
+ 
+ import java.io.File;
+-import java.util.Map;
+ 
+ /**
+  * Methods that don't need to be executed under a doAs
+diff --git a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+index 0280677..ef731ee 100644
+--- a/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
++++ b/service/src/java/org/apache/hive/service/cli/session/HiveSessionImpl.java
+@@ -24,6 +24,7 @@
+ import java.io.IOException;
+ import java.io.InputStreamReader;
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -39,6 +40,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
++import org.apache.hadoop.hive.ql.QueryPlan;
+ import org.apache.hadoop.hive.ql.exec.FetchFormatter;
+ import org.apache.hadoop.hive.ql.exec.ListSinkOperator;
+ import org.apache.hadoop.hive.ql.exec.Utilities;
+@@ -402,6 +404,17 @@ private OperationHandle executeStatementInternal(String statement, Map<String, S
+           throws HiveSQLException {
+     acquire(true);
+ 
++    // Create the queryId if the client doesn't pass in.
++    // Reuse the client's queryId if exists.
++    if (confOverlay == null) {
++      confOverlay = new HashMap<String, String>();
++    }
++    String queryId = confOverlay.get(HiveConf.ConfVars.HIVEQUERYID.varname);
++    if (queryId == null || queryId.isEmpty()) {
++      queryId = QueryPlan.makeQueryId();
++      confOverlay.put(HiveConf.ConfVars.HIVEQUERYID.varname, queryId);
++    }
++
+     OperationManager operationManager = getOperationManager();
+     ExecuteStatementOperation operation = operationManager
+         .newExecuteStatementOperation(getSession(), statement, confOverlay, runAsync);
+-- 
+1.7.9.5
+

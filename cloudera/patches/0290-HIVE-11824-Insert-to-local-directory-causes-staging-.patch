@@ -1,0 +1,43 @@
+From 0738078dc5faefcd23e66b79c8a35e53a3cc70c7 Mon Sep 17 00:00:00 2001
+From: Prasanth Jayachandran <j.prasanth.j@gmail.com>
+Date: Wed, 16 Sep 2015 01:08:02 -0500
+Subject: [PATCH 0290/1164] HIVE-11824: Insert to local directory causes
+ staging directory to be copied (Prasanth
+ Jayachandran reviewed by Ashutosh Chauhan)
+
+---
+ .../org/apache/hadoop/hive/ql/exec/MoveTask.java   |   16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
+index a1800cd..0238fec 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/MoveTask.java
+@@ -127,10 +127,22 @@ private void moveFile(Path sourcePath, Path targetPath, boolean isDfsDir)
+       LocalFileSystem dstFs = FileSystem.getLocal(conf);
+ 
+       if (dstFs.delete(targetPath, true) || !dstFs.exists(targetPath)) {
+-        console.printInfo(mesg, mesg_detail);
+         // if source exists, rename. Otherwise, create a empty directory
+         if (fs.exists(sourcePath)) {
+-          fs.copyToLocalFile(sourcePath, targetPath);
++          try {
++            // create the destination if it does not exist
++            if (!dstFs.exists(targetPath)) {
++              FileUtils.mkdir(dstFs, targetPath, false, conf);
++            }
++          } catch (IOException e) {
++            throw new HiveException("Unable to create target directory for copy" + targetPath, e);
++          }
++
++          FileSystem srcFs = sourcePath.getFileSystem(conf);
++          FileStatus[] srcs = srcFs.listStatus(sourcePath, FileUtils.HIDDEN_FILES_PATH_FILTER);
++          for (FileStatus status : srcs) {
++            fs.copyToLocalFile(status.getPath(), targetPath);
++          }
+         } else {
+           if (!dstFs.mkdirs(targetPath)) {
+             throw new HiveException("Unable to make local directory: "
+-- 
+1.7.9.5
+

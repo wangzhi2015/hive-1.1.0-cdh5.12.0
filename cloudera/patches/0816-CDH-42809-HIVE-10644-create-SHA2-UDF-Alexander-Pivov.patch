@@ -1,0 +1,736 @@
+From bab994ff7205a792d63a26ed808bbbcb7be1a179 Mon Sep 17 00:00:00 2001
+From: Alexander Pivovarov <apivovarov@gmail.com>
+Date: Thu, 7 May 2015 17:10:12 -0700
+Subject: [PATCH 0816/1164] CDH-42809: HIVE-10644 create SHA2 UDF (Alexander
+ Pivovarov, reviewed by Jason Dere)
+
+(cherry picked from commit d703c22212845946cd252f5ac6a6bd28484371c1)
+
+Change-Id: I3ece112922c685edfa48c1129f265ffe56e62320
+---
+ .../hadoop/hive/ql/exec/FunctionRegistry.java      |    1 +
+ .../hive/ql/udf/generic/GenericUDFParamUtils.java  |   71 +++++
+ .../hadoop/hive/ql/udf/generic/GenericUDFSha2.java |  137 ++++++++++
+ .../hive/ql/udf/generic/TestGenericUDFSha2.java    |  271 ++++++++++++++++++++
+ ql/src/test/queries/clientpositive/udf_sha2.q      |   41 +++
+ .../results/clientpositive/show_functions.q.out    |    1 +
+ ql/src/test/results/clientpositive/udf_sha2.q.out  |  134 ++++++++++
+ 7 files changed, 656 insertions(+)
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFParamUtils.java
+ create mode 100644 ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFSha2.java
+ create mode 100644 ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFSha2.java
+ create mode 100644 ql/src/test/queries/clientpositive/udf_sha2.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_sha2.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+index 8a9d025..1d577d1 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionRegistry.java
+@@ -223,6 +223,7 @@
+     system.registerUDF("unhex", UDFUnhex.class, false);
+     system.registerUDF("base64", UDFBase64.class, false);
+     system.registerUDF("unbase64", UDFUnbase64.class, false);
++    system.registerGenericUDF("sha2", GenericUDFSha2.class);
+     system.registerUDF("md5", UDFMd5.class, false);
+     system.registerUDF("uuid", UDFUUID.class, false);
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFParamUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFParamUtils.java
+new file mode 100644
+index 0000000..cdbc6ea
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFParamUtils.java
+@@ -0,0 +1,71 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.Text;
++
++/**
++ * Generic UDF params utility class
++ */
++public class GenericUDFParamUtils {
++
++  private GenericUDFParamUtils() {
++  }
++
++  public static BytesWritable getBinaryValue(DeferredObject[] arguments, int i,
++      Converter[] converters) throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    Object writableValue = converters[i].convert(obj);
++    return (BytesWritable) writableValue;
++  }
++
++  public static Text getTextValue(DeferredObject[] arguments, int i, Converter[] converters)
++      throws HiveException {
++    Object obj;
++    if ((obj = arguments[i].get()) == null) {
++      return null;
++    }
++    Object writableValue = converters[i].convert(obj);
++    return (Text) writableValue;
++  }
++
++  public static void obtainBinaryConverter(ObjectInspector[] arguments, int i,
++      PrimitiveCategory[] inputTypes, Converter[] converters) throws UDFArgumentTypeException {
++    PrimitiveObjectInspector inOi = (PrimitiveObjectInspector) arguments[i];
++    PrimitiveCategory inputType = inOi.getPrimitiveCategory();
++
++    Converter converter = ObjectInspectorConverters.getConverter(arguments[i],
++        PrimitiveObjectInspectorFactory.writableBinaryObjectInspector);
++    converters[i] = converter;
++    inputTypes[i] = inputType;
++  }
++}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFSha2.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFSha2.java
+new file mode 100644
+index 0000000..296a666
+--- /dev/null
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFSha2.java
+@@ -0,0 +1,137 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.BINARY_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.NUMERIC_GROUP;
++import static org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils.PrimitiveGrouping.STRING_GROUP;
++
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++
++import org.apache.commons.codec.binary.Hex;
++import org.apache.hadoop.hive.ql.exec.Description;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentException;
++import org.apache.hadoop.hive.ql.exec.UDFArgumentTypeException;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorConverters.Converter;
++import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector.PrimitiveCategory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.Text;
++
++/**
++ * GenericUDFSha2.
++ *
++ */
++@Description(name = "sha2", value = "_FUNC_(string/binary, len) - Calculates the SHA-2 family of hash functions "
++    + "(SHA-224, SHA-256, SHA-384, and SHA-512).",
++    extended = "The first argument is the string or binary to be hashed. "
++    + "The second argument indicates the desired bit length of the result, "
++    + "which must have a value of 224, 256, 384, 512, or 0 (which is equivalent to 256). "
++    + "SHA-224 is supported starting from Java 8. "
++    + "If either argument is NULL or the hash length is not one of the permitted values, the return value is NULL.\n"
++    + "Example: > SELECT _FUNC_('ABC', 256);\n 'b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78'")
++public class GenericUDFSha2 extends GenericUDF {
++  private transient Converter[] converters = new Converter[2];
++  private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[2];
++  private final Text output = new Text();
++  private transient boolean isStr;
++  private transient MessageDigest digest;
++
++  @Override
++  public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
++    checkArgsSize(arguments, 2, 2);
++
++    checkArgPrimitive(arguments, 0);
++    checkArgPrimitive(arguments, 1);
++
++    // the function should support both string and binary input types
++    checkArgGroups(arguments, 0, inputTypes, STRING_GROUP, BINARY_GROUP);
++    checkArgGroups(arguments, 1, inputTypes, NUMERIC_GROUP);
++
++    if (PrimitiveObjectInspectorUtils.getPrimitiveGrouping(inputTypes[0]) == STRING_GROUP) {
++      obtainStringConverter(arguments, 0, inputTypes, converters);
++      isStr = true;
++    } else {
++      GenericUDFParamUtils.obtainBinaryConverter(arguments, 0, inputTypes, converters);
++      isStr = false;
++    }
++
++    if (arguments[1] instanceof ConstantObjectInspector) {
++      Integer lenObj = getConstantIntValue(arguments, 1);
++      if (lenObj != null) {
++        int len = lenObj.intValue();
++        if (len == 0) {
++          len = 256;
++        }
++        try {
++          digest = MessageDigest.getInstance("SHA-" + len);
++        } catch (NoSuchAlgorithmException e) {
++          // ignore
++        }
++      }
++    } else {
++      throw new UDFArgumentTypeException(1, getFuncName() + " only takes constant as "
++          + getArgOrder(1) + " argument");
++    }
++
++    ObjectInspector outputOI = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    return outputOI;
++  }
++
++  @Override
++  public Object evaluate(DeferredObject[] arguments) throws HiveException {
++    if (digest == null) {
++      return null;
++    }
++
++    digest.reset();
++    if (isStr) {
++      Text n = GenericUDFParamUtils.getTextValue(arguments, 0, converters);
++      if (n == null) {
++        return null;
++      }
++      digest.update(n.getBytes(), 0, n.getLength());
++    } else {
++      BytesWritable bWr = GenericUDFParamUtils.getBinaryValue(arguments, 0, converters);
++      if (bWr == null) {
++        return null;
++      }
++      digest.update(bWr.getBytes(), 0, bWr.getLength());
++    }
++    byte[] resBin = digest.digest();
++    String resStr = Hex.encodeHexString(resBin);
++
++    output.set(resStr);
++    return output;
++  }
++
++  @Override
++  public String getDisplayString(String[] children) {
++    return getStandardDisplayString(getFuncName(), children);
++  }
++
++  @Override
++  protected String getFuncName() {
++    return "sha2";
++  }
++}
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFSha2.java b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFSha2.java
+new file mode 100644
+index 0000000..c9e97eb
+--- /dev/null
++++ b/ql/src/test/org/apache/hadoop/hive/ql/udf/generic/TestGenericUDFSha2.java
+@@ -0,0 +1,271 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hive.ql.udf.generic;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
++import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredObject;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
++import org.apache.hadoop.io.BytesWritable;
++import org.apache.hadoop.io.IntWritable;
++import org.apache.hadoop.io.Text;
++
++public class TestGenericUDFSha2 extends TestCase {
++
++  public void testSha0Str() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    IntWritable lenWr = new IntWritable(0);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr("ABC", lenWr,
++        "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78", udf);
++    runAndVerifyStr("", lenWr, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++        udf);
++    // null
++    runAndVerifyStr(null, lenWr, null, udf);
++  }
++
++  public void testSha0Bin() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableBinaryObjectInspector;
++    IntWritable lenWr = new IntWritable(0);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, lenWr,
++        "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78", udf);
++    runAndVerifyBin(new byte[0], lenWr,
++        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", udf);
++    // null
++    runAndVerifyBin(null, lenWr, null, udf);
++  }
++
++  public void testSha200Str() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    IntWritable lenWr = new IntWritable(200);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr("ABC", lenWr, null, udf);
++  }
++
++  public void testSha200Bin() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableBinaryObjectInspector;
++    IntWritable lenWr = new IntWritable(200);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, lenWr, null, udf);
++  }
++
++  public void testSha256Str() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    IntWritable lenWr = new IntWritable(256);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr("ABC", lenWr,
++        "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78", udf);
++    runAndVerifyStr("", lenWr, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
++        udf);
++    // null
++    runAndVerifyStr(null, lenWr, null, udf);
++  }
++
++  public void testSha256Bin() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableBinaryObjectInspector;
++    IntWritable lenWr = new IntWritable(256);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, lenWr,
++        "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78", udf);
++    runAndVerifyBin(new byte[0], lenWr,
++        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", udf);
++    // null
++    runAndVerifyBin(null, lenWr, null, udf);
++  }
++
++  public void testSha384Str() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    IntWritable lenWr = new IntWritable(384);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr(
++        "ABC",
++        lenWr,
++        "1e02dc92a41db610c9bcdc9b5935d1fb9be5639116f6c67e97bc1a3ac649753baba7ba021c813e1fe20c0480213ad371",
++        udf);
++    runAndVerifyStr(
++        "",
++        lenWr,
++        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
++        udf);
++    // null
++    runAndVerifyStr(null, lenWr, null, udf);
++  }
++
++  public void testSha384Bin() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableBinaryObjectInspector;
++    IntWritable lenWr = new IntWritable(384);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyBin(
++        new byte[] { 65, 66, 67 },
++        lenWr,
++        "1e02dc92a41db610c9bcdc9b5935d1fb9be5639116f6c67e97bc1a3ac649753baba7ba021c813e1fe20c0480213ad371",
++        udf);
++    runAndVerifyBin(
++        new byte[0],
++        lenWr,
++        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
++        udf);
++    // null
++    runAndVerifyBin(null, lenWr, null, udf);
++  }
++
++  public void testSha512Str() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    IntWritable lenWr = new IntWritable(512);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr(
++        "ABC",
++        lenWr,
++        "397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119",
++        udf);
++    runAndVerifyStr(
++        "",
++        lenWr,
++        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
++        udf);
++    // null
++    runAndVerifyStr(null, lenWr, null, udf);
++  }
++
++  public void testSha512Bin() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableBinaryObjectInspector;
++    IntWritable lenWr = new IntWritable(512);
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyBin(
++        new byte[] { 65, 66, 67 },
++        lenWr,
++        "397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119",
++        udf);
++    runAndVerifyBin(
++        new byte[0],
++        lenWr,
++        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
++        udf);
++    // null
++    runAndVerifyBin(null, lenWr, null, udf);
++  }
++
++  public void testShaNullStr() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableStringObjectInspector;
++    IntWritable lenWr = null;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyStr("ABC", lenWr, null, udf);
++  }
++
++  public void testShaNullBin() throws HiveException {
++    GenericUDFSha2 udf = new GenericUDFSha2();
++    ObjectInspector valueOI0 = PrimitiveObjectInspectorFactory.writableBinaryObjectInspector;
++    IntWritable lenWr = null;
++    ObjectInspector valueOI1 = PrimitiveObjectInspectorFactory
++        .getPrimitiveWritableConstantObjectInspector(TypeInfoFactory.intTypeInfo, lenWr);
++    ObjectInspector[] arguments = { valueOI0, valueOI1 };
++
++    udf.initialize(arguments);
++
++    runAndVerifyBin(new byte[] { 65, 66, 67 }, lenWr, null, udf);
++  }
++
++  private void runAndVerifyStr(String str, IntWritable lenWr, String expResult, GenericUDFSha2 udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(str != null ? new Text(str) : null);
++    DeferredObject valueObj1 = new DeferredJavaObject(lenWr);
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("sha2() test ", expResult, output != null ? output.toString() : null);
++  }
++
++  private void runAndVerifyBin(byte[] b, IntWritable lenWr, String expResult, GenericUDFSha2 udf)
++      throws HiveException {
++    DeferredObject valueObj0 = new DeferredJavaObject(b != null ? new BytesWritable(b) : null);
++    DeferredObject valueObj1 = new DeferredJavaObject(lenWr);
++    DeferredObject[] args = { valueObj0, valueObj1 };
++    Text output = (Text) udf.evaluate(args);
++    assertEquals("sha2() test ", expResult, output != null ? output.toString() : null);
++  }
++}
+diff --git a/ql/src/test/queries/clientpositive/udf_sha2.q b/ql/src/test/queries/clientpositive/udf_sha2.q
+new file mode 100644
+index 0000000..0a3443b
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_sha2.q
+@@ -0,0 +1,41 @@
++DESCRIBE FUNCTION sha2;
++DESC FUNCTION EXTENDED sha2;
++
++explain select sha2('ABC', 256);
++
++select
++sha2('ABC', 0),
++sha2('', 0),
++sha2(binary('ABC'), 0),
++sha2(binary(''), 0),
++sha2(cast(null as string), 0),
++sha2(cast(null as binary), 0);
++
++select
++sha2('ABC', 256),
++sha2('', 256),
++sha2(binary('ABC'), 256),
++sha2(binary(''), 256),
++sha2(cast(null as string), 256),
++sha2(cast(null as binary), 256);
++
++select
++sha2('ABC', 384),
++sha2('', 384),
++sha2(binary('ABC'), 384),
++sha2(binary(''), 384),
++sha2(cast(null as string), 384),
++sha2(cast(null as binary), 384);
++
++select
++sha2('ABC', 512),
++sha2('', 512),
++sha2(binary('ABC'), 512),
++sha2(binary(''), 512),
++sha2(cast(null as string), 512),
++sha2(cast(null as binary), 512);
++
++--null
++select
++sha2('ABC', 200),
++sha2('ABC', cast(null as int));
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/show_functions.q.out b/ql/src/test/results/clientpositive/show_functions.q.out
+index f3c6e79..ebcdd06 100644
+--- a/ql/src/test/results/clientpositive/show_functions.q.out
++++ b/ql/src/test/results/clientpositive/show_functions.q.out
+@@ -167,6 +167,7 @@ rpad
+ rtrim
+ second
+ sentences
++sha2
+ sign
+ sin
+ size
+diff --git a/ql/src/test/results/clientpositive/udf_sha2.q.out b/ql/src/test/results/clientpositive/udf_sha2.q.out
+new file mode 100644
+index 0000000..e39da08
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_sha2.q.out
+@@ -0,0 +1,134 @@
++PREHOOK: query: DESCRIBE FUNCTION sha2
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION sha2
++POSTHOOK: type: DESCFUNCTION
++sha2(string/binary, len) - Calculates the SHA-2 family of hash functions (SHA-224, SHA-256, SHA-384, and SHA-512).
++PREHOOK: query: DESC FUNCTION EXTENDED sha2
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED sha2
++POSTHOOK: type: DESCFUNCTION
++sha2(string/binary, len) - Calculates the SHA-2 family of hash functions (SHA-224, SHA-256, SHA-384, and SHA-512).
++The first argument is the string or binary to be hashed. The second argument indicates the desired bit length of the result, which must have a value of 224, 256, 384, 512, or 0 (which is equivalent to 256). SHA-224 is supported starting from Java 8. If either argument is NULL or the hash length is not one of the permitted values, the return value is NULL.
++Example: > SELECT sha2('ABC', 256);
++ 'b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78'
++PREHOOK: query: explain select sha2('ABC', 256)
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select sha2('ABC', 256)
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 'b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78' (type: string)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++sha2('ABC', 0),
++sha2('', 0),
++sha2(binary('ABC'), 0),
++sha2(binary(''), 0),
++sha2(cast(null as string), 0),
++sha2(cast(null as binary), 0)
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++sha2('ABC', 0),
++sha2('', 0),
++sha2(binary('ABC'), 0),
++sha2(binary(''), 0),
++sha2(cast(null as string), 0),
++sha2(cast(null as binary), 0)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	NULL	NULL
++PREHOOK: query: select
++sha2('ABC', 256),
++sha2('', 256),
++sha2(binary('ABC'), 256),
++sha2(binary(''), 256),
++sha2(cast(null as string), 256),
++sha2(cast(null as binary), 256)
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++sha2('ABC', 256),
++sha2('', 256),
++sha2(binary('ABC'), 256),
++sha2(binary(''), 256),
++sha2(cast(null as string), 256),
++sha2(cast(null as binary), 256)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855	NULL	NULL
++PREHOOK: query: select
++sha2('ABC', 384),
++sha2('', 384),
++sha2(binary('ABC'), 384),
++sha2(binary(''), 384),
++sha2(cast(null as string), 384),
++sha2(cast(null as binary), 384)
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++sha2('ABC', 384),
++sha2('', 384),
++sha2(binary('ABC'), 384),
++sha2(binary(''), 384),
++sha2(cast(null as string), 384),
++sha2(cast(null as binary), 384)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++1e02dc92a41db610c9bcdc9b5935d1fb9be5639116f6c67e97bc1a3ac649753baba7ba021c813e1fe20c0480213ad371	38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b	1e02dc92a41db610c9bcdc9b5935d1fb9be5639116f6c67e97bc1a3ac649753baba7ba021c813e1fe20c0480213ad371	38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b	NULL	NULL
++PREHOOK: query: select
++sha2('ABC', 512),
++sha2('', 512),
++sha2(binary('ABC'), 512),
++sha2(binary(''), 512),
++sha2(cast(null as string), 512),
++sha2(cast(null as binary), 512)
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++sha2('ABC', 512),
++sha2('', 512),
++sha2(binary('ABC'), 512),
++sha2(binary(''), 512),
++sha2(cast(null as string), 512),
++sha2(cast(null as binary), 512)
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119	cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e	397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119	cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e	NULL	NULL
++PREHOOK: query: --null
++select
++sha2('ABC', 200),
++sha2('ABC', cast(null as int))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: --null
++select
++sha2('ABC', 200),
++sha2('ABC', cast(null as int))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++NULL	NULL
+-- 
+1.7.9.5
+

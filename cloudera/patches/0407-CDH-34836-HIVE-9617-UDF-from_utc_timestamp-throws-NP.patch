@@ -1,0 +1,326 @@
+From 6cf8f76c4317e4df23f6801e89f01e90c1f442fc Mon Sep 17 00:00:00 2001
+From: Alan Gates <gates@apache.org>
+Date: Wed, 18 Feb 2015 19:11:58 +0000
+Subject: [PATCH 0407/1164] CDH-34836: HIVE-9617 UDF from_utc_timestamp throws
+ NPE if the second argument is null (Alexander
+ Pivovarov via Alan Gates)
+
+Change-Id: Ifafd24de6937f5ff5595e3efd131c05f5ddb7e97
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1660701 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../ql/udf/generic/GenericUDFFromUtcTimestamp.java |   25 +++---
+ .../clientpositive/udf_from_utc_timestamp.q        |   24 ++++++
+ .../queries/clientpositive/udf_to_utc_timestamp.q  |   24 ++++++
+ .../clientpositive/udf_from_utc_timestamp.q.out    |   82 ++++++++++++++++++++
+ .../clientpositive/udf_to_utc_timestamp.q.out      |   82 ++++++++++++++++++++
+ 5 files changed, 221 insertions(+), 16 deletions(-)
+ create mode 100644 ql/src/test/queries/clientpositive/udf_from_utc_timestamp.q
+ create mode 100644 ql/src/test/queries/clientpositive/udf_to_utc_timestamp.q
+ create mode 100644 ql/src/test/results/clientpositive/udf_from_utc_timestamp.q.out
+ create mode 100644 ql/src/test/results/clientpositive/udf_to_utc_timestamp.q.out
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFFromUtcTimestamp.java b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFFromUtcTimestamp.java
+index f76fc10..1343d3b 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFFromUtcTimestamp.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDFFromUtcTimestamp.java
+@@ -32,11 +32,10 @@
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.TextConverter;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorConverter.TimestampConverter;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+-import org.apache.hadoop.io.Text;
+ 
+ @Description(name = "from_utc_timestamp",
+              value = "from_utc_timestamp(timestamp, string timezone) - "
+-                     + "Assumes given timestamp ist UTC and converts to given timezone (as of Hive 0.8.0)")
++                     + "Assumes given timestamp is UTC and converts to given timezone (as of Hive 0.8.0)")
+ public class GenericUDFFromUtcTimestamp extends GenericUDF {
+ 
+   static final Log LOG = LogFactory.getLog(GenericUDFFromUtcTimestamp.class);
+@@ -48,17 +47,14 @@
+   @Override
+   public ObjectInspector initialize(ObjectInspector[] arguments)
+       throws UDFArgumentException {
+-    if (arguments.length < 2) {
+-      throw new UDFArgumentLengthException(
+-          "The function " + getName() + " requires at least two "
++    if (arguments.length != 2) {
++      throw new UDFArgumentLengthException("The function " + getName() + " requires two "
+           + "argument, got " + arguments.length);
+     }
+     try {
+       argumentOIs = new PrimitiveObjectInspector[2];
+       argumentOIs[0] = (PrimitiveObjectInspector) arguments[0];
+-      if (arguments.length > 1) {
+-        argumentOIs[1] = (PrimitiveObjectInspector) arguments[1];
+-      }
++      argumentOIs[1] = (PrimitiveObjectInspector) arguments[1];
+     } catch (ClassCastException e) {
+       throw new UDFArgumentException(
+           "The function " + getName() + " takes only primitive types");
+@@ -73,20 +69,17 @@ public ObjectInspector initialize(ObjectInspector[] arguments)
+   @Override
+   public Object evaluate(DeferredObject[] arguments) throws HiveException {
+     Object o0 = arguments[0].get();
+-    TimeZone timezone = null;
+     if (o0 == null) {
+       return null;
+     }
+-
+-    if (arguments.length > 1 && arguments[1] != null) {
+-      Text text = textConverter.convert(arguments[1].get());
+-      if (text != null) {
+-        timezone = TimeZone.getTimeZone(text.toString());
+-      }
+-    } else {
++    Object o1 = arguments[1].get();
++    if (o1 == null) {
+       return null;
+     }
+ 
++    String tzStr = textConverter.convert(o1).toString();
++    TimeZone timezone = TimeZone.getTimeZone(tzStr);
++
+     Timestamp timestamp = ((TimestampWritable) timestampConverter.convert(o0))
+         .getTimestamp();
+ 
+diff --git a/ql/src/test/queries/clientpositive/udf_from_utc_timestamp.q b/ql/src/test/queries/clientpositive/udf_from_utc_timestamp.q
+new file mode 100644
+index 0000000..de98507
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_from_utc_timestamp.q
+@@ -0,0 +1,24 @@
++DESCRIBE FUNCTION from_utc_timestamp;
++DESC FUNCTION EXTENDED from_utc_timestamp;
++
++explain select from_utc_timestamp('2015-02-11 10:30:00', 'PST');
++
++select
++from_utc_timestamp('2015-02-11 04:30:00', 'PST'),
++from_utc_timestamp('2015-02-11 04:30:00', 'Europe/Moscow'),
++from_utc_timestamp('2015-02-11 04:30:00', 'GMT+8'),
++from_utc_timestamp('2015-02-11 04:30:00', 'GMT'),
++from_utc_timestamp('2015-02-11 04:30:00', ''),
++from_utc_timestamp('2015-02-11 04:30:00', '---'),
++from_utc_timestamp(cast(null as string), 'PST'),
++from_utc_timestamp('2015-02-11 04:30:00', cast(null as string));
++
++select
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'PST'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'Europe/Moscow'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT+8'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), ''),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), '---'),
++from_utc_timestamp(cast(null as timestamp), 'PST'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), cast(null as string));
+\ No newline at end of file
+diff --git a/ql/src/test/queries/clientpositive/udf_to_utc_timestamp.q b/ql/src/test/queries/clientpositive/udf_to_utc_timestamp.q
+new file mode 100644
+index 0000000..fe0b647
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/udf_to_utc_timestamp.q
+@@ -0,0 +1,24 @@
++DESCRIBE FUNCTION to_utc_timestamp;
++DESC FUNCTION EXTENDED to_utc_timestamp;
++
++explain select to_utc_timestamp('2015-02-11 10:30:00', 'PST');
++
++select
++to_utc_timestamp('2015-02-10 20:30:00', 'PST'),
++to_utc_timestamp('2015-02-11 08:30:00', 'Europe/Moscow'),
++to_utc_timestamp('2015-02-11 12:30:00', 'GMT+8'),
++to_utc_timestamp('2015-02-11 04:30:00', 'GMT'),
++to_utc_timestamp('2015-02-11 04:30:00', ''),
++to_utc_timestamp('2015-02-11 04:30:00', '---'),
++to_utc_timestamp(cast(null as string), 'PST'),
++to_utc_timestamp('2015-02-11 04:30:00', cast(null as string));
++
++select
++to_utc_timestamp(cast('2015-02-10 20:30:00' as timestamp), 'PST'),
++to_utc_timestamp(cast('2015-02-11 08:30:00' as timestamp), 'Europe/Moscow'),
++to_utc_timestamp(cast('2015-02-11 12:30:00' as timestamp), 'GMT+8'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), ''),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), '---'),
++to_utc_timestamp(cast(null as timestamp), 'PST'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), cast(null as string));
+\ No newline at end of file
+diff --git a/ql/src/test/results/clientpositive/udf_from_utc_timestamp.q.out b/ql/src/test/results/clientpositive/udf_from_utc_timestamp.q.out
+new file mode 100644
+index 0000000..4df872c
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_from_utc_timestamp.q.out
+@@ -0,0 +1,82 @@
++PREHOOK: query: DESCRIBE FUNCTION from_utc_timestamp
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION from_utc_timestamp
++POSTHOOK: type: DESCFUNCTION
++from_utc_timestamp(timestamp, string timezone) - Assumes given timestamp is UTC and converts to given timezone (as of Hive 0.8.0)
++PREHOOK: query: DESC FUNCTION EXTENDED from_utc_timestamp
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED from_utc_timestamp
++POSTHOOK: type: DESCFUNCTION
++from_utc_timestamp(timestamp, string timezone) - Assumes given timestamp is UTC and converts to given timezone (as of Hive 0.8.0)
++PREHOOK: query: explain select from_utc_timestamp('2015-02-11 10:30:00', 'PST')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select from_utc_timestamp('2015-02-11 10:30:00', 'PST')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 2015-02-11 02:30:00.0 (type: timestamp)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++from_utc_timestamp('2015-02-11 04:30:00', 'PST'),
++from_utc_timestamp('2015-02-11 04:30:00', 'Europe/Moscow'),
++from_utc_timestamp('2015-02-11 04:30:00', 'GMT+8'),
++from_utc_timestamp('2015-02-11 04:30:00', 'GMT'),
++from_utc_timestamp('2015-02-11 04:30:00', ''),
++from_utc_timestamp('2015-02-11 04:30:00', '---'),
++from_utc_timestamp(cast(null as string), 'PST'),
++from_utc_timestamp('2015-02-11 04:30:00', cast(null as string))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++from_utc_timestamp('2015-02-11 04:30:00', 'PST'),
++from_utc_timestamp('2015-02-11 04:30:00', 'Europe/Moscow'),
++from_utc_timestamp('2015-02-11 04:30:00', 'GMT+8'),
++from_utc_timestamp('2015-02-11 04:30:00', 'GMT'),
++from_utc_timestamp('2015-02-11 04:30:00', ''),
++from_utc_timestamp('2015-02-11 04:30:00', '---'),
++from_utc_timestamp(cast(null as string), 'PST'),
++from_utc_timestamp('2015-02-11 04:30:00', cast(null as string))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2015-02-10 20:30:00	2015-02-11 08:30:00	2015-02-11 12:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	NULL	NULL
++PREHOOK: query: select
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'PST'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'Europe/Moscow'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT+8'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), ''),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), '---'),
++from_utc_timestamp(cast(null as timestamp), 'PST'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), cast(null as string))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'PST'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'Europe/Moscow'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT+8'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), ''),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), '---'),
++from_utc_timestamp(cast(null as timestamp), 'PST'),
++from_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), cast(null as string))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2015-02-10 20:30:00	2015-02-11 08:30:00	2015-02-11 12:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	NULL	NULL
+diff --git a/ql/src/test/results/clientpositive/udf_to_utc_timestamp.q.out b/ql/src/test/results/clientpositive/udf_to_utc_timestamp.q.out
+new file mode 100644
+index 0000000..e70b401
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/udf_to_utc_timestamp.q.out
+@@ -0,0 +1,82 @@
++PREHOOK: query: DESCRIBE FUNCTION to_utc_timestamp
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESCRIBE FUNCTION to_utc_timestamp
++POSTHOOK: type: DESCFUNCTION
++to_utc_timestamp(timestamp, string timezone) - Assumes given timestamp is in given timezone and converts to UTC (as of Hive 0.8.0)
++PREHOOK: query: DESC FUNCTION EXTENDED to_utc_timestamp
++PREHOOK: type: DESCFUNCTION
++POSTHOOK: query: DESC FUNCTION EXTENDED to_utc_timestamp
++POSTHOOK: type: DESCFUNCTION
++to_utc_timestamp(timestamp, string timezone) - Assumes given timestamp is in given timezone and converts to UTC (as of Hive 0.8.0)
++PREHOOK: query: explain select to_utc_timestamp('2015-02-11 10:30:00', 'PST')
++PREHOOK: type: QUERY
++POSTHOOK: query: explain select to_utc_timestamp('2015-02-11 10:30:00', 'PST')
++POSTHOOK: type: QUERY
++STAGE DEPENDENCIES:
++  Stage-0 is a root stage
++
++STAGE PLANS:
++  Stage: Stage-0
++    Fetch Operator
++      limit: -1
++      Processor Tree:
++        TableScan
++          alias: _dummy_table
++          Row Limit Per Split: 1
++          Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++          Select Operator
++            expressions: 2015-02-11 18:30:00.0 (type: timestamp)
++            outputColumnNames: _col0
++            Statistics: Num rows: 0 Data size: 1 Basic stats: PARTIAL Column stats: COMPLETE
++            ListSink
++
++PREHOOK: query: select
++to_utc_timestamp('2015-02-10 20:30:00', 'PST'),
++to_utc_timestamp('2015-02-11 08:30:00', 'Europe/Moscow'),
++to_utc_timestamp('2015-02-11 12:30:00', 'GMT+8'),
++to_utc_timestamp('2015-02-11 04:30:00', 'GMT'),
++to_utc_timestamp('2015-02-11 04:30:00', ''),
++to_utc_timestamp('2015-02-11 04:30:00', '---'),
++to_utc_timestamp(cast(null as string), 'PST'),
++to_utc_timestamp('2015-02-11 04:30:00', cast(null as string))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++to_utc_timestamp('2015-02-10 20:30:00', 'PST'),
++to_utc_timestamp('2015-02-11 08:30:00', 'Europe/Moscow'),
++to_utc_timestamp('2015-02-11 12:30:00', 'GMT+8'),
++to_utc_timestamp('2015-02-11 04:30:00', 'GMT'),
++to_utc_timestamp('2015-02-11 04:30:00', ''),
++to_utc_timestamp('2015-02-11 04:30:00', '---'),
++to_utc_timestamp(cast(null as string), 'PST'),
++to_utc_timestamp('2015-02-11 04:30:00', cast(null as string))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	NULL	NULL
++PREHOOK: query: select
++to_utc_timestamp(cast('2015-02-10 20:30:00' as timestamp), 'PST'),
++to_utc_timestamp(cast('2015-02-11 08:30:00' as timestamp), 'Europe/Moscow'),
++to_utc_timestamp(cast('2015-02-11 12:30:00' as timestamp), 'GMT+8'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), ''),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), '---'),
++to_utc_timestamp(cast(null as timestamp), 'PST'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), cast(null as string))
++PREHOOK: type: QUERY
++PREHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++POSTHOOK: query: select
++to_utc_timestamp(cast('2015-02-10 20:30:00' as timestamp), 'PST'),
++to_utc_timestamp(cast('2015-02-11 08:30:00' as timestamp), 'Europe/Moscow'),
++to_utc_timestamp(cast('2015-02-11 12:30:00' as timestamp), 'GMT+8'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), 'GMT'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), ''),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), '---'),
++to_utc_timestamp(cast(null as timestamp), 'PST'),
++to_utc_timestamp(cast('2015-02-11 04:30:00' as timestamp), cast(null as string))
++POSTHOOK: type: QUERY
++POSTHOOK: Input: _dummy_database@_dummy_table
++#### A masked pattern was here ####
++2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	2015-02-11 04:30:00	NULL	NULL
+-- 
+1.7.9.5
+

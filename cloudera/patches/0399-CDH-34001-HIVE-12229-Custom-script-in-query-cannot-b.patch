@@ -1,0 +1,260 @@
+From 8e6a1c9cd244bad3deaf51ff8effd77667a71bf1 Mon Sep 17 00:00:00 2001
+From: Rui Li <rui.li@intel.com>
+Date: Thu, 5 Nov 2015 16:48:25 +0800
+Subject: [PATCH 0399/1164] CDH-34001: HIVE-12229: Custom script in query
+ cannot be executed in yarn-cluster mode [Spark
+ Branch] (Rui reviewed by Xuefu)
+
+Conflicts:
+	ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+
+Change-Id: I536e84735ab510d0080e9255b94a7fc22e0441d3
+---
+ .../apache/hadoop/hive/ql/exec/ScriptOperator.java |   15 ++++++++++++
+ .../hive/ql/exec/spark/RemoteHiveSparkClient.java  |    4 ++--
+ .../hadoop/hive/ql/exec/spark/SparkUtilities.java  |   10 ++++----
+ .../org/apache/hive/spark/client/JobContext.java   |    4 ++--
+ .../apache/hive/spark/client/JobContextImpl.java   |    8 +++----
+ .../apache/hive/spark/client/SparkClientImpl.java  |    2 +-
+ .../hive/spark/client/SparkClientUtilities.java    |   24 +++++++++++++-------
+ 7 files changed, 44 insertions(+), 23 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/ScriptOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/ScriptOperator.java
+index 1aebe28..60a0ead 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/ScriptOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/ScriptOperator.java
+@@ -53,6 +53,8 @@
+ import org.apache.hadoop.mapred.Reporter;
+ import org.apache.hadoop.util.Shell;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.spark.SparkConf;
++import org.apache.spark.SparkEnv;
+ import org.apache.spark.SparkFiles;
+ 
+ /**
+@@ -325,6 +327,7 @@ public void processOp(Object row, int tag) throws HiveException {
+     // initialize the user's process only when you receive the first row
+     if (firstRow) {
+       firstRow = false;
++      SparkConf sparkConf = null;
+       try {
+         String[] cmdArgs = splitArgs(conf.getScriptCmd());
+ 
+@@ -337,6 +340,7 @@ public void processOp(Object row, int tag) throws HiveException {
+ 
+           // In spark local mode, we need to search added files in root directory.
+           if (HiveConf.getVar(hconf, HiveConf.ConfVars.HIVE_EXECUTION_ENGINE).equals("spark")) {
++            sparkConf = SparkEnv.get().conf();
+             finder.prependPathComponent(SparkFiles.getRootDirectory());
+           }
+           File f = finder.getAbsolutePath(prog);
+@@ -365,6 +369,17 @@ public void processOp(Object row, int tag) throws HiveException {
+         String idEnvVarVal = getOperatorId();
+         env.put(safeEnvVarName(idEnvVarName), idEnvVarVal);
+ 
++        // For spark, in non-local mode, any added dependencies are stored at
++        // SparkFiles::getRootDirectory, which is the executor's working directory.
++        // In local mode, we need to manually point the process's working directory to it,
++        // in order to make the dependencies accessible.
++        if (sparkConf != null) {
++          String master = sparkConf.get("spark.master");
++          if (master.equals("local") || master.startsWith("local[")) {
++            pb.directory(new File(SparkFiles.getRootDirectory()));
++          }
++        }
++
+         scriptPid = pb.start(); // Runtime.getRuntime().exec(wrappedCmdArgs);
+ 
+         DataOutputStream scriptOut = new DataOutputStream(
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+index 2e8d1d3..cf81424 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+@@ -295,11 +295,11 @@ public Serializable call(JobContext jc) throws Exception {
+ 
+       // Add jar to current thread class loader dynamically, and add jar paths to JobConf as Spark
+       // may need to load classes from this jar in other threads.
+-      Set<String> addedJars = jc.getAddedJars();
++      Map<String, Long> addedJars = jc.getAddedJars();
+       if (addedJars != null && !addedJars.isEmpty()) {
+         SparkClientUtilities.addToClassPath(addedJars, localJobConf, jc.getLocalTmpDir());
+         KryoSerializer.setClassLoader(Thread.currentThread().getContextClassLoader());
+-        localJobConf.set(Utilities.HIVE_ADDED_JARS, StringUtils.join(addedJars, ";"));
++        localJobConf.set(Utilities.HIVE_ADDED_JARS, StringUtils.join(addedJars.keySet(), ";"));
+       }
+ 
+       Path localScratchDir = KryoSerializer.deserialize(scratchDirBytes, Path.class);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+index 39210ac..f4dd5bc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkUtilities.java
+@@ -21,7 +21,7 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+-import java.util.UUID;
++import java.util.Collection;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+@@ -78,11 +78,11 @@ public static URI getURI(String path) throws URISyntaxException {
+    */
+   public static URI uploadToHDFS(URI source, HiveConf conf) throws IOException {
+     Path localFile = new Path(source.getPath());
+-    // give the uploaded file a UUID
+-    Path remoteFile = new Path(SessionState.getHDFSSessionPath(conf),
+-        UUID.randomUUID() + "-" + getFileName(source));
++    Path remoteFile = new Path(SessionState.getHDFSSessionPath(conf), getFileName(source));
+     FileSystem fileSystem = FileSystem.get(conf);
+-    fileSystem.copyFromLocalFile(localFile, remoteFile);
++    // Overwrite if the remote file already exists. Whether the file can be added
++    // on executor is up to spark, i.e. spark.files.overwrite
++    fileSystem.copyFromLocalFile(false, true, localFile, remoteFile);
+     Path fullPath = fileSystem.getFileStatus(remoteFile).getPath();
+     return fullPath.toUri();
+   }
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/JobContext.java b/spark-client/src/main/java/org/apache/hive/spark/client/JobContext.java
+index af6332e..c9c975b 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/JobContext.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/JobContext.java
+@@ -55,9 +55,9 @@
+   Map<String, List<JavaFutureAction<?>>> getMonitoredJobs();
+ 
+   /**
+-   * Return all added jar path which added through AddJarJob.
++   * Return all added jar path and timestamp which added through AddJarJob.
+    */
+-  Set<String> getAddedJars();
++  Map<String, Long> getAddedJars();
+ 
+   /**
+    * Returns a local tmp dir specific to the context
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/JobContextImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/JobContextImpl.java
+index beed8a3..b73bcd7 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/JobContextImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/JobContextImpl.java
+@@ -18,12 +18,10 @@
+ package org.apache.hive.spark.client;
+ 
+ import java.io.File;
+-import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.CopyOnWriteArrayList;
+ 
+ import org.apache.hive.spark.counter.SparkCounters;
+ 
+@@ -35,14 +33,14 @@
+   private final JavaSparkContext sc;
+   private final ThreadLocal<MonitorCallback> monitorCb;
+   private final Map<String, List<JavaFutureAction<?>>> monitoredJobs;
+-  private final Set<String> addedJars;
++  private final Map<String, Long> addedJars;
+   private final File localTmpDir;
+ 
+   public JobContextImpl(JavaSparkContext sc, File localTmpDir) {
+     this.sc = sc;
+     this.monitorCb = new ThreadLocal<MonitorCallback>();
+     monitoredJobs = new ConcurrentHashMap<String, List<JavaFutureAction<?>>>();
+-    addedJars = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
++    addedJars = new ConcurrentHashMap<>();
+     this.localTmpDir = localTmpDir;
+   }
+ 
+@@ -65,7 +63,7 @@ public JavaSparkContext sc() {
+   }
+ 
+   @Override
+-  public Set<String> getAddedJars() {
++  public Map<String, Long> getAddedJars() {
+     return addedJars;
+   }
+ 
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+index ceebbb3..3d682a0 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+@@ -617,7 +617,7 @@ public Serializable call(JobContext jc) throws Exception {
+       jc.sc().addJar(path);
+       // Following remote job may refer to classes in this jar, and the remote job would be executed
+       // in a different thread, so we add this jar path to JobContext for further usage.
+-      jc.getAddedJars().add(path);
++      jc.getAddedJars().put(path, System.currentTimeMillis());
+       return null;
+     }
+ 
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java
+index 589436d..bbbd97b 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientUtilities.java
+@@ -24,7 +24,8 @@
+ import java.net.URL;
+ import java.net.URLClassLoader;
+ import java.util.List;
+-import java.util.Set;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+@@ -35,20 +36,21 @@
+ 
+ public class SparkClientUtilities {
+   protected static final transient Log LOG = LogFactory.getLog(SparkClientUtilities.class);
++  private static final Map<String, Long> downloadedFiles = new ConcurrentHashMap<>();
+ 
+   /**
+    * Add new elements to the classpath.
+    *
+-   * @param newPaths Set of classpath elements
++   * @param newPaths Map of classpath elements and corresponding timestamp
+    */
+-  public static void addToClassPath(Set<String> newPaths, Configuration conf, File localTmpDir)
++  public static void addToClassPath(Map<String, Long> newPaths, Configuration conf, File localTmpDir)
+       throws Exception {
+     URLClassLoader loader = (URLClassLoader) Thread.currentThread().getContextClassLoader();
+     List<URL> curPath = Lists.newArrayList(loader.getURLs());
+ 
+     boolean newPathAdded = false;
+-    for (String newPath : newPaths) {
+-      URL newUrl = urlFromPathString(newPath, conf, localTmpDir);
++    for (Map.Entry<String, Long> entry : newPaths.entrySet()) {
++      URL newUrl = urlFromPathString(entry.getKey(), entry.getValue(), conf, localTmpDir);
+       if (newUrl != null && !curPath.contains(newUrl)) {
+         curPath.add(newUrl);
+         LOG.info("Added jar[" + newUrl + "] to classpath.");
+@@ -69,7 +71,8 @@ public static void addToClassPath(Set<String> newPaths, Configuration conf, File
+    * @param path  path string
+    * @return
+    */
+-  private static URL urlFromPathString(String path, Configuration conf, File localTmpDir) {
++  private static URL urlFromPathString(String path, Long timeStamp,
++      Configuration conf, File localTmpDir) {
+     URL url = null;
+     try {
+       if (StringUtils.indexOf(path, "file:/") == 0) {
+@@ -78,12 +81,17 @@ private static URL urlFromPathString(String path, Configuration conf, File local
+         Path remoteFile = new Path(path);
+         Path localFile =
+             new Path(localTmpDir.getAbsolutePath() + File.separator + remoteFile.getName());
+-        if (!new File(localFile.toString()).exists()) {
++        Long currentTS = downloadedFiles.get(path);
++        if (currentTS == null) {
++          currentTS = -1L;
++        }
++        if (!new File(localFile.toString()).exists() || currentTS < timeStamp) {
+           LOG.info("Copying " + remoteFile + " to " + localFile);
+           FileSystem remoteFS = remoteFile.getFileSystem(conf);
+           remoteFS.copyToLocalFile(remoteFile, localFile);
++          downloadedFiles.put(path, timeStamp);
+         }
+-        return urlFromPathString(localFile.toString(), conf, localTmpDir);
++        return urlFromPathString(localFile.toString(), timeStamp, conf, localTmpDir);
+       } else {
+         url = new File(path).toURL();
+       }
+-- 
+1.7.9.5
+

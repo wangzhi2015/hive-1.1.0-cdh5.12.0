@@ -1,0 +1,157 @@
+From 92e5478ec108d48a97a159cc27bfc90aecf17556 Mon Sep 17 00:00:00 2001
+From: ctang <ctang@cloudera.com>
+Date: Fri, 30 Sep 2016 21:33:28 -0400
+Subject: [PATCH 0785/1164] CDH-45460: HIVE-9423: HiveServer2: Provide the
+ user with different error messages depending on
+ the Thrift client exception code (Peter Vary via
+ Chaoyu Tang)
+
+Change-Id: Ie438f2e4a9b3f4e7235799608ade5655577903fd
+---
+ .../src/java/org/apache/hive/beeline/BeeLine.java  |   21 +++++-
+ beeline/src/main/resources/BeeLine.properties      |   10 ++-
+ .../hive/beeline/TestBeeLineExceptionHandling.java |   72 ++++++++++++++++++++
+ 3 files changed, 101 insertions(+), 2 deletions(-)
+ create mode 100644 beeline/src/test/org/apache/hive/beeline/TestBeeLineExceptionHandling.java
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/BeeLine.java b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+index b68a786..ab7dd1c 100644
+--- a/beeline/src/java/org/apache/hive/beeline/BeeLine.java
++++ b/beeline/src/java/org/apache/hive/beeline/BeeLine.java
+@@ -96,6 +96,7 @@
+ 
+ import org.apache.hive.jdbc.Utils;
+ import org.apache.hive.jdbc.Utils.JdbcConnectionParams;
++import org.apache.thrift.transport.TTransportException;
+ 
+ /**
+  * A console SQL shell with command completion.
+@@ -1783,7 +1784,25 @@ void handleSQLException(SQLException e) {
+     }
+ 
+     if (e.getCause() instanceof TTransportException) {
+-      error(loc("hs2-unavailable"));
++      switch (((TTransportException)e.getCause()).getType()) {
++        case TTransportException.ALREADY_OPEN:
++          error(loc("hs2-connection-already-open"));
++          break;
++        case TTransportException.END_OF_FILE:
++          error(loc("hs2-unexpected-end-of-file"));
++          break;
++        case TTransportException.NOT_OPEN:
++          error(loc("hs2-could-not-open-connection"));
++          break;
++        case TTransportException.TIMED_OUT:
++          error(loc("hs2-connection-timed-out"));
++          break;
++        case TTransportException.UNKNOWN:
++          error(loc("hs2-unknown-connection-problem"));
++          break;
++        default:
++          error(loc("hs2-unexpected-error"));
++      }
+     }
+ 
+     error(loc(e instanceof SQLWarning ? "Warning" : "Error",
+diff --git a/beeline/src/main/resources/BeeLine.properties b/beeline/src/main/resources/BeeLine.properties
+index e649209..52f080a 100644
+--- a/beeline/src/main/resources/BeeLine.properties
++++ b/beeline/src/main/resources/BeeLine.properties
+@@ -142,7 +142,15 @@ active-connections: 0#No active connections|1#{0} active connection:|1<{0} activ
+ 
+ time-ms: ({0,number,#.###} seconds)
+ 
+-hs2-unavailable: HS2 may be unavailable, check server status
++hs2-connection-already-open: Socket already connected.
++hs2-unexpected-end-of-file: Unexpected end of file when reading from HS2 server. The root \
++cause might be too many concurrent connections. Please ask the administrator to check the number \
++of active connections, and adjust hive.server2.thrift.max.worker.threads if applicable.
++hs2-could-not-open-connection: Could not open connection to the HS2 server. Please check the \
++server URI and if the URI is correct, then ask the administrator to check the server status.\
++hs2-connection-timed-out: Connection timeout when communicating with HS2 server.
++hs2-unknown-connection-problem: Unknown HS2 problem when communicating with Thrift server.
++hs2-unexpected-error: Unexpected HS2 error when communicating with the Thrift server.
+ 
+ cmd-usage: Usage: java org.apache.hive.cli.beeline.BeeLine \n \
+ \  -u <database url>               the JDBC URL to connect to\n \
+diff --git a/beeline/src/test/org/apache/hive/beeline/TestBeeLineExceptionHandling.java b/beeline/src/test/org/apache/hive/beeline/TestBeeLineExceptionHandling.java
+new file mode 100644
+index 0000000..08579e8
+--- /dev/null
++++ b/beeline/src/test/org/apache/hive/beeline/TestBeeLineExceptionHandling.java
+@@ -0,0 +1,72 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * <p/>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p/>
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hive.beeline;
++
++import junit.framework.Assert;
++import org.apache.thrift.transport.TTransportException;
++import org.junit.Test;
++import org.mockito.ArgumentCaptor;
++
++import java.sql.SQLException;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++public class TestBeeLineExceptionHandling {
++
++  public class TestBeeline extends BeeLine {
++    private String expectedLoc;
++    private int logCount;
++    public TestBeeline(String expectedLoc) {
++      this.expectedLoc = expectedLoc;
++      this.logCount = 0;
++    }
++
++    @Override
++    boolean error(String log) {
++      if (logCount == 0) {
++        Assert.assertEquals(loc(expectedLoc), log);
++      } else {
++        Assert.assertEquals("Error: org.apache.thrift.transport.TTransportException "
++            + "(state=,code=0)", log);
++      }
++      logCount++;
++      return false;
++    }
++  }
++
++  @Test
++  public void testHandleSQLExceptionLog() throws Exception {
++    checkException(TTransportException.ALREADY_OPEN, "hs2-connection-already-open");
++    checkException(TTransportException.END_OF_FILE, "hs2-unexpected-end-of-file");
++    checkException(TTransportException.NOT_OPEN, "hs2-could-not-open-connection");
++    checkException(TTransportException.TIMED_OUT, "hs2-connection-timed-out");
++    checkException(TTransportException.UNKNOWN, "hs2-unknown-connection-problem");
++    checkException(-1, "hs2-unexpected-error");
++  }
++
++  private void checkException(int type, String loc) {
++    BeeLine testBeeLine = new TestBeeline(loc);
++    TTransportException tTransportException = new TTransportException(type);
++    SQLException sqlException = new SQLException(tTransportException);
++    testBeeLine.handleSQLException(sqlException);
++  }
++}
+-- 
+1.7.9.5
+

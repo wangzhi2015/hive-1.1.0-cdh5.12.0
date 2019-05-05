@@ -1,0 +1,2487 @@
+From 764200caacc13d9c8987030e26b82ab36e26a40b Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Mon, 2 Feb 2015 17:04:41 +0000
+Subject: [PATCH 0368/1164] HIVE-9298 : Support reading alternate timestamp
+ formats (Jason Dere via Ashutosh Chauhan)
+
+Change-Id: Ic14dac59382ddbe21641c67a2b57bf769f5f6884
+---
+ common/pom.xml                                     |    5 +
+ .../apache/hive/common/util/HiveStringUtils.java   |   29 ++++
+ .../apache/hive/common/util/TimestampParser.java   |  151 ++++++++++++++++
+ .../hive/common/util/TestHiveStringUtils.java      |   64 +++++++
+ .../hive/common/util/TestTimestampParser.java      |  181 ++++++++++++++++++++
+ data/files/ts_formats.txt                          |   21 +++
+ .../hadoop/hive/hbase/DefaultHBaseKeyFactory.java  |    4 +-
+ .../hadoop/hive/hbase/HBaseLazyObjectFactory.java  |    9 +-
+ .../hive/hbase/struct/AvroHBaseValueFactory.java   |    4 +-
+ .../hbase/struct/DefaultHBaseValueFactory.java     |    5 +-
+ .../test/queries/positive/hbase_timestamp_format.q |   21 +++
+ .../results/positive/hbase_timestamp_format.q.out  |   94 ++++++++++
+ pom.xml                                            |    1 +
+ ql/pom.xml                                         |    6 +
+ .../queries/clientpositive/timestamp_formats.q     |   23 +++
+ .../results/clientpositive/timestamp_formats.q.out |  145 ++++++++++++++++
+ .../hadoop/hive/serde/test/ThriftTestObj.java      |    4 +-
+ .../hadoop/hive/serde2/thrift/test/Complex.java    |   12 +-
+ .../hadoop/hive/serde2/thrift/test/MegaStruct.java |   32 ++--
+ .../hive/serde2/thrift/test/PropValueUnion.java    |    4 +-
+ .../hive/serde2/thrift/test/SetIntString.java      |    4 +-
+ .../hive/serde2/avro/AvroLazyObjectInspector.java  |    8 +
+ .../hadoop/hive/serde2/columnar/ColumnarSerDe.java |    4 +-
+ .../hadoop/hive/serde2/lazy/LazyFactory.java       |  120 +++++++++----
+ .../hive/serde2/lazy/LazySerDeParameters.java      |    9 +-
+ .../hadoop/hive/serde2/lazy/LazySimpleSerDe.java   |    8 +-
+ .../hadoop/hive/serde2/lazy/LazyTimestamp.java     |    2 +-
+ .../objectinspector/LazyListObjectInspector.java   |   21 +--
+ .../objectinspector/LazyMapObjectInspector.java    |   33 +++-
+ .../LazyObjectInspectorFactory.java                |  114 +++++++-----
+ .../LazySimpleStructObjectInspector.java           |   49 ++++--
+ .../objectinspector/LazyUnionObjectInspector.java  |   42 ++---
+ .../primitive/LazyObjectInspectorParameters.java   |   33 ++++
+ .../LazyObjectInspectorParametersImpl.java         |  144 ++++++++++++++++
+ .../LazyPrimitiveObjectInspectorFactory.java       |   38 +++-
+ .../primitive/LazyTimestampObjectInspector.java    |   23 ++-
+ 36 files changed, 1279 insertions(+), 188 deletions(-)
+ create mode 100644 common/src/java/org/apache/hive/common/util/TimestampParser.java
+ create mode 100644 common/src/test/org/apache/hive/common/util/TestHiveStringUtils.java
+ create mode 100644 common/src/test/org/apache/hive/common/util/TestTimestampParser.java
+ create mode 100644 data/files/ts_formats.txt
+ create mode 100644 hbase-handler/src/test/queries/positive/hbase_timestamp_format.q
+ create mode 100644 hbase-handler/src/test/results/positive/hbase_timestamp_format.q.out
+ create mode 100644 ql/src/test/queries/clientpositive/timestamp_formats.q
+ create mode 100644 ql/src/test/results/clientpositive/timestamp_formats.q.out
+ create mode 100644 serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParameters.java
+ create mode 100644 serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParametersImpl.java
+
+diff --git a/common/pom.xml b/common/pom.xml
+index 25c22dc..8137634 100644
+--- a/common/pom.xml
++++ b/common/pom.xml
+@@ -56,6 +56,11 @@
+       <version>${commons-logging.version}</version>
+     </dependency>
+     <dependency>
++      <groupId>joda-time</groupId>
++      <artifactId>joda-time</artifactId>
++      <version>${joda.version}</version>
++    </dependency>
++    <dependency>
+       <groupId>log4j</groupId>
+       <artifactId>log4j</artifactId>
+       <version>${log4j.version}</version>
+diff --git a/common/src/java/org/apache/hive/common/util/HiveStringUtils.java b/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
+index 8db2c2c..4bac077 100644
+--- a/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
++++ b/common/src/java/org/apache/hive/common/util/HiveStringUtils.java
+@@ -45,6 +45,7 @@
+ import org.apache.hadoop.hive.common.classification.InterfaceAudience;
+ import org.apache.hadoop.hive.common.classification.InterfaceStability;
+ import org.apache.hadoop.io.Text;
++import org.apache.hadoop.util.StringUtils;
+ 
+ /**
+  * HiveStringUtils
+@@ -492,6 +493,34 @@ public static String getFormattedTimeWithDiff(DateFormat dateFormat,
+   }
+ 
+   /**
++   * Split a string using the default separator/escape character,
++   * then unescape the resulting array of strings
++   * @param str
++   * @return an array of unescaped strings
++   */
++  public static String[] splitAndUnEscape(String str) {
++    return splitAndUnEscape(str, ESCAPE_CHAR, COMMA);
++  }
++
++  /**
++   * Split a string using the specified separator/escape character,
++   * then unescape the resulting array of strings using the same escape/separator.
++   * @param str a string that may have escaped separator
++   * @param escapeChar a char that be used to escape the separator
++   * @param separator a separator char
++   * @return an array of unescaped strings
++   */
++  public static String[] splitAndUnEscape(String str, char escapeChar, char separator) {
++    String[] result = split(str, escapeChar, separator);
++    if (result != null) {
++      for (int idx = 0; idx < result.length; ++idx) {
++        result[idx] = unEscapeString(result[idx], escapeChar, separator);
++      }
++    }
++    return result;
++  }
++
++  /**
+    * Finds the first occurrence of the separator character ignoring the escaped
+    * separators starting from the index. Note the substring between the index
+    * and the position of the separator is passed.
+diff --git a/common/src/java/org/apache/hive/common/util/TimestampParser.java b/common/src/java/org/apache/hive/common/util/TimestampParser.java
+new file mode 100644
+index 0000000..db7ea25
+--- /dev/null
++++ b/common/src/java/org/apache/hive/common/util/TimestampParser.java
+@@ -0,0 +1,151 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.common.util;
++
++import java.math.BigDecimal;
++import java.sql.Timestamp;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import org.joda.time.DateTime;
++import org.joda.time.MutableDateTime;
++import org.joda.time.DateTimeFieldType;
++import org.joda.time.format.DateTimeFormat;
++import org.joda.time.format.DateTimeFormatter;
++import org.joda.time.format.DateTimeFormatterBuilder;
++import org.joda.time.format.DateTimeParser;
++import org.joda.time.format.DateTimeParserBucket;
++
++/**
++ * Timestamp parser using Joda DateTimeFormatter. Parser accepts 0 or more date time format
++ * patterns. If no format patterns are provided it will default to the normal Timestamp parsing.
++ * Datetime formats are compatible with Java SimpleDateFormat. Also added special case pattern
++ * "millis" to parse the string as milliseconds since Unix epoch.
++ * Since this uses Joda DateTimeFormatter, this parser should be thread safe.
++ */
++public class TimestampParser {
++
++  protected final static String[] stringArray = new String[] {};
++  protected final static String millisFormatString = "millis";
++  protected final static DateTime startingDateValue = new DateTime(1970, 1, 1, 0, 0, 0, 0);
++
++  protected String[] formatStrings = null;
++  protected DateTimeFormatter fmt = null;
++
++  public TimestampParser() {
++  }
++
++  public TimestampParser(TimestampParser tsParser) {
++    this(tsParser.formatStrings == null ?
++        null : Arrays.copyOf(tsParser.formatStrings, tsParser.formatStrings.length));
++  }
++
++  public TimestampParser(List<String> formatStrings) {
++    this(formatStrings == null ? null : formatStrings.toArray(stringArray));
++  }
++
++  public TimestampParser(String[] formatStrings) {
++    this.formatStrings = formatStrings;
++
++    // create formatter that includes all of the input patterns
++    if (formatStrings != null && formatStrings.length > 0) {
++      DateTimeParser[] parsers = new DateTimeParser[formatStrings.length];
++      for (int idx = 0; idx < formatStrings.length; ++idx) {
++        String formatString = formatStrings[idx];
++        if (formatString.equalsIgnoreCase(millisFormatString)) {
++          // Use milliseconds parser if pattern matches our special-case millis pattern string
++          parsers[idx] = new MillisDateFormatParser();
++        } else {
++          parsers[idx] = DateTimeFormat.forPattern(formatString).getParser();
++        }
++      }
++      fmt = new DateTimeFormatterBuilder().append(null, parsers).toFormatter();
++    }
++  }
++
++  /**
++   * Parse the input string and return a timestamp value
++   * @param strValue
++   * @return
++   * @throws IllegalArgumentException if input string cannot be parsed into timestamp
++   */
++  public Timestamp parseTimestamp(String strValue) throws IllegalArgumentException {
++    if (fmt != null) {
++      // reset value in case any date fields are missing from the date pattern
++      MutableDateTime mdt = new MutableDateTime(startingDateValue);
++
++      // Using parseInto() avoids throwing exception when parsing,
++      // allowing fallback to default timestamp parsing if custom patterns fail.
++      int ret = fmt.parseInto(mdt, strValue, 0);
++      // Only accept parse results if we parsed the entire string
++      if (ret == strValue.length()) {
++        return new Timestamp(mdt.getMillis());
++      }
++    }
++
++    // Otherwise try default timestamp parsing
++    return Timestamp.valueOf(strValue);
++  }
++
++  /**
++   * DateTimeParser to parse the date string as the millis since Unix epoch
++   */
++  public static class MillisDateFormatParser implements DateTimeParser {
++    private static final ThreadLocal<Matcher> numericMatcher = new ThreadLocal<Matcher>() {
++      @Override
++      protected Matcher initialValue() {
++        return Pattern.compile("(-?\\d+)(\\.\\d+)?$").matcher("");
++      }
++    };
++
++    private final static DateTimeFieldType[] dateTimeFields = {
++      DateTimeFieldType.year(),
++      DateTimeFieldType.monthOfYear(),
++      DateTimeFieldType.dayOfMonth(),
++      DateTimeFieldType.hourOfDay(),
++      DateTimeFieldType.minuteOfHour(),
++      DateTimeFieldType.secondOfMinute(),
++      DateTimeFieldType.millisOfSecond()
++    };
++
++    public int estimateParsedLength() {
++      return 13; // Shouldn't hit 14 digits until year 2286
++    }
++
++    public int parseInto(DateTimeParserBucket bucket, String text, int position) {
++      String substr = text.substring(position);
++      Matcher matcher = numericMatcher.get();
++      matcher.reset(substr);
++      if (!matcher.matches()) {
++        return -1;
++      }
++
++      // Joda DateTime only has precision to millis, cut off any fractional portion
++      long millis = Long.parseLong(matcher.group(1));
++      DateTime dt = new DateTime(millis);
++      for (DateTimeFieldType field : dateTimeFields) {
++        bucket.saveField(field, dt.get(field));
++      }
++      return substr.length();
++    }
++  }
++}
+diff --git a/common/src/test/org/apache/hive/common/util/TestHiveStringUtils.java b/common/src/test/org/apache/hive/common/util/TestHiveStringUtils.java
+new file mode 100644
+index 0000000..6bd7037
+--- /dev/null
++++ b/common/src/test/org/apache/hive/common/util/TestHiveStringUtils.java
+@@ -0,0 +1,64 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.common.util;
++
++import static org.junit.Assert.*;
++
++import java.util.Arrays;
++
++import org.junit.Test;
++
++public class TestHiveStringUtils {
++  @Test
++  public void testSplitAndUnEscape() throws Exception {
++    splitAndUnEscapeTestCase(
++        null, null);
++
++    splitAndUnEscapeTestCase(
++        "'single element'",
++        new String[] {
++            "'single element'"
++        });
++
++    splitAndUnEscapeTestCase(
++        "yyyy-MM-dd'T'HH:mm:ss,yyyy-MM-dd'T'HH:mm:ss.S",
++        new String[] {
++            "yyyy-MM-dd'T'HH:mm:ss",
++            "yyyy-MM-dd'T'HH:mm:ss.S"
++        });
++
++    splitAndUnEscapeTestCase(
++        "single\\,element",
++        new String[] {
++            "single,element"
++        });
++    splitAndUnEscapeTestCase(
++        "element\\,one\\\\,element\\\\two\\\\\\,",
++        new String[] {
++            "element,one\\",
++            "element\\two\\,"
++        });
++  }
++
++  public void splitAndUnEscapeTestCase(String testValue, String[] expectedResults) throws Exception {
++    String[] testResults = HiveStringUtils.splitAndUnEscape(testValue);
++    assertTrue(Arrays.toString(expectedResults) + " == " + Arrays.toString(testResults),
++        Arrays.equals(expectedResults, testResults));
++  }
++}
+diff --git a/common/src/test/org/apache/hive/common/util/TestTimestampParser.java b/common/src/test/org/apache/hive/common/util/TestTimestampParser.java
+new file mode 100644
+index 0000000..4917603
+--- /dev/null
++++ b/common/src/test/org/apache/hive/common/util/TestTimestampParser.java
+@@ -0,0 +1,181 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hive.common.util;
++
++import java.sql.Timestamp;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.Assert.*;
++import org.junit.Test;
++
++public class TestTimestampParser {
++  public static class ValidTimestampCase {
++    String strValue;
++    Timestamp expectedValue;
++
++    public ValidTimestampCase(String strValue, Timestamp expectedValue) {
++      this.strValue = strValue;
++      this.expectedValue = expectedValue;
++    }
++  }
++
++  static void testValidCases(TimestampParser tp, ValidTimestampCase[] validCases) {
++    for (ValidTimestampCase validCase : validCases) {
++      Timestamp ts = tp.parseTimestamp(validCase.strValue);
++      assertEquals("Parsing " + validCase.strValue, validCase.expectedValue, ts);
++    }
++  }
++
++  static void testInvalidCases(TimestampParser tp, String[] invalidCases) {
++    for (String invalidString : invalidCases) {
++      try {
++        Timestamp ts = tp.parseTimestamp(invalidString);
++        fail("Expected exception parsing " + invalidString + ", but parsed value to " + ts);
++      } catch (IllegalArgumentException err) {
++        // Exception expected
++      }
++    }
++  }
++
++  @Test
++  public void testDefault() {
++    // No timestamp patterns, should default to normal timestamp format
++    TimestampParser tp = new TimestampParser();
++    ValidTimestampCase[] validCases = {
++        new ValidTimestampCase("1945-12-31 23:59:59.0",
++            Timestamp.valueOf("1945-12-31 23:59:59.0")),
++        new ValidTimestampCase("1945-12-31 23:59:59.1234",
++            Timestamp.valueOf("1945-12-31 23:59:59.1234")),
++        new ValidTimestampCase("1970-01-01 00:00:00",
++            Timestamp.valueOf("1970-01-01 00:00:00")),
++    };
++
++    String[] invalidCases = {
++        "1945-12-31T23:59:59",
++        "12345",
++    };
++
++    testValidCases(tp, validCases);
++    testInvalidCases(tp, invalidCases);
++  }
++
++  @Test
++  public void testPattern1() {
++    // Joda pattern matching expects fractional seconds length to match
++    // the number of 'S' in the pattern. So if you want to match .1, .12, .123,
++    // you need 3 different patterns with .S, .SS, .SSS
++    String[] patterns = {
++        // ISO-8601 timestamps
++        "yyyy-MM-dd'T'HH:mm:ss",
++        "yyyy-MM-dd'T'HH:mm:ss.S",
++        "yyyy-MM-dd'T'HH:mm:ss.SS",
++        "yyyy-MM-dd'T'HH:mm:ss.SSS",
++        "yyyy-MM-dd'T'HH:mm:ss.SSSS",
++    };
++    TimestampParser tp = new TimestampParser(patterns);
++
++    ValidTimestampCase[] validCases = {
++        new ValidTimestampCase("1945-12-31T23:59:59.0",
++            Timestamp.valueOf("1945-12-31 23:59:59.0")),
++        new ValidTimestampCase("2001-01-01 00:00:00.100",
++            Timestamp.valueOf("2001-01-01 00:00:00.100")),
++        new ValidTimestampCase("2001-01-01 00:00:00.001",
++            Timestamp.valueOf("2001-01-01 00:00:00.001")),
++        // Joda parsing only supports up to millisecond precision
++        new ValidTimestampCase("1945-12-31T23:59:59.1234",
++            Timestamp.valueOf("1945-12-31 23:59:59.123")),
++        new ValidTimestampCase("1970-01-01T00:00:00",
++            Timestamp.valueOf("1970-01-01 00:00:00")),
++        new ValidTimestampCase("1970-4-5T6:7:8",
++             Timestamp.valueOf("1970-04-05 06:07:08")),
++
++        // Default timestamp format still works?
++        new ValidTimestampCase("2001-01-01 00:00:00",
++            Timestamp.valueOf("2001-01-01 00:00:00")),
++        new ValidTimestampCase("1945-12-31 23:59:59.1234",
++            Timestamp.valueOf("1945-12-31 23:59:59.1234")),
++    };
++
++    String[] invalidCases = {
++        "1945-12-31-23:59:59",
++        "1945-12-31T23:59:59.12345", // our pattern didn't specify 5 decimal places
++        "12345",
++    };
++
++    testValidCases(tp, validCases);
++    testInvalidCases(tp, invalidCases);
++  }
++
++  @Test
++  public void testMillisParser() {
++    String[] patterns = {
++        "millis",
++        // Also try other patterns
++        "yyyy-MM-dd'T'HH:mm:ss",
++    };
++    TimestampParser tp = new TimestampParser(patterns);
++
++    ValidTimestampCase[] validCases = {
++        new ValidTimestampCase("0", new Timestamp(0)),
++        new ValidTimestampCase("-1000000", new Timestamp(-1000000)),
++        new ValidTimestampCase("1420509274123", new Timestamp(1420509274123L)),
++        new ValidTimestampCase("1420509274123.456789", new Timestamp(1420509274123L)),
++
++        // Other format pattern should also work
++        new ValidTimestampCase("1945-12-31T23:59:59",
++            Timestamp.valueOf("1945-12-31 23:59:59")),
++    };
++
++    String[] invalidCases = {
++        "1945-12-31-23:59:59",
++        "1945-12-31T23:59:59.12345", // our pattern didn't specify 5 decimal places
++        "1420509274123-",
++    };
++
++    testValidCases(tp, validCases);
++    testInvalidCases(tp, invalidCases);
++  }
++
++  @Test
++  public void testPattern2() {
++    // Pattern does not contain all date fields
++    String[] patterns = {
++        "HH:mm",
++        "MM:dd:ss",
++    };
++    TimestampParser tp = new TimestampParser(patterns);
++
++    ValidTimestampCase[] validCases = {
++        new ValidTimestampCase("05:06",
++            Timestamp.valueOf("1970-01-01 05:06:00")),
++        new ValidTimestampCase("05:06:07",
++            Timestamp.valueOf("1970-05-06 00:00:07")),
++    };
++
++    String[] invalidCases = {
++        "1945-12-31T23:59:59",
++        "1945:12:31-",
++        "12345",
++    };
++
++    testValidCases(tp, validCases);
++    testInvalidCases(tp, invalidCases);
++  }
++}
+diff --git a/data/files/ts_formats.txt b/data/files/ts_formats.txt
+new file mode 100644
+index 0000000..e13718b
+--- /dev/null
++++ b/data/files/ts_formats.txt
+@@ -0,0 +1,21 @@
++2011-01-01 01:01:01.1111111112011-01-01 01:01:01.1111111112011-01-01T01:01:01.1111111112011-01-01T01:01:01.1111111112011-01-01T01:01:012011-01-01T01:01:01
++2012-02-02 02:02:02.2222222222012-02-02 02:02:02.2222222222012-02-02T02:02:02.2222222222012-02-02T02:02:02.2222222222012-02-02T02:02:022012-02-02T02:02:02
++2013-03-03 03:03:03.3333333332013-03-03 03:03:03.3333333332013-03-03T03:03:03.3333333332013-03-03T03:03:03.3333333332013-03-03T03:03:032013-03-03T03:03:03
++2014-04-04 04:04:04.4444444442014-04-04 04:04:04.4444444442014-04-04T04:04:04.4444444442014-04-04T04:04:04.4444444442014-04-04T04:04:042014-04-04T04:04:04
++2015-05-05 05:05:05.5555555552015-05-05 05:05:05.5555555552015-05-05T05:05:05.5555555552015-05-05T05:05:05.5555555552015-05-05T05:05:052015-05-05T05:05:05
++2016-06-06 06:06:06.6666666662016-06-06 06:06:06.6666666662016-06-06T06:06:06.6666666662016-06-06T06:06:06.6666666662016-06-06T06:06:062016-06-06T06:06:06
++2017-07-07 07:07:07.7777777772017-07-07 07:07:07.7777777772017-07-07T07:07:07.7777777772017-07-07T07:07:07.7777777772017-07-07T07:07:072017-07-07T07:07:07
++2018-08-08 08:08:08.8888888882018-08-08 08:08:08.8888888882018-08-08T08:08:08.8888888882018-08-08T08:08:08.8888888882018-08-08T08:08:082018-08-08T08:08:08
++2019-09-09 09:09:09.9999999992019-09-09 09:09:09.9999999992019-09-09T09:09:09.9999999992019-09-09T09:09:09.9999999992019-09-09T09:09:092019-09-09T09:09:09
++2020-10-10 10:10:10.1010101012020-10-10 10:10:10.1010101012020-10-10T10:10:10.1010101012020-10-10T10:10:10.1010101012020-10-10T10:10:102020-10-10T10:10:10
++2021-11-11 11:11:11.1111111112021-11-11 11:11:11.1111111112021-11-11T11:11:11.1111111112021-11-11T11:11:11.1111111112021-11-11T11:11:112021-11-11T11:11:11
++2022-12-12 12:12:12.1212121212022-12-12 12:12:12.1212121212022-12-12T12:12:12.1212121212022-12-12T12:12:12.1212121212022-12-12T12:12:122022-12-12T12:12:12
++2023-01-02 13:13:13.1313131312023-01-02 13:13:13.1313131312023-01-02T13:13:13.1313131312023-01-02T13:13:13.1313131312023-01-02T13:13:132023-01-02T13:13:13
++2024-02-02 14:14:14.1414141412024-02-02 14:14:14.1414141412024-02-02T14:14:14.1414141412024-02-02T14:14:14.1414141412024-02-02T14:14:142024-02-02T14:14:14
++2025-03-03 15:15:15.1515151512025-03-03 15:15:15.1515151512025-03-03T15:15:15.1515151512025-03-03T15:15:15.1515151512025-03-03T15:15:152025-03-03T15:15:15
++2026-04-04 16:16:16.1616161612026-04-04 16:16:16.1616161612026-04-04T16:16:16.1616161612026-04-04T16:16:16.1616161612026-04-04T16:16:162026-04-04T16:16:16
++2027-05-05 17:17:17.1717171712027-05-05 17:17:17.1717171712027-05-05T17:17:17.1717171712027-05-05T17:17:17.1717171712027-05-05T17:17:172027-05-05T17:17:17
++2028-06-06 18:18:18.1818181812028-06-06 18:18:18.1818181812028-06-06T18:18:18.1818181812028-06-06T18:18:18.1818181812028-06-06T18:18:182028-06-06T18:18:18
++2029-07-07 19:19:19.1919191912029-07-07 19:19:19.1919191912029-07-07T19:19:19.1919191912029-07-07T19:19:19.1919191912029-07-07T19:19:192029-07-07T19:19:19
++2030-08-08 20:20:20.2020202022030-08-08 20:20:20.2020202022030-08-08T20:20:20.2020202022030-08-08T20:20:20.2020202022030-08-08T20:20:202030-08-08T20:20:20
++2031-09-09 21:21:21.2121212122031-09-09 21:21:21.2121212122031-09-09T21:21:21.2121212122031-09-09T21:21:21.2121212122031-09-09T21:21:212031-09-09T21:21:21
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/DefaultHBaseKeyFactory.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/DefaultHBaseKeyFactory.java
+index c2bc847..7e7ebb6 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/DefaultHBaseKeyFactory.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/DefaultHBaseKeyFactory.java
+@@ -29,6 +29,7 @@
+ import org.apache.hadoop.hive.serde2.lazy.LazySerDeParameters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.StructField;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ 
+ public class DefaultHBaseKeyFactory extends AbstractHBaseKeyFactory implements HBaseKeyFactory {
+@@ -45,8 +46,7 @@ public void init(HBaseSerDeParameters hbaseParam, Properties properties) throws
+ 
+   @Override
+   public ObjectInspector createKeyObjectInspector(TypeInfo type) throws SerDeException {
+-    return LazyFactory.createLazyObjectInspector(type, serdeParams.getSeparators(), 1,
+-        serdeParams.getNullSequence(), serdeParams.isEscaped(), serdeParams.getEscapeChar());
++    return LazyFactory.createLazyObjectInspector(type, 1, serdeParams, ObjectInspectorOptions.JAVA);
+   }
+ 
+   @Override
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseLazyObjectFactory.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseLazyObjectFactory.java
+index c763322..cb9f9d3 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseLazyObjectFactory.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/HBaseLazyObjectFactory.java
+@@ -25,8 +25,12 @@
+ import org.apache.hadoop.hive.serde2.SerDeException;
+ import org.apache.hadoop.hive.serde2.lazy.LazySerDeParameters;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.LazyObjectInspectorFactory;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
++import org.apache.hadoop.io.Text;
+ 
+ // Does same thing with LazyFactory#createLazyObjectInspector except that this replaces
+ // original keyOI with OI which is create by HBaseKeyFactory provided by serde property for hbase
+@@ -46,8 +50,7 @@ public static ObjectInspector createLazyHBaseStructInspector(
+       }
+     }
+     return LazyObjectInspectorFactory.getLazySimpleStructObjectInspector(
+-        serdeParams.getColumnNames(), columnObjectInspectors, serdeParams.getSeparators()[0],
+-        serdeParams.getNullSequence(), serdeParams.isLastColumnTakesRest(),
+-        serdeParams.isEscaped(), serdeParams.getEscapeChar());
++        serdeParams.getColumnNames(), columnObjectInspectors, null, serdeParams.getSeparators()[0],
++        serdeParams, ObjectInspectorOptions.JAVA);
+   }
+ }
+\ No newline at end of file
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/AvroHBaseValueFactory.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/AvroHBaseValueFactory.java
+index a2ba827..3225e5c 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/AvroHBaseValueFactory.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/AvroHBaseValueFactory.java
+@@ -74,9 +74,7 @@ public void init(HBaseSerDeParameters hbaseParams, Configuration conf, Propertie
+   @Override
+   public ObjectInspector createValueObjectInspector(TypeInfo type) throws SerDeException {
+     ObjectInspector oi =
+-        LazyFactory.createLazyObjectInspector(type, serdeParams.getSeparators(), 1,
+-        serdeParams.getNullSequence(), serdeParams.isEscaped(), serdeParams.getEscapeChar(),
+-        ObjectInspectorOptions.AVRO);
++        LazyFactory.createLazyObjectInspector(type, 1, serdeParams, ObjectInspectorOptions.AVRO);
+ 
+     // initialize the object inspectors
+     initInternalObjectInspectors(oi);
+diff --git a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/DefaultHBaseValueFactory.java b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/DefaultHBaseValueFactory.java
+index 4cb5691..c85a4e4 100644
+--- a/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/DefaultHBaseValueFactory.java
++++ b/hbase-handler/src/java/org/apache/hadoop/hive/hbase/struct/DefaultHBaseValueFactory.java
+@@ -29,6 +29,7 @@
+ import org.apache.hadoop.hive.serde2.lazy.LazyObjectBase;
+ import org.apache.hadoop.hive.serde2.lazy.LazySerDeParameters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
++import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions;
+ import org.apache.hadoop.hive.serde2.objectinspector.StructField;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ 
+@@ -62,8 +63,8 @@ public void init(HBaseSerDeParameters hbaseParams, Configuration conf, Propertie
+   @Override
+   public ObjectInspector createValueObjectInspector(TypeInfo type)
+       throws SerDeException {
+-    return LazyFactory.createLazyObjectInspector(type, serdeParams.getSeparators(),
+-        1, serdeParams.getNullSequence(), serdeParams.isEscaped(), serdeParams.getEscapeChar());
++    return LazyFactory.createLazyObjectInspector(type,
++        1, serdeParams, ObjectInspectorOptions.JAVA);
+   }
+ 
+   @Override
+diff --git a/hbase-handler/src/test/queries/positive/hbase_timestamp_format.q b/hbase-handler/src/test/queries/positive/hbase_timestamp_format.q
+new file mode 100644
+index 0000000..a8d5501
+--- /dev/null
++++ b/hbase-handler/src/test/queries/positive/hbase_timestamp_format.q
+@@ -0,0 +1,21 @@
++
++create table hbase_str(rowkey string,mytime string,mystr string)
++  STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
++  WITH SERDEPROPERTIES ('hbase.columns.mapping' = 'm:mytime,m:mystr')
++  TBLPROPERTIES ('hbase.table.name' = 'hbase_ts');
++
++describe hbase_str;
++insert overwrite table hbase_str select key, '2001-02-03-04.05.06.123456', value from src limit 3;
++select * from hbase_str;
++
++-- Timestamp string does not match the default timestamp format, specify a custom timestamp format
++create external table hbase_ts(rowkey string,mytime timestamp,mystr string)
++  STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
++  WITH SERDEPROPERTIES ('hbase.columns.mapping' = 'm:mytime,m:mystr', 'timestamp.formats' = 'yyyy-MM-dd-HH.mm.ss.SSSSSS')
++  TBLPROPERTIES ('hbase.table.name' = 'hbase_ts');
++
++describe hbase_ts;
++select * from hbase_ts;
++
++drop table hbase_str;
++drop table hbase_ts;
+diff --git a/hbase-handler/src/test/results/positive/hbase_timestamp_format.q.out b/hbase-handler/src/test/results/positive/hbase_timestamp_format.q.out
+new file mode 100644
+index 0000000..138cfe6
+--- /dev/null
++++ b/hbase-handler/src/test/results/positive/hbase_timestamp_format.q.out
+@@ -0,0 +1,94 @@
++PREHOOK: query: create table hbase_str(rowkey string,mytime string,mystr string)
++  STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
++  WITH SERDEPROPERTIES ('hbase.columns.mapping' = 'm:mytime,m:mystr')
++  TBLPROPERTIES ('hbase.table.name' = 'hbase_ts')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@hbase_str
++POSTHOOK: query: create table hbase_str(rowkey string,mytime string,mystr string)
++  STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
++  WITH SERDEPROPERTIES ('hbase.columns.mapping' = 'm:mytime,m:mystr')
++  TBLPROPERTIES ('hbase.table.name' = 'hbase_ts')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@hbase_str
++PREHOOK: query: describe hbase_str
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@hbase_str
++POSTHOOK: query: describe hbase_str
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@hbase_str
++rowkey              	string              	from deserializer   
++mytime              	string              	from deserializer   
++mystr               	string              	from deserializer   
++PREHOOK: query: insert overwrite table hbase_str select key, '2001-02-03-04.05.06.123456', value from src limit 3
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src
++PREHOOK: Output: default@hbase_str
++POSTHOOK: query: insert overwrite table hbase_str select key, '2001-02-03-04.05.06.123456', value from src limit 3
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src
++POSTHOOK: Output: default@hbase_str
++PREHOOK: query: select * from hbase_str
++PREHOOK: type: QUERY
++PREHOOK: Input: default@hbase_str
++#### A masked pattern was here ####
++POSTHOOK: query: select * from hbase_str
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@hbase_str
++#### A masked pattern was here ####
++238	2001-02-03-04.05.06.123456	val_238
++311	2001-02-03-04.05.06.123456	val_311
++86	2001-02-03-04.05.06.123456	val_86
++PREHOOK: query: -- Timestamp string does not match the default timestamp format, specify a custom timestamp format
++create external table hbase_ts(rowkey string,mytime timestamp,mystr string)
++  STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
++  WITH SERDEPROPERTIES ('hbase.columns.mapping' = 'm:mytime,m:mystr', 'timestamp.formats' = 'yyyy-MM-dd-HH.mm.ss.SSSSSS')
++  TBLPROPERTIES ('hbase.table.name' = 'hbase_ts')
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@hbase_ts
++POSTHOOK: query: -- Timestamp string does not match the default timestamp format, specify a custom timestamp format
++create external table hbase_ts(rowkey string,mytime timestamp,mystr string)
++  STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
++  WITH SERDEPROPERTIES ('hbase.columns.mapping' = 'm:mytime,m:mystr', 'timestamp.formats' = 'yyyy-MM-dd-HH.mm.ss.SSSSSS')
++  TBLPROPERTIES ('hbase.table.name' = 'hbase_ts')
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@hbase_ts
++PREHOOK: query: describe hbase_ts
++PREHOOK: type: DESCTABLE
++PREHOOK: Input: default@hbase_ts
++POSTHOOK: query: describe hbase_ts
++POSTHOOK: type: DESCTABLE
++POSTHOOK: Input: default@hbase_ts
++rowkey              	string              	from deserializer   
++mytime              	timestamp           	from deserializer   
++mystr               	string              	from deserializer   
++PREHOOK: query: select * from hbase_ts
++PREHOOK: type: QUERY
++PREHOOK: Input: default@hbase_ts
++#### A masked pattern was here ####
++POSTHOOK: query: select * from hbase_ts
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@hbase_ts
++#### A masked pattern was here ####
++238	2001-02-03 04:05:06.123	val_238
++311	2001-02-03 04:05:06.123	val_311
++86	2001-02-03 04:05:06.123	val_86
++PREHOOK: query: drop table hbase_str
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@hbase_str
++PREHOOK: Output: default@hbase_str
++POSTHOOK: query: drop table hbase_str
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@hbase_str
++POSTHOOK: Output: default@hbase_str
++PREHOOK: query: drop table hbase_ts
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@hbase_ts
++PREHOOK: Output: default@hbase_ts
++POSTHOOK: query: drop table hbase_ts
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@hbase_ts
++POSTHOOK: Output: default@hbase_ts
+diff --git a/pom.xml b/pom.xml
+index 347b88d..04e0dde 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -142,6 +142,7 @@
+     <jersey.version>1.14</jersey.version>
+     <jline.version>2.12</jline.version>
+     <jms.version>1.1</jms.version>
++    <joda.version>2.5</joda.version>
+     <jodd.version>3.5.2</jodd.version>
+     <json.version>20090211</json.version>
+     <junit.version>4.11</junit.version>
+diff --git a/ql/pom.xml b/ql/pom.xml
+index 24011b2..8cc45cb 100644
+--- a/ql/pom.xml
++++ b/ql/pom.xml
+@@ -36,6 +36,11 @@
+     <!-- intra-project -->
+     <!-- used for vector code-gen -->
+     <dependency>
++      <groupId>joda-time</groupId>
++      <artifactId>joda-time</artifactId>
++      <version>${joda.version}</version>
++    </dependency>
++    <dependency>
+       <groupId>org.apache.hive</groupId>
+       <artifactId>hive-ant</artifactId>
+       <version>${project.version}</version>
+@@ -700,6 +705,7 @@
+                   <include>com.google.guava:guava</include>
+                   <include>net.sf.opencsv:opencsv</include>
+                   <include>org.apache.hive:spark-client</include>
++                  <include>joda-time:joda-time</include>
+                 </includes>
+               </artifactSet>
+               <relocations>
+diff --git a/ql/src/test/queries/clientpositive/timestamp_formats.q b/ql/src/test/queries/clientpositive/timestamp_formats.q
+new file mode 100644
+index 0000000..b187b40
+--- /dev/null
++++ b/ql/src/test/queries/clientpositive/timestamp_formats.q
+@@ -0,0 +1,23 @@
++
++CREATE TABLE timestamp_formats (
++  c1 string,
++  c1_ts timestamp,
++  c2 string,
++  c2_ts timestamp,
++  c3 string,
++  c3_ts timestamp
++);
++
++LOAD DATA LOCAL INPATH '../../data/files/ts_formats.txt' overwrite into table timestamp_formats;
++
++SELECT * FROM timestamp_formats;
++
++-- Add single timestamp format. This should allow c3_ts to parse
++ALTER TABLE timestamp_formats SET SERDEPROPERTIES ("timestamp.formats"="yyyy-MM-dd'T'HH:mm:ss");
++SELECT * FROM timestamp_formats;
++
++-- Add another format, to allow c2_ts to parse
++ALTER TABLE timestamp_formats SET SERDEPROPERTIES ("timestamp.formats"="yyyy-MM-dd'T'HH:mm:ss,yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS");
++SELECT * FROM timestamp_formats;
++
++DROP TABLE timestamp_formats;
+diff --git a/ql/src/test/results/clientpositive/timestamp_formats.q.out b/ql/src/test/results/clientpositive/timestamp_formats.q.out
+new file mode 100644
+index 0000000..9cc9b29
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/timestamp_formats.q.out
+@@ -0,0 +1,145 @@
++PREHOOK: query: CREATE TABLE timestamp_formats (
++  c1 string,
++  c1_ts timestamp,
++  c2 string,
++  c2_ts timestamp,
++  c3 string,
++  c3_ts timestamp
++)
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@timestamp_formats
++POSTHOOK: query: CREATE TABLE timestamp_formats (
++  c1 string,
++  c1_ts timestamp,
++  c2 string,
++  c2_ts timestamp,
++  c3 string,
++  c3_ts timestamp
++)
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@timestamp_formats
++PREHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/ts_formats.txt' overwrite into table timestamp_formats
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@timestamp_formats
++POSTHOOK: query: LOAD DATA LOCAL INPATH '../../data/files/ts_formats.txt' overwrite into table timestamp_formats
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@timestamp_formats
++PREHOOK: query: SELECT * FROM timestamp_formats
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamp_formats
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM timestamp_formats
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamp_formats
++#### A masked pattern was here ####
++2011-01-01 01:01:01.111111111	2011-01-01 01:01:01.111111111	2011-01-01T01:01:01.111111111	NULL	2011-01-01T01:01:01	NULL
++2012-02-02 02:02:02.222222222	2012-02-02 02:02:02.222222222	2012-02-02T02:02:02.222222222	NULL	2012-02-02T02:02:02	NULL
++2013-03-03 03:03:03.333333333	2013-03-03 03:03:03.333333333	2013-03-03T03:03:03.333333333	NULL	2013-03-03T03:03:03	NULL
++2014-04-04 04:04:04.444444444	2014-04-04 04:04:04.444444444	2014-04-04T04:04:04.444444444	NULL	2014-04-04T04:04:04	NULL
++2015-05-05 05:05:05.555555555	2015-05-05 05:05:05.555555555	2015-05-05T05:05:05.555555555	NULL	2015-05-05T05:05:05	NULL
++2016-06-06 06:06:06.666666666	2016-06-06 06:06:06.666666666	2016-06-06T06:06:06.666666666	NULL	2016-06-06T06:06:06	NULL
++2017-07-07 07:07:07.777777777	2017-07-07 07:07:07.777777777	2017-07-07T07:07:07.777777777	NULL	2017-07-07T07:07:07	NULL
++2018-08-08 08:08:08.888888888	2018-08-08 08:08:08.888888888	2018-08-08T08:08:08.888888888	NULL	2018-08-08T08:08:08	NULL
++2019-09-09 09:09:09.999999999	2019-09-09 09:09:09.999999999	2019-09-09T09:09:09.999999999	NULL	2019-09-09T09:09:09	NULL
++2020-10-10 10:10:10.101010101	2020-10-10 10:10:10.101010101	2020-10-10T10:10:10.101010101	NULL	2020-10-10T10:10:10	NULL
++2021-11-11 11:11:11.111111111	2021-11-11 11:11:11.111111111	2021-11-11T11:11:11.111111111	NULL	2021-11-11T11:11:11	NULL
++2022-12-12 12:12:12.121212121	2022-12-12 12:12:12.121212121	2022-12-12T12:12:12.121212121	NULL	2022-12-12T12:12:12	NULL
++2023-01-02 13:13:13.131313131	2023-01-02 13:13:13.131313131	2023-01-02T13:13:13.131313131	NULL	2023-01-02T13:13:13	NULL
++2024-02-02 14:14:14.141414141	2024-02-02 14:14:14.141414141	2024-02-02T14:14:14.141414141	NULL	2024-02-02T14:14:14	NULL
++2025-03-03 15:15:15.151515151	2025-03-03 15:15:15.151515151	2025-03-03T15:15:15.151515151	NULL	2025-03-03T15:15:15	NULL
++2026-04-04 16:16:16.161616161	2026-04-04 16:16:16.161616161	2026-04-04T16:16:16.161616161	NULL	2026-04-04T16:16:16	NULL
++2027-05-05 17:17:17.171717171	2027-05-05 17:17:17.171717171	2027-05-05T17:17:17.171717171	NULL	2027-05-05T17:17:17	NULL
++2028-06-06 18:18:18.181818181	2028-06-06 18:18:18.181818181	2028-06-06T18:18:18.181818181	NULL	2028-06-06T18:18:18	NULL
++2029-07-07 19:19:19.191919191	2029-07-07 19:19:19.191919191	2029-07-07T19:19:19.191919191	NULL	2029-07-07T19:19:19	NULL
++2030-08-08 20:20:20.202020202	2030-08-08 20:20:20.202020202	2030-08-08T20:20:20.202020202	NULL	2030-08-08T20:20:20	NULL
++2031-09-09 21:21:21.212121212	2031-09-09 21:21:21.212121212	2031-09-09T21:21:21.212121212	NULL	2031-09-09T21:21:21	NULL
++PREHOOK: query: -- Add single timestamp format. This should allow c3_ts to parse
++ALTER TABLE timestamp_formats SET SERDEPROPERTIES ("timestamp.formats"="yyyy-MM-dd'T'HH:mm:ss")
++PREHOOK: type: ALTERTABLE_SERDEPROPERTIES
++PREHOOK: Input: default@timestamp_formats
++PREHOOK: Output: default@timestamp_formats
++POSTHOOK: query: -- Add single timestamp format. This should allow c3_ts to parse
++ALTER TABLE timestamp_formats SET SERDEPROPERTIES ("timestamp.formats"="yyyy-MM-dd'T'HH:mm:ss")
++POSTHOOK: type: ALTERTABLE_SERDEPROPERTIES
++POSTHOOK: Input: default@timestamp_formats
++POSTHOOK: Output: default@timestamp_formats
++PREHOOK: query: SELECT * FROM timestamp_formats
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamp_formats
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM timestamp_formats
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamp_formats
++#### A masked pattern was here ####
++2011-01-01 01:01:01.111111111	2011-01-01 01:01:01.111111111	2011-01-01T01:01:01.111111111	NULL	2011-01-01T01:01:01	2011-01-01 01:01:01
++2012-02-02 02:02:02.222222222	2012-02-02 02:02:02.222222222	2012-02-02T02:02:02.222222222	NULL	2012-02-02T02:02:02	2012-02-02 02:02:02
++2013-03-03 03:03:03.333333333	2013-03-03 03:03:03.333333333	2013-03-03T03:03:03.333333333	NULL	2013-03-03T03:03:03	2013-03-03 03:03:03
++2014-04-04 04:04:04.444444444	2014-04-04 04:04:04.444444444	2014-04-04T04:04:04.444444444	NULL	2014-04-04T04:04:04	2014-04-04 04:04:04
++2015-05-05 05:05:05.555555555	2015-05-05 05:05:05.555555555	2015-05-05T05:05:05.555555555	NULL	2015-05-05T05:05:05	2015-05-05 05:05:05
++2016-06-06 06:06:06.666666666	2016-06-06 06:06:06.666666666	2016-06-06T06:06:06.666666666	NULL	2016-06-06T06:06:06	2016-06-06 06:06:06
++2017-07-07 07:07:07.777777777	2017-07-07 07:07:07.777777777	2017-07-07T07:07:07.777777777	NULL	2017-07-07T07:07:07	2017-07-07 07:07:07
++2018-08-08 08:08:08.888888888	2018-08-08 08:08:08.888888888	2018-08-08T08:08:08.888888888	NULL	2018-08-08T08:08:08	2018-08-08 08:08:08
++2019-09-09 09:09:09.999999999	2019-09-09 09:09:09.999999999	2019-09-09T09:09:09.999999999	NULL	2019-09-09T09:09:09	2019-09-09 09:09:09
++2020-10-10 10:10:10.101010101	2020-10-10 10:10:10.101010101	2020-10-10T10:10:10.101010101	NULL	2020-10-10T10:10:10	2020-10-10 10:10:10
++2021-11-11 11:11:11.111111111	2021-11-11 11:11:11.111111111	2021-11-11T11:11:11.111111111	NULL	2021-11-11T11:11:11	2021-11-11 11:11:11
++2022-12-12 12:12:12.121212121	2022-12-12 12:12:12.121212121	2022-12-12T12:12:12.121212121	NULL	2022-12-12T12:12:12	2022-12-12 12:12:12
++2023-01-02 13:13:13.131313131	2023-01-02 13:13:13.131313131	2023-01-02T13:13:13.131313131	NULL	2023-01-02T13:13:13	2023-01-02 13:13:13
++2024-02-02 14:14:14.141414141	2024-02-02 14:14:14.141414141	2024-02-02T14:14:14.141414141	NULL	2024-02-02T14:14:14	2024-02-02 14:14:14
++2025-03-03 15:15:15.151515151	2025-03-03 15:15:15.151515151	2025-03-03T15:15:15.151515151	NULL	2025-03-03T15:15:15	2025-03-03 15:15:15
++2026-04-04 16:16:16.161616161	2026-04-04 16:16:16.161616161	2026-04-04T16:16:16.161616161	NULL	2026-04-04T16:16:16	2026-04-04 16:16:16
++2027-05-05 17:17:17.171717171	2027-05-05 17:17:17.171717171	2027-05-05T17:17:17.171717171	NULL	2027-05-05T17:17:17	2027-05-05 17:17:17
++2028-06-06 18:18:18.181818181	2028-06-06 18:18:18.181818181	2028-06-06T18:18:18.181818181	NULL	2028-06-06T18:18:18	2028-06-06 18:18:18
++2029-07-07 19:19:19.191919191	2029-07-07 19:19:19.191919191	2029-07-07T19:19:19.191919191	NULL	2029-07-07T19:19:19	2029-07-07 19:19:19
++2030-08-08 20:20:20.202020202	2030-08-08 20:20:20.202020202	2030-08-08T20:20:20.202020202	NULL	2030-08-08T20:20:20	2030-08-08 20:20:20
++2031-09-09 21:21:21.212121212	2031-09-09 21:21:21.212121212	2031-09-09T21:21:21.212121212	NULL	2031-09-09T21:21:21	2031-09-09 21:21:21
++PREHOOK: query: -- Add another format, to allow c2_ts to parse
++ALTER TABLE timestamp_formats SET SERDEPROPERTIES ("timestamp.formats"="yyyy-MM-dd'T'HH:mm:ss,yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS")
++PREHOOK: type: ALTERTABLE_SERDEPROPERTIES
++PREHOOK: Input: default@timestamp_formats
++PREHOOK: Output: default@timestamp_formats
++POSTHOOK: query: -- Add another format, to allow c2_ts to parse
++ALTER TABLE timestamp_formats SET SERDEPROPERTIES ("timestamp.formats"="yyyy-MM-dd'T'HH:mm:ss,yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS")
++POSTHOOK: type: ALTERTABLE_SERDEPROPERTIES
++POSTHOOK: Input: default@timestamp_formats
++POSTHOOK: Output: default@timestamp_formats
++PREHOOK: query: SELECT * FROM timestamp_formats
++PREHOOK: type: QUERY
++PREHOOK: Input: default@timestamp_formats
++#### A masked pattern was here ####
++POSTHOOK: query: SELECT * FROM timestamp_formats
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@timestamp_formats
++#### A masked pattern was here ####
++2011-01-01 01:01:01.111111111	2011-01-01 01:01:01.111111111	2011-01-01T01:01:01.111111111	2011-01-01 01:01:01.111	2011-01-01T01:01:01	2011-01-01 01:01:01
++2012-02-02 02:02:02.222222222	2012-02-02 02:02:02.222222222	2012-02-02T02:02:02.222222222	2012-02-02 02:02:02.222	2012-02-02T02:02:02	2012-02-02 02:02:02
++2013-03-03 03:03:03.333333333	2013-03-03 03:03:03.333333333	2013-03-03T03:03:03.333333333	2013-03-03 03:03:03.333	2013-03-03T03:03:03	2013-03-03 03:03:03
++2014-04-04 04:04:04.444444444	2014-04-04 04:04:04.444444444	2014-04-04T04:04:04.444444444	2014-04-04 04:04:04.444	2014-04-04T04:04:04	2014-04-04 04:04:04
++2015-05-05 05:05:05.555555555	2015-05-05 05:05:05.555555555	2015-05-05T05:05:05.555555555	2015-05-05 05:05:05.555	2015-05-05T05:05:05	2015-05-05 05:05:05
++2016-06-06 06:06:06.666666666	2016-06-06 06:06:06.666666666	2016-06-06T06:06:06.666666666	2016-06-06 06:06:06.666	2016-06-06T06:06:06	2016-06-06 06:06:06
++2017-07-07 07:07:07.777777777	2017-07-07 07:07:07.777777777	2017-07-07T07:07:07.777777777	2017-07-07 07:07:07.777	2017-07-07T07:07:07	2017-07-07 07:07:07
++2018-08-08 08:08:08.888888888	2018-08-08 08:08:08.888888888	2018-08-08T08:08:08.888888888	2018-08-08 08:08:08.888	2018-08-08T08:08:08	2018-08-08 08:08:08
++2019-09-09 09:09:09.999999999	2019-09-09 09:09:09.999999999	2019-09-09T09:09:09.999999999	2019-09-09 09:09:09.999	2019-09-09T09:09:09	2019-09-09 09:09:09
++2020-10-10 10:10:10.101010101	2020-10-10 10:10:10.101010101	2020-10-10T10:10:10.101010101	2020-10-10 10:10:10.101	2020-10-10T10:10:10	2020-10-10 10:10:10
++2021-11-11 11:11:11.111111111	2021-11-11 11:11:11.111111111	2021-11-11T11:11:11.111111111	2021-11-11 11:11:11.111	2021-11-11T11:11:11	2021-11-11 11:11:11
++2022-12-12 12:12:12.121212121	2022-12-12 12:12:12.121212121	2022-12-12T12:12:12.121212121	2022-12-12 12:12:12.121	2022-12-12T12:12:12	2022-12-12 12:12:12
++2023-01-02 13:13:13.131313131	2023-01-02 13:13:13.131313131	2023-01-02T13:13:13.131313131	2023-01-02 13:13:13.131	2023-01-02T13:13:13	2023-01-02 13:13:13
++2024-02-02 14:14:14.141414141	2024-02-02 14:14:14.141414141	2024-02-02T14:14:14.141414141	2024-02-02 14:14:14.141	2024-02-02T14:14:14	2024-02-02 14:14:14
++2025-03-03 15:15:15.151515151	2025-03-03 15:15:15.151515151	2025-03-03T15:15:15.151515151	2025-03-03 15:15:15.151	2025-03-03T15:15:15	2025-03-03 15:15:15
++2026-04-04 16:16:16.161616161	2026-04-04 16:16:16.161616161	2026-04-04T16:16:16.161616161	2026-04-04 16:16:16.161	2026-04-04T16:16:16	2026-04-04 16:16:16
++2027-05-05 17:17:17.171717171	2027-05-05 17:17:17.171717171	2027-05-05T17:17:17.171717171	2027-05-05 17:17:17.171	2027-05-05T17:17:17	2027-05-05 17:17:17
++2028-06-06 18:18:18.181818181	2028-06-06 18:18:18.181818181	2028-06-06T18:18:18.181818181	2028-06-06 18:18:18.181	2028-06-06T18:18:18	2028-06-06 18:18:18
++2029-07-07 19:19:19.191919191	2029-07-07 19:19:19.191919191	2029-07-07T19:19:19.191919191	2029-07-07 19:19:19.191	2029-07-07T19:19:19	2029-07-07 19:19:19
++2030-08-08 20:20:20.202020202	2030-08-08 20:20:20.202020202	2030-08-08T20:20:20.202020202	2030-08-08 20:20:20.202	2030-08-08T20:20:20	2030-08-08 20:20:20
++2031-09-09 21:21:21.212121212	2031-09-09 21:21:21.212121212	2031-09-09T21:21:21.212121212	2031-09-09 21:21:21.212	2031-09-09T21:21:21	2031-09-09 21:21:21
++PREHOOK: query: DROP TABLE timestamp_formats
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@timestamp_formats
++PREHOOK: Output: default@timestamp_formats
++POSTHOOK: query: DROP TABLE timestamp_formats
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@timestamp_formats
++POSTHOOK: Output: default@timestamp_formats
+diff --git a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/test/ThriftTestObj.java b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/test/ThriftTestObj.java
+index 1b708dd..dda3c5f 100644
+--- a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/test/ThriftTestObj.java
++++ b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/test/ThriftTestObj.java
+@@ -528,7 +528,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, ThriftTestObj struc
+                 struct.field3 = new ArrayList<InnerStruct>(_list0.size);
+                 for (int _i1 = 0; _i1 < _list0.size; ++_i1)
+                 {
+-                  InnerStruct _elem2; // required
++                  InnerStruct _elem2; // optional
+                   _elem2 = new InnerStruct();
+                   _elem2.read(iprot);
+                   struct.field3.add(_elem2);
+@@ -636,7 +636,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, ThriftTestObj struct
+           struct.field3 = new ArrayList<InnerStruct>(_list5.size);
+           for (int _i6 = 0; _i6 < _list5.size; ++_i6)
+           {
+-            InnerStruct _elem7; // required
++            InnerStruct _elem7; // optional
+             _elem7 = new InnerStruct();
+             _elem7.read(iprot);
+             struct.field3.add(_elem7);
+diff --git a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/Complex.java b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/Complex.java
+index 07ea8b9..ff0c1f2 100644
+--- a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/Complex.java
++++ b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/Complex.java
+@@ -1211,7 +1211,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, Complex struct) thr
+                 struct.lint = new ArrayList<Integer>(_list18.size);
+                 for (int _i19 = 0; _i19 < _list18.size; ++_i19)
+                 {
+-                  int _elem20; // required
++                  int _elem20; // optional
+                   _elem20 = iprot.readI32();
+                   struct.lint.add(_elem20);
+                 }
+@@ -1229,7 +1229,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, Complex struct) thr
+                 struct.lString = new ArrayList<String>(_list21.size);
+                 for (int _i22 = 0; _i22 < _list21.size; ++_i22)
+                 {
+-                  String _elem23; // required
++                  String _elem23; // optional
+                   _elem23 = iprot.readString();
+                   struct.lString.add(_elem23);
+                 }
+@@ -1247,7 +1247,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, Complex struct) thr
+                 struct.lintString = new ArrayList<IntString>(_list24.size);
+                 for (int _i25 = 0; _i25 < _list24.size; ++_i25)
+                 {
+-                  IntString _elem26; // required
++                  IntString _elem26; // optional
+                   _elem26 = new IntString();
+                   _elem26.read(iprot);
+                   struct.lintString.add(_elem26);
+@@ -1610,7 +1610,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, Complex struct) thro
+           struct.lint = new ArrayList<Integer>(_list57.size);
+           for (int _i58 = 0; _i58 < _list57.size; ++_i58)
+           {
+-            int _elem59; // required
++            int _elem59; // optional
+             _elem59 = iprot.readI32();
+             struct.lint.add(_elem59);
+           }
+@@ -1623,7 +1623,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, Complex struct) thro
+           struct.lString = new ArrayList<String>(_list60.size);
+           for (int _i61 = 0; _i61 < _list60.size; ++_i61)
+           {
+-            String _elem62; // required
++            String _elem62; // optional
+             _elem62 = iprot.readString();
+             struct.lString.add(_elem62);
+           }
+@@ -1636,7 +1636,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, Complex struct) thro
+           struct.lintString = new ArrayList<IntString>(_list63.size);
+           for (int _i64 = 0; _i64 < _list63.size; ++_i64)
+           {
+-            IntString _elem65; // required
++            IntString _elem65; // optional
+             _elem65 = new IntString();
+             _elem65.read(iprot);
+             struct.lintString.add(_elem65);
+diff --git a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/MegaStruct.java b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/MegaStruct.java
+index 386fef9..fba49e4 100644
+--- a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/MegaStruct.java
++++ b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/MegaStruct.java
+@@ -2280,7 +2280,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                     _val19 = new ArrayList<String>(_list20.size);
+                     for (int _i21 = 0; _i21 < _list20.size; ++_i21)
+                     {
+-                      String _elem22; // required
++                      String _elem22; // optional
+                       _elem22 = iprot.readString();
+                       _val19.add(_elem22);
+                     }
+@@ -2310,7 +2310,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                     _val26 = new ArrayList<MiniStruct>(_list27.size);
+                     for (int _i28 = 0; _i28 < _list27.size; ++_i28)
+                     {
+-                      MiniStruct _elem29; // required
++                      MiniStruct _elem29; // optional
+                       _elem29 = new MiniStruct();
+                       _elem29.read(iprot);
+                       _val26.add(_elem29);
+@@ -2333,7 +2333,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                 struct.my_stringlist = new ArrayList<String>(_list30.size);
+                 for (int _i31 = 0; _i31 < _list30.size; ++_i31)
+                 {
+-                  String _elem32; // required
++                  String _elem32; // optional
+                   _elem32 = iprot.readString();
+                   struct.my_stringlist.add(_elem32);
+                 }
+@@ -2351,7 +2351,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                 struct.my_structlist = new ArrayList<MiniStruct>(_list33.size);
+                 for (int _i34 = 0; _i34 < _list33.size; ++_i34)
+                 {
+-                  MiniStruct _elem35; // required
++                  MiniStruct _elem35; // optional
+                   _elem35 = new MiniStruct();
+                   _elem35.read(iprot);
+                   struct.my_structlist.add(_elem35);
+@@ -2370,7 +2370,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                 struct.my_enumlist = new ArrayList<MyEnum>(_list36.size);
+                 for (int _i37 = 0; _i37 < _list36.size; ++_i37)
+                 {
+-                  MyEnum _elem38; // required
++                  MyEnum _elem38; // optional
+                   _elem38 = MyEnum.findByValue(iprot.readI32());
+                   struct.my_enumlist.add(_elem38);
+                 }
+@@ -2388,7 +2388,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                 struct.my_stringset = new HashSet<String>(2*_set39.size);
+                 for (int _i40 = 0; _i40 < _set39.size; ++_i40)
+                 {
+-                  String _elem41; // required
++                  String _elem41; // optional
+                   _elem41 = iprot.readString();
+                   struct.my_stringset.add(_elem41);
+                 }
+@@ -2406,7 +2406,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                 struct.my_enumset = new HashSet<MyEnum>(2*_set42.size);
+                 for (int _i43 = 0; _i43 < _set42.size; ++_i43)
+                 {
+-                  MyEnum _elem44; // required
++                  MyEnum _elem44; // optional
+                   _elem44 = MyEnum.findByValue(iprot.readI32());
+                   struct.my_enumset.add(_elem44);
+                 }
+@@ -2424,7 +2424,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, MegaStruct struct)
+                 struct.my_structset = new HashSet<MiniStruct>(2*_set45.size);
+                 for (int _i46 = 0; _i46 < _set45.size; ++_i46)
+                 {
+-                  MiniStruct _elem47; // required
++                  MiniStruct _elem47; // optional
+                   _elem47 = new MiniStruct();
+                   _elem47.read(iprot);
+                   struct.my_structset.add(_elem47);
+@@ -3023,7 +3023,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+               _val95 = new ArrayList<String>(_list96.size);
+               for (int _i97 = 0; _i97 < _list96.size; ++_i97)
+               {
+-                String _elem98; // required
++                String _elem98; // optional
+                 _elem98 = iprot.readString();
+                 _val95.add(_elem98);
+               }
+@@ -3047,7 +3047,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+               _val102 = new ArrayList<MiniStruct>(_list103.size);
+               for (int _i104 = 0; _i104 < _list103.size; ++_i104)
+               {
+-                MiniStruct _elem105; // required
++                MiniStruct _elem105; // optional
+                 _elem105 = new MiniStruct();
+                 _elem105.read(iprot);
+                 _val102.add(_elem105);
+@@ -3064,7 +3064,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+           struct.my_stringlist = new ArrayList<String>(_list106.size);
+           for (int _i107 = 0; _i107 < _list106.size; ++_i107)
+           {
+-            String _elem108; // required
++            String _elem108; // optional
+             _elem108 = iprot.readString();
+             struct.my_stringlist.add(_elem108);
+           }
+@@ -3077,7 +3077,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+           struct.my_structlist = new ArrayList<MiniStruct>(_list109.size);
+           for (int _i110 = 0; _i110 < _list109.size; ++_i110)
+           {
+-            MiniStruct _elem111; // required
++            MiniStruct _elem111; // optional
+             _elem111 = new MiniStruct();
+             _elem111.read(iprot);
+             struct.my_structlist.add(_elem111);
+@@ -3091,7 +3091,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+           struct.my_enumlist = new ArrayList<MyEnum>(_list112.size);
+           for (int _i113 = 0; _i113 < _list112.size; ++_i113)
+           {
+-            MyEnum _elem114; // required
++            MyEnum _elem114; // optional
+             _elem114 = MyEnum.findByValue(iprot.readI32());
+             struct.my_enumlist.add(_elem114);
+           }
+@@ -3104,7 +3104,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+           struct.my_stringset = new HashSet<String>(2*_set115.size);
+           for (int _i116 = 0; _i116 < _set115.size; ++_i116)
+           {
+-            String _elem117; // required
++            String _elem117; // optional
+             _elem117 = iprot.readString();
+             struct.my_stringset.add(_elem117);
+           }
+@@ -3117,7 +3117,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+           struct.my_enumset = new HashSet<MyEnum>(2*_set118.size);
+           for (int _i119 = 0; _i119 < _set118.size; ++_i119)
+           {
+-            MyEnum _elem120; // required
++            MyEnum _elem120; // optional
+             _elem120 = MyEnum.findByValue(iprot.readI32());
+             struct.my_enumset.add(_elem120);
+           }
+@@ -3130,7 +3130,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, MegaStruct struct) t
+           struct.my_structset = new HashSet<MiniStruct>(2*_set121.size);
+           for (int _i122 = 0; _i122 < _set121.size; ++_i122)
+           {
+-            MiniStruct _elem123; // required
++            MiniStruct _elem123; // optional
+             _elem123 = new MiniStruct();
+             _elem123.read(iprot);
+             struct.my_structset.add(_elem123);
+diff --git a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/PropValueUnion.java b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/PropValueUnion.java
+index aa56dc9..a50a508 100644
+--- a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/PropValueUnion.java
++++ b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/PropValueUnion.java
+@@ -300,7 +300,7 @@ protected Object standardSchemeReadValue(org.apache.thrift.protocol.TProtocol ip
+               lString = new ArrayList<String>(_list0.size);
+               for (int _i1 = 0; _i1 < _list0.size; ++_i1)
+               {
+-                String _elem2; // required
++                String _elem2; // optional
+                 _elem2 = iprot.readString();
+                 lString.add(_elem2);
+               }
+@@ -423,7 +423,7 @@ protected Object tupleSchemeReadValue(org.apache.thrift.protocol.TProtocol iprot
+             lString = new ArrayList<String>(_list9.size);
+             for (int _i10 = 0; _i10 < _list9.size; ++_i10)
+             {
+-              String _elem11; // required
++              String _elem11; // optional
+               _elem11 = iprot.readString();
+               lString.add(_elem11);
+             }
+diff --git a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/SetIntString.java b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/SetIntString.java
+index 676f2b2..334d225 100644
+--- a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/SetIntString.java
++++ b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde2/thrift/test/SetIntString.java
+@@ -431,7 +431,7 @@ public void read(org.apache.thrift.protocol.TProtocol iprot, SetIntString struct
+                 struct.sIntString = new HashSet<IntString>(2*_set82.size);
+                 for (int _i83 = 0; _i83 < _set82.size; ++_i83)
+                 {
+-                  IntString _elem84; // required
++                  IntString _elem84; // optional
+                   _elem84 = new IntString();
+                   _elem84.read(iprot);
+                   struct.sIntString.add(_elem84);
+@@ -530,7 +530,7 @@ public void read(org.apache.thrift.protocol.TProtocol prot, SetIntString struct)
+           struct.sIntString = new HashSet<IntString>(2*_set87.size);
+           for (int _i88 = 0; _i88 < _set87.size; ++_i88)
+           {
+-            IntString _elem89; // required
++            IntString _elem89; // optional
+             _elem89 = new IntString();
+             _elem89.read(iprot);
+             struct.sIntString.add(_elem89);
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java
+index 2fb1c28..9fc9873 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/avro/AvroLazyObjectInspector.java
+@@ -44,6 +44,7 @@
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.LazyMapObjectInspector;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.LazySimpleStructObjectInspector;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.LazyUnionObjectInspector;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
+ import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+@@ -84,6 +85,7 @@
+    * @param escaped whether the data is escaped or not
+    * @param escapeChar if escaped is true, the escape character
+    * */
++  @Deprecated
+   public AvroLazyObjectInspector(List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors, List<String> structFieldComments,
+       byte separator, Text nullSequence, boolean lastColumnTakesRest, boolean escaped,
+@@ -92,6 +94,12 @@ public AvroLazyObjectInspector(List<String> structFieldNames,
+         nullSequence, lastColumnTakesRest, escaped, escapeChar);
+   }
+ 
++  public AvroLazyObjectInspector(List<String> structFieldNames,
++      List<ObjectInspector> structFieldObjectInspectors, List<String> structFieldComments,
++      byte separator, LazyObjectInspectorParameters lazyParams) {
++    super(structFieldNames, structFieldObjectInspectors, structFieldComments, separator, lazyParams);
++  }
++
+   /**
+    * Set the reader schema for the {@link AvroLazyObjectInspector} to the given schema
+    * */
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/columnar/ColumnarSerDe.java b/serde/src/java/org/apache/hadoop/hive/serde2/columnar/ColumnarSerDe.java
+index ee6fcff..a611c05 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/columnar/ColumnarSerDe.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/columnar/ColumnarSerDe.java
+@@ -97,9 +97,7 @@ public void initialize(Configuration conf, Properties tbl) throws SerDeException
+     // Create the ObjectInspectors for the fields. Note: Currently
+     // ColumnarObject uses same ObjectInpector as LazyStruct
+     cachedObjectInspector = LazyFactory.createColumnarStructInspector(
+-        serdeParams.getColumnNames(), serdeParams.getColumnTypes(), serdeParams
+-            .getSeparators(), serdeParams.getNullSequence(), serdeParams
+-            .isEscaped(), serdeParams.getEscapeChar());
++        serdeParams.getColumnNames(), serdeParams.getColumnTypes(), serdeParams);
+ 
+     int size = serdeParams.getColumnTypes().size();
+     List<Integer> notSkipIDs = new ArrayList<Integer>();
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyFactory.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyFactory.java
+index 525c65e..c78a040 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyFactory.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyFactory.java
+@@ -38,6 +38,8 @@
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyHiveVarcharObjectInspector;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyIntObjectInspector;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyLongObjectInspector;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyPrimitiveObjectInspectorFactory;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyShortObjectInspector;
+ import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyStringObjectInspector;
+@@ -216,6 +218,7 @@
+    * @return The ObjectInspector
+    * @throws SerDeException
+    */
++  @Deprecated
+   public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+   		byte[] separators, int separatorIndex, Text nullSequence, boolean escaped,
+       byte escapeChar, ObjectInspectorOptions option) throws SerDeException {
+@@ -240,6 +243,7 @@ public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+    * @return The ObjectInspector
+    * @throws SerDeException
+    */
++  @Deprecated
+   public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+   		byte[] separators, int separatorIndex, Text nullSequence, boolean escaped,
+       byte escapeChar) throws SerDeException {
+@@ -261,6 +265,7 @@ public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+    * @return The ObjectInspector
+    * @throws SerDeException
+    */
++  @Deprecated
+   public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+   		byte[] separators, int separatorIndex, Text nullSequence, boolean escaped,
+       byte escapeChar, boolean extendedBooleanLiteral) throws SerDeException {
+@@ -282,30 +287,51 @@ public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+    * @return The ObjectInspector
+    * @throws SerDeException
+    */
++  @Deprecated
+   public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+   		byte[] separators, int separatorIndex, Text nullSequence, boolean escaped,
+       byte escapeChar, boolean extendedBooleanLiteral, ObjectInspectorOptions option) throws SerDeException {
++    LazyObjectInspectorParametersImpl lazyParams = new LazyObjectInspectorParametersImpl(
++        escaped, escapeChar, extendedBooleanLiteral, null, separators, nullSequence);
++    return createLazyObjectInspector(typeInfo, separatorIndex, lazyParams, option);
++  }
++
++  /**
++   * Create a hierarchical ObjectInspector for LazyObject with the given typeInfo.
++   *
++   * @param typeInfo The type information for the LazyObject
++   * @param separator The array of separators for delimiting each level
++   * @param separatorIndex The current level (for separators). List(array), struct uses 1 level of
++   *          separator, and map uses 2 levels: the first one for delimiting entries, the second one
++   *          for delimiting key and values.
++   * @param lazyParams Params for lazy types
++   * @param option the {@link ObjectInspectorOption}
++   * @return The ObjectInspector
++   * @throws SerDeException
++   */
++  public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
++      int separatorIndex, LazyObjectInspectorParameters lazyParams,
++      ObjectInspectorOptions option) throws SerDeException {
+     ObjectInspector.Category c = typeInfo.getCategory();
+     switch (c) {
+     case PRIMITIVE:
+       return LazyPrimitiveObjectInspectorFactory.getLazyObjectInspector(
+-          (PrimitiveTypeInfo) typeInfo, escaped, escapeChar, extendedBooleanLiteral);
++          (PrimitiveTypeInfo) typeInfo, lazyParams);
+     case MAP:
+       return LazyObjectInspectorFactory.getLazySimpleMapObjectInspector(
+-          createLazyObjectInspector(((MapTypeInfo) typeInfo)
+-          .getMapKeyTypeInfo(), separators, separatorIndex + 2,
+-          nullSequence, escaped, escapeChar, extendedBooleanLiteral, option), createLazyObjectInspector(
+-          ((MapTypeInfo) typeInfo).getMapValueTypeInfo(), separators,
+-          separatorIndex + 2, nullSequence, escaped, escapeChar, extendedBooleanLiteral, option),
+-          LazyUtils.getSeparator(separators, separatorIndex),
+-          LazyUtils.getSeparator(separators, separatorIndex+1),
+-          nullSequence, escaped, escapeChar);
++          createLazyObjectInspector(((MapTypeInfo) typeInfo).getMapKeyTypeInfo(),
++              separatorIndex + 2, lazyParams, option),
++          createLazyObjectInspector(((MapTypeInfo) typeInfo).getMapValueTypeInfo(),
++              separatorIndex + 2, lazyParams, option),
++          LazyUtils.getSeparator(lazyParams.getSeparators(), separatorIndex),
++          LazyUtils.getSeparator(lazyParams.getSeparators(), separatorIndex+1),
++          lazyParams);
+     case LIST:
+       return LazyObjectInspectorFactory.getLazySimpleListObjectInspector(
+           createLazyObjectInspector(((ListTypeInfo) typeInfo)
+-          .getListElementTypeInfo(), separators, separatorIndex + 1,
+-          nullSequence, escaped, escapeChar, extendedBooleanLiteral, option), LazyUtils.getSeparator(separators, separatorIndex),
+-          nullSequence, escaped, escapeChar);
++          .getListElementTypeInfo(), separatorIndex + 1,
++          lazyParams, option), LazyUtils.getSeparator(lazyParams.getSeparators(), separatorIndex),
++          lazyParams);
+     case STRUCT:
+       StructTypeInfo structTypeInfo = (StructTypeInfo) typeInfo;
+       List<String> fieldNames = structTypeInfo.getAllStructFieldNames();
+@@ -315,25 +341,22 @@ public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+           fieldTypeInfos.size());
+       for (int i = 0; i < fieldTypeInfos.size(); i++) {
+         fieldObjectInspectors.add(createLazyObjectInspector(fieldTypeInfos
+-            .get(i), separators, separatorIndex + 1, nullSequence, escaped,
+-            escapeChar, extendedBooleanLiteral, option));
++            .get(i), separatorIndex + 1, lazyParams, option));
+       }
+       return LazyObjectInspectorFactory.getLazySimpleStructObjectInspector(
+-          fieldNames, fieldObjectInspectors,
+-          LazyUtils.getSeparator(separators, separatorIndex),
+-          nullSequence,
+-          false, escaped, escapeChar, option);
++          fieldNames, fieldObjectInspectors, null,
++          LazyUtils.getSeparator(lazyParams.getSeparators(), separatorIndex),
++          lazyParams, option);
+     case UNION:
+       UnionTypeInfo unionTypeInfo = (UnionTypeInfo) typeInfo;
+       List<ObjectInspector> lazyOIs = new ArrayList<ObjectInspector>();
+       for (TypeInfo uti : unionTypeInfo.getAllUnionObjectTypeInfos()) {
+-        lazyOIs.add(createLazyObjectInspector(uti, separators,
+-            separatorIndex + 1, nullSequence, escaped,
+-            escapeChar, extendedBooleanLiteral, option));
++        lazyOIs.add(createLazyObjectInspector(uti,
++            separatorIndex + 1, lazyParams, option));
+       }
+       return LazyObjectInspectorFactory.getLazyUnionObjectInspector(lazyOIs,
+-          LazyUtils.getSeparator(separators, separatorIndex),
+-          nullSequence, escaped, escapeChar);
++          LazyUtils.getSeparator(lazyParams.getSeparators(), separatorIndex),
++          lazyParams);
+     }
+     throw new RuntimeException("Hive LazySerDe Internal error.");
+   }
+@@ -349,6 +372,7 @@ public static ObjectInspector createLazyObjectInspector(TypeInfo typeInfo,
+    * @see LazyFactory#createLazyObjectInspector(TypeInfo, byte[], int, Text,
+    *      boolean, byte)
+    */
++  @Deprecated
+   public static ObjectInspector createLazyStructInspector(
+       List<String> columnNames, List<TypeInfo> typeInfos, byte[] separators,
+       Text nullSequence, boolean lastColumnTakesRest, boolean escaped,
+@@ -369,20 +393,41 @@ public static ObjectInspector createLazyStructInspector(
+    * @see LazyFactory#createLazyObjectInspector(TypeInfo, byte[], int, Text,
+    *      boolean, byte)
+    */
++  @Deprecated
+   public static ObjectInspector createLazyStructInspector(
+      List<String> columnNames, List<TypeInfo> typeInfos, byte[] separators,
+       Text nullSequence, boolean lastColumnTakesRest, boolean escaped,
+       byte escapeChar, boolean extendedBooleanLiteral) throws SerDeException {
++    LazyObjectInspectorParametersImpl lazyParams = new LazyObjectInspectorParametersImpl(
++        escaped, escapeChar, extendedBooleanLiteral, null, separators, nullSequence, lastColumnTakesRest);
++    return createLazyStructInspector(columnNames, typeInfos, lazyParams);
++  }
++
++  /**
++   * Create a hierarchical ObjectInspector for LazyStruct with the given
++   * columnNames and columnTypeInfos.
++   *
++   * @param lastColumnTakesRest
++   *          whether the last column of the struct should take the rest of the
++   *          row if there are extra fields.
++   * @param lazyParams  parameters for the lazy types
++   * @throws SerDeException
++   * @see LazyFactory#createLazyObjectInspector(TypeInfo, byte[], int, Text,
++   *      boolean, byte)
++   */
++  public static ObjectInspector createLazyStructInspector(
++      List<String> columnNames, List<TypeInfo> typeInfos,
++      LazyObjectInspectorParameters lazyParams) throws SerDeException {
+     ArrayList<ObjectInspector> columnObjectInspectors = new ArrayList<ObjectInspector>(
+         typeInfos.size());
+     for (int i = 0; i < typeInfos.size(); i++) {
+       columnObjectInspectors.add(LazyFactory.createLazyObjectInspector(
+-          typeInfos.get(i), separators, 1, nullSequence, escaped, escapeChar,
+-          extendedBooleanLiteral));
++          typeInfos.get(i), 1,
++          lazyParams, ObjectInspectorOptions.JAVA));
+     }
+     return LazyObjectInspectorFactory.getLazySimpleStructObjectInspector(
+-        columnNames, columnObjectInspectors, separators[0], nullSequence,
+-        lastColumnTakesRest, escaped, escapeChar);
++        columnNames, columnObjectInspectors, null, lazyParams.getSeparators()[0],
++        lazyParams, ObjectInspectorOptions.JAVA);
+   }
+ 
+   /**
+@@ -393,15 +438,32 @@ public static ObjectInspector createLazyStructInspector(
+    * @see LazyFactory#createLazyObjectInspector(TypeInfo, byte[], int, Text,
+    *      boolean, byte)
+    */
++  @Deprecated
+   public static ObjectInspector createColumnarStructInspector(
+       List<String> columnNames, List<TypeInfo> columnTypes, byte[] separators,
+       Text nullSequence, boolean escaped, byte escapeChar) throws SerDeException {
++    LazyObjectInspectorParametersImpl lazyParams = new LazyObjectInspectorParametersImpl(
++        escaped, escapeChar, false, null, separators, nullSequence);
++    return createColumnarStructInspector(columnNames, columnTypes, lazyParams);
++  }
++
++  /**
++   * Create a hierarchical ObjectInspector for ColumnarStruct with the given
++   * columnNames and columnTypeInfos.
++   * @throws SerDeException
++   *
++   * @see LazyFactory#createLazyObjectInspector(TypeInfo, byte[], int, Text,
++   *      boolean, byte)
++   */
++  public static ObjectInspector createColumnarStructInspector(
++      List<String> columnNames, List<TypeInfo> columnTypes,
++      LazyObjectInspectorParameters lazyParams) throws SerDeException {
+     ArrayList<ObjectInspector> columnObjectInspectors = new ArrayList<ObjectInspector>(
+         columnTypes.size());
+     for (int i = 0; i < columnTypes.size(); i++) {
+       columnObjectInspectors
+-          .add(LazyFactory.createLazyObjectInspector(columnTypes.get(i),
+-          separators, 1, nullSequence, escaped, escapeChar, false));
++          .add(LazyFactory.createLazyObjectInspector(columnTypes.get(i), 1,
++          lazyParams, ObjectInspectorOptions.JAVA));
+     }
+     return ObjectInspectorFactory.getColumnarStructObjectInspector(columnNames,
+         columnObjectInspectors);
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySerDeParameters.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySerDeParameters.java
+index 615010a..4f2303d 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySerDeParameters.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySerDeParameters.java
+@@ -11,6 +11,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.SerDeException;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
+@@ -21,7 +22,7 @@
+  * SerDeParameters.
+  *
+  */
+-public class LazySerDeParameters {
++public class LazySerDeParameters implements LazyObjectInspectorParameters {
+   public static final byte[] DefaultSeparators = {(byte) 1, (byte) 2, (byte) 3};
+   public static final String SERIALIZATION_EXTEND_NESTING_LEVELS
+   	= "hive.serialization.extend.nesting.levels";
+@@ -83,6 +84,12 @@ public LazySerDeParameters(Configuration job, Properties tbl, String serdeName)
+     
+     extendedBooleanLiteral = (job == null ? false :
+         job.getBoolean(ConfVars.HIVE_LAZYSIMPLE_EXTENDED_BOOLEAN_LITERAL.varname, false));
++
++    String[] timestampFormatsArray =
++            HiveStringUtils.splitAndUnEscape(tbl.getProperty(serdeConstants.TIMESTAMP_FORMATS));
++    if (timestampFormatsArray != null) {
++      timestampFormats = Arrays.asList(timestampFormatsArray);
++    }
+   }
+   
+   /**
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySimpleSerDe.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySimpleSerDe.java
+index 4f00e47..789e5a6 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySimpleSerDe.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySimpleSerDe.java
+@@ -38,6 +38,8 @@
+ import org.apache.hadoop.hive.serde2.SerDeSpec;
+ import org.apache.hadoop.hive.serde2.SerDeStats;
+ import org.apache.hadoop.hive.serde2.SerDeUtils;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+@@ -54,6 +56,7 @@
+ import org.apache.hadoop.io.BinaryComparable;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
++import org.apache.hive.common.util.HiveStringUtils;
+ 
+ 
+ /**
+@@ -123,10 +126,7 @@ public void initialize(Configuration job, Properties tbl)
+ 
+     // Create the ObjectInspectors for the fields
+     cachedObjectInspector = LazyFactory.createLazyStructInspector(serdeParams
+-        .getColumnNames(), serdeParams.getColumnTypes(), serdeParams
+-        .getSeparators(), serdeParams.getNullSequence(), serdeParams
+-        .isLastColumnTakesRest(), serdeParams.isEscaped(), serdeParams
+-        .getEscapeChar(), serdeParams.isExtendedBooleanLiteral());
++        .getColumnNames(), serdeParams.getColumnTypes(), serdeParams);
+ 
+     cachedLazyStruct = (LazyStruct) LazyFactory
+         .createLazyObject(cachedObjectInspector);
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyTimestamp.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyTimestamp.java
+index 27895c5..66134e1 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyTimestamp.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazyTimestamp.java
+@@ -72,7 +72,7 @@ public void init(ByteArrayRef bytes, int start, int length) {
+       logExceptionMessage(bytes, start, length, "TIMESTAMP");
+     } else {
+       try {
+-        t = Timestamp.valueOf(s);
++        t = oi.getTimestampParser().parseTimestamp(s);
+         isNull = false;
+       } catch (IllegalArgumentException e) {
+         isNull = true;
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyListObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyListObjectInspector.java
+index 9d66a78..e293582 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyListObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyListObjectInspector.java
+@@ -23,6 +23,8 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.serde2.lazy.LazyArray;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.io.Text;
+@@ -40,9 +42,7 @@
+ 
+   private ObjectInspector listElementObjectInspector;
+   private byte separator;
+-  private Text nullSequence;
+-  private boolean escaped;
+-  private byte escapeChar;
++  private LazyObjectInspectorParameters lazyParams;
+ 
+   protected LazyListObjectInspector() {
+     super();
+@@ -51,12 +51,10 @@ protected LazyListObjectInspector() {
+    * Call ObjectInspectorFactory.getLazySimpleListObjectInspector instead.
+    */
+   protected LazyListObjectInspector(ObjectInspector listElementObjectInspector,
+-      byte separator, Text nullSequence, boolean escaped, byte escapeChar) {
++      byte separator, LazyObjectInspectorParameters lazyParams) {
+     this.listElementObjectInspector = listElementObjectInspector;
+     this.separator = separator;
+-    this.nullSequence = nullSequence;
+-    this.escaped = escaped;
+-    this.escapeChar = escapeChar;
++    this.lazyParams = lazyParams;
+   }
+ 
+   @Override
+@@ -116,15 +114,18 @@ public byte getSeparator() {
+    * Returns the NullSequence for this array. Called by LazyArray.init(...).
+    */
+   public Text getNullSequence() {
+-    return nullSequence;
++    return lazyParams.getNullSequence();
+   }
+ 
+   public boolean isEscaped() {
+-    return escaped;
++    return lazyParams.isEscaped();
+   }
+ 
+   public byte getEscapeChar() {
+-    return escapeChar;
++    return lazyParams.getEscapeChar();
+   }
+ 
++  public LazyObjectInspectorParameters getLazyParams() {
++    return lazyParams;
++  }
+ }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyMapObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyMapObjectInspector.java
+index ee870f5..4f51823 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyMapObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyMapObjectInspector.java
+@@ -23,6 +23,8 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.serde2.lazy.LazyMap;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.io.Text;
+@@ -42,12 +44,11 @@
+   private ObjectInspector mapValueObjectInspector;
+   private byte itemSeparator;
+   private byte keyValueSeparator;
+-  private Text nullSequence;
+-  private boolean escaped;
+-  private byte escapeChar;
++  private LazyObjectInspectorParameters lazyParams;
+ 
+   protected LazyMapObjectInspector() {
+     super();
++    lazyParams = new LazyObjectInspectorParametersImpl();
+   }
+   /**
+    * Call ObjectInspectorFactory.getStandardListObjectInspector instead.
+@@ -61,9 +62,19 @@ protected LazyMapObjectInspector(ObjectInspector mapKeyObjectInspector,
+ 
+     this.itemSeparator = itemSeparator;
+     this.keyValueSeparator = keyValueSeparator;
+-    this.nullSequence = nullSequence;
+-    this.escaped = escaped;
+-    this.escapeChar = escapeChar;
++    this.lazyParams = new LazyObjectInspectorParametersImpl(
++        escaped, escapeChar, false, null, null, nullSequence);
++  }
++
++  protected LazyMapObjectInspector(ObjectInspector mapKeyObjectInspector,
++      ObjectInspector mapValueObjectInspector, byte itemSeparator,
++      byte keyValueSeparator, LazyObjectInspectorParameters lazyParams) {
++    this.mapKeyObjectInspector = mapKeyObjectInspector;
++    this.mapValueObjectInspector = mapValueObjectInspector;
++
++    this.itemSeparator = itemSeparator;
++    this.keyValueSeparator = keyValueSeparator;
++    this.lazyParams = lazyParams;
+   }
+ 
+   @Override
+@@ -122,14 +133,18 @@ public byte getKeyValueSeparator() {
+   }
+ 
+   public Text getNullSequence() {
+-    return nullSequence;
++    return lazyParams.getNullSequence();
+   }
+ 
+   public boolean isEscaped() {
+-    return escaped;
++    return lazyParams.isEscaped();
+   }
+ 
+   public byte getEscapeChar() {
+-    return escapeChar;
++    return lazyParams.getEscapeChar();
++  }
++
++  public LazyObjectInspectorParameters getLazyParams() {
++    return lazyParams;
+   }
+ }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyObjectInspectorFactory.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyObjectInspectorFactory.java
+index c896710..4c714ef 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyObjectInspectorFactory.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyObjectInspectorFactory.java
+@@ -23,6 +23,8 @@
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.hadoop.hive.serde2.avro.AvroLazyObjectInspector;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions;
+ import org.apache.hadoop.io.Text;
+@@ -43,6 +45,7 @@
+   static ConcurrentHashMap<ArrayList<Object>, LazySimpleStructObjectInspector> cachedLazySimpleStructObjectInspector =
+       new ConcurrentHashMap<ArrayList<Object>, LazySimpleStructObjectInspector>();
+ 
++  @Deprecated
+   public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector(
+       List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors, byte separator,
+@@ -52,7 +55,8 @@ public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector
+       structFieldObjectInspectors, null, separator, nullSequence,
+       lastColumnTakesRest, escaped, escapeChar, ObjectInspectorOptions.JAVA);
+   }
+-  
++
++  @Deprecated
+   public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector(
+       List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors, byte separator,
+@@ -63,6 +67,7 @@ public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector
+       lastColumnTakesRest, escaped, escapeChar, option);
+   }
+ 
++  @Deprecated
+   public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector(
+       List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors, List<String> structFieldComments,
+@@ -72,39 +77,49 @@ public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector
+       structFieldComments, separator, nullSequence, lastColumnTakesRest, escaped, escapeChar,
+       ObjectInspectorOptions.JAVA);
+   }
+-  
++
++  @Deprecated
+   public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector(
+       List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors, List<String> structFieldComments,
+       byte separator, Text nullSequence, boolean lastColumnTakesRest,
+       boolean escaped,byte escapeChar, ObjectInspectorOptions option) {
++
++    return getLazySimpleStructObjectInspector(structFieldNames, structFieldObjectInspectors,
++      structFieldComments, separator,
++      new LazyObjectInspectorParametersImpl(
++          escaped, escapeChar, false, null, null, nullSequence, lastColumnTakesRest),
++      option);
++  }
++
++  public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector(
++      List<String> structFieldNames,
++      List<ObjectInspector> structFieldObjectInspectors, List<String> structFieldComments,
++      byte separator,
++      LazyObjectInspectorParameters lazyParams, ObjectInspectorOptions option) {
+     ArrayList<Object> signature = new ArrayList<Object>();
+     signature.add(structFieldNames);
+     signature.add(structFieldObjectInspectors);
+     signature.add(Byte.valueOf(separator));
+-    signature.add(nullSequence.toString());
+-    signature.add(Boolean.valueOf(lastColumnTakesRest));
+-    signature.add(Boolean.valueOf(escaped));
+-    signature.add(Byte.valueOf(escapeChar));
++    signature.add(lazyParams.getNullSequence().toString());
++    signature.add(Boolean.valueOf(lazyParams.isLastColumnTakesRest()));
++    LazyObjectInspectorFactory.addCommonLazyParamsToSignature(lazyParams, signature);
+     signature.add(option);
+     if(structFieldComments != null) {
+       signature.add(structFieldComments);
+     }
+-    LazySimpleStructObjectInspector result = cachedLazySimpleStructObjectInspector
+-        .get(signature);
++    LazySimpleStructObjectInspector result = cachedLazySimpleStructObjectInspector.get(signature);
+     if (result == null) {
+       switch (option) {
+       case JAVA:
+         result =
+             new LazySimpleStructObjectInspector(structFieldNames, structFieldObjectInspectors,
+-                structFieldComments, separator, nullSequence, lastColumnTakesRest, escaped,
+-                escapeChar);
++                structFieldComments, separator, lazyParams);
+         break;
+       case AVRO:
+         result =
+             new AvroLazyObjectInspector(structFieldNames, structFieldObjectInspectors,
+-                structFieldComments, separator, nullSequence, lastColumnTakesRest, escaped,
+-                escapeChar);
++                structFieldComments, separator, lazyParams);
+         break;
+       default:
+         throw new IllegalArgumentException("Illegal ObjectInspector type [" + option + "]");
+@@ -122,25 +137,28 @@ public static LazySimpleStructObjectInspector getLazySimpleStructObjectInspector
+   static ConcurrentHashMap<ArrayList<Object>, LazyListObjectInspector> cachedLazySimpleListObjectInspector =
+       new ConcurrentHashMap<ArrayList<Object>, LazyListObjectInspector>();
+ 
++  @Deprecated
+   public static LazyListObjectInspector getLazySimpleListObjectInspector(
+       ObjectInspector listElementObjectInspector, byte separator,
+       Text nullSequence, boolean escaped, byte escapeChar) {
++    return getLazySimpleListObjectInspector(listElementObjectInspector, separator,
++        new LazyObjectInspectorParametersImpl(escaped, escapeChar, false, null, null, nullSequence));
++  }
++
++  public static LazyListObjectInspector getLazySimpleListObjectInspector(
++      ObjectInspector listElementObjectInspector, byte separator,
++      LazyObjectInspectorParameters lazyParams) {
+     ArrayList<Object> signature = new ArrayList<Object>();
+     signature.add(listElementObjectInspector);
+     signature.add(Byte.valueOf(separator));
+-    signature.add(nullSequence.toString());
+-    signature.add(Boolean.valueOf(escaped));
+-    signature.add(Byte.valueOf(escapeChar));
++    signature.add(lazyParams.getNullSequence().toString());
++    LazyObjectInspectorFactory.addCommonLazyParamsToSignature(lazyParams, signature);
+     LazyListObjectInspector result = cachedLazySimpleListObjectInspector
+         .get(signature);
+     if (result == null) {
+       result = new LazyListObjectInspector(listElementObjectInspector,
+-          separator, nullSequence, escaped, escapeChar);
+-      LazyListObjectInspector prev =
+-        cachedLazySimpleListObjectInspector.putIfAbsent(signature, result);
+-      if (prev != null) {
+-        result = prev;
+-      }
++          separator, lazyParams);
++      cachedLazySimpleListObjectInspector.put(signature, result);
+     }
+     return result;
+   }
+@@ -148,30 +166,34 @@ public static LazyListObjectInspector getLazySimpleListObjectInspector(
+   static ConcurrentHashMap<ArrayList<Object>, LazyMapObjectInspector> cachedLazySimpleMapObjectInspector =
+       new ConcurrentHashMap<ArrayList<Object>, LazyMapObjectInspector>();
+ 
++  @Deprecated
+   public static LazyMapObjectInspector getLazySimpleMapObjectInspector(
+       ObjectInspector mapKeyObjectInspector,
+       ObjectInspector mapValueObjectInspector, byte itemSeparator,
+       byte keyValueSeparator, Text nullSequence, boolean escaped,
+       byte escapeChar) {
++    return getLazySimpleMapObjectInspector(mapKeyObjectInspector, mapValueObjectInspector,
++        itemSeparator, keyValueSeparator,
++        new LazyObjectInspectorParametersImpl(escaped, escapeChar, false, null, null, nullSequence));
++  }
++
++  public static LazyMapObjectInspector getLazySimpleMapObjectInspector(
++      ObjectInspector mapKeyObjectInspector,
++      ObjectInspector mapValueObjectInspector, byte itemSeparator,
++      byte keyValueSeparator, LazyObjectInspectorParameters lazyParams) {
+     ArrayList<Object> signature = new ArrayList<Object>();
+     signature.add(mapKeyObjectInspector);
+     signature.add(mapValueObjectInspector);
+     signature.add(Byte.valueOf(itemSeparator));
+     signature.add(Byte.valueOf(keyValueSeparator));
+-    signature.add(nullSequence.toString());
+-    signature.add(Boolean.valueOf(escaped));
+-    signature.add(Byte.valueOf(escapeChar));
++    signature.add(lazyParams.getNullSequence().toString());
++    LazyObjectInspectorFactory.addCommonLazyParamsToSignature(lazyParams, signature);
+     LazyMapObjectInspector result = cachedLazySimpleMapObjectInspector
+         .get(signature);
+     if (result == null) {
+       result = new LazyMapObjectInspector(mapKeyObjectInspector,
+-          mapValueObjectInspector, itemSeparator, keyValueSeparator,
+-          nullSequence, escaped, escapeChar);
+-      LazyMapObjectInspector prev =
+-        cachedLazySimpleMapObjectInspector.putIfAbsent(signature, result);
+-      if (prev != null) {
+-        result = prev;
+-      }
++          mapValueObjectInspector, itemSeparator, keyValueSeparator, lazyParams);
++      cachedLazySimpleMapObjectInspector.put(signature, result);
+     }
+     return result;
+   }
+@@ -180,25 +202,27 @@ public static LazyMapObjectInspector getLazySimpleMapObjectInspector(
+     cachedLazyUnionObjectInspector =
+       new ConcurrentHashMap<List<Object>, LazyUnionObjectInspector>();
+ 
++  @Deprecated
+   public static LazyUnionObjectInspector getLazyUnionObjectInspector(
+       List<ObjectInspector> ois, byte separator, Text nullSequence,
+       boolean escaped, byte escapeChar) {
++    return getLazyUnionObjectInspector(ois, separator,
++        new LazyObjectInspectorParametersImpl(escaped, escapeChar, false, null, null, nullSequence));
++  }
++
++  public static LazyUnionObjectInspector getLazyUnionObjectInspector(
++      List<ObjectInspector> ois, byte separator,
++      LazyObjectInspectorParameters lazyParams) {
+     List<Object> signature = new ArrayList<Object>();
+     signature.add(ois);
+     signature.add(Byte.valueOf(separator));
+-    signature.add(nullSequence.toString());
+-    signature.add(Boolean.valueOf(escaped));
+-    signature.add(Byte.valueOf(escapeChar));
++    signature.add(lazyParams.getNullSequence().toString());
++    LazyObjectInspectorFactory.addCommonLazyParamsToSignature(lazyParams, signature);
+     LazyUnionObjectInspector result = cachedLazyUnionObjectInspector
+         .get(signature);
+     if (result == null) {
+-      result = new LazyUnionObjectInspector(ois, separator,
+-          nullSequence, escaped, escapeChar);
+-      LazyUnionObjectInspector prev =
+-        cachedLazyUnionObjectInspector.putIfAbsent(signature, result);
+-      if (prev != null) {
+-        result = prev;
+-      }
++      result = new LazyUnionObjectInspector(ois, separator, lazyParams);
++      cachedLazyUnionObjectInspector.put(signature, result);
+     }
+     return result;
+   }
+@@ -206,4 +230,12 @@ public static LazyUnionObjectInspector getLazyUnionObjectInspector(
+   private LazyObjectInspectorFactory() {
+     // prevent instantiation
+   }
++
++  private static void addCommonLazyParamsToSignature(LazyObjectInspectorParameters lazyParams,
++      List<Object> signature) {
++    signature.add(lazyParams.isEscaped());
++    signature.add(lazyParams.getEscapeChar());
++    signature.add(lazyParams.isExtendedBooleanLiteral());
++    signature.add(lazyParams.getTimestampFormats());
++  }
+ }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazySimpleStructObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazySimpleStructObjectInspector.java
+index 9611e9f..34f8c48 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazySimpleStructObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazySimpleStructObjectInspector.java
+@@ -24,6 +24,8 @@
+ import org.apache.hadoop.hive.serde2.BaseStructObjectInspector;
+ import org.apache.hadoop.hive.serde2.StructObject;
+ import org.apache.hadoop.hive.serde2.avro.AvroLazyObjectInspector;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.StructField;
+@@ -42,22 +44,12 @@
+ public class LazySimpleStructObjectInspector extends BaseStructObjectInspector {
+ 
+   private byte separator;
+-  private Text nullSequence;
+-  private boolean lastColumnTakesRest;
+-  private boolean escaped;
+-  private byte escapeChar;
++  private LazyObjectInspectorParameters lazyParams;
+ 
+   protected LazySimpleStructObjectInspector() {
+     super();
+   }
+ 
+-  protected LazySimpleStructObjectInspector(
+-      List<StructField> fields, byte separator, Text nullSequence) {
+-    init(fields);
+-    this.separator = separator;
+-    this.nullSequence = nullSequence;
+-  }
+-
+   /**
+    * Call ObjectInspectorFactory.getLazySimpleStructObjectInspector instead.
+    */
+@@ -70,6 +62,7 @@ protected LazySimpleStructObjectInspector(List<String> structFieldNames,
+         nullSequence, lastColumnTakesRest, escaped, escapeChar);
+   }
+ 
++  @Deprecated
+   public LazySimpleStructObjectInspector(List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors,
+       List<String> structFieldComments, byte separator, Text nullSequence,
+@@ -78,17 +71,32 @@ public LazySimpleStructObjectInspector(List<String> structFieldNames,
+         separator, nullSequence, lastColumnTakesRest, escaped, escapeChar);
+   }
+ 
++  public LazySimpleStructObjectInspector(List<String> structFieldNames,
++      List<ObjectInspector> structFieldObjectInspectors,
++      List<String> structFieldComments, byte separator, LazyObjectInspectorParameters lazyParams) {
++    init(structFieldNames, structFieldObjectInspectors, structFieldComments,
++        separator, lazyParams);
++  }
++
+   protected void init(List<String> structFieldNames,
+       List<ObjectInspector> structFieldObjectInspectors,
+       List<String> structFieldComments, byte separator,
+       Text nullSequence, boolean lastColumnTakesRest, boolean escaped,
+       byte escapeChar) {
++    LazyObjectInspectorParameters lazyParams =
++        new LazyObjectInspectorParametersImpl(escaped, escapeChar,
++            false, null, null, nullSequence, lastColumnTakesRest);
++    init(structFieldNames, structFieldObjectInspectors, structFieldComments,
++        separator, lazyParams);
++  }
++
++  protected void init(List<String> structFieldNames,
++      List<ObjectInspector> structFieldObjectInspectors,
++      List<String> structFieldComments, byte separator,
++      LazyObjectInspectorParameters lazyParams) {
+     init(structFieldNames, structFieldObjectInspectors, structFieldComments);
+     this.separator = separator;
+-    this.nullSequence = nullSequence;
+-    this.lastColumnTakesRest = lastColumnTakesRest;
+-    this.escaped = escaped;
+-    this.escapeChar = escapeChar;
++    this.lazyParams = lazyParams;
+   }
+ 
+   // With Data
+@@ -142,19 +150,22 @@ public byte getSeparator() {
+   }
+ 
+   public Text getNullSequence() {
+-    return nullSequence;
++    return lazyParams.getNullSequence();
+   }
+ 
+   public boolean getLastColumnTakesRest() {
+-    return lastColumnTakesRest;
++    return lazyParams.isLastColumnTakesRest();
+   }
+ 
+   public boolean isEscaped() {
+-    return escaped;
++    return lazyParams.isEscaped();
+   }
+ 
+   public byte getEscapeChar() {
+-    return escapeChar;
++    return lazyParams.getEscapeChar();
+   }
+ 
++  public LazyObjectInspectorParameters getLazyParams() {
++    return lazyParams;
++  }
+ }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyUnionObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyUnionObjectInspector.java
+index 792a9a2..bedc8e8 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyUnionObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/LazyUnionObjectInspector.java
+@@ -24,6 +24,8 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.serde2.lazy.LazyUnion;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParameters;
++import org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive.LazyObjectInspectorParametersImpl;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorUtils;
+ import org.apache.hadoop.hive.serde2.objectinspector.UnionObjectInspector;
+@@ -44,19 +46,16 @@
+ 
+   private  List<ObjectInspector> ois;
+   private byte separator;
+-  private Text nullSequence;
+-  private boolean escaped;
+-  private byte escapeChar;
++  private LazyObjectInspectorParameters lazyParams;
+ 
+   protected LazyUnionObjectInspector() {
+     super();
+   }
++
+   protected LazyUnionObjectInspector(
+       List<ObjectInspector> ois, byte separator,
+-      Text nullSequence, boolean escaped,
+-      byte escapeChar) {
+-    init(ois, separator,
+-        nullSequence, escaped, escapeChar);
++      LazyObjectInspectorParameters lazyParams) {
++    init(ois, separator, lazyParams);
+   }
+ 
+   @Override
+@@ -66,25 +65,9 @@ public String getTypeName() {
+ 
+   protected void init(
+       List<ObjectInspector> ois, byte separator,
+-      Text nullSequence, boolean escaped,
+-      byte escapeChar) {
++      LazyObjectInspectorParameters lazyParams) {
+     this.separator = separator;
+-    this.nullSequence = nullSequence;
+-    this.escaped = escaped;
+-    this.escapeChar = escapeChar;
+-    this.ois = new ArrayList<ObjectInspector>();
+-    this.ois.addAll(ois);
+-  }
+-
+-  protected LazyUnionObjectInspector(List<ObjectInspector> ois,
+-      byte separator, Text nullSequence) {
+-    init(ois, separator, nullSequence);
+-  }
+-
+-  protected void init(List<ObjectInspector> ois, byte separator,
+-      Text nullSequence) {
+-    this.separator = separator;
+-    this.nullSequence = nullSequence;
++    this.lazyParams = lazyParams;
+     this.ois = new ArrayList<ObjectInspector>();
+     this.ois.addAll(ois);
+   }
+@@ -99,17 +82,20 @@ public byte getSeparator() {
+   }
+ 
+   public Text getNullSequence() {
+-    return nullSequence;
++    return lazyParams.getNullSequence();
+   }
+ 
+   public boolean isEscaped() {
+-    return escaped;
++    return lazyParams.isEscaped();
+   }
+ 
+   public byte getEscapeChar() {
+-    return escapeChar;
++    return lazyParams.getEscapeChar();
+   }
+ 
++  public LazyObjectInspectorParameters getLazyParams() {
++    return lazyParams;
++  }
+   @Override
+   public Object getField(Object data) {
+     if (data == null) {
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParameters.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParameters.java
+new file mode 100644
+index 0000000..5cda118
+--- /dev/null
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParameters.java
+@@ -0,0 +1,33 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive;
++
++import java.util.List;
++
++import org.apache.hadoop.io.Text;
++
++public interface LazyObjectInspectorParameters {
++  public boolean isEscaped();
++  public byte getEscapeChar();
++  public boolean isExtendedBooleanLiteral();
++  public List<String> getTimestampFormats();
++  public byte[] getSeparators();
++  public Text getNullSequence();
++  public boolean isLastColumnTakesRest();
++}
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParametersImpl.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParametersImpl.java
+new file mode 100644
+index 0000000..ba02f57
+--- /dev/null
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyObjectInspectorParametersImpl.java
+@@ -0,0 +1,144 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive;
++
++import java.util.Arrays;
++import java.util.List;
++
++import org.apache.commons.lang.ObjectUtils;
++import org.apache.commons.lang.builder.HashCodeBuilder;
++import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
++import org.apache.hadoop.io.Text;
++
++public class LazyObjectInspectorParametersImpl implements
++    LazyObjectInspectorParameters {
++  protected boolean escaped;
++  protected byte escapeChar;
++  protected boolean extendedBooleanLiteral;
++  protected List<String> timestampFormats;
++  protected byte[] separators;
++  protected Text nullSequence;
++  protected boolean lastColumnTakesRest;
++
++
++  public LazyObjectInspectorParametersImpl() {
++    this.escaped = false;
++    this.extendedBooleanLiteral = false;
++    this.timestampFormats = null;
++  }
++
++  public LazyObjectInspectorParametersImpl(boolean escaped, byte escapeChar,
++      boolean extendedBooleanLiteral, List<String> timestampFormats,
++      byte[] separators, Text nullSequence) {
++    super();
++    this.escaped = escaped;
++    this.escapeChar = escapeChar;
++    this.extendedBooleanLiteral = extendedBooleanLiteral;
++    this.timestampFormats = timestampFormats;
++    this.separators = separators;
++    this.nullSequence = nullSequence;
++    this.lastColumnTakesRest = false;
++  }
++
++  public LazyObjectInspectorParametersImpl(boolean escaped, byte escapeChar,
++      boolean extendedBooleanLiteral, List<String> timestampFormats,
++      byte[] separators, Text nullSequence, boolean lastColumnTakesRest) {
++    super();
++    this.escaped = escaped;
++    this.escapeChar = escapeChar;
++    this.extendedBooleanLiteral = extendedBooleanLiteral;
++    this.timestampFormats = timestampFormats;
++    this.separators = separators;
++    this.nullSequence = nullSequence;
++    this.lastColumnTakesRest = lastColumnTakesRest;
++  }
++
++  public LazyObjectInspectorParametersImpl(LazyObjectInspectorParameters lazyParams) {
++    this.escaped = lazyParams.isEscaped();
++    this.escapeChar = lazyParams.getEscapeChar();
++    this.extendedBooleanLiteral = lazyParams.isExtendedBooleanLiteral();
++    this.timestampFormats = lazyParams.getTimestampFormats();
++    this.separators = lazyParams.getSeparators();
++    this.nullSequence = lazyParams.getNullSequence();
++    this.lastColumnTakesRest = lazyParams.isLastColumnTakesRest();
++  }
++
++  @Override
++  public boolean isEscaped() {
++    return escaped;
++  }
++
++  @Override
++  public byte getEscapeChar() {
++    return escapeChar;
++  }
++
++  @Override
++  public boolean isExtendedBooleanLiteral() {
++    return extendedBooleanLiteral;
++  }
++
++  @Override
++  public List<String> getTimestampFormats() {
++    return timestampFormats;
++  }
++
++  @Override
++  public byte[] getSeparators() {
++    return separators;
++  }
++
++  @Override
++  public Text getNullSequence() {
++    return nullSequence;
++  }
++
++  @Override
++  public boolean isLastColumnTakesRest() {
++    return lastColumnTakesRest;
++  }
++
++  protected boolean equals(LazyObjectInspectorParametersImpl other) {
++    return this.escaped == other.escaped
++        && this.escapeChar == other.escapeChar
++        && this.extendedBooleanLiteral == other.extendedBooleanLiteral
++        && this.lastColumnTakesRest == other.lastColumnTakesRest
++        && ObjectUtils.equals(this.nullSequence, other.nullSequence)
++        && Arrays.equals(this.separators, other.separators)
++        && ObjectUtils.equals(this.timestampFormats, other.timestampFormats);
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    if (this == obj) {
++      return true;
++    }
++    if (!(obj instanceof LazyObjectInspectorParametersImpl)) {
++      return false;
++    }
++    return equals((LazyObjectInspectorParametersImpl) obj);
++  }
++
++  @Override
++  public int hashCode() {
++    return new HashCodeBuilder().append(escaped).append(escapeChar)
++        .append(extendedBooleanLiteral).append(timestampFormats)
++        .append(lastColumnTakesRest).append(nullSequence).append(separators).toHashCode();
++  }
++}
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyPrimitiveObjectInspectorFactory.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyPrimitiveObjectInspectorFactory.java
+index 54a5f7a..4501bb8 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyPrimitiveObjectInspectorFactory.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyPrimitiveObjectInspectorFactory.java
+@@ -118,17 +118,28 @@ private LazyPrimitiveObjectInspectorFactory() {
+ 
+   public static AbstractPrimitiveLazyObjectInspector<?> getLazyObjectInspector(
+       PrimitiveTypeInfo typeInfo, boolean escaped, byte escapeChar, boolean extBoolean) {
++    LazyObjectInspectorParameters lazyParams = new LazyObjectInspectorParametersImpl(
++        escaped, escapeChar, extBoolean, null, null, null);
++    return getLazyObjectInspector(typeInfo, lazyParams);
++  }
++
++  public static AbstractPrimitiveLazyObjectInspector<?> getLazyObjectInspector(
++      PrimitiveTypeInfo typeInfo, LazyObjectInspectorParameters lazyParams) {
+     PrimitiveCategory primitiveCategory = typeInfo.getPrimitiveCategory();
+ 
+     switch(primitiveCategory) {
+     case STRING:
+-      return getLazyStringObjectInspector(escaped, escapeChar);
++      return getLazyStringObjectInspector(lazyParams.isEscaped(), lazyParams.getEscapeChar());
+     case CHAR:
+-      return getLazyHiveCharObjectInspector((CharTypeInfo)typeInfo, escaped, escapeChar);
++      return getLazyHiveCharObjectInspector((CharTypeInfo)typeInfo,
++          lazyParams.isEscaped(), lazyParams.getEscapeChar());
+     case VARCHAR:
+-      return getLazyHiveVarcharObjectInspector((VarcharTypeInfo)typeInfo, escaped, escapeChar);
++      return getLazyHiveVarcharObjectInspector((VarcharTypeInfo)typeInfo,
++          lazyParams.isEscaped(), lazyParams.getEscapeChar());
+     case BOOLEAN:
+-      return getLazyBooleanObjectInspector(extBoolean);
++      return getLazyBooleanObjectInspector(lazyParams.isExtendedBooleanLiteral());
++    case TIMESTAMP:
++      return getLazyTimestampObjectInspector(lazyParams.getTimestampFormats());
+     default:
+      return getLazyObjectInspector(typeInfo);
+     }
+@@ -221,6 +232,25 @@ public static LazyHiveVarcharObjectInspector getLazyHiveVarcharObjectInspector(
+     return result;
+   }
+ 
++  public static LazyTimestampObjectInspector getLazyTimestampObjectInspector(
++      List<String> tsFormats) {
++    if (tsFormats == null) {
++      // No timestamp format specified, just use default lazy inspector
++      return (LazyTimestampObjectInspector) getLazyObjectInspector(TypeInfoFactory.timestampTypeInfo);
++    }
++
++    ArrayList<Object> signature = new ArrayList<Object>();
++    signature.add(TypeInfoFactory.timestampTypeInfo);
++    signature.add(tsFormats);
++    LazyTimestampObjectInspector result = (LazyTimestampObjectInspector) cachedLazyStringTypeOIs
++        .get(signature);
++    if (result == null) {
++      result = new LazyTimestampObjectInspector(tsFormats);
++      cachedLazyStringTypeOIs.put(signature, result);
++    }
++    return result;
++  }
++
+   private static LazyBooleanObjectInspector getLazyBooleanObjectInspector(boolean extLiteral) {
+     return extLiteral ? LAZY_EXT_BOOLEAN_OBJECT_INSPECTOR : LAZY_BOOLEAN_OBJECT_INSPECTOR;
+   }
+diff --git a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyTimestampObjectInspector.java b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyTimestampObjectInspector.java
+index 0d15054..3829b08 100644
+--- a/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyTimestampObjectInspector.java
++++ b/serde/src/java/org/apache/hadoop/hive/serde2/lazy/objectinspector/primitive/LazyTimestampObjectInspector.java
+@@ -18,18 +18,30 @@
+ package org.apache.hadoop.hive.serde2.lazy.objectinspector.primitive;
+ 
+ import java.sql.Timestamp;
++import java.util.List;
+ 
+ import org.apache.hadoop.hive.serde2.io.TimestampWritable;
+ import org.apache.hadoop.hive.serde2.lazy.LazyTimestamp;
+ import org.apache.hadoop.hive.serde2.objectinspector.primitive.TimestampObjectInspector;
+ import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
++import org.apache.hive.common.util.TimestampParser;
+ 
+ public class LazyTimestampObjectInspector
+     extends AbstractPrimitiveLazyObjectInspector<TimestampWritable>
+     implements TimestampObjectInspector {
+ 
+-  protected LazyTimestampObjectInspector() {
++  protected List<String> timestampFormats = null;
++  protected TimestampParser timestampParser = null;
++
++  LazyTimestampObjectInspector() {
+     super(TypeInfoFactory.timestampTypeInfo);
++    timestampParser = new TimestampParser();
++  }
++
++  LazyTimestampObjectInspector(List<String> tsFormats) {
++    super(TypeInfoFactory.timestampTypeInfo);
++    this.timestampFormats = tsFormats;
++    timestampParser = new TimestampParser(tsFormats);
+   }
+ 
+   public Object copyObject(Object o) {
+@@ -39,4 +51,13 @@ public Object copyObject(Object o) {
+   public Timestamp getPrimitiveJavaObject(Object o) {
+     return o == null ? null : ((LazyTimestamp) o).getWritableObject().getTimestamp();
+   }
++
++  public List<String> getTimestampFormats() {
++    return timestampFormats;
++  }
++
++  public TimestampParser getTimestampParser() {
++    return timestampParser;
++  }
++
+ }
+-- 
+1.7.9.5
+

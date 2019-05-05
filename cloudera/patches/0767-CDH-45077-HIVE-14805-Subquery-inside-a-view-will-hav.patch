@@ -1,0 +1,69 @@
+From 47a2a3845a4782b8e1a6295137cadc27dad93266 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@apache.org>
+Date: Wed, 21 Sep 2016 13:59:14 -0400
+Subject: [PATCH 0767/1164] CDH-45077: HIVE-14805: Subquery inside a view will
+ have the object in the subquery as the direct
+ input (Aihua Xu, reviewed by Yongzhi Chen)
+
+Change-Id: I56e86c0667ece3091c0d6fa1dd7bb87709d44143
+---
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |    2 +-
+ .../apache/hadoop/hive/ql/plan/TestViewEntity.java |   31 ++++++++++++++++++++
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index 7a3c2b9..2948e2d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -939,7 +939,7 @@ private String processSubQuery(QB qb, ASTNode subq) throws SemanticException {
+     // Recursively do the first phase of semantic analysis for the subquery
+     QBExpr qbexpr = new QBExpr(alias);
+ 
+-    doPhase1QBExpr(subqref, qbexpr, qb.getId(), alias);
++    doPhase1QBExpr(subqref, qbexpr, qb.getId(), alias, qb.isInsideView());
+ 
+     // If the alias is already there then we have a conflict
+     if (qb.exists(alias)) {
+diff --git a/ql/src/test/org/apache/hadoop/hive/ql/plan/TestViewEntity.java b/ql/src/test/org/apache/hadoop/hive/ql/plan/TestViewEntity.java
+index e24208e..88bc360 100644
+--- a/ql/src/test/org/apache/hadoop/hive/ql/plan/TestViewEntity.java
++++ b/ql/src/test/org/apache/hadoop/hive/ql/plan/TestViewEntity.java
+@@ -138,4 +138,35 @@ public void testViewInSubQuery() throws Exception {
+ 
+   }
+ 
++  /**
++   * Verify that the the query with the subquery inside a view will have the correct
++   * direct and indirect inputs.
++   * @throws Exception
++   */
++  @Test
++  public void testSubQueryInSubView() throws Exception {
++    String prefix = "tvsubqueryinsubview" + NAME_PREFIX;
++    final String tab1 = prefix + "t";
++    final String view1 = prefix + "v";
++    final String view2 = prefix + "v2";
++
++    int ret = driver.run("create table " + tab1 + "(id int)").getResponseCode();
++    assertEquals("Checking command success", 0, ret);
++    ret = driver.run("create view " + view1 + " as select * from " + tab1).getResponseCode();
++    assertEquals("Checking command success", 0, ret);
++
++    ret = driver.run("create view " + view2 + " as select * from (select * from " + view1 + ") x").getResponseCode();
++    assertEquals("Checking command success", 0, ret);
++
++    driver.compile("select * from " + view2);
++    // view entity
++    assertEquals("default@" + view2, CheckInputReadEntity.readEntities[0].getName());
++
++    // table1 and view1 as second read entity
++    assertEquals("default@" + view1, CheckInputReadEntity.readEntities[1].getName());
++    assertFalse("Table is not direct input", CheckInputReadEntity.readEntities[1].isDirect());
++    assertEquals("default@" + tab1, CheckInputReadEntity.readEntities[2].getName());
++    assertFalse("Table is not direct input", CheckInputReadEntity.readEntities[2].isDirect());
++
++  }
+ }
+-- 
+1.7.9.5
+

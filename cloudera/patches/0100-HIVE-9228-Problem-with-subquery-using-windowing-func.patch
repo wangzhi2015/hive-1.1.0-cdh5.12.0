@@ -1,0 +1,445 @@
+From 91d08936821401ae5a2c5917f4074abaceef794f Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Tue, 10 Feb 2015 00:46:21 +0000
+Subject: [PATCH 0100/1164] HIVE-9228 : Problem with subquery using windowing
+ functions (Navis via Ashutosh Chauhan)
+
+---
+ .../hive/ql/optimizer/ColumnPrunerProcFactory.java |   12 ++++++
+ .../apache/hadoop/hive/ql/parse/RowResolver.java   |   11 +++++
+ .../hadoop/hive/ql/parse/SemanticAnalyzer.java     |   13 +++---
+ .../queries/clientpositive/windowing_windowspec.q  |    4 ++
+ ql/src/test/results/clientpositive/ptf.q.out       |   16 ++++---
+ ql/src/test/results/clientpositive/spark/ptf.q.out |   14 ++++---
+ .../clientpositive/spark/vectorized_ptf.q.out      |   18 ++++----
+ .../results/clientpositive/subquery_notin.q.out    |   12 +++---
+ .../clientpositive/subquery_unqualcolumnrefs.q.out |    2 +-
+ ql/src/test/results/clientpositive/tez/ptf.q.out   |   14 ++++---
+ .../clientpositive/tez/vectorized_ptf.q.out        |   18 ++++----
+ .../results/clientpositive/vectorized_ptf.q.out    |   44 +++++++++++---------
+ .../clientpositive/windowing_windowspec.q.out      |   17 ++++++++
+ 13 files changed, 132 insertions(+), 63 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ColumnPrunerProcFactory.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ColumnPrunerProcFactory.java
+index 6c07637..608a3b6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ColumnPrunerProcFactory.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ColumnPrunerProcFactory.java
+@@ -276,6 +276,7 @@ public Object process(Node nd, Stack<Node> stack, NodeProcessorCtx ctx,
+       WindowTableFunctionDef def = null;
+       if (conf.forWindowing()) {
+         def = (WindowTableFunctionDef) conf.getFuncDef();
++        prunedCols = Utilities.mergeUniqElems(getWindowFunctionColumns(def), prunedCols);
+         prunedCols = prunedColumnsList(prunedCols, def);
+       }
+       ArrayList<ColumnInfo> sig = new ArrayList<ColumnInfo>();
+@@ -302,6 +303,17 @@ private RowResolver buildPrunedRR(List<String> prunedCols,
+       return newRR;
+     }
+ 
++    // always should be in this order (see PTFDeserializer#initializeWindowing)
++    private List<String> getWindowFunctionColumns(WindowTableFunctionDef tDef) {
++      List<String> columns = new ArrayList<String>();
++      if (tDef.getWindowFunctions() != null) {
++        for (WindowFunctionDef wDef : tDef.getWindowFunctions()) {
++          columns.add(wDef.getAlias());
++        }
++      }
++      return columns;
++    }
++    
+     /*
+      * add any input columns referenced in WindowFn args or expressions.
+      */
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/RowResolver.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/RowResolver.java
+index 469dc9f..2c52a43 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/RowResolver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/RowResolver.java
+@@ -458,4 +458,15 @@ public static RowResolver getCombinedRR(RowResolver leftRR,
+     }
+     return combinedRR;
+   }
++
++  public RowResolver duplicate() {
++    RowResolver resolver = new RowResolver();
++    resolver.rowSchema = new RowSchema(rowSchema);
++    resolver.rslvMap.putAll(rslvMap);
++    resolver.invRslvMap.putAll(invRslvMap);
++    resolver.altInvRslvMap.putAll(altInvRslvMap);
++    resolver.expressionMap.putAll(expressionMap);
++    resolver.isExprResolver = isExprResolver;
++    return resolver;
++  }
+ }
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+index e1c9483..d3beb75 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java
+@@ -5215,7 +5215,7 @@ private Operator genGroupByPlan1ReduceMultiGBY(List<String> dests, QB qb, Operat
+ 
+     // insert a select operator here used by the ColumnPruner to reduce
+     // the data to shuffle
+-    Operator select = insertSelectAllPlanForGroupBy(selectInput);
++    Operator select = genSelectAllDesc(selectInput);
+ 
+     // Generate ReduceSinkOperator
+     ReduceSinkOperator reduceSinkOperatorInfo =
+@@ -8460,8 +8460,7 @@ private JoinType getType(JoinCond[] conds) {
+     return type;
+   }
+ 
+-  private Operator insertSelectAllPlanForGroupBy(Operator input)
+-      throws SemanticException {
++  private Operator genSelectAllDesc(Operator input) throws SemanticException {
+     OpParseContext inputCtx = opParseCtx.get(input);
+     RowResolver inputRR = inputCtx.getRowResolver();
+     ArrayList<ColumnInfo> columns = inputRR.getColumnInfos();
+@@ -8475,9 +8474,10 @@ private Operator insertSelectAllPlanForGroupBy(Operator input)
+       columnNames.add(col.getInternalName());
+       columnExprMap.put(col.getInternalName(), new ExprNodeColumnDesc(col));
+     }
++    RowResolver outputRR = inputRR.duplicate();
+     Operator output = putOpInsertMap(OperatorFactory.getAndMakeChild(
+-        new SelectDesc(colList, columnNames, true), new RowSchema(inputRR
+-            .getColumnInfos()), input), inputRR);
++        new SelectDesc(colList, columnNames, true), 
++        outputRR.getRowSchema(), input), outputRR);
+     output.setColumnExprMap(columnExprMap);
+     return output;
+   }
+@@ -8926,7 +8926,7 @@ private Operator genBodyPlan(QB qb, Operator input, Map<String, Operator> aliasT
+                 }
+                 // insert a select operator here used by the ColumnPruner to reduce
+                 // the data to shuffle
+-                curr = insertSelectAllPlanForGroupBy(curr);
++                curr = genSelectAllDesc(curr);
+                 // Check and transform group by *. This will only happen for select distinct *.
+                 // Here the "genSelectPlan" is being leveraged.
+                 // The main benefits are (1) remove virtual columns that should
+@@ -12150,6 +12150,7 @@ Operator genWindowingPlan(WindowingSpec wSpec, Operator input) throws SemanticEx
+       input = putOpInsertMap(OperatorFactory.getAndMakeChild(ptfDesc,
+           new RowSchema(ptfOpRR.getColumnInfos()),
+           input), ptfOpRR);
++      input = genSelectAllDesc(input);
+       rr = ptfOpRR;
+     }
+ 
+diff --git a/ql/src/test/queries/clientpositive/windowing_windowspec.q b/ql/src/test/queries/clientpositive/windowing_windowspec.q
+index 6d8ce67..63f97b7 100644
+--- a/ql/src/test/queries/clientpositive/windowing_windowspec.q
++++ b/ql/src/test/queries/clientpositive/windowing_windowspec.q
+@@ -34,3 +34,7 @@ select f, sum(f) over (partition by ts order by f range between unbounded preced
+ select s, i, round(avg(d) over (partition by s order by i) / 10.0 , 2) from over10k limit 7;
+ 
+ select s, i, round((avg(d) over  w1 + 10.0) - (avg(d) over w1 - 10.0),2) from over10k window w1 as (partition by s order by i) limit 7;
++
++set hive.cbo.enable=false;
++-- HIVE-9228 
++select s, i from ( select s, i, round((avg(d) over  w1 + 10.0) - (avg(d) over w1 - 10.0),2) from over10k window w1 as (partition by s order by i)) X limit 7;
+diff --git a/ql/src/test/results/clientpositive/ptf.q.out b/ql/src/test/results/clientpositive/ptf.q.out
+index f678035..196b404 100644
+--- a/ql/src/test/results/clientpositive/ptf.q.out
++++ b/ql/src/test/results/clientpositive/ptf.q.out
+@@ -2476,12 +2476,16 @@ STAGE PLANS:
+           Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+           PTF Operator
+             Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+-            File Output Operator
+-              compressed: false
+-              table:
+-                  input format: org.apache.hadoop.mapred.SequenceFileInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
+-                  serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
++            Select Operator
++              expressions: _col1 (type: string), _col2 (type: string), _col5 (type: int), _wcol0 (type: bigint)
++              outputColumnNames: _col1, _col2, _col5, _wcol0
++              Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
++              File Output Operator
++                compressed: false
++                table:
++                    input format: org.apache.hadoop.mapred.SequenceFileInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
++                    serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+ 
+   Stage: Stage-6
+     Map Reduce
+diff --git a/ql/src/test/results/clientpositive/spark/ptf.q.out b/ql/src/test/results/clientpositive/spark/ptf.q.out
+index 8ca5496..0d4f449 100644
+--- a/ql/src/test/results/clientpositive/spark/ptf.q.out
++++ b/ql/src/test/results/clientpositive/spark/ptf.q.out
+@@ -2336,12 +2336,16 @@ STAGE PLANS:
+                 Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+                 PTF Operator
+                   Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+-                  Reduce Output Operator
+-                    key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
+-                    sort order: +++
+-                    Map-reduce partition columns: _col2 (type: string)
++                  Select Operator
++                    expressions: _col1 (type: string), _col2 (type: string), _col5 (type: int), _wcol0 (type: bigint)
++                    outputColumnNames: _col1, _col2, _col5, _wcol0
+                     Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+-                    value expressions: _wcol0 (type: bigint), _col5 (type: int)
++                    Reduce Output Operator
++                      key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
++                      sort order: +++
++                      Map-reduce partition columns: _col2 (type: string)
++                      Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
++                      value expressions: _wcol0 (type: bigint), _col5 (type: int)
+         Reducer 5 
+             Reduce Operator Tree:
+               Select Operator
+diff --git a/ql/src/test/results/clientpositive/spark/vectorized_ptf.q.out b/ql/src/test/results/clientpositive/spark/vectorized_ptf.q.out
+index 020fdff..023f46d 100644
+--- a/ql/src/test/results/clientpositive/spark/vectorized_ptf.q.out
++++ b/ql/src/test/results/clientpositive/spark/vectorized_ptf.q.out
+@@ -5303,14 +5303,18 @@ STAGE PLANS:
+                 Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+                 PTF Operator
+                   Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+-                  Reduce Output Operator
+-                    key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
+-                    sort order: +++
+-                    Map-reduce partition columns: _col2 (type: string)
++                  Select Operator
++                    expressions: _col1 (type: string), _col2 (type: string), _col5 (type: int), _wcol0 (type: bigint)
++                    outputColumnNames: _col1, _col2, _col5, _wcol0
+                     Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+-                    tag: -1
+-                    value expressions: _wcol0 (type: bigint), _col5 (type: int)
+-                    auto parallelism: false
++                    Reduce Output Operator
++                      key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
++                      sort order: +++
++                      Map-reduce partition columns: _col2 (type: string)
++                      Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
++                      tag: -1
++                      value expressions: _wcol0 (type: bigint), _col5 (type: int)
++                      auto parallelism: false
+         Reducer 5 
+             Needs Tagging: false
+             Reduce Operator Tree:
+diff --git a/ql/src/test/results/clientpositive/subquery_notin.q.out b/ql/src/test/results/clientpositive/subquery_notin.q.out
+index 599a61e..08e6649 100644
+--- a/ql/src/test/results/clientpositive/subquery_notin.q.out
++++ b/ql/src/test/results/clientpositive/subquery_notin.q.out
+@@ -285,7 +285,7 @@ POSTHOOK: Input: default@src
+ 199	val_199
+ 199	val_199
+ 2	val_2
+-Warning: Shuffle Join JOIN[30][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[32][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
+ PREHOOK: query: -- non agg, corr
+ explain
+ select p_mfgr, b.p_name, p_size 
+@@ -498,7 +498,7 @@ STAGE PLANS:
+       Processor Tree:
+         ListSink
+ 
+-Warning: Shuffle Join JOIN[30][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[32][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
+ PREHOOK: query: select p_mfgr, b.p_name, p_size 
+ from part b 
+ where b.p_name not in 
+@@ -537,7 +537,7 @@ Manufacturer#4	almond azure aquamarine papaya violet	12
+ Manufacturer#5	almond antique blue firebrick mint	31
+ Manufacturer#5	almond aquamarine dodger light gainsboro	46
+ Manufacturer#5	almond azure blanched chiffon midnight	23
+-Warning: Shuffle Join JOIN[45][tables = [$hdt$_0, $hdt$_1, $hdt$_2]] in Stage 'Stage-2:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[47][tables = [$hdt$_0, $hdt$_1, $hdt$_2]] in Stage 'Stage-2:MAPRED' is a cross product
+ PREHOOK: query: -- agg, non corr
+ explain
+ select p_name, p_size 
+@@ -787,7 +787,7 @@ STAGE PLANS:
+       Processor Tree:
+         ListSink
+ 
+-Warning: Shuffle Join JOIN[45][tables = [$hdt$_0, $hdt$_1, $hdt$_2]] in Stage 'Stage-2:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[47][tables = [$hdt$_0, $hdt$_1, $hdt$_2]] in Stage 'Stage-2:MAPRED' is a cross product
+ PREHOOK: query: select p_name, p_size 
+ from 
+ part where part.p_size not in 
+@@ -834,7 +834,7 @@ almond aquamarine sandy cyan gainsboro	18
+ almond aquamarine yellow dodger mint	7
+ almond azure aquamarine papaya violet	12
+ almond azure blanched chiffon midnight	23
+-Warning: Shuffle Join JOIN[42][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[44][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
+ PREHOOK: query: -- agg, corr
+ explain
+ select p_mfgr, p_name, p_size 
+@@ -1116,7 +1116,7 @@ STAGE PLANS:
+       Processor Tree:
+         ListSink
+ 
+-Warning: Shuffle Join JOIN[42][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[44][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
+ PREHOOK: query: select p_mfgr, p_name, p_size 
+ from part b where b.p_size not in 
+   (select min(p_size) 
+diff --git a/ql/src/test/results/clientpositive/subquery_unqualcolumnrefs.q.out b/ql/src/test/results/clientpositive/subquery_unqualcolumnrefs.q.out
+index 06d5708..1b3d422 100644
+--- a/ql/src/test/results/clientpositive/subquery_unqualcolumnrefs.q.out
++++ b/ql/src/test/results/clientpositive/subquery_unqualcolumnrefs.q.out
+@@ -767,7 +767,7 @@ STAGE PLANS:
+       Processor Tree:
+         ListSink
+ 
+-Warning: Shuffle Join JOIN[30][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
++Warning: Shuffle Join JOIN[32][tables = [$hdt$_0, $hdt$_1]] in Stage 'Stage-1:MAPRED' is a cross product
+ PREHOOK: query: -- non agg, corr
+ explain
+ select p_mfgr, b.p_name, p_size 
+diff --git a/ql/src/test/results/clientpositive/tez/ptf.q.out b/ql/src/test/results/clientpositive/tez/ptf.q.out
+index 6f9dd91..5ed1108 100644
+--- a/ql/src/test/results/clientpositive/tez/ptf.q.out
++++ b/ql/src/test/results/clientpositive/tez/ptf.q.out
+@@ -2354,12 +2354,16 @@ STAGE PLANS:
+                 Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+                 PTF Operator
+                   Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+-                  Reduce Output Operator
+-                    key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
+-                    sort order: +++
+-                    Map-reduce partition columns: _col2 (type: string)
++                  Select Operator
++                    expressions: _col1 (type: string), _col2 (type: string), _col5 (type: int), _wcol0 (type: bigint)
++                    outputColumnNames: _col1, _col2, _col5, _wcol0
+                     Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
+-                    value expressions: _wcol0 (type: bigint), _col5 (type: int)
++                    Reduce Output Operator
++                      key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
++                      sort order: +++
++                      Map-reduce partition columns: _col2 (type: string)
++                      Statistics: Num rows: 26 Data size: 3147 Basic stats: COMPLETE Column stats: NONE
++                      value expressions: _wcol0 (type: bigint), _col5 (type: int)
+         Reducer 5 
+             Reduce Operator Tree:
+               Select Operator
+diff --git a/ql/src/test/results/clientpositive/tez/vectorized_ptf.q.out b/ql/src/test/results/clientpositive/tez/vectorized_ptf.q.out
+index a814849..2e0b724 100644
+--- a/ql/src/test/results/clientpositive/tez/vectorized_ptf.q.out
++++ b/ql/src/test/results/clientpositive/tez/vectorized_ptf.q.out
+@@ -5330,14 +5330,18 @@ STAGE PLANS:
+                 Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+                 PTF Operator
+                   Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+-                  Reduce Output Operator
+-                    key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
+-                    sort order: +++
+-                    Map-reduce partition columns: _col2 (type: string)
++                  Select Operator
++                    expressions: _col1 (type: string), _col2 (type: string), _col5 (type: int), _wcol0 (type: bigint)
++                    outputColumnNames: _col1, _col2, _col5, _wcol0
+                     Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+-                    tag: -1
+-                    value expressions: _wcol0 (type: bigint), _col5 (type: int)
+-                    auto parallelism: true
++                    Reduce Output Operator
++                      key expressions: _col2 (type: string), _col2 (type: string), _col1 (type: string)
++                      sort order: +++
++                      Map-reduce partition columns: _col2 (type: string)
++                      Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
++                      tag: -1
++                      value expressions: _wcol0 (type: bigint), _col5 (type: int)
++                      auto parallelism: true
+         Reducer 5 
+             Needs Tagging: false
+             Reduce Operator Tree:
+diff --git a/ql/src/test/results/clientpositive/vectorized_ptf.q.out b/ql/src/test/results/clientpositive/vectorized_ptf.q.out
+index 1e3c43c..0da477c 100644
+--- a/ql/src/test/results/clientpositive/vectorized_ptf.q.out
++++ b/ql/src/test/results/clientpositive/vectorized_ptf.q.out
+@@ -6207,23 +6207,27 @@ STAGE PLANS:
+           Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+           PTF Operator
+             Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
+-            File Output Operator
+-              compressed: false
+-              GlobalTableId: 0
++            Select Operator
++              expressions: _col1 (type: string), _col2 (type: string), _col5 (type: int), _wcol0 (type: bigint)
++              outputColumnNames: _col1, _col2, _col5, _wcol0
++              Statistics: Num rows: 26 Data size: 16042 Basic stats: COMPLETE Column stats: NONE
++              File Output Operator
++                compressed: false
++                GlobalTableId: 0
+ #### A masked pattern was here ####
+-              NumFilesPerFileSink: 1
+-              table:
+-                  input format: org.apache.hadoop.mapred.SequenceFileInputFormat
+-                  output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
+-                  properties:
+-                    columns _wcol0,_col1,_col2,_col5
+-                    columns.types bigint,string,string,int
+-                    escape.delim \
+-                    serialization.lib org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+-                  serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+-              TotalFiles: 1
+-              GatherStats: false
+-              MultiFileSpray: false
++                NumFilesPerFileSink: 1
++                table:
++                    input format: org.apache.hadoop.mapred.SequenceFileInputFormat
++                    output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
++                    properties:
++                      columns _col1,_col2,_col5,_wcol0
++                      columns.types string,string,int,bigint
++                      escape.delim \
++                      serialization.lib org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
++                    serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
++                TotalFiles: 1
++                GatherStats: false
++                MultiFileSpray: false
+ 
+   Stage: Stage-6
+     Map Reduce
+@@ -6247,8 +6251,8 @@ STAGE PLANS:
+             input format: org.apache.hadoop.mapred.SequenceFileInputFormat
+             output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
+             properties:
+-              columns _wcol0,_col1,_col2,_col5
+-              columns.types bigint,string,string,int
++              columns _col1,_col2,_col5,_wcol0
++              columns.types string,string,int,bigint
+               escape.delim \
+               serialization.lib org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+             serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+@@ -6256,8 +6260,8 @@ STAGE PLANS:
+               input format: org.apache.hadoop.mapred.SequenceFileInputFormat
+               output format: org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat
+               properties:
+-                columns _wcol0,_col1,_col2,_col5
+-                columns.types bigint,string,string,int
++                columns _col1,_col2,_col5,_wcol0
++                columns.types string,string,int,bigint
+                 escape.delim \
+                 serialization.lib org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+               serde: org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe
+diff --git a/ql/src/test/results/clientpositive/windowing_windowspec.q.out b/ql/src/test/results/clientpositive/windowing_windowspec.q.out
+index 00af6b8..8d78c22 100644
+--- a/ql/src/test/results/clientpositive/windowing_windowspec.q.out
++++ b/ql/src/test/results/clientpositive/windowing_windowspec.q.out
+@@ -830,3 +830,20 @@ alice allen	65609	20.0
+ alice allen	65662	20.0
+ alice allen	65670	20.0
+ alice allen	65720	20.0
++PREHOOK: query: -- HIVE-9228 
++select s, i from ( select s, i, round((avg(d) over  w1 + 10.0) - (avg(d) over w1 - 10.0),2) from over10k window w1 as (partition by s order by i)) X limit 7
++PREHOOK: type: QUERY
++PREHOOK: Input: default@over10k
++#### A masked pattern was here ####
++POSTHOOK: query: -- HIVE-9228 
++select s, i from ( select s, i, round((avg(d) over  w1 + 10.0) - (avg(d) over w1 - 10.0),2) from over10k window w1 as (partition by s order by i)) X limit 7
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@over10k
++#### A masked pattern was here ####
++alice allen	65545
++alice allen	65557
++alice allen	65600
++alice allen	65609
++alice allen	65662
++alice allen	65670
++alice allen	65720
+-- 
+1.7.9.5
+

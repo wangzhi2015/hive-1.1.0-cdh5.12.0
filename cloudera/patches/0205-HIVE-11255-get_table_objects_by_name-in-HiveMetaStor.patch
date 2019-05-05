@@ -1,0 +1,214 @@
+From 05f619a88369616cbec377e57439d7264deadfab Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@gmail.com>
+Date: Thu, 16 Jul 2015 15:03:40 -0700
+Subject: [PATCH 0205/1164] HIVE-11255 - get_table_objects_by_name() in
+ HiveMetaStore.java needs to retrieve table
+ objects in multiple batches (Aihua Xu, reviewed
+ by Chao Sun)
+
+---
+ .../hadoop/hive/metastore/TestHiveMetaStore.java   |   57 +++++++++++++++++++-
+ .../hadoop/hive/metastore/HiveMetaStore.java       |   48 +++++++++++++----
+ 2 files changed, 93 insertions(+), 12 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
+index 130fd67..d41704b 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestHiveMetaStore.java
+@@ -39,6 +39,7 @@
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hive.common.FileUtils;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
+ import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
+ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsData;
+@@ -99,6 +100,8 @@ protected void setUp() throws Exception {
+     hiveConf.set("hive.key2", "http://www.example.com");
+     hiveConf.set("hive.key3", "");
+     hiveConf.set("hive.key4", "0");
++
++    hiveConf.setIntVar(ConfVars.METASTORE_BATCH_RETRIEVE_MAX, 2);
+   }
+ 
+   public void testNameMethods() {
+@@ -1330,7 +1333,7 @@ public void testSimpleTable() throws Exception {
+       tableNames.add(tblName2);
+       List<Table> foundTables = client.getTableObjectsByName(dbName, tableNames);
+ 
+-      assertEquals(foundTables.size(), 2);
++      assertEquals(2, foundTables.size());
+       for (Table t: foundTables) {
+         if (t.getTableName().equals(tblName2)) {
+           assertEquals(t.getSd().getLocation(), tbl2.getSd().getLocation());
+@@ -2700,6 +2703,26 @@ private Type createType(String typeName, Map<String, String> fields) throws Thro
+     return typ1;
+   }
+ 
++  /**
++   * Creates a simple table under specified database
++   * @param dbName    the database name that the table will be created under
++   * @param tableName the table name to be created
++   * @throws Exception
++   */
++  private void createTable(String dbName, String tableName)
++      throws Exception {
++    List<FieldSchema> columns = new ArrayList<FieldSchema>();
++    columns.add(new FieldSchema("foo", "string", ""));
++    columns.add(new FieldSchema("bar", "string", ""));
++
++    Map<String, String> serdParams = new HashMap<String, String>();
++    serdParams.put(serdeConstants.SERIALIZATION_FORMAT, "1");
++
++    StorageDescriptor sd =  createStorageDescriptor(tableName, columns, null, serdParams);
++
++    createTable(dbName, tableName, null, null, null, sd, 0);
++  }
++
+   private Table createTable(String dbName, String tblName, String owner,
+       Map<String,String> tableParams, Map<String, String> partitionKeys,
+       StorageDescriptor sd, int lastAccessTime) throws Exception {
+@@ -2852,6 +2875,38 @@ public void testDBOwnerChange() throws NoSuchObjectException, MetaException, TEx
+ 
+   }
+ 
++  /**
++   * Test table objects can be retrieved in batches
++   * @throws Exception
++   */
++  @Test
++  public void testGetTableObjects() throws Exception {
++    String dbName = "db";
++    List<String> tableNames = Arrays.asList("table1", "table2", "table3", "table4", "table5");
++
++    // Setup
++    silentDropDatabase(dbName);
++
++    Database db = new Database();
++    db.setName(dbName);
++    client.createDatabase(db);
++    for (String tableName : tableNames) {
++      createTable(dbName, tableName);
++    }
++
++    // Test
++    List<Table> tableObjs = client.getTableObjectsByName(dbName, tableNames);
++
++    // Verify
++    assertEquals(tableNames.size(), tableObjs.size());
++    for(Table table : tableObjs) {
++      assertTrue(tableNames.contains(table.getTableName().toLowerCase()));
++    }
++
++    // Cleanup
++    client.dropDatabase(dbName, true, true, true);
++  }
++
+   private void checkDbOwnerType(String dbName, String ownerName, PrincipalType ownerType)
+       throws NoSuchObjectException, MetaException, TException {
+     Database db = client.getDatabase(dbName);
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+index 0a0b5ec..6eee868 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStore.java
+@@ -26,6 +26,7 @@
+ import com.google.common.collect.ImmutableListMultimap;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Multimaps;
++
+ import org.apache.commons.cli.OptionBuilder;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -182,6 +183,7 @@
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.util.ReflectionUtils;
+ import org.apache.hadoop.util.StringUtils;
++import org.apache.hive.common.util.HiveStringUtils;
+ import org.apache.thrift.TException;
+ import org.apache.thrift.TProcessor;
+ import org.apache.thrift.protocol.TBinaryProtocol;
+@@ -206,6 +208,7 @@
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Multimaps;
+ import javax.jdo.JDOException;
++
+ import java.io.IOException;
+ import java.text.DateFormat;
+ import java.text.SimpleDateFormat;
+@@ -1804,9 +1807,9 @@ public Table get_table_core(final String dbname, final String name) throws MetaE
+     /**
+      * Gets multiple tables from the hive metastore.
+      *
+-     * @param dbname
++     * @param dbName
+      *          The name of the database in which the tables reside
+-     * @param names
++     * @param tableNames
+      *          The names of the tables to get.
+      *
+      * @return A list of tables whose names are in the the list "names" and
+@@ -1818,21 +1821,44 @@ public Table get_table_core(final String dbname, final String name) throws MetaE
+      * @throws UnknownDBException
+      */
+     @Override
+-    public List<Table> get_table_objects_by_name(final String dbname, final List<String> names)
++    public List<Table> get_table_objects_by_name(final String dbName, final List<String> tableNames)
+         throws MetaException, InvalidOperationException, UnknownDBException {
+-      List<Table> tables = null;
+-      startMultiTableFunction("get_multi_table", dbname, names);
++      List<Table> tables = new ArrayList<Table>();
++      startMultiTableFunction("get_multi_table", dbName, tableNames);
+       Exception ex = null;
+-      try {
++      int tableBatchSize = HiveConf.getIntVar(hiveConf,
++          ConfVars.METASTORE_BATCH_RETRIEVE_MAX);
+ 
+-        if (dbname == null || dbname.isEmpty()) {
++      try {
++        if (dbName == null || dbName.isEmpty()) {
+           throw new UnknownDBException("DB name is null or empty");
+         }
+-        if (names == null)
++        if (tableNames == null)
+         {
+-          throw new InvalidOperationException(dbname + " cannot find null tables");
++          throw new InvalidOperationException(dbName + " cannot find null tables");
++        }
++
++        // The list of table names could contain duplicates. RawStore.getTableObjectsByName()
++        // only guarantees returning no duplicate table objects in one batch. If we need
++        // to break into multiple batches, remove duplicates first.
++        List<String> distinctTableNames = tableNames;
++        if (distinctTableNames.size() > tableBatchSize) {
++          List<String> lowercaseTableNames = new ArrayList<String>();
++          for (String tableName : tableNames) {
++            lowercaseTableNames.add(HiveStringUtils.normalizeIdentifier(tableName));
++          }
++          distinctTableNames = new ArrayList<String>(new HashSet<String>(lowercaseTableNames));
++        }
++
++        RawStore ms = getMS();
++        int startIndex = 0;
++        // Retrieve the tables from the metastore in batches. Some databases like
++        // Oracle cannot have over 1000 expressions in a in-list
++        while (startIndex < distinctTableNames.size()) {
++          int endIndex = Math.min(startIndex + tableBatchSize, distinctTableNames.size());
++          tables.addAll(ms.getTableObjectsByName(dbName, distinctTableNames.subList(startIndex, endIndex)));
++          startIndex = endIndex;
+         }
+-        tables = getMS().getTableObjectsByName(dbname, names);
+       } catch (Exception e) {
+         ex = e;
+         if (e instanceof MetaException) {
+@@ -1845,7 +1871,7 @@ public Table get_table_core(final String dbname, final String name) throws MetaE
+           throw newMetaException(e);
+         }
+       } finally {
+-        endFunction("get_multi_table", tables != null, ex, join(names, ","));
++        endFunction("get_multi_table", tables != null, ex, join(tableNames, ","));
+       }
+       return tables;
+     }
+-- 
+1.7.9.5
+

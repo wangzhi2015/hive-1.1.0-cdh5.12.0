@@ -1,0 +1,258 @@
+From 443cbfbb3338043e1c6fa66b43e07c2e02b20e45 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@apache.org>
+Date: Tue, 9 Feb 2016 19:57:36 -0800
+Subject: [PATCH 0616/1164] HIVE-12987: Add metrics for HS2 active users and
+ SQL operations(Jimmy, reviewed by Szehon, Aihua)
+
+Change-Id: I6fbd6f88cb8d4ae44ee659778c759f6d881f04f9
+---
+ .../common/metrics/common/MetricsConstant.java     |    3 +
+ .../apache/hive/jdbc/miniHS2/TestHs2Metrics.java   |    5 ++
+ .../hive/service/cli/operation/Operation.java      |   50 ++++++++-------
+ .../hive/service/cli/operation/SQLOperation.java   |   66 +++++++++++++++++++-
+ 4 files changed, 102 insertions(+), 22 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+index 9a5c605..9e5171e 100644
+--- a/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
++++ b/common/src/java/org/apache/hadoop/hive/common/metrics/common/MetricsConstant.java
+@@ -45,6 +45,9 @@
+   public static final String OPERATION_PREFIX = "hs2_operation_";
+   public static final String COMPLETED_OPERATION_PREFIX = "hs2_completed_operation_";
+ 
++  public static final String SQL_OPERATION_PREFIX = "hs2_sql_operation_";
++  public static final String COMPLETED_SQL_OPERATION_PREFIX = "hs2_completed_sql_operation_";
++
+   public static final String INIT_TOTAL_DATABASES = "init_total_count_dbs";
+   public static final String INIT_TOTAL_TABLES = "init_total_count_tables";
+   public static final String INIT_TOTAL_PARTITIONS = "init_total_count_partitions";
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+index a3f20ab..7337e9c 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/miniHS2/TestHs2Metrics.java
+@@ -58,6 +58,7 @@ public ASTNode preAnalyze(HiveSemanticAnalyzerHookContext context,
+         MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 1);
+         MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_compile", 1);
+         MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 1);
++        MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_sql_operation_RUNNING", 1);
+       } catch (Exception e) {
+         throw new SemanticException("metrics verification failed", e);
+       }
+@@ -105,12 +106,16 @@ public void testMetrics() throws Exception {
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_operation_PENDING", 1);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_operation_RUNNING", 1);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "hs2_completed_operation_FINISHED", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_sql_operation_PENDING", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_hs2_sql_operation_RUNNING", 1);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "hs2_completed_sql_operation_FINISHED", 1);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.TIMER, "api_Driver.run", 1);
+ 
+     //but there should be no more active calls.
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_semanticAnalyze", 0);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_compile", 0);
+     MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_operation_RUNNING", 0);
++    MetricsTestUtils.verifyMetricsJson(json, MetricsTestUtils.COUNTER, "active_calls_api_hs2_sql_operation_RUNNING", 0);
+ 
+     serviceClient.closeSession(sessHandle);
+   }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/Operation.java b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+index 8767f7e..7a6f3eb 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/Operation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/Operation.java
+@@ -55,8 +55,8 @@
+   public static final String QUERYID_LOG_KEY = "queryId";
+ 
+   protected final HiveSession parentSession;
+-  private OperationState state = OperationState.INITIALIZED;
+-  private MetricsScope currentStateScope;
++  private volatile OperationState state = OperationState.INITIALIZED;
++  private volatile MetricsScope currentStateScope;
+   private final OperationHandle opHandle;
+   private HiveConf configuration;
+   public static final Log LOG = LogFactory.getLog(Operation.class.getName());
+@@ -150,9 +150,10 @@ public OperationLog getOperationLog() {
+ 
+   protected final OperationState setState(OperationState newState) throws HiveSQLException {
+     state.validateTransition(newState);
++    OperationState prevState = state;
+     this.state = newState;
+     setMetrics(state);
+-    onNewState(state);
++    onNewState(state, prevState);
+     this.lastAccessTime = System.currentTimeMillis();
+     return this.state;
+   }
+@@ -395,24 +396,31 @@ protected HiveSQLException toSQLException(String prefix, CommandProcessorRespons
+     OperationState.UNKNOWN
+   );
+ 
+-  protected void setMetrics(OperationState state) {
+-     Metrics metrics = MetricsFactory.getInstance();
+-     if (metrics != null) {
+-       try {
+-         if (currentStateScope != null) {
+-           metrics.endScope(currentStateScope);
+-           currentStateScope = null;
+-         }
+-         if (scopeStates.contains(state)) {
+-           currentStateScope = metrics.createScope(MetricsConstant.OPERATION_PREFIX + state.toString());
+-         }
+-         if (terminalStates.contains(state)) {
+-           metrics.incrementCounter(MetricsConstant.COMPLETED_OPERATION_PREFIX + state.toString());
+-         }
+-       } catch (IOException e) {
+-         LOG.warn("Error metrics", e);
+-       }
++  private void setMetrics(OperationState state) {
++    currentStateScope = setMetrics(currentStateScope, MetricsConstant.OPERATION_PREFIX,
++      MetricsConstant.COMPLETED_OPERATION_PREFIX, state);
++  }
++
++  protected static MetricsScope setMetrics(MetricsScope stateScope, String operationPrefix,
++      String completedOperationPrefix, OperationState state) {
++    Metrics metrics = MetricsFactory.getInstance();
++    if (metrics != null) {
++      try {
++        if (stateScope != null) {
++          metrics.endScope(stateScope);
++          stateScope = null;
++        }
++        if (scopeStates.contains(state)) {
++          stateScope = metrics.createScope(operationPrefix + state);
++        }
++        if (terminalStates.contains(state)) {
++          metrics.incrementCounter(completedOperationPrefix + state);
++        }
++      } catch (IOException e) {
++        LOG.warn("Error metrics", e);
++      }
+     }
++    return stateScope;
+   }
+ 
+   public long getBeginTime() {
+@@ -423,6 +431,6 @@ protected OperationState getState() {
+     return state;
+   }
+ 
+-  protected void onNewState(OperationState state) {
++  protected void onNewState(OperationState state, OperationState prevState) {
+   }
+ }
+diff --git a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+index f062d9f..4649d92 100644
+--- a/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
++++ b/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java
+@@ -25,13 +25,19 @@
+ import java.security.PrivilegedExceptionAction;
+ import java.sql.SQLException;
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Properties;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.lang3.CharEncoding;
++import org.apache.hadoop.hive.common.metrics.common.Metrics;
++import org.apache.hadoop.hive.common.metrics.common.MetricsConstant;
++import org.apache.hadoop.hive.common.metrics.common.MetricsFactory;
++import org.apache.hadoop.hive.common.metrics.common.MetricsScope;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveVariableSource;
+ import org.apache.hadoop.hive.conf.VariableSubstitution;
+@@ -69,6 +75,7 @@
+  * SQLOperation.
+  *
+  */
++@SuppressWarnings("deprecation")
+ public class SQLOperation extends ExecuteStatementOperation {
+ 
+   private Driver driver = null;
+@@ -77,10 +84,16 @@
+   private Schema mResultSchema = null;
+   private SerDe serde = null;
+   private boolean fetchStarted = false;
++  private volatile MetricsScope currentSQLStateScope;
+ 
+   //Display for WebUI.
+   private SQLOperationDisplay sqlOpDisplay;
+ 
++  /**
++   * A map to track query count running by each user
++   */
++  private static Map<String, AtomicInteger> userQueries = new HashMap<String, AtomicInteger>();
++  private static final String ACTIVE_SQL_USER = MetricsConstant.SQL_OPERATION_PREFIX + "active_user";
+ 
+   public SQLOperation(HiveSession parentSession, String statement, Map<String,
+       String> confOverlay, boolean runInBackground) {
+@@ -493,7 +506,26 @@ public SQLOperationDisplay getSQLOperationDisplay() {
+   }
+ 
+   @Override
+-  protected void onNewState(OperationState state) {
++  protected void onNewState(OperationState state, OperationState prevState) {
++    currentSQLStateScope = setMetrics(currentSQLStateScope, MetricsConstant.SQL_OPERATION_PREFIX,
++      MetricsConstant.COMPLETED_SQL_OPERATION_PREFIX, state);
++
++    Metrics metrics = MetricsFactory.getInstance();
++    if (metrics != null) {
++      try {
++        // New state is changed to running from something else (user is active)
++        if (state == OperationState.RUNNING && prevState != state) {
++          incrementUserQueries(metrics);
++        }
++        // New state is not running (user not active) any more
++        if (prevState == OperationState.RUNNING && prevState != state) {
++          decrementUserQueries(metrics);
++        }
++      } catch (IOException e) {
++        LOG.warn("Error metrics", e);
++      }
++    }
++
+     if (state == OperationState.CLOSED) {
+       sqlOpDisplay.closed();
+     } else {
+@@ -501,4 +533,36 @@ protected void onNewState(OperationState state) {
+       sqlOpDisplay.updateState(state);
+     }
+   }
++
++  private void incrementUserQueries(Metrics metrics) throws IOException {
++    String username = parentSession.getUserName();
++    if (username != null) {
++      synchronized (userQueries) {
++        AtomicInteger count = userQueries.get(username);
++        if (count == null) {
++          count = new AtomicInteger(0);
++          AtomicInteger prev = userQueries.put(username, count);
++          if (prev == null) {
++            metrics.incrementCounter(ACTIVE_SQL_USER);
++          } else {
++            count = prev;
++          }
++        }
++        count.incrementAndGet();
++      }
++    }
++  }
++
++  private void decrementUserQueries(Metrics metrics) throws IOException {
++    String username = parentSession.getUserName();
++    if (username != null) {
++      synchronized (userQueries) {
++        AtomicInteger count = userQueries.get(username);
++        if (count != null && count.decrementAndGet() <= 0) {
++          metrics.decrementCounter(ACTIVE_SQL_USER);
++          userQueries.remove(username);
++        }
++      }
++    }
++  }
+ }
+-- 
+1.7.9.5
+

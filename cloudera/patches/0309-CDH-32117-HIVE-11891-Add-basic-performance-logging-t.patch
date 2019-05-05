@@ -1,0 +1,1106 @@
+From 3cf5df29681c6a450d8283b56af376170876a025 Mon Sep 17 00:00:00 2001
+From: Brock Noland <brock@apache.org>
+Date: Sun, 20 Sep 2015 15:49:01 -0700
+Subject: [PATCH 0309/1164] CDH-32117:HIVE-11891 - Add basic performance
+ logging to metastore calls (Brock via Szehon)
+
+Conflicts:
+	metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+	ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+	ql/src/java/org/apache/hadoop/hive/ql/exec/tez/RecordProcessor.java
+	ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordProcessor.java
+	ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+	ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
+	ql/src/java/org/apache/hadoop/hive/ql/parse/spark/SparkCompiler.java
+---
+ .../org/apache/hadoop/hive/ql/log/PerfLogger.java  |  197 ++++++++++++++++++++
+ .../hadoop/hive/metastore/RetryingHMSHandler.java  |   35 +++-
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   11 +-
+ .../hadoop/hive/ql/exec/MapJoinOperator.java       |    3 +-
+ .../hive/ql/exec/SparkHashTableSinkOperator.java   |    3 +-
+ .../org/apache/hadoop/hive/ql/exec/Utilities.java  |   10 +-
+ .../hadoop/hive/ql/exec/spark/SparkPlan.java       |    3 +-
+ .../hive/ql/exec/spark/SparkPlanGenerator.java     |    3 +-
+ .../hive/ql/exec/spark/SparkRecordHandler.java     |    3 +-
+ .../hadoop/hive/ql/exec/spark/SparkTask.java       |    2 +-
+ .../hive/ql/exec/spark/status/SparkJobMonitor.java |    2 +-
+ .../hadoop/hive/ql/exec/tez/RecordProcessor.java   |    6 +-
+ .../hive/ql/exec/tez/ReduceRecordProcessor.java    |    1 +
+ .../hive/ql/exec/tez/ReduceRecordSource.java       |    3 +-
+ .../hadoop/hive/ql/exec/tez/TezJobMonitor.java     |    5 +-
+ .../hadoop/hive/ql/exec/tez/TezProcessor.java      |    3 +-
+ .../apache/hadoop/hive/ql/exec/tez/TezTask.java    |    2 +-
+ .../hadoop/hive/ql/io/CombineHiveInputFormat.java  |    4 +-
+ .../apache/hadoop/hive/ql/io/HiveInputFormat.java  |    4 +-
+ .../hadoop/hive/ql/io/orc/OrcInputFormat.java      |    4 +-
+ .../hadoop/hive/ql/io/orc/OrcNewInputFormat.java   |    4 +-
+ .../org/apache/hadoop/hive/ql/log/PerfLogger.java  |  196 -------------------
+ .../hive/ql/optimizer/ppr/PartitionPruner.java     |    7 +-
+ .../hadoop/hive/ql/parse/spark/SparkCompiler.java  |    3 +-
+ .../hadoop/hive/ql/session/SessionState.java       |   37 ++--
+ 25 files changed, 307 insertions(+), 244 deletions(-)
+ create mode 100644 common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+ delete mode 100644 ql/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+
+diff --git a/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+new file mode 100644
+index 0000000..965b583
+--- /dev/null
++++ b/common/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+@@ -0,0 +1,197 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hive.ql.log;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.util.ReflectionUtils;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * PerfLogger.
++ *
++ * Can be used to measure and log the time spent by a piece of code.
++ */
++public class PerfLogger {
++  public static final String ACQUIRE_READ_WRITE_LOCKS = "acquireReadWriteLocks";
++  public static final String COMPILE = "compile";
++  public static final String PARSE = "parse";
++  public static final String ANALYZE = "semanticAnalyze";
++  public static final String DO_AUTHORIZATION = "doAuthorization";
++  public static final String DRIVER_EXECUTE = "Driver.execute";
++  public static final String INPUT_SUMMARY = "getInputSummary";
++  public static final String GET_SPLITS = "getSplits";
++  public static final String RUN_TASKS = "runTasks";
++  public static final String SERIALIZE_PLAN = "serializePlan";
++  public static final String DESERIALIZE_PLAN = "deserializePlan";
++  public static final String CLONE_PLAN = "clonePlan";
++  public static final String TASK = "task.";
++  public static final String RELEASE_LOCKS = "releaseLocks";
++  public static final String PRUNE_LISTING = "prune-listing";
++  public static final String PARTITION_RETRIEVING = "partition-retrieving";
++  public static final String PRE_HOOK = "PreHook.";
++  public static final String POST_HOOK = "PostHook.";
++  public static final String FAILURE_HOOK = "FailureHook.";
++  public static final String DRIVER_RUN = "Driver.run";
++  public static final String TIME_TO_SUBMIT = "TimeToSubmit";
++  public static final String TEZ_SUBMIT_TO_RUNNING = "TezSubmitToRunningDag";
++  public static final String TEZ_BUILD_DAG = "TezBuildDag";
++  public static final String TEZ_SUBMIT_DAG = "TezSubmitDag";
++  public static final String TEZ_RUN_DAG = "TezRunDag";
++  public static final String TEZ_CREATE_VERTEX = "TezCreateVertex.";
++  public static final String TEZ_RUN_VERTEX = "TezRunVertex.";
++  public static final String TEZ_INITIALIZE_PROCESSOR = "TezInitializeProcessor";
++  public static final String TEZ_RUN_PROCESSOR = "TezRunProcessor";
++  public static final String TEZ_INIT_OPERATORS = "TezInitializeOperators";
++  public static final String LOAD_HASHTABLE = "LoadHashtable";
++  public static final String ORC_GET_SPLITS = "OrcGetSplits";
++
++  public static final String SPARK_SUBMIT_TO_RUNNING = "SparkSubmitToRunning";
++  public static final String SPARK_BUILD_PLAN = "SparkBuildPlan";
++  public static final String SPARK_BUILD_RDD_GRAPH = "SparkBuildRDDGraph";
++  public static final String SPARK_SUBMIT_JOB = "SparkSubmitJob";
++  public static final String SPARK_RUN_JOB = "SparkRunJob";
++  public static final String SPARK_CREATE_TRAN = "SparkCreateTran.";
++  public static final String SPARK_RUN_STAGE = "SparkRunStage.";
++  public static final String SPARK_INIT_OPERATORS = "SparkInitializeOperators";
++  public static final String SPARK_GENERATE_TASK_TREE = "SparkGenerateTaskTree";
++  public static final String SPARK_OPTIMIZE_OPERATOR_TREE = "SparkOptimizeOperatorTree";
++  public static final String SPARK_OPTIMIZE_TASK_TREE = "SparkOptimizeTaskTree";
++  public static final String SPARK_FLUSH_HASHTABLE = "SparkFlushHashTable.";
++
++  protected final Map<String, Long> startTimes = new HashMap<String, Long>();
++  protected final Map<String, Long> endTimes = new HashMap<String, Long>();
++
++  static final private Log LOG = LogFactory.getLog(PerfLogger.class.getName());
++  protected static final ThreadLocal<PerfLogger> perfLogger = new ThreadLocal<PerfLogger>();
++
++
++  public PerfLogger() {
++    // Use getPerfLogger to get an instance of PerfLogger
++  }
++
++  public static PerfLogger getPerfLogger(HiveConf conf, boolean resetPerfLogger) {
++    PerfLogger result = perfLogger.get();
++    if (resetPerfLogger || result == null) {
++      if (conf == null) {
++        result = new PerfLogger();
++      } else {
++        try {
++          result = (PerfLogger) ReflectionUtils.newInstance(conf.getClassByName(
++            conf.getVar(HiveConf.ConfVars.HIVE_PERF_LOGGER)), conf);
++        } catch (ClassNotFoundException e) {
++          LOG.error("Performance Logger Class not found:" + e.getMessage());
++          result = new PerfLogger();
++        }
++      }
++      perfLogger.set(result);
++    }
++    return result;
++  }
++
++  /**
++   * Call this function when you start to measure time spent by a piece of code.
++   * @param callerName the logging object to be used.
++   * @param method method or ID that identifies this perf log element.
++   */
++  public void PerfLogBegin(String callerName, String method) {
++    long startTime = System.currentTimeMillis();
++    LOG.info("<PERFLOG method=" + method + " from=" + callerName + ">");
++    startTimes.put(method, new Long(startTime));
++  }
++  /**
++   * Call this function in correspondence of PerfLogBegin to mark the end of the measurement.
++   * @param callerName
++   * @param method
++   * @return long duration  the difference between now and startTime, or -1 if startTime is null
++   */
++  public long PerfLogEnd(String callerName, String method) {
++    return PerfLogEnd(callerName, method, null);
++  }
++
++  /**
++   * Call this function in correspondence of PerfLogBegin to mark the end of the measurement.
++   * @param callerName
++   * @param method
++   * @return long duration  the difference between now and startTime, or -1 if startTime is null
++   */
++  public long PerfLogEnd(String callerName, String method, String additionalInfo) {
++    Long startTime = startTimes.get(method);
++    long endTime = System.currentTimeMillis();
++    long duration = -1;
++
++    endTimes.put(method, new Long(endTime));
++
++    StringBuilder sb = new StringBuilder("</PERFLOG method=").append(method);
++    if (startTime != null) {
++      sb.append(" start=").append(startTime);
++    }
++    sb.append(" end=").append(endTime);
++    if (startTime != null) {
++      duration = endTime - startTime.longValue();
++      sb.append(" duration=").append(duration);
++    }
++    sb.append(" from=").append(callerName);
++    if (additionalInfo != null) {
++      sb.append(" ").append(additionalInfo);
++    }
++    sb.append(">");
++    LOG.info(sb);
++
++    return duration;
++  }
++
++  public Long getStartTime(String method) {
++    long startTime = 0L;
++
++    if (startTimes.containsKey(method)) {
++      startTime = startTimes.get(method);
++    }
++    return startTime;
++  }
++
++  public Long getEndTime(String method) {
++    long endTime = 0L;
++
++    if (endTimes.containsKey(method)) {
++      endTime = endTimes.get(method);
++    }
++    return endTime;
++  }
++
++  public boolean startTimeHasMethod(String method) {
++    return startTimes.containsKey(method);
++  }
++
++  public boolean endTimeHasMethod(String method) {
++    return endTimes.containsKey(method);
++  }
++
++  public Long getDuration(String method) {
++    long duration = 0;
++    if (startTimes.containsKey(method) && endTimes.containsKey(method)) {
++      duration = endTimes.get(method) - startTimes.get(method);
++    }
++    return duration;
++  }
++
++}
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
+index 81e7b58..1d28435 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingHMSHandler.java
+@@ -34,6 +34,7 @@
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
++import org.apache.hadoop.hive.ql.log.PerfLogger;
+ import org.datanucleus.exceptions.NucleusException;
+ 
+ @InterfaceAudience.Private
+@@ -41,6 +42,17 @@
+ public class RetryingHMSHandler implements InvocationHandler {
+ 
+   private static final Log LOG = LogFactory.getLog(RetryingHMSHandler.class);
++  private static final String CLASS_NAME = RetryingHMSHandler.class.getName();
++
++  private static class Result {
++    private final Object result;
++    private final int numRetries;
++
++    public Result(Object result, int numRetries) {
++      this.result = result;
++      this.numRetries = numRetries;
++    }
++  }
+ 
+   private final IHMSHandler baseHandler;
+   private final MetaStoreInit.MetaStoreInitData metaStoreInitData =
+@@ -78,6 +90,25 @@ public static IHMSHandler getProxy(HiveConf hiveConf, IHMSHandler baseHandler, b
+ 
+   @Override
+   public Object invoke(final Object proxy, final Method method, final Object[] args) throws Throwable {
++    int retryCount = -1;
++    int threadId = HiveMetaStore.HMSHandler.get();
++    boolean error = true;
++    PerfLogger perfLogger = PerfLogger.getPerfLogger(origConf, false);
++    perfLogger.PerfLogBegin(CLASS_NAME, method.getName());
++    try {
++      Result result = invokeInternal(proxy, method, args);
++      retryCount = result.numRetries;
++      error = false;
++      return result.result;
++    } finally {
++      StringBuffer additionalInfo = new StringBuffer();
++      additionalInfo.append("threadId=").append(threadId).append(" retryCount=").append(retryCount)
++        .append(" error=").append(error);
++      perfLogger.PerfLogEnd(CLASS_NAME, method.getName(), additionalInfo.toString());
++    }
++  }
++
++  public Result invokeInternal(final Object proxy, final Method method, final Object[] args) throws Throwable {
+ 
+     boolean gotNewConnectUrl = false;
+     boolean reloadConf = HiveConf.getBoolVar(origConf,
+@@ -99,8 +130,8 @@ public Object invoke(final Object proxy, final Method method, final Object[] arg
+         if (reloadConf || gotNewConnectUrl) {
+           baseHandler.setConf(getActiveConf());
+         }
+-        return method.invoke(baseHandler, args);
+-
++        Object object = method.invoke(baseHandler, args);
++        return new Result(object, retryCount);
+       } catch (javax.jdo.JDOException e) {
+         caughtException = e;
+       } catch (UndeclaredThrowableException e) {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index f9aeb40..bb78997 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -359,7 +359,7 @@ public void restoreSession(QueryState qs) {
+    * @return 0 for ok
+    */
+   public int compile(String command, boolean resetTaskIds) {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.COMPILE);
+ 
+     //holder for parent command type/string when executing reentrant queries
+@@ -941,7 +941,7 @@ private void recordValidTxns() throws LockException {
+    * transactions have been opened and locks acquired.
+    **/
+   private int acquireLocksAndOpenTxn() {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.ACQUIRE_READ_WRITE_LOCKS);
+ 
+     SessionState ss = SessionState.get();
+@@ -1004,7 +1004,7 @@ private int acquireLocksAndOpenTxn() {
+    **/
+   private void releaseLocksAndCommitOrRollback(List<HiveLock> hiveLocks, boolean commit)
+       throws LockException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.RELEASE_LOCKS);
+ 
+     SessionState ss = SessionState.get();
+@@ -1149,7 +1149,7 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+     }
+ 
+     // Reset the perf logger
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger(true);
++    PerfLogger perfLogger = SessionState.getPerfLogger(true);
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.DRIVER_RUN);
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.TIME_TO_SUBMIT);
+ 
+@@ -1202,7 +1202,6 @@ private CommandProcessorResponse runInternal(String command, boolean alreadyComp
+     }
+ 
+     perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.DRIVER_RUN);
+-    perfLogger.close(LOG, plan);
+ 
+     // Take all the driver run hooks and post-execute them.
+     try {
+@@ -1300,7 +1299,7 @@ private boolean validateConfVariables() {
+   }
+ 
+   public int execute() throws CommandNeedRetryException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.DRIVER_EXECUTE);
+ 
+     boolean noName = StringUtils.isEmpty(conf.getVar(HiveConf.ConfVars.HADOOPJOBNAME));
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
+index ff93a3d..576e3fd 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
+@@ -42,6 +42,7 @@
+ import org.apache.hadoop.hive.ql.plan.MapJoinDesc;
+ import org.apache.hadoop.hive.ql.plan.TableDesc;
+ import org.apache.hadoop.hive.ql.plan.api.OperatorType;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.serde2.SerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+ import org.apache.hadoop.hive.serde2.SerDeUtils;
+@@ -56,7 +57,7 @@
+   private static final long serialVersionUID = 1L;
+   private static final Log LOG = LogFactory.getLog(MapJoinOperator.class.getName());
+   private static final String CLASS_NAME = MapJoinOperator.class.getName();
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+ 
+   private transient String tableKey;
+   private transient String serdeKey;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/SparkHashTableSinkOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/SparkHashTableSinkOperator.java
+index 61330b8..b69d079 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/SparkHashTableSinkOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/SparkHashTableSinkOperator.java
+@@ -39,6 +39,7 @@
+ import org.apache.hadoop.hive.ql.plan.SparkBucketMapJoinContext;
+ import org.apache.hadoop.hive.ql.plan.SparkHashTableSinkDesc;
+ import org.apache.hadoop.hive.ql.plan.api.OperatorType;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+ 
+ public class SparkHashTableSinkOperator
+@@ -46,7 +47,7 @@
+   private static final int MIN_REPLICATION = 10;
+   private static final long serialVersionUID = 1L;
+   private final String CLASS_NAME = this.getClass().getName();
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+   protected static final Log LOG = LogFactory.getLog(SparkHashTableSinkOperator.class.getName());
+ 
+   private HashTableSinkOperator htsOperator;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+index 0a5b106..a1b47f4 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java
+@@ -920,7 +920,7 @@ public Path read(Kryo kryo, Input input, Class<Path> type) {
+   }
+ 
+   private static void serializePlan(Object plan, OutputStream out, Configuration conf, boolean cloningPlan) {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.SERIALIZE_PLAN);
+     String serializationType = conf.get(HiveConf.ConfVars.PLAN_SERIALIZATION.varname, "kryo");
+     LOG.info("Serializing " + plan.getClass().getSimpleName() + " via " + serializationType);
+@@ -946,7 +946,7 @@ public static void serializePlan(Object plan, OutputStream out, Configuration co
+   }
+ 
+   private static <T> T deserializePlan(InputStream in, Class<T> planClass, Configuration conf, boolean cloningPlan) {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.DESERIALIZE_PLAN);
+     T plan;
+     String serializationType = conf.get(HiveConf.ConfVars.PLAN_SERIALIZATION.varname, "kryo");
+@@ -981,7 +981,7 @@ public static void serializePlan(Object plan, OutputStream out, Configuration co
+    */
+   public static MapredWork clonePlan(MapredWork plan) {
+     // TODO: need proper clone. Meanwhile, let's at least keep this horror in one place
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.CLONE_PLAN);
+     ByteArrayOutputStream baos = new ByteArrayOutputStream(4096);
+     Configuration conf = new HiveConf();
+@@ -998,7 +998,7 @@ public static MapredWork clonePlan(MapredWork plan) {
+    * @return The clone.
+    */
+   public static BaseWork cloneBaseWork(BaseWork plan) {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.CLONE_PLAN);
+     ByteArrayOutputStream baos = new ByteArrayOutputStream(4096);
+     Configuration conf = new HiveConf();
+@@ -2478,7 +2478,7 @@ public static void copyTablePropertiesToConf(TableDesc tbl, JobConf job) {
+    */
+   public static ContentSummary getInputSummary(final Context ctx, MapWork work, PathFilter filter)
+       throws IOException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.INPUT_SUMMARY);
+ 
+     long[] summary = {0, 0, 0};
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlan.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlan.java
+index ee5c78a..10b2bc0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlan.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlan.java
+@@ -30,6 +30,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.ql.io.HiveKey;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.io.BytesWritable;
+ import org.apache.spark.api.java.JavaPairRDD;
+ 
+@@ -39,7 +40,7 @@
+ public class SparkPlan {
+   private static final String CLASS_NAME = SparkPlan.class.getName();
+   private static final Log LOG = LogFactory.getLog(SparkPlan.class);
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+ 
+   private final Set<SparkTran> rootTrans = new HashSet<SparkTran>();
+   private final Set<SparkTran> leafTrans = new HashSet<SparkTran>();
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
+index 491f9c0..b1009ab 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkPlanGenerator.java
+@@ -32,6 +32,7 @@
+ import org.apache.hadoop.hive.ql.io.merge.MergeFileOutputFormat;
+ import org.apache.hadoop.hive.ql.io.merge.MergeFileWork;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.mapred.FileOutputFormat;
+ import org.apache.hadoop.mapred.Partitioner;
+ import org.apache.hadoop.hive.conf.HiveConf;
+@@ -60,7 +61,7 @@
+ @SuppressWarnings("rawtypes")
+ public class SparkPlanGenerator {
+   private static final String CLASS_NAME = SparkPlanGenerator.class.getName();
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private static final Log LOG = LogFactory.getLog(SparkPlanGenerator.class);
+ 
+   private JavaSparkContext sc;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkRecordHandler.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkRecordHandler.java
+index 97b3471..3d37753 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkRecordHandler.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkRecordHandler.java
+@@ -22,6 +22,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.ql.exec.MapredContext;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.OutputCollector;
+ import org.apache.hadoop.mapred.Reporter;
+@@ -35,7 +36,7 @@
+ 
+ public abstract class SparkRecordHandler {
+   protected static final String CLASS_NAME = SparkRecordHandler.class.getName();
+-  protected final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  protected final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private static final Log LOG = LogFactory.getLog(SparkRecordHandler.class);
+ 
+   // used to log memory usage periodically
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+index b28ba89..ec14872 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/SparkTask.java
+@@ -76,7 +76,7 @@
+ 
+ public class SparkTask extends Task<SparkWork> {
+   private static final String CLASS_NAME = SparkTask.class.getName();
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private static final long serialVersionUID = 1L;
+   private SparkCounters sparkCounters;
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobMonitor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobMonitor.java
+index b7e8142..218dd61 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobMonitor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/status/SparkJobMonitor.java
+@@ -39,7 +39,7 @@
+   protected static final String CLASS_NAME = SparkJobMonitor.class.getName();
+   protected static final Log LOG = LogFactory.getLog(CLASS_NAME);
+   protected static SessionState.LogHelper console = new SessionState.LogHelper(LOG);
+-  protected final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  protected final PerfLogger perfLogger = SessionState.getPerfLogger();
+   protected final int checkInterval = 1000;
+   protected final long monitorTimeoutInteval;
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/RecordProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/RecordProcessor.java
+index 258557f..f84b6c6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/RecordProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/RecordProcessor.java
+@@ -22,6 +22,10 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hive.ql.exec.tez.TezProcessor.TezKVOutputCollector;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
++import org.apache.hadoop.hive.ql.plan.BaseWork;
++import org.apache.hadoop.hive.ql.plan.MapWork;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.OutputCollector;
+ import org.apache.tez.mapreduce.processor.MRTaskReporter;
+@@ -56,7 +60,7 @@
+   protected boolean isLogTraceEnabled = false;
+   protected MRTaskReporter reporter;
+ 
+-  protected PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  protected PerfLogger perfLogger = SessionState.getPerfLogger();
+   protected String CLASS_NAME = RecordProcessor.class.getName();
+ 
+   /**
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordProcessor.java
+index 8910af6..34a56c0 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordProcessor.java
+@@ -45,6 +45,7 @@
+ import org.apache.tez.runtime.api.LogicalInput;
+ import org.apache.tez.runtime.api.LogicalOutput;
+ import org.apache.tez.runtime.api.ProcessorContext;
++import org.apache.tez.runtime.api.Reader;
+ import org.apache.tez.runtime.library.api.KeyValuesReader;
+ 
+ /**
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordSource.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordSource.java
+index aa80510..3d183d5 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordSource.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/ReduceRecordSource.java
+@@ -36,6 +36,7 @@
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
+ import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.TableDesc;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.serde2.Deserializer;
+ import org.apache.hadoop.hive.serde2.SerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
+@@ -106,7 +107,7 @@
+ 
+   private ObjectInspector valueObjectInspector;
+ 
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+ 
+   private Iterable<Object> valueWritables;
+   
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezJobMonitor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezJobMonitor.java
+index f0404e7..4d3991d 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezJobMonitor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezJobMonitor.java
+@@ -23,6 +23,7 @@
+ import static org.fusesource.jansi.internal.CLibrary.STDOUT_FILENO;
+ import static org.fusesource.jansi.internal.CLibrary.isatty;
+ 
++import jline.TerminalFactory;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.ql.exec.FileSinkOperator;
+ import org.apache.hadoop.hive.ql.exec.Heartbeater;
+@@ -62,8 +63,6 @@
+ import java.util.SortedSet;
+ import java.util.TreeSet;
+ 
+-import jline.TerminalFactory;
+-
+ /**
+  * TezJobMonitor keeps track of a tez job while it's being executed. It will
+  * print status to the console and retrieve final status of the job after
+@@ -101,7 +100,7 @@
+   private String separator;
+ 
+   private transient LogHelper console;
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private final int checkInterval = 200;
+   private final int maxRetryInterval = 2500;
+   private final int printInterval = 3000;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezProcessor.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezProcessor.java
+index 1e528a9..b07d14f 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezProcessor.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezProcessor.java
+@@ -26,6 +26,7 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.OutputCollector;
+ import org.apache.hadoop.util.StringUtils;
+@@ -55,7 +56,7 @@
+   protected JobConf jobConf;
+ 
+   private static final String CLASS_NAME = TezProcessor.class.getName();
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+ 
+   protected ProcessorContext processorContext;
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
+index fc83a86..455f4cc 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/tez/TezTask.java
+@@ -75,7 +75,7 @@
+ public class TezTask extends Task<TezWork> {
+ 
+   private static final String CLASS_NAME = TezTask.class.getName();
+-  private final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private final PerfLogger perfLogger = SessionState.getPerfLogger();
+ 
+   private TezCounters counters;
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+index 1de7e40..b0bb864 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/CombineHiveInputFormat.java
+@@ -25,6 +25,7 @@
+ import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+@@ -51,6 +52,7 @@
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ import org.apache.hadoop.hive.ql.plan.PartitionDesc;
+ import org.apache.hadoop.hive.ql.plan.TableDesc;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.shims.HadoopShims.CombineFileInputFormatShim;
+ import org.apache.hadoop.hive.shims.HadoopShimsSecure.InputSplitShim;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+@@ -500,7 +502,7 @@ public int hashCode() {
+    */
+   @Override
+   public InputSplit[] getSplits(JobConf job, int numSplits) throws IOException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.GET_SPLITS);
+     init(job);
+ 
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
+index 9d5730d..b3f2afb 100755
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/HiveInputFormat.java
+@@ -45,10 +45,10 @@
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
+ import org.apache.hadoop.hive.ql.plan.MapWork;
+-import org.apache.hadoop.hive.ql.plan.MergeJoinWork;
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ import org.apache.hadoop.hive.ql.plan.PartitionDesc;
+ import org.apache.hadoop.hive.ql.plan.TableScanDesc;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.serde2.ColumnProjectionUtils;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.io.Writable;
+@@ -328,7 +328,7 @@ private void addSplitsForGroup(List<Path> dirs, TableScanOperator tableScan, Job
+   }
+ 
+   public InputSplit[] getSplits(JobConf job, int numSplits) throws IOException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.GET_SPLITS);
+     init(job);
+     Path[] dirs = getInputPaths(job);
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcInputFormat.java
+index 8c44e3e..2f17633 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcInputFormat.java
+@@ -47,6 +47,8 @@
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgument.TruthValue;
+ import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
+ import org.apache.hadoop.hive.ql.plan.TableScanDesc;
+ import org.apache.hadoop.hive.serde2.ColumnProjectionUtils;
+@@ -116,7 +118,7 @@
+   private static final long DEFAULT_MIN_SPLIT_SIZE = 16 * 1024 * 1024;
+   private static final long DEFAULT_MAX_SPLIT_SIZE = 256 * 1024 * 1024;
+ 
+-  private static final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private static final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private static final String CLASS_NAME = ReaderImpl.class.getName();
+ 
+   /**
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcNewInputFormat.java b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcNewInputFormat.java
+index b6ad0dc..2ce3b02 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcNewInputFormat.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/io/orc/OrcNewInputFormat.java
+@@ -25,6 +25,8 @@
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hive.ql.log.PerfLogger;
++import org.apache.hadoop.hive.ql.session.SessionState;
++import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
+ import org.apache.hadoop.hive.shims.ShimLoader;
+ import org.apache.hadoop.io.NullWritable;
+ import org.apache.hadoop.mapreduce.InputFormat;
+@@ -37,7 +39,7 @@
+ /** An InputFormat for ORC files. Keys are meaningless,
+  * value is the OrcStruct object */
+ public class OrcNewInputFormat extends InputFormat<NullWritable, OrcStruct>{
+-  private static final PerfLogger perfLogger = PerfLogger.getPerfLogger();
++  private static final PerfLogger perfLogger = SessionState.getPerfLogger();
+   private static final String CLASS_NAME = ReaderImpl.class.getName();
+ 
+   @Override
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java b/ql/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
+deleted file mode 100644
+index f202991..0000000
+--- a/ql/src/java/org/apache/hadoop/hive/ql/log/PerfLogger.java
++++ /dev/null
+@@ -1,196 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.hadoop.hive.ql.log;
+-
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hive.ql.QueryPlan;
+-import org.apache.hadoop.hive.ql.session.SessionState;
+-
+-import java.util.HashMap;
+-import java.util.Map;
+-
+-/**
+- * PerfLogger.
+- *
+- * Can be used to measure and log the time spent by a piece of code.
+- */
+-public class PerfLogger {
+-  public static final String ACQUIRE_READ_WRITE_LOCKS = "acquireReadWriteLocks";
+-  public static final String COMPILE = "compile";
+-  public static final String PARSE = "parse";
+-  public static final String ANALYZE = "semanticAnalyze";
+-  public static final String DO_AUTHORIZATION = "doAuthorization";
+-  public static final String DRIVER_EXECUTE = "Driver.execute";
+-  public static final String INPUT_SUMMARY = "getInputSummary";
+-  public static final String GET_SPLITS = "getSplits";
+-  public static final String RUN_TASKS = "runTasks";
+-  public static final String SERIALIZE_PLAN = "serializePlan";
+-  public static final String DESERIALIZE_PLAN = "deserializePlan";
+-  public static final String CLONE_PLAN = "clonePlan";
+-  public static final String TASK = "task.";
+-  public static final String RELEASE_LOCKS = "releaseLocks";
+-  public static final String PRUNE_LISTING = "prune-listing";
+-  public static final String PARTITION_RETRIEVING = "partition-retrieving";
+-  public static final String PRE_HOOK = "PreHook.";
+-  public static final String POST_HOOK = "PostHook.";
+-  public static final String FAILURE_HOOK = "FailureHook.";
+-  public static final String DRIVER_RUN = "Driver.run";
+-  public static final String TIME_TO_SUBMIT = "TimeToSubmit";
+-  public static final String TEZ_SUBMIT_TO_RUNNING = "TezSubmitToRunningDag";
+-  public static final String TEZ_BUILD_DAG = "TezBuildDag";
+-  public static final String TEZ_SUBMIT_DAG = "TezSubmitDag";
+-  public static final String TEZ_RUN_DAG = "TezRunDag";
+-  public static final String TEZ_CREATE_VERTEX = "TezCreateVertex.";
+-  public static final String TEZ_RUN_VERTEX = "TezRunVertex.";
+-  public static final String TEZ_INITIALIZE_PROCESSOR = "TezInitializeProcessor";
+-  public static final String TEZ_RUN_PROCESSOR = "TezRunProcessor";
+-  public static final String TEZ_INIT_OPERATORS = "TezInitializeOperators";
+-  public static final String LOAD_HASHTABLE = "LoadHashtable";
+-  public static final String ORC_GET_SPLITS = "OrcGetSplits";
+-
+-  public static final String SPARK_SUBMIT_TO_RUNNING = "SparkSubmitToRunning";
+-  public static final String SPARK_BUILD_PLAN = "SparkBuildPlan";
+-  public static final String SPARK_BUILD_RDD_GRAPH = "SparkBuildRDDGraph";
+-  public static final String SPARK_SUBMIT_JOB = "SparkSubmitJob";
+-  public static final String SPARK_RUN_JOB = "SparkRunJob";
+-  public static final String SPARK_CREATE_TRAN = "SparkCreateTran.";
+-  public static final String SPARK_RUN_STAGE = "SparkRunStage.";
+-  public static final String SPARK_INIT_OPERATORS = "SparkInitializeOperators";
+-  public static final String SPARK_GENERATE_TASK_TREE = "SparkGenerateTaskTree";
+-  public static final String SPARK_OPTIMIZE_OPERATOR_TREE = "SparkOptimizeOperatorTree";
+-  public static final String SPARK_OPTIMIZE_TASK_TREE = "SparkOptimizeTaskTree";
+-  public static final String SPARK_FLUSH_HASHTABLE = "SparkFlushHashTable.";
+-
+-  protected static final ThreadLocal<PerfLogger> perfLogger = new ThreadLocal<PerfLogger>();
+-
+-  protected final Map<String, Long> startTimes = new HashMap<String, Long>();
+-  protected final Map<String, Long> endTimes = new HashMap<String, Long>();
+-
+-  static final private Log LOG = LogFactory.getLog(PerfLogger.class.getName());
+-
+-  public PerfLogger() {
+-    // Use getPerfLogger to get an instance of PerfLogger
+-  }
+-
+-  public static PerfLogger getPerfLogger() {
+-    return getPerfLogger(false);
+-  }
+-
+-  /**
+-   * Call this function to get an instance of PerfLogger.
+-   *
+-   * Use resetPerfLogger to require a new instance.  Useful at the beginning of execution.
+-   *
+-   * @return Session perflogger if there's a sessionstate, otherwise return the thread local instance
+-   */
+-  public static PerfLogger getPerfLogger(boolean resetPerfLogger) {
+-    if (SessionState.get() == null) {
+-      if (perfLogger.get() == null || resetPerfLogger) {
+-        perfLogger.set(new PerfLogger());
+-      }
+-      return perfLogger.get();
+-    } else {
+-      return SessionState.get().getPerfLogger(resetPerfLogger);
+-    }
+-  }
+-
+-  /**
+-   * Call this function when you start to measure time spent by a piece of code.
+-   * @param _log the logging object to be used.
+-   * @param method method or ID that identifies this perf log element.
+-   */
+-  public void PerfLogBegin(String callerName, String method) {
+-    long startTime = System.currentTimeMillis();
+-    LOG.info("<PERFLOG method=" + method + " from=" + callerName + ">");
+-    startTimes.put(method, new Long(startTime));
+-  }
+-
+-  /**
+-   * Call this function in correspondence of PerfLogBegin to mark the end of the measurement.
+-   * @param _log
+-   * @param method
+-   * @return long duration  the difference between now and startTime, or -1 if startTime is null
+-   */
+-  public long PerfLogEnd(String callerName, String method) {
+-    Long startTime = startTimes.get(method);
+-    long endTime = System.currentTimeMillis();
+-    long duration = -1;
+-
+-    endTimes.put(method, new Long(endTime));
+-
+-    StringBuilder sb = new StringBuilder("</PERFLOG method=").append(method);
+-    if (startTime != null) {
+-      sb.append(" start=").append(startTime);
+-    }
+-    sb.append(" end=").append(endTime);
+-    if (startTime != null) {
+-      duration = endTime - startTime.longValue();
+-      sb.append(" duration=").append(duration);
+-    }
+-    sb.append(" from=").append(callerName).append(">");
+-    LOG.info(sb);
+-
+-    return duration;
+-  }
+-
+-  /**
+-   * Call this function at the end of processing a query (any time after the last call to PerfLogEnd
+-   * for a given query) to run any cleanup/final steps that need to be run
+-   * @param _log
+-   */
+-  public void close(Log _log, QueryPlan queryPlan) {
+-
+-  }
+-
+-  public Long getStartTime(String method) {
+-    long startTime = 0L;
+-
+-    if (startTimes.containsKey(method)) {
+-      startTime = startTimes.get(method);
+-    }
+-    return startTime;
+-  }
+-
+-  public Long getEndTime(String method) {
+-    long endTime = 0L;
+-
+-    if (endTimes.containsKey(method)) {
+-      endTime = endTimes.get(method);
+-    }
+-    return endTime;
+-  }
+-
+-  public boolean startTimeHasMethod(String method) {
+-    return startTimes.containsKey(method);
+-  }
+-
+-  public boolean endTimeHasMethod(String method) {
+-    return endTimes.containsKey(method);
+-  }
+-
+-  public Long getDuration(String method) {
+-    long duration = 0;
+-    if (startTimes.containsKey(method) && endTimes.containsKey(method)) {
+-      duration = endTimes.get(method) - startTimes.get(method);
+-    }
+-    return duration;
+-  }
+-
+-}
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java
+index 9c6a252..efe7d0e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/optimizer/ppr/PartitionPruner.java
+@@ -53,6 +53,7 @@
+ import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
+ import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDFOPAnd;
+ import org.apache.hadoop.hive.ql.udf.generic.GenericUDFOPOr;
+@@ -364,7 +365,7 @@ private static PrunedPartitionList getPartitionsFromServer(Table tab,
+       // Now filter.
+       List<Partition> partitions = new ArrayList<Partition>();
+       boolean hasUnknownPartitions = false;
+-      PerfLogger perfLogger = PerfLogger.getPerfLogger();
++      PerfLogger perfLogger = SessionState.getPerfLogger();
+       if (!doEvalClientSide) {
+         perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.PARTITION_RETRIEVING);
+         try {
+@@ -396,7 +397,7 @@ private static PrunedPartitionList getPartitionsFromServer(Table tab,
+   }
+ 
+   private static Set<Partition> getAllPartitions(Table tab) throws HiveException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.PARTITION_RETRIEVING);
+     Set<Partition> result = Hive.get().getAllPartitionsOf(tab);
+     perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.PARTITION_RETRIEVING);
+@@ -414,7 +415,7 @@ private static PrunedPartitionList getPartitionsFromServer(Table tab,
+    */
+   static private boolean pruneBySequentialScan(Table tab, List<Partition> partitions,
+       ExprNodeGenericFuncDesc prunerExpr, HiveConf conf) throws HiveException, MetaException {
+-    PerfLogger perfLogger = PerfLogger.getPerfLogger();
++    PerfLogger perfLogger = SessionState.getPerfLogger();
+     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.PRUNE_LISTING);
+ 
+     List<String> partNames = Hive.get().getPartitionNames(
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/SparkCompiler.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/SparkCompiler.java
+index 19aae70..6794fe6 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/SparkCompiler.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/spark/SparkCompiler.java
+@@ -83,6 +83,7 @@
+ import org.apache.hadoop.hive.ql.plan.OperatorDesc;
+ import org.apache.hadoop.hive.ql.plan.SparkWork;
+ import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ 
+ /**
+  * SparkCompiler translates the operator plan into SparkTasks.
+@@ -91,7 +92,7 @@
+  */
+ public class SparkCompiler extends TaskCompiler {
+   private static final String CLASS_NAME = SparkCompiler.class.getName();
+-  private static final PerfLogger PERF_LOGGER = PerfLogger.getPerfLogger();
++  private static final PerfLogger PERF_LOGGER = SessionState.getPerfLogger();
+   private static final Log LOGGER = LogFactory.getLog(SparkCompiler.class);
+ 
+   public SparkCompiler() {
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index c711fef..354753e 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -99,6 +99,7 @@
+   private static final String LOCAL_SESSION_PATH_KEY = "_hive.local.session.path";
+   private static final String HDFS_SESSION_PATH_KEY = "_hive.hdfs.session.path";
+   private static final String TMP_TABLE_SPACE_KEY = "_hive.tmp_table_space";
++
+   private final Map<String, Map<String, Table>> tempTables = new HashMap<String, Map<String, Table>>();
+   private final Map<String, Map<String, ColumnStatisticsObj>> tempTableColStats =
+       new HashMap<String, Map<String, ColumnStatisticsObj>>();
+@@ -603,7 +604,7 @@ private Path createRootHDFSDir(HiveConf conf) throws IOException {
+    * Create a given path if it doesn't exist.
+    *
+    * @param conf
+-   * @param pathString
++   * @param path
+    * @param permission
+    * @param isLocal
+    * @param isCleanUp
+@@ -1384,25 +1385,37 @@ public boolean isAuthorizationModeV2(){
+   }
+ 
+   /**
+-   * @param resetPerfLogger
+    * @return  Tries to return an instance of the class whose name is configured in
+    *          hive.exec.perf.logger, but if it can't it just returns an instance of
+    *          the base PerfLogger class
++   *
++   */
++  public static PerfLogger getPerfLogger() {
++    return getPerfLogger(false);
++  }
+ 
++  /**
++   * @param resetPerfLogger
++   * @return  Tries to return an instance of the class whose name is configured in
++   *          hive.exec.perf.logger, but if it can't it just returns an instance of
++   *          the base PerfLogger class
++   *
+    */
+-  public PerfLogger getPerfLogger(boolean resetPerfLogger) {
+-    if ((perfLogger == null) || resetPerfLogger) {
+-      try {
+-        perfLogger = (PerfLogger) ReflectionUtils.newInstance(conf.getClassByName(
+-            conf.getVar(ConfVars.HIVE_PERF_LOGGER)), conf);
+-      } catch (ClassNotFoundException e) {
+-        LOG.error("Performance Logger Class not found:" + e.getMessage());
+-        perfLogger = new PerfLogger();
+-      }
++  public static PerfLogger getPerfLogger(boolean resetPerfLogger) {
++    SessionState ss = get();
++    if (ss == null) {
++      return PerfLogger.getPerfLogger(null, resetPerfLogger);
++    } else if (ss.perfLogger != null && !resetPerfLogger) {
++      return ss.perfLogger;
++    } else {
++      PerfLogger perfLogger = PerfLogger.getPerfLogger(ss.getConf(), resetPerfLogger);
++      ss.perfLogger = perfLogger;
++      return perfLogger;
+     }
+-    return perfLogger;
+   }
+ 
++
++
+   public TezSessionState getTezSession() {
+     return tezSessionState;
+   }
+-- 
+1.7.9.5
+

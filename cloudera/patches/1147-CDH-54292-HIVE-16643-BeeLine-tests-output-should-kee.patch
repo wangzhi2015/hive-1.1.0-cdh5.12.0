@@ -1,0 +1,277 @@
+From b57a8cd42c746e0ef5809de93b58f4c907244c26 Mon Sep 17 00:00:00 2001
+From: Yongzhi Chen <ychena@apache.org>
+Date: Wed, 24 May 2017 10:30:13 -0400
+Subject: [PATCH 1147/1164] CDH-54292: HIVE-16643: BeeLine tests output should
+ keep the PREHOOK/POSTHOOK Input/Output
+ orderdering (Peter Vary, reviewed by Yongzhi
+ Chen)
+
+(cherry picked from commit dec96ca6f6fb8de04b2847be2285792275ea9423)
+
+Change-Id: Ib693a67cb8d1907f9de7cb33bf936a9f80e4516d
+---
+ .../test/resources/testconfiguration.properties    |    3 +-
+ .../main/java/org/apache/hive/beeline/QFile.java   |   33 ++++-
+ .../beeline/create_merge_compressed.q.out          |  138 ++++++++++++++++++++
+ .../clientpositive/beeline/escape_comments.q.out   |    2 -
+ 4 files changed, 169 insertions(+), 7 deletions(-)
+ create mode 100644 ql/src/test/results/clientpositive/beeline/create_merge_compressed.q.out
+
+diff --git a/itests/src/test/resources/testconfiguration.properties b/itests/src/test/resources/testconfiguration.properties
+index d731136..0ff3cb5 100644
+--- a/itests/src/test/resources/testconfiguration.properties
++++ b/itests/src/test/resources/testconfiguration.properties
+@@ -332,7 +332,8 @@ encrypted.query.files=encryption_join_unencrypted_tbl.q,\
+   encryption_ctas.q,\
+   encryption_drop_table_in_encrypted_db.q
+ 
+-beeline.positive.include=drop_with_concurrency.q,\
++beeline.positive.include=create_merge_compressed.q,\
++  drop_with_concurrency.q,\
+   escape_comments.q,\
+   mapjoin2.q,\
+   smb_mapjoin_1.q,\
+diff --git a/itests/util/src/main/java/org/apache/hive/beeline/QFile.java b/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
+index 3d9ca99..e829dd0 100644
+--- a/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
++++ b/itests/util/src/main/java/org/apache/hive/beeline/QFile.java
+@@ -19,6 +19,7 @@
+ package org.apache.hive.beeline;
+ 
+ import org.apache.commons.io.FileUtils;
++import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.hive.ql.QTestProcessExecResult;
+ import org.apache.hadoop.hive.ql.QTestUtil;
+ import org.apache.hadoop.util.Shell;
+@@ -31,8 +32,11 @@
+ import java.io.PrintStream;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Set;
++import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+ /**
+@@ -59,6 +63,8 @@
+ 
+   private static final Pattern USE_PATTERN =
+       Pattern.compile("^\\s*use\\s.*", Pattern.CASE_INSENSITIVE);
++  private static final Pattern ENTITYLIST_PATTERN =
++      Pattern.compile("(((PREHOOK|POSTHOOK): (Input|Output): \\S+\n)+)", Pattern.MULTILINE);
+ 
+   private static final String MASK_PATTERN = "#### A masked pattern was here ####\n";
+ 
+@@ -169,13 +175,29 @@ private String revertReplaceTableNames(String source) {
+     return source;
+   }
+ 
++  /**
++   * The PREHOOK/POSTHOOK Input/Output lists should be sorted again after reverting the database
++   * name in those strings to match the original Cli output.
++   * @param source The original query output
++   * @return The query output where the input/output list are alphabetically ordered
++   */
++  private String sortInputOutput(String source) {
++    Matcher matcher = ENTITYLIST_PATTERN.matcher(source);
++    while(matcher.find()) {
++      List<String> lines = Arrays.asList(matcher.group(1).split("\n"));
++      Collections.sort(lines);
++      source = source.replaceAll(matcher.group(1), StringUtils.join(lines, "\n") + "\n");
++    }
++    return source;
++  }
++
+   public void filterOutput() throws IOException {
+-    String rawOutput = FileUtils.readFileToString(rawOutputFile, "UTF-8");
++    String output = FileUtils.readFileToString(rawOutputFile, "UTF-8");
++    output = staticFilterSet.filter(specificFilterSet.filter(output));
+     if (rewriteSourceTables) {
+-      rawOutput = revertReplaceTableNames(rawOutput);
++      output = sortInputOutput(revertReplaceTableNames(output));
+     }
+-    String filteredOutput = staticFilterSet.filter(specificFilterSet.filter(rawOutput));
+-    FileUtils.writeStringToFile(outputFile, filteredOutput);
++    FileUtils.writeStringToFile(outputFile, output);
+   }
+ 
+   public QTestProcessExecResult compareResults() throws IOException, InterruptedException {
+@@ -280,6 +302,9 @@ private static RegexFilterSet getStaticFilterSet() {
+         .addFilter(".*file\\..*\n", MASK_PATTERN)
+         .addFilter(".*CreateTime.*\n", MASK_PATTERN)
+         .addFilter(".*transient_lastDdlTime.*\n", MASK_PATTERN)
++        .addFilter(".*lastUpdateTime.*\n", MASK_PATTERN)
++        .addFilter(".*lastAccessTime.*\n", MASK_PATTERN)
++        .addFilter(".*[Oo]wner.*\n", MASK_PATTERN)
+         .addFilter("(?s)(" + MASK_PATTERN + ")+", MASK_PATTERN);
+   }
+ 
+diff --git a/ql/src/test/results/clientpositive/beeline/create_merge_compressed.q.out b/ql/src/test/results/clientpositive/beeline/create_merge_compressed.q.out
+new file mode 100644
+index 0000000..58f517c
+--- /dev/null
++++ b/ql/src/test/results/clientpositive/beeline/create_merge_compressed.q.out
+@@ -0,0 +1,138 @@
++PREHOOK: query: create table src_rc_merge_test(key int, value string) stored as rcfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@src_rc_merge_test
++POSTHOOK: query: create table src_rc_merge_test(key int, value string) stored as rcfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@src_rc_merge_test
++PREHOOK: query: load data local inpath '../../data/files/smbbucket_1.rc' into table src_rc_merge_test
++PREHOOK: type: LOAD
++#### A masked pattern was here ####
++PREHOOK: Output: default@src_rc_merge_test
++POSTHOOK: query: load data local inpath '../../data/files/smbbucket_1.rc' into table src_rc_merge_test
++POSTHOOK: type: LOAD
++#### A masked pattern was here ####
++POSTHOOK: Output: default@src_rc_merge_test
++PREHOOK: query: create table tgt_rc_merge_test(key int, value string) stored as rcfile
++PREHOOK: type: CREATETABLE
++PREHOOK: Output: database:default
++PREHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: query: create table tgt_rc_merge_test(key int, value string) stored as rcfile
++POSTHOOK: type: CREATETABLE
++POSTHOOK: Output: database:default
++POSTHOOK: Output: default@tgt_rc_merge_test
++PREHOOK: query: insert into table tgt_rc_merge_test select * from src_rc_merge_test
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_rc_merge_test
++PREHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: query: insert into table tgt_rc_merge_test select * from src_rc_merge_test
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_rc_merge_test
++POSTHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: Lineage: tgt_rc_merge_test.key SIMPLE [(src_rc_merge_test)src_rc_merge_test.FieldSchema(name:key, type:int, comment:null), ]
++POSTHOOK: Lineage: tgt_rc_merge_test.value SIMPLE [(src_rc_merge_test)src_rc_merge_test.FieldSchema(name:value, type:string, comment:null), ]
++PREHOOK: query: insert into table tgt_rc_merge_test select * from src_rc_merge_test
++PREHOOK: type: QUERY
++PREHOOK: Input: default@src_rc_merge_test
++PREHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: query: insert into table tgt_rc_merge_test select * from src_rc_merge_test
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@src_rc_merge_test
++POSTHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: Lineage: tgt_rc_merge_test.key SIMPLE [(src_rc_merge_test)src_rc_merge_test.FieldSchema(name:key, type:int, comment:null), ]
++POSTHOOK: Lineage: tgt_rc_merge_test.value SIMPLE [(src_rc_merge_test)src_rc_merge_test.FieldSchema(name:value, type:string, comment:null), ]
++PREHOOK: query: show table extended like `tgt_rc_merge_test`
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like `tgt_rc_merge_test`
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:tgt_rc_merge_test
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.hive.ql.io.RCFileInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.RCFileOutputFormat
++columns:struct columns { i32 key, string value}
++partitioned:false
++partitionColumns:
++totalNumberFiles:2
++totalFileSize:342
++maxFileSize:171
++minFileSize:171
++#### A masked pattern was here ####
++
++PREHOOK: query: select count(1) from tgt_rc_merge_test
++PREHOOK: type: QUERY
++PREHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++POSTHOOK: query: select count(1) from tgt_rc_merge_test
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++10
++PREHOOK: query: select sum(hash(key)), sum(hash(value)) from tgt_rc_merge_test
++PREHOOK: type: QUERY
++PREHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++POSTHOOK: query: select sum(hash(key)), sum(hash(value)) from tgt_rc_merge_test
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++46	-751895388
++PREHOOK: query: alter table tgt_rc_merge_test concatenate
++PREHOOK: type: ALTER_TABLE_MERGE
++PREHOOK: Input: default@tgt_rc_merge_test
++PREHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: query: alter table tgt_rc_merge_test concatenate
++POSTHOOK: type: ALTER_TABLE_MERGE
++POSTHOOK: Input: default@tgt_rc_merge_test
++POSTHOOK: Output: default@tgt_rc_merge_test
++PREHOOK: query: show table extended like `tgt_rc_merge_test`
++PREHOOK: type: SHOW_TABLESTATUS
++POSTHOOK: query: show table extended like `tgt_rc_merge_test`
++POSTHOOK: type: SHOW_TABLESTATUS
++tableName:tgt_rc_merge_test
++#### A masked pattern was here ####
++inputformat:org.apache.hadoop.hive.ql.io.RCFileInputFormat
++outputformat:org.apache.hadoop.hive.ql.io.RCFileOutputFormat
++columns:struct columns { i32 key, string value}
++partitioned:false
++partitionColumns:
++totalNumberFiles:1
++totalFileSize:243
++maxFileSize:243
++minFileSize:243
++#### A masked pattern was here ####
++
++PREHOOK: query: select count(1) from tgt_rc_merge_test
++PREHOOK: type: QUERY
++PREHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++POSTHOOK: query: select count(1) from tgt_rc_merge_test
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++10
++PREHOOK: query: select sum(hash(key)), sum(hash(value)) from tgt_rc_merge_test
++PREHOOK: type: QUERY
++PREHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++POSTHOOK: query: select sum(hash(key)), sum(hash(value)) from tgt_rc_merge_test
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@tgt_rc_merge_test
++#### A masked pattern was here ####
++46	-751895388
++PREHOOK: query: drop table src_rc_merge_test
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@src_rc_merge_test
++PREHOOK: Output: default@src_rc_merge_test
++POSTHOOK: query: drop table src_rc_merge_test
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@src_rc_merge_test
++POSTHOOK: Output: default@src_rc_merge_test
++PREHOOK: query: drop table tgt_rc_merge_test
++PREHOOK: type: DROPTABLE
++PREHOOK: Input: default@tgt_rc_merge_test
++PREHOOK: Output: default@tgt_rc_merge_test
++POSTHOOK: query: drop table tgt_rc_merge_test
++POSTHOOK: type: DROPTABLE
++POSTHOOK: Input: default@tgt_rc_merge_test
++POSTHOOK: Output: default@tgt_rc_merge_test
+diff --git a/ql/src/test/results/clientpositive/beeline/escape_comments.q.out b/ql/src/test/results/clientpositive/beeline/escape_comments.q.out
+index d1470a7..b6838de 100644
+--- a/ql/src/test/results/clientpositive/beeline/escape_comments.q.out
++++ b/ql/src/test/results/clientpositive/beeline/escape_comments.q.out
+@@ -96,7 +96,6 @@ b	NULL	NULL
+ 	NULL	NULL
+ # Detailed Table Information	NULL	NULL
+ Database:           	escape_comments_db  	NULL
+-Owner:              	user                	NULL
+ #### A masked pattern was here ####
+ LastAccessTime:     	UNKNOWN             	NULL
+ Protect Mode:       	None                	NULL
+@@ -171,7 +170,6 @@ b	NULL	NULL
+ 	NULL	NULL
+ # Detailed Table Information	NULL	NULL
+ Database:           	escape_comments_db  	NULL
+-Owner:              	user                	NULL
+ #### A masked pattern was here ####
+ LastAccessTime:     	UNKNOWN             	NULL
+ Protect Mode:       	None                	NULL
+-- 
+1.7.9.5
+

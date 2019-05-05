@@ -1,0 +1,367 @@
+From a44721177a0c70b0e983368c2479067d41b40999 Mon Sep 17 00:00:00 2001
+From: Szehon Ho <szehon@cloudera.com>
+Date: Tue, 15 Dec 2015 13:27:22 -0800
+Subject: [PATCH 0456/1164] CDH-34693 : HIVE-12431 : Support timeout for
+ compile lock (Mohit Sabharwal via Szehon)
+
+(cherry picked from commit e091bc27183dc0e24a554e599f1584249650306a)
+
+Conflicts:
+	common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+	ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+	ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+	service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
+
+Change-Id: I8cba3851afb10d91fd0db13dbd5907d775740a3f
+---
+ .../java/org/apache/hadoop/hive/conf/HiveConf.java |    5 +-
+ ql/src/java/org/apache/hadoop/hive/ql/Driver.java  |   53 +++++-
+ .../java/org/apache/hadoop/hive/ql/ErrorMsg.java   |    2 +-
+ .../apache/hive/service/cli/CLIServiceTest.java    |  172 +++++++++++++++++++-
+ 4 files changed, 225 insertions(+), 7 deletions(-)
+
+diff --git a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+index 8e32a21..3497876 100644
+--- a/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
++++ b/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+@@ -1702,7 +1702,10 @@ public void setSparkConfigUpdated(boolean isSparkConfigUpdated) {
+         "Transport mode of HiveServer2."),
+     HIVE_SERVER2_THRIFT_BIND_HOST("hive.server2.thrift.bind.host", "",
+         "Bind host on which to run the HiveServer2 Thrift service."),
+-
++    HIVE_SERVER2_COMPILE_LOCK_TIMEOUT("hive.server2.compile.lock.timeout", "0s",
++        new TimeValidator(TimeUnit.SECONDS),
++        "Number of seconds a request will wait to acquire the compile lock before giving up. " +
++        "Setting it to 0s disables the timeout."),
+     // http (over thrift) transport settings
+     HIVE_SERVER2_THRIFT_HTTP_PORT("hive.server2.thrift.http.port", 10001,
+         "Port number of HiveServer2 Thrift interface when hive.server2.transport.mode is 'http'."),
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+index 4cd0475..71f8aa8 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+@@ -32,6 +32,8 @@
+ import java.util.Map;
+ import java.util.Queue;
+ import java.util.Set;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+@@ -125,8 +127,6 @@
+   static final private Log LOG = LogFactory.getLog(CLASS_NAME);
+   static final private LogHelper console = new LogHelper(LOG);
+ 
+-  private static final Object compileMonitor = new Object();
+-
+   private int maxRows = 100;
+   ByteStream.Output bos = new ByteStream.Output();
+ 
+@@ -1150,12 +1150,21 @@ public CommandProcessorResponse compileAndRespond(String command) {
+     return createProcessorResponse(compileInternal(command));
+   }
+ 
++  private static final ReentrantLock globalCompileLock = new ReentrantLock();
+   private int compileInternal(String command) {
+     int ret;
+     LOG.debug("Acquire a monitor for compiling query");
+-    synchronized (compileMonitor) {
++    final ReentrantLock compileLock = tryAcquireCompileLock(command);
++    if (compileLock == null) {
++      return ErrorMsg.COMPILE_LOCK_TIMED_OUT.getErrorCode();
++    }
++
++    try {
+       ret = compile(command);
++    } finally {
++      compileLock.unlock();
+     }
++
+     if (ret != 0) {
+       try {
+         releaseLocksAndCommitOrRollback(false);
+@@ -1164,9 +1173,47 @@ private int compileInternal(String command) {
+             + org.apache.hadoop.util.StringUtils.stringifyException(e));
+       }
+     }
++
+     return ret;
+   }
+ 
++  /**
++   * Acquires the compile lock. If the compile lock wait timeout is configured,
++   * it will acquire the lock if it is not held by another thread within the given
++   * waiting time.
++   * @return the ReentrantLock object if the lock was successfully acquired,
++   *         or {@code null} if compile lock wait timeout is configured and
++   *         either the waiting time elapsed before the lock could be acquired
++   *         or if the current thread is interrupted.
++   */
++  private ReentrantLock tryAcquireCompileLock(String command) {
++    long maxCompileLockWaitTime = HiveConf.getTimeVar(
++          this.conf, ConfVars.HIVE_SERVER2_COMPILE_LOCK_TIMEOUT,
++          TimeUnit.SECONDS);
++    if (maxCompileLockWaitTime > 0) {
++      try {
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Waiting to acquire compile lock: " + command);
++        }
++        if(!globalCompileLock.tryLock(maxCompileLockWaitTime, TimeUnit.SECONDS)) {
++          errorMessage = ErrorMsg.COMPILE_LOCK_TIMED_OUT.getErrorCodedMsg();
++          LOG.error(errorMessage + ": " + command);
++          return null;
++        }
++      } catch (InterruptedException e) {
++        Thread.currentThread().interrupt();
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Interrupted Exception ignored", e);
++        }
++        return null;
++      }
++    } else {
++      globalCompileLock.lock();
++    }
++
++    return globalCompileLock;
++  }
++
+   private CommandProcessorResponse runInternal(String command, boolean alreadyCompiled)
+       throws CommandNeedRetryException {
+     errorMessage = null;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+index 68b23e7..0b8e689 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/ErrorMsg.java
+@@ -429,7 +429,7 @@
+       "Alter table partition type {0} does not support cascade", true),
+ 
+   DROP_NATIVE_FUNCTION(10301, "Cannot drop native function"),
+-
++  COMPILE_LOCK_TIMED_OUT(10308, "Attempt to acquire compile lock timed out.", true),
+   //========================== 20000 range starts here ========================//
+   SCRIPT_INIT_ERROR(20000, "Unable to initialize custom script."),
+   SCRIPT_IO_ERROR(20001, "An error occurred while reading or writing to your custom script. "
+diff --git a/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java b/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
+index b4d517f..0643a6e 100644
+--- a/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
++++ b/service/src/test/org/apache/hive/service/cli/CLIServiceTest.java
+@@ -23,12 +23,26 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import java.io.Serializable;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.Callable;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.FutureTask;
+ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.ql.ErrorMsg;
++import org.apache.hadoop.hive.ql.exec.Task;
++import org.apache.hadoop.hive.ql.parse.ASTNode;
++import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHook;
++import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHookContext;
++import org.apache.hadoop.hive.ql.parse.SemanticException;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Test;
+@@ -38,6 +52,7 @@
+  *
+  */
+ public abstract class CLIServiceTest {
++  private static final Logger LOG = LoggerFactory.getLogger(CLIServiceTest.class);
+ 
+   protected static CLIServiceClient client;
+ 
+@@ -259,6 +274,141 @@ public void testExecuteStatementAsync() throws Exception {
+     client.closeSession(sessionHandle);
+   }
+ 
++  private void syncThreadStart(final CountDownLatch cdlIn, final CountDownLatch cdlOut) {
++    cdlIn.countDown();
++    try {
++      cdlOut.await();
++    } catch (InterruptedException e) {
++      throw new RuntimeException(e);
++    }
++  }
++
++
++  public static class CompileLockTestSleepHook implements HiveSemanticAnalyzerHook {
++    @Override
++    public ASTNode preAnalyze(HiveSemanticAnalyzerHookContext context,
++      ASTNode ast) throws SemanticException {
++      try {
++        Thread.sleep(20 * 1000);
++      } catch (Throwable t) {
++        // do nothing
++      }
++      return ast;
++    }
++
++    @Override
++    public void postAnalyze(HiveSemanticAnalyzerHookContext context,
++      List<Task<? extends Serializable>> rootTasks) throws SemanticException {
++    }
++  }
++
++  @Test
++  public void testGlobalCompileLockTimeout() throws Exception {
++    String tableName = "TEST_COMPILE_LOCK_TIMEOUT";
++    String columnDefinitions = "(ID STRING)";
++
++    // Open a session and set up the test data
++    SessionHandle sessionHandle = setupTestData(tableName, columnDefinitions,
++        new HashMap<String, String>());
++    assertNotNull(sessionHandle);
++
++    int THREAD_COUNT = 3;
++    @SuppressWarnings("unchecked")
++    FutureTask<Void>[] tasks = (FutureTask<Void>[])new FutureTask[THREAD_COUNT];
++    long longPollingTimeoutMs = 10 * 60 * 1000; // Larger than max compile duration used in test
++
++    // 1st query acquires the lock and takes 20 secs to compile
++    Map<String, String> confOverlay = getConfOverlay(0, longPollingTimeoutMs);
++    confOverlay.put(HiveConf.ConfVars.SEMANTIC_ANALYZER_HOOK.varname,
++        CompileLockTestSleepHook.class.getName());
++    String query = "SELECT 0 FROM " + tableName;
++    tasks[0] = new FutureTask<Void>(
++        createQueryCallable(query, confOverlay, longPollingTimeoutMs, 1,
++            OperationState.FINISHED, false, null, null));
++    new Thread(tasks[0]).start();
++    Thread.sleep(5 * 1000);
++
++    // 2nd query's session has compile lock timeout of 1 sec, so it should
++    // not be able to acquire the lock within that time period
++    confOverlay = getConfOverlay(1, longPollingTimeoutMs);
++    query = "SELECT 1 FROM " + tableName;
++    tasks[1] = new FutureTask<Void>(
++        createQueryCallable(query, confOverlay, longPollingTimeoutMs, 1,
++            OperationState.ERROR, false, null, null));
++    new Thread(tasks[1]).start();
++
++    // 3rd query's session has compile lock timeout of 100 secs, so it should
++    // be able to acquire the lock and finish successfully
++    confOverlay = getConfOverlay(100, longPollingTimeoutMs);
++    query = "SELECT 2 FROM " + tableName;
++    tasks[2] = new FutureTask<Void>(
++        createQueryCallable(query, confOverlay, longPollingTimeoutMs, 1,
++            OperationState.FINISHED, false, null, null));
++    new Thread(tasks[2]).start();
++
++    boolean foundExpectedException = false;
++    for (int i = 0; i < THREAD_COUNT; ++i) {
++      try {
++        tasks[i].get();
++      } catch (Throwable t) {
++        if (i == 1) {
++          assertTrue(t.getMessage().contains(
++              ErrorMsg.COMPILE_LOCK_TIMED_OUT.getMsg()));
++          foundExpectedException = true;
++        } else {
++          throw new RuntimeException(t);
++        }
++      }
++    }
++    assertTrue(foundExpectedException);
++
++    // Cleanup
++    client.executeStatement(sessionHandle, "DROP TABLE " + tableName,
++        getConfOverlay(0, longPollingTimeoutMs));
++    client.closeSession(sessionHandle);
++  }
++
++  private Map<String, String> getConfOverlay(long compileLockTimeoutSecs,
++    long longPollingTimeoutMs) {
++    Map<String, String> confOverlay = new HashMap<String, String>();
++    confOverlay.put(
++        HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname,
++        longPollingTimeoutMs + "ms");
++    if (compileLockTimeoutSecs > 0) {
++      confOverlay.put(
++          HiveConf.ConfVars.HIVE_SERVER2_COMPILE_LOCK_TIMEOUT.varname,
++          compileLockTimeoutSecs + "s");
++    }
++    return confOverlay;
++  }
++
++  private Callable<Void> createQueryCallable(final String queryStringFormat,
++      final Map<String, String> confOverlay, final long longPollingTimeout,
++      final int queryCount, final OperationState expectedOperationState,
++      final boolean syncThreadStart, final CountDownLatch cdlIn,
++      final CountDownLatch cdlOut) {
++    return new Callable<Void>() {
++      @Override
++      public Void call() throws Exception {
++        if (syncThreadStart) {
++          syncThreadStart(cdlIn, cdlOut);
++        }
++
++        SessionHandle sessionHandle = openSession(confOverlay);
++        OperationHandle[] hs  = new OperationHandle[queryCount];
++        for (int i = 0; i < hs.length; ++i) {
++          String queryString = String.format(queryStringFormat, i);
++          LOG.info("Submitting " + i);
++          hs[i] = client.executeStatementAsync(sessionHandle, queryString, confOverlay);
++        }
++        for (int i = hs.length - 1; i >= 0; --i) {
++          waitForAsyncQuery(hs[i], expectedOperationState, longPollingTimeout);
++        }
++        return null;
++      }
++    };
++  }
++
+   /**
+    * Sets up a test specific table with the given column definitions and config
+    * @param tableName
+@@ -286,18 +436,36 @@ private SessionHandle setupTestData(String tableName, String columnDefinitions,
+     return sessionHandle;
+   }
+ 
++  private SessionHandle openSession(Map<String, String> confOverlay)
++      throws HiveSQLException {
++    SessionHandle sessionHandle = client.openSession("tom", "password", confOverlay);
++    assertNotNull(sessionHandle);
++    SessionState.get().setIsHiveServerQuery(true); // Pretend we are in HS2.
++
++    String queryString = "SET " + HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname
++        + " = false";
++    client.executeStatement(sessionHandle, queryString, confOverlay);
++    return sessionHandle;
++  }
++
+   private OperationStatus runQueryAsync(SessionHandle sessionHandle, String queryString,
+       Map<String, String> confOverlay, OperationState expectedState,
+       long longPollingTimeout) throws HiveSQLException {
+     // Timeout for the iteration in case of asynchronous execute
++    confOverlay.put(
++        HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname, longPollingTimeout + "ms");
++    OperationHandle h = client.executeStatementAsync(sessionHandle, queryString, confOverlay);
++    return waitForAsyncQuery(h, expectedState, longPollingTimeout);
++  }
++
++  private OperationStatus waitForAsyncQuery(OperationHandle opHandle,
++                                            OperationState expectedState, long longPollingTimeout) throws HiveSQLException {
+     long testIterationTimeout = System.currentTimeMillis() + 100000;
+     long longPollingStart;
+     long longPollingEnd;
+     long longPollingTimeDelta;
+     OperationStatus opStatus = null;
+     OperationState state = null;
+-    confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname, longPollingTimeout + "ms");
+-    OperationHandle opHandle = client.executeStatementAsync(sessionHandle, queryString, confOverlay);
+     int count = 0;
+     while (true) {
+       // Break if iteration times out
+-- 
+1.7.9.5
+

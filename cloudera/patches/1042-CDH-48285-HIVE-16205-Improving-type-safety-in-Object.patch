@@ -1,0 +1,248 @@
+From 5092723ac2e981b2703f3f8dd15d11fd2ce9e930 Mon Sep 17 00:00:00 2001
+From: Vihang Karajgaonkar <vihang@cloudera.com>
+Date: Mon, 20 Mar 2017 10:46:29 -0500
+Subject: [PATCH 1042/1164] CDH-48285 : HIVE-16205 : Improving type safety in
+ Objectstore (Vihang Karajgaonkar, reviewed by
+ Sergio Pena)
+
+Change-Id: Ia4be4ad2a11ea71b1dbf754983336548bad7a139
+---
+ .../java/org/apache/hive/jdbc/TestJdbcDriver2.java |   39 ++++++++
+ .../apache/hadoop/hive/metastore/ObjectStore.java  |  101 ++++++++------------
+ 2 files changed, 81 insertions(+), 59 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+index 4286624..7e900c4 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcDriver2.java
+@@ -988,6 +988,45 @@ public void testShowTables() throws SQLException {
+   }
+ 
+   @Test
++  public void testShowTablesInDb() throws SQLException {
++    Statement stmt = con.createStatement();
++    assertNotNull("Statement is null", stmt);
++
++    String tableNameInDbUnique = tableName + "_unique";
++    // create a table with a unique name in testDb
++    stmt.execute("drop table if exists " + testDbName + "." + tableNameInDbUnique);
++    stmt.execute("create table " + testDbName + "." + tableNameInDbUnique
++        + " (under_col int comment 'the under column', value string) comment '" + tableComment
++        + "'");
++
++    ResultSet res = stmt.executeQuery("show tables in " + testDbName);
++
++    boolean testTableExists = false;
++    while (res.next()) {
++      assertNotNull("table name is null in result set", res.getString(1));
++      if (tableNameInDbUnique.equalsIgnoreCase(res.getString(1))) {
++        testTableExists = true;
++      }
++    }
++    assertTrue("table name " + tableNameInDbUnique
++        + " not found in SHOW TABLES result set", testTableExists);
++    stmt.execute("drop table if exists " + testDbName + "." + tableNameInDbUnique);
++    stmt.close();
++  }
++
++  @Test
++  public void testInvalidShowTables() throws SQLException {
++    Statement stmt = con.createStatement();
++    assertNotNull("Statement is null", stmt);
++
++    //show tables <dbname> is in invalid show tables syntax. Hive does not return
++    //any tables in this case
++    ResultSet res = stmt.executeQuery("show tables " + testDbName);
++    assertFalse(res.next());
++    stmt.close();
++  }
++
++  @Test
+   public void testMetaDataGetTables() throws SQLException {
+     getTablesTest(ImmutableSet.of(ClassicTableTypes.TABLE.toString()),
+         ClassicTableTypes.VIEW.toString());
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+index 2e36f42..a5077b0 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/ObjectStore.java
+@@ -186,6 +186,7 @@
+   private static final Map<String, Class> PINCLASSMAP;
+   private static final String HOSTNAME;
+   private static final String USER;
++  private static final String JDO_PARAM = ":param";
+   static {
+     Map<String, Class> map = new HashMap<String, Class>();
+     map.put("table", MTable.class);
+@@ -736,21 +737,13 @@ public boolean dropDatabase(String dbname) throws NoSuchObjectException, MetaExc
+       // Take the pattern and split it on the | to get all the composing
+       // patterns
+       String[] subpatterns = pattern.trim().split("\\|");
+-      String queryStr = "select name from org.apache.hadoop.hive.metastore.model.MDatabase where (";
+-      boolean first = true;
+-      for (String subpattern : subpatterns) {
+-        subpattern = "(?i)" + subpattern.replaceAll("\\*", ".*");
+-        if (!first) {
+-          queryStr = queryStr + " || ";
+-        }
+-        queryStr = queryStr + " name.matches(\"" + subpattern + "\")";
+-        first = false;
+-      }
+-      queryStr = queryStr + ")";
+-      query = pm.newQuery(queryStr);
++      StringBuilder filterBuilder = new StringBuilder();
++      List<String> parameterVals = new ArrayList<>(subpatterns.length);
++      appendPatternCondition(filterBuilder, "name", subpatterns, parameterVals);
++      query = pm.newQuery(MDatabase.class, filterBuilder.toString());
+       query.setResult("name");
+       query.setOrdering("name ascending");
+-      Collection names = (Collection) query.execute();
++      Collection names = (Collection) query.executeWithArray(parameterVals.toArray(new String[parameterVals.size()]));
+       databases = new ArrayList<String>();
+       for (Iterator i = names.iterator(); i.hasNext();) {
+         databases.add((String) i.next());
+@@ -1034,25 +1027,17 @@ public Table getTable(String dbName, String tableName) throws MetaException {
+       dbName = HiveStringUtils.normalizeIdentifier(dbName);
+       // Take the pattern and split it on the | to get all the composing
+       // patterns
+-      String[] subpatterns = pattern.trim().split("\\|");
+-      String queryStr =
+-          "select tableName from org.apache.hadoop.hive.metastore.model.MTable "
+-              + "where database.name == dbName && (";
+-      boolean first = true;
+-      for (String subpattern : subpatterns) {
+-        subpattern = "(?i)" + subpattern.replaceAll("\\*", ".*");
+-        if (!first) {
+-          queryStr = queryStr + " || ";
+-        }
+-        queryStr = queryStr + " tableName.matches(\"" + subpattern + "\")";
+-        first = false;
+-      }
+-      queryStr = queryStr + ")";
+-      query = pm.newQuery(queryStr);
+-      query.declareParameters("java.lang.String dbName");
++      List<String> parameterVals = new ArrayList<>();
++      StringBuilder filterBuilder = new StringBuilder();
++      //adds database.name == dbName to the filter
++      appendSimpleCondition(filterBuilder, "database.name", new String[] {dbName}, parameterVals);
++      if(pattern != null) {
++        appendPatternCondition(filterBuilder, "tableName", pattern, parameterVals);
++      }
++      query = pm.newQuery(MTable.class, filterBuilder.toString());
+       query.setResult("tableName");
+       query.setOrdering("tableName ascending");
+-      Collection names = (Collection) query.execute(dbName);
++      Collection names = (Collection) query.executeWithArray(parameterVals.toArray(new String[parameterVals.size()]));
+       tbls = new ArrayList<String>();
+       for (Iterator i = names.iterator(); i.hasNext();) {
+         tbls.add((String) i.next());
+@@ -1117,19 +1102,20 @@ private int getObjectCount(String fieldName, String objName) {
+       openTransaction();
+       // Take the pattern and split it on the | to get all the composing
+       // patterns
+-      StringBuilder builder = new StringBuilder();
++      StringBuilder filterBuilder = new StringBuilder();
++      List<String> parameterVals = new ArrayList<>();
+       if (dbNames != null && !dbNames.equals("*")) {
+-        appendPatternCondition(builder, "database.name", dbNames);
++        appendPatternCondition(filterBuilder, "database.name", dbNames, parameterVals);
+       }
+       if (tableNames != null && !tableNames.equals("*")) {
+-        appendPatternCondition(builder, "tableName", tableNames);
++        appendPatternCondition(filterBuilder, "tableName", tableNames, parameterVals);
+       }
+       if (tableTypes != null && !tableTypes.isEmpty()) {
+-        appendSimpleCondition(builder, "tableType", tableTypes.toArray(new String[0]));
++        appendSimpleCondition(filterBuilder, "tableType", tableTypes.toArray(new String[0]), parameterVals);
+       }
+ 
+-      query = pm.newQuery(MTable.class, builder.toString());
+-      Collection<MTable> tables = (Collection<MTable>) query.execute();
++      query = pm.newQuery(MTable.class, filterBuilder.toString());
++      Collection<MTable> tables = (Collection<MTable>) query.executeWithArray(parameterVals.toArray(new String[parameterVals.size()]));
+       for (MTable table : tables) {
+         TableMeta metaData = new TableMeta(
+             table.getDatabase().getName(), table.getTableName(), table.getTableType());
+@@ -1148,19 +1134,24 @@ private int getObjectCount(String fieldName, String objName) {
+     return metas;
+   }
+ 
++  private StringBuilder appendPatternCondition(StringBuilder filterBuilder, String fieldName,
++      String[] elements, List<String> parameterVals) {
++    return appendCondition(filterBuilder, fieldName, elements, true, parameterVals);
++  }
++
+   private StringBuilder appendPatternCondition(StringBuilder builder,
+-      String fieldName, String elements) {
++      String fieldName, String elements, List<String> parameters) {
+       elements = HiveStringUtils.normalizeIdentifier(elements);
+-    return appendCondition(builder, fieldName, elements.split("\\|"), true);
++    return appendCondition(builder, fieldName, elements.split("\\|"), true, parameters);
+   }
+ 
+   private StringBuilder appendSimpleCondition(StringBuilder builder,
+-      String fieldName, String[] elements) {
+-    return appendCondition(builder, fieldName, elements, false);
++      String fieldName, String[] elements, List<String> parameters) {
++    return appendCondition(builder, fieldName, elements, false, parameters);
+   }
+ 
+   private StringBuilder appendCondition(StringBuilder builder,
+-      String fieldName, String[] elements, boolean pattern) {
++      String fieldName, String[] elements, boolean pattern, List<String> parameters) {
+     if (builder.length() > 0) {
+       builder.append(" && ");
+     }
+@@ -1170,14 +1161,15 @@ private StringBuilder appendCondition(StringBuilder builder,
+       if (pattern) {
+         element = "(?i)" + element.replaceAll("\\*", ".*");
+       }
++      parameters.add(element);
+       if (builder.length() > length) {
+         builder.append(" || ");
+       }
+       builder.append(fieldName);
+       if (pattern) {
+-        builder.append(".matches(\"").append(element).append("\")");
++        builder.append(".matches(").append(JDO_PARAM).append(parameters.size()).append(")");
+       } else {
+-        builder.append(" == \"").append(element).append("\"");
++        builder.append(" == ").append(JDO_PARAM).append(parameters.size());
+       }
+     }
+     builder.append(" )");
+@@ -7598,25 +7590,16 @@ public Function getFunction(String dbName, String funcName) throws MetaException
+       dbName = HiveStringUtils.normalizeIdentifier(dbName);
+       // Take the pattern and split it on the | to get all the composing
+       // patterns
+-      String[] subpatterns = pattern.trim().split("\\|");
+-      String queryStr =
+-          "select functionName from org.apache.hadoop.hive.metastore.model.MFunction "
+-              + "where database.name == dbName && (";
+-      boolean first = true;
+-      for (String subpattern : subpatterns) {
+-        subpattern = "(?i)" + subpattern.replaceAll("\\*", ".*");
+-        if (!first) {
+-          queryStr = queryStr + " || ";
+-        }
+-        queryStr = queryStr + " functionName.matches(\"" + subpattern + "\")";
+-        first = false;
++      List<String> parameterVals = new ArrayList<>();
++      StringBuilder filterBuilder = new StringBuilder();
++      appendSimpleCondition(filterBuilder, "database.name", new String[] { dbName }, parameterVals);
++      if(pattern != null) {
++        appendPatternCondition(filterBuilder, "functionName", pattern, parameterVals);
+       }
+-      queryStr = queryStr + ")";
+-      query = pm.newQuery(queryStr);
+-      query.declareParameters("java.lang.String dbName");
++      query = pm.newQuery(MFunction.class, filterBuilder.toString());
+       query.setResult("functionName");
+       query.setOrdering("functionName ascending");
+-      Collection names = (Collection) query.execute(dbName);
++      Collection names = (Collection) query.executeWithArray(parameterVals.toArray(new String[parameterVals.size()]));
+       funcs = new ArrayList<String>();
+       for (Iterator i = names.iterator(); i.hasNext();) {
+         funcs.add((String) i.next());
+-- 
+1.7.9.5
+

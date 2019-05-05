@@ -1,0 +1,725 @@
+From 5457854f724b23541e11ecb0965fe82a1c16e555 Mon Sep 17 00:00:00 2001
+From: Zsombor Klara <zsombor.klara@cloudera.com>
+Date: Thu, 19 Jan 2017 10:28:26 +0100
+Subject: [PATCH 0935/1164] CDH-41901: HIVE-13149: Remove some unnecessary HMS
+ connections from HS2
+
+Change-Id: I70e24c4139b301196f4b6b4c12ac9817ed97a267
+---
+ .../hive/metastore/TestMetastoreVersion.java       |    7 ++---
+ .../org/apache/hive/jdbc/TestJdbcWithMiniHS2.java  |   27 ++++++++++++++-----
+ .../hive/service/cli/session/TestQueryDisplay.java |    9 ++++++-
+ .../apache/hadoop/hive/hbase/HBaseQTestUtil.java   |    7 +++++
+ .../apache/hadoop/hive/hbase/HBaseTestSetup.java   |    3 ---
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |   24 ++++++++++-------
+ .../hadoop/hive/metastore/HiveMetaStoreClient.java |    8 +++---
+ .../hadoop/hive/ql/session/SessionState.java       |    6 ++---
+ .../results/clientpositive/spark/stats12.q.out     |   20 --------------
+ .../results/clientpositive/spark/stats13.q.out     |   20 --------------
+ .../test/results/clientpositive/spark/stats5.q.out |    2 +-
+ .../test/results/clientpositive/spark/stats6.q.out |   10 -------
+ .../clientpositive/spark/stats_noscan_1.q.out      |   28 --------------------
+ .../clientpositive/spark/stats_partscan_1_23.q.out |   15 -----------
+ .../clientpositive/spark/union_remove_25.q.out     |   15 -----------
+ 15 files changed, 63 insertions(+), 138 deletions(-)
+
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+index 5514228..ecae3ff 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/metastore/TestMetastoreVersion.java
+@@ -19,7 +19,6 @@
+ 
+ import java.io.File;
+ import java.lang.reflect.Field;
+-import java.util.Random;
+ 
+ import junit.framework.TestCase;
+ 
+@@ -32,6 +31,7 @@
+ import org.apache.hadoop.hive.metastore.api.MetaException;
+ import org.apache.hadoop.hive.metastore.ObjectStore;
+ import org.apache.hadoop.hive.ql.Driver;
++import org.apache.hadoop.hive.ql.metadata.Hive;
+ import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ 
+@@ -99,8 +99,9 @@ public void testVersionRestriction () throws Exception {
+     // session creation should fail since the schema didn't get created
+     try {
+       SessionState.start(new CliSessionState(hiveConf));
+-      fail("Expected exception");
+-    } catch (RuntimeException re) {
++      Hive.get(hiveConf).getMSC();
++      fail("An exception is expected since schema is not created.");
++    } catch (Exception re) {
+       LOG.info("Exception in testVersionRestriction: " + re, re);
+       String msg = HiveStringUtils.stringifyException(re);
+       assertTrue("Expected 'Version information not found in metastore' in: " + msg, msg
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+index 9aa453c..9363ec4 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/jdbc/TestJdbcWithMiniHS2.java
+@@ -82,9 +82,8 @@ public static void beforeTest() throws Exception {
+     miniHS2.start(confOverlay);
+   }
+ 
+-  @Before
+-  public void setUp() throws Exception {
+-    hs2Conn = getConnection(miniHS2.getJdbcURL(), System.getProperty("user.name"), "bar");
++  private Connection getConnection() throws Exception {
++    return getConnection(miniHS2.getJdbcURL(), System.getProperty("user.name"), "bar");
+   }
+ 
+   private Connection getConnection(String jdbcURL, String user, String pwd) throws SQLException {
+@@ -95,7 +94,9 @@ private Connection getConnection(String jdbcURL, String user, String pwd) throws
+ 
+   @After
+   public void tearDown() throws Exception {
+-    hs2Conn.close();
++    if (hs2Conn != null) {
++      hs2Conn.close();
++    }
+   }
+ 
+   @AfterClass
+@@ -108,6 +109,7 @@ public static void afterTest() throws Exception {
+   @Test
+   public void testConnection() throws Exception {
+     String tableName = "testTab1";
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+ 
+     // create table
+@@ -129,6 +131,7 @@ public void testConnection() throws Exception {
+   @Test
+   public void testConcurrentStatements() throws Exception {
+     String tableName = "testConcurrentStatements";
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+ 
+     // create table
+@@ -307,6 +310,7 @@ public void testURIDatabaseName() throws Exception{
+     stmt.execute(" drop table if exists table_in_non_default_schema");
+     expected = stmt.execute("DROP DATABASE "+ dbName);
+     stmt.close();
++    hs2Conn.close();
+ 
+     hs2Conn  = getConnection(jdbcUri+"default",System.getProperty("user.name"),"bar");
+     stmt = hs2Conn .createStatement();
+@@ -340,6 +344,7 @@ public void testConnectionSchemaAPIs() throws Exception {
+      * get/set Schema are new in JDK7 and not available in java.sql.Connection in JDK6.
+      * Hence the test uses HiveConnection object to call these methods so that test will run with older JDKs
+      */
++    hs2Conn = getConnection();
+     HiveConnection hiveConn = (HiveConnection)hs2Conn;
+ 
+     assertEquals("default", hiveConn.getSchema());
+@@ -373,6 +378,7 @@ public void testConnectionSchemaAPIs() throws Exception {
+    */
+   private void verifyCurrentDB(String expectedDbName, Connection hs2Conn) throws Exception {
+     String verifyTab = "miniHS2DbVerificationTable";
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+     stmt.execute("DROP TABLE IF EXISTS " + expectedDbName + "." + verifyTab);
+     stmt.execute("CREATE TABLE " + expectedDbName + "." + verifyTab + "(id INT)");
+@@ -472,6 +478,7 @@ public void testSessionScratchDirs() throws Exception {
+     // Downloaded resources dir
+     scratchDirPath = new Path(HiveConf.getVar(conf, HiveConf.ConfVars.DOWNLOADED_RESOURCES_DIR));
+     verifyScratchDir(conf, fs, scratchDirPath, expectedFSPermission, userName, true);
++    hs2Conn.close();
+ 
+     // 2. Test with doAs=true
+     // Restart HiveServer2 with doAs=true
+@@ -498,6 +505,7 @@ public void testSessionScratchDirs() throws Exception {
+     // Downloaded resources dir
+     scratchDirPath = new Path(HiveConf.getVar(conf, HiveConf.ConfVars.DOWNLOADED_RESOURCES_DIR));
+     verifyScratchDir(conf, fs, scratchDirPath, expectedFSPermission, userName, true);
++    hs2Conn.close();
+ 
+     // Test for user "trinity"
+     userName = "trinity";
+@@ -529,6 +537,7 @@ public void testUdfWhiteList() throws Exception {
+     HiveConf testConf = new HiveConf();
+     assertTrue(testConf.getVar(ConfVars.HIVE_SERVER2_BUILTIN_UDF_WHITELIST).isEmpty());
+     // verify that udf in default whitelist can be executed
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+     stmt.executeQuery("SELECT substr('foobar', 4) ");
+     hs2Conn.close();
+@@ -570,10 +579,11 @@ public void testUdfWhiteList() throws Exception {
+   public void testUdfBlackList() throws Exception {
+     HiveConf testConf = new HiveConf();
+     assertTrue(testConf.getVar(ConfVars.HIVE_SERVER2_BUILTIN_UDF_BLACKLIST).isEmpty());
+-
++    hs2Conn = getConnection();
+     Statement stmt = hs2Conn.createStatement();
+     // verify that udf in default whitelist can be executed
+     stmt.executeQuery("SELECT substr('foobar', 4) ");
++    hs2Conn.close();
+ 
+     miniHS2.stop();
+     testConf.setVar(ConfVars.HIVE_SERVER2_BUILTIN_UDF_BLACKLIST, "reflect");
+@@ -595,6 +605,9 @@ public void testUdfBlackList() throws Exception {
+    */
+   @Test
+   public void testUdfBlackListOverride() throws Exception {
++    if (miniHS2.isStarted()) {
++      miniHS2.stop();
++    }
+     // setup whitelist
+     HiveConf testConf = new HiveConf();
+ 
+@@ -649,6 +662,8 @@ public void testRootScratchDir() throws Exception {
+     // HDFS scratch dir
+     scratchDirPath = new Path(HiveConf.getVar(conf, HiveConf.ConfVars.SCRATCHDIR));
+     verifyScratchDir(conf, fs, scratchDirPath, expectedFSPermission, userName, false);
++    hs2Conn.close();
++
+     // Test with multi-level scratch dir path
+     // Stop HiveServer2
+     if (miniHS2.isStarted()) {
+@@ -729,4 +744,4 @@ private int getReflectionUtilsCacheSize() {
+     }
+     return -1;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
+index 5a889d5..3dcb4a4 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/service/cli/session/TestQueryDisplay.java
+@@ -19,7 +19,10 @@
+ 
+ import org.apache.hadoop.hive.cli.CliSessionState;
+ import org.apache.hadoop.hive.conf.HiveConf;
++import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+ import org.apache.hadoop.hive.ql.QueryDisplay;
++import org.apache.hadoop.hive.ql.metadata.Hive;
++import org.apache.hadoop.hive.ql.metadata.HiveException;
+ import org.apache.hadoop.hive.ql.plan.api.StageType;
+ import org.apache.hadoop.hive.ql.session.SessionState;
+ import org.apache.hive.service.cli.OperationHandle;
+@@ -45,13 +48,17 @@
+ 
+ 
+   @Before
+-  public void setup() {
++  public void setup() throws Exception {
+     conf = new HiveConf();
+     conf.set("hive.support.concurrency", "false");
+ 
+     HiveServer2 dummyHs2 = new HiveServer2();
+     sessionManager = new SessionManager(dummyHs2);
+     sessionManager.init(conf);
++    // this is a hack to guarantee that we have calls to the MSC in the compilation phase
++    // without it the second test in the class will fail as the MSC#getAllFunctions() is called
++    // only once when Hive class is loaded
++    Hive.get(conf).getMSC();
+   }
+ 
+   /**
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
+index 9c20f90..2740f94 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
+@@ -39,12 +39,15 @@
+   /** A handle to this harness's cluster */
+   private final HConnection conn;
+ 
++  private HBaseTestSetup hbaseSetup = null;
++
+   public HBaseQTestUtil(
+     String outDir, String logDir, MiniClusterType miniMr, HBaseTestSetup setup,
+     String initScript, String cleanupScript)
+     throws Exception {
+ 
+     super(outDir, logDir, miniMr, null, initScript, cleanupScript);
++    hbaseSetup = setup;
+     setup.preTest(conf);
+     this.conn = setup.getConnection();
+     super.init();
+@@ -69,6 +72,10 @@ public void init() throws Exception {
+   }
+ 
+   @Override
++  protected void initConfFromSetup() throws Exception {
++    super.initConfFromSetup();
++    hbaseSetup.preTest(conf);
++  }
+   public void createSources() throws Exception {
+     super.createSources();
+ 
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java
+index 42f85c8..4f8fa05 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseTestSetup.java
+@@ -22,9 +22,6 @@
+ import java.net.ServerSocket;
+ import java.util.Arrays;
+ 
+-import junit.extensions.TestSetup;
+-import junit.framework.Test;
+-
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index 781eef8..c40663b 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -464,6 +464,7 @@ public void shutdown() throws Exception {
+       dfs.shutdown();
+       dfs = null;
+     }
++    Hive.closeCurrent();
+   }
+ 
+   public String readEntireFileIntoString(File queryFile) throws IOException {
+@@ -688,6 +689,9 @@ public void clearTablesCreatedDuringTests() throws Exception {
+       return;
+     }
+ 
++    conf.set("hive.metastore.filter.hook",
++        "org.apache.hadoop.hive.metastore.DefaultMetaStoreFilterHookImpl");
++    db = Hive.get(conf);
+     // Delete any tables other than the source tables
+     // and any databases other than the default database.
+     for (String dbName : db.getAllDatabases()) {
+@@ -749,18 +753,20 @@ public void clearTestSideEffects() throws Exception {
+       return;
+     }
+ 
++    // allocate and initialize a new conf since a test can
++    // modify conf by using 'set' commands
++    conf = new HiveConf(Driver.class);
++    initConf();
++    initConfFromSetup();
++
++    // renew the metastore since the cluster type is unencrypted
++    db = Hive.get(conf);  // propagate new conf to meta store
++
+     clearTablesCreatedDuringTests();
+     clearKeysCreatedInTests();
++  }
+ 
+-    if (clusterType != MiniClusterType.encrypted) {
+-      // allocate and initialize a new conf since a test can
+-      // modify conf by using 'set' commands
+-      conf = new HiveConf (Driver.class);
+-      initConf();
+-      // renew the metastore since the cluster type is unencrypted
+-      db = Hive.get(conf);  // propagate new conf to meta store
+-    }
+-
++  protected void initConfFromSetup() throws Exception {
+     setup.preTest(conf);
+   }
+ 
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+index f2c00e8..b3ceb86 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+@@ -167,7 +167,7 @@
+   private boolean isConnected = false;
+   private URI metastoreUris[];
+   private final HiveMetaHookLoader hookLoader;
+-  protected final HiveConf conf;
++  protected final HiveConf conf;  // Keep a copy of HiveConf so if Session conf changes, we may need to get a new HMS client.
+   private String tokenStrForm;
+   private final boolean localMetaStore;
+   private final MetaStoreFilterHook filterHook;
+@@ -193,8 +193,10 @@ public HiveMetaStoreClient(HiveConf conf, HiveMetaHookLoader hookLoader)
+     this.hookLoader = hookLoader;
+     if (conf == null) {
+       conf = new HiveConf(HiveMetaStoreClient.class);
++      this.conf = conf;
++    } else {
++      this.conf = new HiveConf(conf);
+     }
+-    this.conf = conf;
+     filterHook = loadFilterHooks();
+ 
+     String msUri = conf.getVar(HiveConf.ConfVars.METASTOREURIS);
+@@ -202,7 +204,7 @@ public HiveMetaStoreClient(HiveConf conf, HiveMetaHookLoader hookLoader)
+     if (localMetaStore) {
+       // instantiate the metastore server handler directly instead of connecting
+       // through the network
+-      client = HiveMetaStore.newRetryingHMSHandler("hive client", conf, true);
++      client = HiveMetaStore.newRetryingHMSHandler("hive client", this.conf, true);
+       isConnected = true;
+       snapshotActiveConf();
+       return;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+index 56afa6a..bfa0359 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/session/SessionState.java
+@@ -523,10 +523,6 @@ public static SessionState start(SessionState startSs) {
+     // Get the following out of the way when you start the session these take a
+     // while and should be done when we start up.
+     try {
+-      // Hive object instance should be created with a copy of the conf object. If the conf is
+-      // shared with SessionState, other parts of the code might update the config, but
+-      // Hive.get(HiveConf) would not recognize the case when it needs refreshing
+-      Hive.get(new HiveConf(startSs.conf)).getMSC();
+       UserGroupInformation sessionUGI = Utils.getUGI();
+       FileSystem.get(startSs.conf);
+ 
+@@ -550,6 +546,8 @@ public static SessionState start(SessionState startSs) {
+           throw new RuntimeException(e);
+         }
+       }
++    } catch (RuntimeException e) {
++      throw e;
+     } catch (Exception e) {
+       // Catch-all due to some exec time dependencies on session state
+       // that would cause ClassNoFoundException otherwise
+diff --git a/ql/src/test/results/clientpositive/spark/stats12.q.out b/ql/src/test/results/clientpositive/spark/stats12.q.out
+index db575df..73f06f0 100644
+--- a/ql/src/test/results/clientpositive/spark/stats12.q.out
++++ b/ql/src/test/results/clientpositive/spark/stats12.q.out
+@@ -81,22 +81,17 @@ STAGE PLANS:
+                     ds 2008-04-08
+                     hr 11
+                   properties:
+-                    COLUMN_STATS_ACCURATE false
+                     bucket_count -1
+                     columns key,value
+                     columns.comments 'default','default'
+                     columns.types string:string
+ #### A masked pattern was here ####
+                     name default.analyze_srcpart
+-                    numFiles 1
+-                    numRows -1
+                     partition_columns ds/hr
+                     partition_columns.types string:string
+-                    rawDataSize -1
+                     serialization.ddl struct analyze_srcpart { string key, string value}
+                     serialization.format 1
+                     serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    totalSize 5812
+ #### A masked pattern was here ####
+                   serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+                 
+@@ -127,22 +122,17 @@ STAGE PLANS:
+                     ds 2008-04-08
+                     hr 12
+                   properties:
+-                    COLUMN_STATS_ACCURATE false
+                     bucket_count -1
+                     columns key,value
+                     columns.comments 'default','default'
+                     columns.types string:string
+ #### A masked pattern was here ####
+                     name default.analyze_srcpart
+-                    numFiles 1
+-                    numRows -1
+                     partition_columns ds/hr
+                     partition_columns.types string:string
+-                    rawDataSize -1
+                     serialization.ddl struct analyze_srcpart { string key, string value}
+                     serialization.format 1
+                     serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    totalSize 5812
+ #### A masked pattern was here ####
+                   serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+                 
+@@ -334,11 +324,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -376,11 +361,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+diff --git a/ql/src/test/results/clientpositive/spark/stats13.q.out b/ql/src/test/results/clientpositive/spark/stats13.q.out
+index f38f876..9987e9e 100644
+--- a/ql/src/test/results/clientpositive/spark/stats13.q.out
++++ b/ql/src/test/results/clientpositive/spark/stats13.q.out
+@@ -82,22 +82,17 @@ STAGE PLANS:
+                     ds 2008-04-08
+                     hr 11
+                   properties:
+-                    COLUMN_STATS_ACCURATE false
+                     bucket_count -1
+                     columns key,value
+                     columns.comments 'default','default'
+                     columns.types string:string
+ #### A masked pattern was here ####
+                     name default.analyze_srcpart
+-                    numFiles 1
+-                    numRows -1
+                     partition_columns ds/hr
+                     partition_columns.types string:string
+-                    rawDataSize -1
+                     serialization.ddl struct analyze_srcpart { string key, string value}
+                     serialization.format 1
+                     serialization.lib org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+-                    totalSize 5812
+ #### A masked pattern was here ####
+                   serde: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+                 
+@@ -242,11 +237,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -284,11 +274,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -326,11 +311,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+diff --git a/ql/src/test/results/clientpositive/spark/stats5.q.out b/ql/src/test/results/clientpositive/spark/stats5.q.out
+index b61101d..524621e 100644
+--- a/ql/src/test/results/clientpositive/spark/stats5.q.out
++++ b/ql/src/test/results/clientpositive/spark/stats5.q.out
+@@ -25,7 +25,7 @@ STAGE PLANS:
+             Map Operator Tree:
+                 TableScan
+                   alias: analyze_src
+-                  Statistics: Num rows: -1 Data size: 5812 Basic stats: PARTIAL Column stats: COMPLETE
++                  Statistics: Num rows: 1 Data size: 5812 Basic stats: COMPLETE Column stats: COMPLETE
+ 
+   Stage: Stage-1
+     Stats-Aggr Operator
+diff --git a/ql/src/test/results/clientpositive/spark/stats6.q.out b/ql/src/test/results/clientpositive/spark/stats6.q.out
+index b4435f2..6fb5998 100644
+--- a/ql/src/test/results/clientpositive/spark/stats6.q.out
++++ b/ql/src/test/results/clientpositive/spark/stats6.q.out
+@@ -166,11 +166,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -208,11 +203,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+diff --git a/ql/src/test/results/clientpositive/spark/stats_noscan_1.q.out b/ql/src/test/results/clientpositive/spark/stats_noscan_1.q.out
+index 80c3092..ec5e9ba 100644
+--- a/ql/src/test/results/clientpositive/spark/stats_noscan_1.q.out
++++ b/ql/src/test/results/clientpositive/spark/stats_noscan_1.q.out
+@@ -105,8 +105,6 @@ Protect Mode:       	None
+ Partition Parameters:	 	 
+ 	COLUMN_STATS_ACCURATE	true                
+ 	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+ 	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+@@ -147,8 +145,6 @@ Protect Mode:       	None
+ Partition Parameters:	 	 
+ 	COLUMN_STATS_ACCURATE	true                
+ 	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+ 	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+@@ -187,11 +183,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -229,11 +220,6 @@ Table:              	analyze_srcpart
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -386,8 +372,6 @@ Protect Mode:       	None
+ Partition Parameters:	 	 
+ 	COLUMN_STATS_ACCURATE	true                
+ 	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+ 	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+@@ -428,8 +412,6 @@ Protect Mode:       	None
+ Partition Parameters:	 	 
+ 	COLUMN_STATS_ACCURATE	true                
+ 	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+ 	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+@@ -468,11 +450,6 @@ Table:              	analyze_srcpart_partial
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -510,11 +487,6 @@ Table:              	analyze_srcpart_partial
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+diff --git a/ql/src/test/results/clientpositive/spark/stats_partscan_1_23.q.out b/ql/src/test/results/clientpositive/spark/stats_partscan_1_23.q.out
+index adcf150..9445ee2 100644
+--- a/ql/src/test/results/clientpositive/spark/stats_partscan_1_23.q.out
++++ b/ql/src/test/results/clientpositive/spark/stats_partscan_1_23.q.out
+@@ -78,11 +78,6 @@ Table:              	analyze_srcpart_partial_scan
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5293                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -153,11 +148,6 @@ Table:              	analyze_srcpart_partial_scan
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5293                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -195,11 +185,6 @@ Table:              	analyze_srcpart_partial_scan
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	1                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	5293                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+diff --git a/ql/src/test/results/clientpositive/spark/union_remove_25.q.out b/ql/src/test/results/clientpositive/spark/union_remove_25.q.out
+index 055cbd6..c9e9bae 100644
+--- a/ql/src/test/results/clientpositive/spark/union_remove_25.q.out
++++ b/ql/src/test/results/clientpositive/spark/union_remove_25.q.out
+@@ -221,11 +221,6 @@ Table:              	outputtbl1
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	4                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	40                  
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -432,11 +427,6 @@ Table:              	outputtbl2
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	2                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	6826                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+@@ -627,11 +617,6 @@ Table:              	outputtbl3
+ Protect Mode:       	None                	 
+ #### A masked pattern was here ####
+ Partition Parameters:	 	 
+-	COLUMN_STATS_ACCURATE	false               
+-	numFiles            	2                   
+-	numRows             	-1                  
+-	rawDataSize         	-1                  
+-	totalSize           	6812                
+ #### A masked pattern was here ####
+ 	 	 
+ # Storage Information	 	 
+-- 
+1.7.9.5
+

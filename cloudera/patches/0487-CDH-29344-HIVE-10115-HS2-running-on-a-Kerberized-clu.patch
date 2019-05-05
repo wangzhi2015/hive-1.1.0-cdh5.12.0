@@ -1,0 +1,185 @@
+From 57e17e2b86f89e5169fb9055cf9133511b3a2069 Mon Sep 17 00:00:00 2001
+From: Sergio Pena <sergio.pena@cloudera.com>
+Date: Fri, 5 Feb 2016 14:37:25 -0600
+Subject: [PATCH 0487/1164] CDH-29344: HIVE-10115: HS2 running on a Kerberized
+ cluster should offer Kerberos(GSSAPI) and
+ Delegation token(DIGEST) when alternate
+ authentication is enabled (Mubashir Kazia,
+ reviewed by Sergio Pena)
+
+Change-Id: I998df24f53735b79bfd961fae27683caceb74a1a
+---
+ .../apache/hive/service/auth/HiveAuthFactory.java  |   51 +++++++++++++++-----
+ .../apache/hive/service/auth/PlainSaslHelper.java  |    2 +-
+ .../hadoop/hive/thrift/HadoopThriftAuthBridge.java |   23 +++++++++
+ 3 files changed, 64 insertions(+), 12 deletions(-)
+
+diff --git a/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java b/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
+index da71b7c..74748de 100644
+--- a/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
++++ b/service/src/java/org/apache/hive/service/auth/HiveAuthFactory.java
+@@ -17,6 +17,8 @@
+  */
+ package org.apache.hive.service.auth;
+ 
++import static org.apache.hadoop.fs.CommonConfigurationKeys.HADOOP_SECURITY_AUTHENTICATION;
++
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
+ import java.net.UnknownHostException;
+@@ -28,8 +30,10 @@
+ 
+ import javax.net.ssl.SSLServerSocket;
+ import javax.security.auth.login.LoginException;
++import javax.security.sasl.AuthenticationException;
+ import javax.security.sasl.Sasl;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hive.conf.HiveConf;
+ import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
+ import org.apache.hadoop.hive.metastore.HiveMetaStore;
+@@ -47,6 +51,7 @@
+ import org.apache.hive.service.cli.thrift.ThriftCLIService;
+ import org.apache.thrift.TProcessorFactory;
+ import org.apache.thrift.transport.TSSLTransportFactory;
++import org.apache.thrift.transport.TSaslServerTransport;
+ import org.apache.thrift.transport.TServerSocket;
+ import org.apache.thrift.transport.TSocket;
+ import org.apache.thrift.transport.TTransport;
+@@ -87,6 +92,7 @@ public String getAuthName() {
+   private String authTypeStr;
+   private final String transportMode;
+   private final HiveConf conf;
++  private String hadoopAuth;
+ 
+   public static final String HS2_PROXY_USER = "hive.server2.proxy.user";
+   public static final String HS2_CLIENT_TOKEN = "hiveserver2ClientToken";
+@@ -96,6 +102,10 @@ public HiveAuthFactory(HiveConf conf) throws TTransportException {
+     transportMode = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_TRANSPORT_MODE);
+     authTypeStr = conf.getVar(HiveConf.ConfVars.HIVE_SERVER2_AUTHENTICATION);
+ 
++    // ShimLoader.getHadoopShims().isSecurityEnabled() will only check that·
++    // hadoopAuth is not simple, it does not guarantee it is kerberos
++    hadoopAuth = conf.get(HADOOP_SECURITY_AUTHENTICATION, "simple");
++
+     // In http mode we use NOSASL as the default auth type
+     if ("http".equalsIgnoreCase(transportMode)) {
+       if (authTypeStr == null) {
+@@ -105,7 +115,8 @@ public HiveAuthFactory(HiveConf conf) throws TTransportException {
+       if (authTypeStr == null) {
+         authTypeStr = AuthTypes.NONE.getAuthName();
+       }
+-      if (authTypeStr.equalsIgnoreCase(AuthTypes.KERBEROS.getAuthName())) {
++      if (hadoopAuth.equalsIgnoreCase("kerberos") && !authTypeStr.equalsIgnoreCase(
++          AuthTypes.NOSASL.getAuthName())) {
+         saslServer = ShimLoader.getHadoopThriftAuthBridge()
+           .createServer(conf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB),
+                         conf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL));
+@@ -141,22 +152,40 @@ public HiveAuthFactory(HiveConf conf) throws TTransportException {
+ 
+   public TTransportFactory getAuthTransFactory() throws LoginException {
+     TTransportFactory transportFactory;
+-    if (authTypeStr.equalsIgnoreCase(AuthTypes.KERBEROS.getAuthName())) {
++    TSaslServerTransport.Factory serverTransportFactory;
++
++    if (hadoopAuth.equalsIgnoreCase("kerberos") && !authTypeStr.equalsIgnoreCase(
++          AuthTypes.NOSASL.getAuthName())) {
+       try {
+-        transportFactory = saslServer.createTransportFactory(getSaslProperties());
++        serverTransportFactory = saslServer.createSaslServerTransportFactory(
++            getSaslProperties());
+       } catch (TTransportException e) {
+         throw new LoginException(e.getMessage());
+       }
+-    } else if (authTypeStr.equalsIgnoreCase(AuthTypes.NONE.getAuthName())) {
+-      transportFactory = PlainSaslHelper.getPlainTransportFactory(authTypeStr);
+-    } else if (authTypeStr.equalsIgnoreCase(AuthTypes.LDAP.getAuthName())) {
+-      transportFactory = PlainSaslHelper.getPlainTransportFactory(authTypeStr);
+-    } else if (authTypeStr.equalsIgnoreCase(AuthTypes.PAM.getAuthName())) {
+-      transportFactory = PlainSaslHelper.getPlainTransportFactory(authTypeStr);
++      if (authTypeStr.equalsIgnoreCase(AuthTypes.KERBEROS.getAuthName())) {
++        // no-op
++      } else if (authTypeStr.equalsIgnoreCase(AuthTypes.NONE.getAuthName()) || 
++          authTypeStr.equalsIgnoreCase(AuthTypes.LDAP.getAuthName()) ||
++          authTypeStr.equalsIgnoreCase(AuthTypes.PAM.getAuthName()) ||
++          authTypeStr.equalsIgnoreCase(AuthTypes.CUSTOM.getAuthName())) {
++        try {
++          serverTransportFactory.addServerDefinition("PLAIN",
++              authTypeStr, null, new HashMap<String, String>(),
++              new PlainSaslHelper.PlainServerCallbackHandler(authTypeStr));
++        } catch (AuthenticationException e) {
++          throw new LoginException ("Error setting callback handler" + e); 
++        }
++      } else {
++        throw new LoginException("Unsupported authentication type " + authTypeStr);
++      }
++      transportFactory = saslServer.wrapTransportFactory(serverTransportFactory);
++    } else if (authTypeStr.equalsIgnoreCase(AuthTypes.NONE.getAuthName()) ||
++          authTypeStr.equalsIgnoreCase(AuthTypes.LDAP.getAuthName()) ||
++          authTypeStr.equalsIgnoreCase(AuthTypes.PAM.getAuthName()) ||
++          authTypeStr.equalsIgnoreCase(AuthTypes.CUSTOM.getAuthName())) {
++       transportFactory = PlainSaslHelper.getPlainTransportFactory(authTypeStr);
+     } else if (authTypeStr.equalsIgnoreCase(AuthTypes.NOSASL.getAuthName())) {
+       transportFactory = new TTransportFactory();
+-    } else if (authTypeStr.equalsIgnoreCase(AuthTypes.CUSTOM.getAuthName())) {
+-      transportFactory = PlainSaslHelper.getPlainTransportFactory(authTypeStr);
+     } else {
+       throw new LoginException("Unsupported authentication type " + authTypeStr);
+     }
+diff --git a/service/src/java/org/apache/hive/service/auth/PlainSaslHelper.java b/service/src/java/org/apache/hive/service/auth/PlainSaslHelper.java
+index afc1441..ff2b0f5 100644
+--- a/service/src/java/org/apache/hive/service/auth/PlainSaslHelper.java
++++ b/service/src/java/org/apache/hive/service/auth/PlainSaslHelper.java
+@@ -74,7 +74,7 @@ private PlainSaslHelper() {
+     throw new UnsupportedOperationException("Can't initialize class");
+   }
+ 
+-  private static final class PlainServerCallbackHandler implements CallbackHandler {
++  public static final class PlainServerCallbackHandler implements CallbackHandler {
+ 
+     private final AuthMethods authMethod;
+ 
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java b/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java
+index 984679f..87335ce 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge.java
+@@ -370,6 +370,20 @@ protected Server(String keytabFile, String principalConf)
+ 
+     public TTransportFactory createTransportFactory(Map<String, String> saslProps)
+         throws TTransportException {
++
++      TSaslServerTransport.Factory transFactory = createSaslServerTransportFactory(saslProps);
++
++      return new TUGIAssumingTransportFactory(transFactory, realUgi);
++    }
++
++    /**
++     * Create a TSaslServerTransport.Factory that, upon connection of a client
++     * socket, negotiates a Kerberized SASL transport. 
++     *
++     * @param saslProps Map of SASL properties
++     */
++    public TSaslServerTransport.Factory createSaslServerTransportFactory(
++        Map<String, String> saslProps) throws TTransportException {
+       // Parse out the kerberos principal, host, realm.
+       String kerberosName = realUgi.getUserName();
+       final String names[] = SaslRpcServer.splitKerberosName(kerberosName);
+@@ -387,6 +401,15 @@ public TTransportFactory createTransportFactory(Map<String, String> saslProps)
+           null, SaslRpcServer.SASL_DEFAULT_REALM,
+           saslProps, new SaslDigestCallbackHandler(secretManager));
+ 
++      return transFactory;
++    }
++
++    /**
++     * Wrap a TTransportFactory in such a way that, before processing any RPC, it
++     * assumes the UserGroupInformation of the user authenticated by
++     * the SASL transport.
++     */
++    public TTransportFactory wrapTransportFactory(TTransportFactory transFactory) {
+       return new TUGIAssumingTransportFactory(transFactory, realUgi);
+     }
+ 
+-- 
+1.7.9.5
+

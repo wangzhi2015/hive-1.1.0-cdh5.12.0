@@ -1,0 +1,124 @@
+From bba252231d57356ab61b380a17a89f3240abd33d Mon Sep 17 00:00:00 2001
+From: Ashutosh Chauhan <hashutosh@apache.org>
+Date: Mon, 27 Apr 2015 13:48:00 -0700
+Subject: [PATCH 0168/1164] CDH-29027: HIVE-10437 : NullPointerException on
+ queries where map/reduce is not involved on
+ tables with partitions (Ashutosh Chauhan via
+ Gunther Hagleitner) + fix for build error.
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../apache/hive/hcatalog/data/HCatRecordSerDe.java |    9 +++++++--
+ .../org/apache/hive/hcatalog/data/JsonSerDe.java   |    7 ++++++-
+ .../apache/hadoop/hive/ql/exec/FetchOperator.java  |    8 +++++++-
+ .../apache/hadoop/hive/serde/serdeConstants.java   |    2 ++
+ 4 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/HCatRecordSerDe.java b/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/HCatRecordSerDe.java
+index 722e05d..81c7943 100644
+--- a/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/HCatRecordSerDe.java
++++ b/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/HCatRecordSerDe.java
+@@ -29,6 +29,7 @@
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.SerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
++import org.apache.hadoop.hive.serde2.SerDeSpec;
+ import org.apache.hadoop.hive.serde2.SerDeStats;
+ import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
+ import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
+@@ -51,6 +52,10 @@
+ /**
+  * SerDe class for serializing to and from HCatRecord
+  */
++
++@SerDeSpec(schemaProps = {serdeConstants.LIST_COLUMNS,
++                          serdeConstants.LIST_COLUMN_TYPES})
++
+ public class HCatRecordSerDe implements SerDe {
+ 
+   private static final Logger LOG = LoggerFactory.getLogger(HCatRecordSerDe.class);
+@@ -124,7 +129,7 @@ public Object deserialize(Writable data) throws SerDeException {
+       throw new SerDeException(getClass().getName() + ": expects HCatRecord!");
+     }
+ 
+-    return (HCatRecord) data;
++    return data;
+   }
+ 
+   /**
+@@ -302,7 +307,7 @@ private static Object serializePrimitiveField(Object field,
+    */
+   @Override
+   public ObjectInspector getObjectInspector() throws SerDeException {
+-    return (ObjectInspector) cachedObjectInspector;
++    return cachedObjectInspector;
+   }
+ 
+   @Override
+diff --git a/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/JsonSerDe.java b/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/JsonSerDe.java
+index 9c87aa3..fdf8963 100644
+--- a/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/JsonSerDe.java
++++ b/hcatalog/core/src/main/java/org/apache/hive/hcatalog/data/JsonSerDe.java
+@@ -40,6 +40,7 @@
+ import org.apache.hadoop.hive.serde.serdeConstants;
+ import org.apache.hadoop.hive.serde2.SerDe;
+ import org.apache.hadoop.hive.serde2.SerDeException;
++import org.apache.hadoop.hive.serde2.SerDeSpec;
+ import org.apache.hadoop.hive.serde2.SerDeStats;
+ import org.apache.hadoop.hive.serde2.SerDeUtils;
+ import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
+@@ -82,6 +83,10 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++@SerDeSpec(schemaProps = {serdeConstants.LIST_COLUMNS,
++                          serdeConstants.LIST_COLUMN_TYPES,
++                          serdeConstants.TIMESTAMP_FORMATS})
++
+ public class JsonSerDe implements SerDe {
+ 
+   private static final Logger LOG = LoggerFactory.getLogger(JsonSerDe.class);
+@@ -492,7 +497,7 @@ private static void buildJSONString(StringBuilder sb, Object o, ObjectInspector
+           break;
+         }
+         case STRING: {
+-          String s = 
++          String s =
+                   SerDeUtils.escapeString(((StringObjectInspector) poi).getPrimitiveJavaObject(o));
+           appendWithQuotes(sb, s);
+           break;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java
+index dbd6e60..28becd9 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FetchOperator.java
+@@ -604,7 +604,13 @@ private boolean needConversion(PartitionDesc partitionDesc) {
+   // if table and all partitions have the same schema and serde, no need to convert
+   private boolean needConversion(TableDesc tableDesc, List<PartitionDesc> partDescs) {
+     Class<?> tableSerDe = tableDesc.getDeserializerClass();
+-    String[] schemaProps = AnnotationUtils.getAnnotation(tableSerDe, SerDeSpec.class).schemaProps();
++    SerDeSpec spec = AnnotationUtils.getAnnotation(tableSerDe, SerDeSpec.class);
++    if (null == spec) {
++      // Serde may not have this optional annotation defined in which case be conservative
++      // and say conversion is needed.
++      return true;
++    }
++    String[] schemaProps = spec.schemaProps();
+     Properties tableProps = tableDesc.getProperties();
+     for (PartitionDesc partitionDesc : partDescs) {
+       if (!tableSerDe.getName().equals(partitionDesc.getDeserializerClassName())) {
+diff --git a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/serdeConstants.java b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/serdeConstants.java
+index 8d3595b..e70d0c4 100644
+--- a/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/serdeConstants.java
++++ b/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/serdeConstants.java
+@@ -111,6 +111,8 @@
+ 
+   public static final String LIST_COLUMN_TYPES = "columns.types";
+ 
++  public static final String TIMESTAMP_FORMATS = "timestamp.formats";
++
+   public static final Set<String> PrimitiveTypes = new HashSet<String>();
+   static {
+     PrimitiveTypes.add("void");
+-- 
+1.7.9.5
+

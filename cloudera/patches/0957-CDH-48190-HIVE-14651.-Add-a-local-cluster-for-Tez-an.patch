@@ -1,0 +1,606 @@
+From 08672c4972b8149296ed7d5ed69341dc7f624ff1 Mon Sep 17 00:00:00 2001
+From: Peter Vary <pvary@cloudera.com>
+Date: Mon, 30 Jan 2017 11:40:47 +0100
+Subject: [PATCH 0957/1164] CDH-48190: HIVE-14651. Add a local cluster for Tez
+ and LLAP. (Siddharth Seth,reviewed by Prasanth
+ Jayachandran, Sergey Shelukhin)
+
+(cherry picked from commit e297a157cfa57f0bd08843bf770856b2f168da75)
+
+Change-Id: I5c6c98441a2a4a7cbfe94b23844c4d3a2939101b
+---
+ data/conf/tez/hive-site.xml                        |    1 -
+ .../apache/hadoop/hive/ql/TestLocationQueries.java |    2 +-
+ .../hadoop/hive/accumulo/AccumuloQTestUtil.java    |    2 +-
+ .../apache/hadoop/hive/hbase/HBaseQTestUtil.java   |    2 +-
+ .../java/org/apache/hadoop/hive/ql/QTestUtil.java  |  255 +++++++++++++++-----
+ .../apache/hadoop/hive/shims/Hadoop23Shims.java    |   73 +++---
+ .../org/apache/hadoop/hive/shims/HadoopShims.java  |    2 +
+ 7 files changed, 244 insertions(+), 93 deletions(-)
+
+diff --git a/data/conf/tez/hive-site.xml b/data/conf/tez/hive-site.xml
+index e0238aa..1dae83d 100644
+--- a/data/conf/tez/hive-site.xml
++++ b/data/conf/tez/hive-site.xml
+@@ -253,5 +253,4 @@
+   </description>
+ </property>
+ 
+-
+ </configuration>
+diff --git a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/TestLocationQueries.java b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/TestLocationQueries.java
+index 633ba92..6ee98cb 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/TestLocationQueries.java
++++ b/itests/hive-unit/src/test/java/org/apache/hadoop/hive/ql/TestLocationQueries.java
+@@ -88,7 +88,7 @@ public CheckResults(String outDir, String logDir, MiniClusterType miniMr,
+         String hadoopVer, String locationSubdir)
+       throws Exception
+     {
+-      super(outDir, logDir, miniMr, hadoopVer, "", "");
++      super(outDir, logDir, miniMr, null, hadoopVer, "", "");
+       this.locationSubdir = locationSubdir;
+     }
+   }
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/accumulo/AccumuloQTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/accumulo/AccumuloQTestUtil.java
+index b83543a..52994ea 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/accumulo/AccumuloQTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/accumulo/AccumuloQTestUtil.java
+@@ -26,7 +26,7 @@
+   public AccumuloQTestUtil(String outDir, String logDir, MiniClusterType miniMr,
+       AccumuloTestSetup setup, String initScript, String cleanupScript) throws Exception {
+ 
+-    super(outDir, logDir, miniMr, null, initScript, cleanupScript);
++    super(outDir, logDir, miniMr, null, "0.20", initScript, cleanupScript);
+     setup.setupWithHiveConf(conf);
+     super.init();
+   }
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
+index 2740f94..2ce4e34 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/hbase/HBaseQTestUtil.java
+@@ -46,7 +46,7 @@ public HBaseQTestUtil(
+     String initScript, String cleanupScript)
+     throws Exception {
+ 
+-    super(outDir, logDir, miniMr, null, initScript, cleanupScript);
++    super(outDir, logDir, miniMr, null, "0.20", initScript, cleanupScript);
+     hbaseSetup = setup;
+     setup.preTest(conf);
+     this.conn = setup.getConnection();
+diff --git a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+index d188e93..3864701 100644
+--- a/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
++++ b/itests/util/src/main/java/org/apache/hadoop/hive/ql/QTestUtil.java
+@@ -63,16 +63,16 @@
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+-import junit.framework.Assert;
++import com.google.common.base.Preconditions;
+ import junit.framework.TestSuite;
+-
+-import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.io.FileUtils;
+ import org.apache.commons.io.IOUtils;
++import org.apache.commons.lang.StringUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.commons.lang3.tuple.ImmutablePair;
+ import org.apache.commons.lang3.tuple.Pair;
++import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -118,6 +118,7 @@
+ import org.apache.zookeeper.ZooKeeper;
+ 
+ import com.google.common.collect.ImmutableList;
++import org.junit.Assert;
+ 
+ /**
+  * QTestUtil.
+@@ -137,8 +138,13 @@
+   private final static String defaultCleanupScript = "q_test_cleanup.sql";
+   private final String[] testOnlyCommands = new String[]{"crypto"};
+ 
++  private static final String TEST_TMP_DIR_PROPERTY = "test.tmp.dir"; // typically target/tmp
++  private static final String BUILD_DIR_PROPERTY = "build.dir"; // typically target
++
+   private String testWarehouse;
+   private final String testFiles;
++  private final boolean useLocalFs;
++  private final boolean localMode;
+   protected final String outDir;
+   protected final String logDir;
+   private final TreeMap<String, String> qMap;
+@@ -150,7 +156,7 @@
+   private final Set<String> qJavaVersionSpecificOutput;
+   private static final String SORT_SUFFIX = ".sorted";
+   private final HashSet<String> srcTables;
+-  private static MiniClusterType clusterType = MiniClusterType.none;
++  private final MiniClusterType clusterType;
+   private ParseDriver pd;
+   protected Hive db;
+   protected HiveConf conf;
+@@ -160,6 +166,7 @@
+   private CliDriver cliDriver;
+   private HadoopShims.MiniMrShim mr = null;
+   private HadoopShims.MiniDFSShim dfs = null;
++  private FileSystem fs;
+   private HadoopShims.HdfsEncryptionShim hes = null;
+   private String hadoopVer = null;
+   private QTestSetup setup = null;
+@@ -263,7 +270,8 @@ public void normalizeNames(File path) throws Exception {
+ 
+   public QTestUtil(String outDir, String logDir, String initScript, String cleanupScript) throws
+       Exception {
+-    this(outDir, logDir, MiniClusterType.none, null, "0.20", initScript, cleanupScript);
++    this(outDir, logDir, MiniClusterType.none, null, "0.20", initScript, cleanupScript, false,
++        false);
+   }
+ 
+   public String getOutputDirectory() {
+@@ -298,17 +306,10 @@ public void initConf() throws Exception {
+       "org.apache.hadoop.hive.metastore.VerifyingObjectStore");
+ 
+     if (mr != null) {
+-      assert dfs != null;
+-
+       mr.setupConfiguration(conf);
+ 
+-      // set fs.default.name to the uri of mini-dfs
+-      String dfsUriString = WindowsPathUtil.getHdfsUriString(dfs.getFileSystem().getUri().toString());
+-      conf.setVar(HiveConf.ConfVars.HADOOPFS, dfsUriString);
+-      // hive.metastore.warehouse.dir needs to be set relative to the mini-dfs
+-      conf.setVar(HiveConf.ConfVars.METASTOREWAREHOUSE,
+-                  (new Path(dfsUriString,
+-                            "/build/ql/test/data/warehouse/")).toString());
++      // TODO Ideally this should be done independent of whether mr is setup or not.
++      setFsRelatedProperties(conf, fs.getScheme().equals("file"),fs);
+     }
+ 
+     // Windows paths should be converted after MiniMrShim.setupConfiguration()
+@@ -318,6 +319,76 @@ public void initConf() throws Exception {
+     }
+   }
+ 
++  private void setFsRelatedProperties(HiveConf conf, boolean isLocalFs, FileSystem fs) {
++    String fsUriString = WindowsPathUtil.getHdfsUriString(fs.getUri().toString());
++
++    // Different paths if running locally vs a remote fileSystem. Ideally this difference should not exist.
++    Path warehousePath;
++    Path jarPath;
++    Path userInstallPath;
++    if (isLocalFs) {
++      String buildDir = System.getProperty(BUILD_DIR_PROPERTY);
++      Preconditions.checkState(buildDir != null && !buildDir.trim().isEmpty());
++      Path path = new Path(fsUriString, buildDir);
++
++      // Create a fake fs root for local fs
++      Path localFsRoot  = new Path(path, "localfs");
++      warehousePath = new Path(localFsRoot, "warehouse");
++      jarPath = new Path(localFsRoot, "jar");
++      userInstallPath = new Path(localFsRoot, "user_install");
++    } else {
++      // TODO Why is this changed from the default in hive-conf?
++      warehousePath = new Path(fsUriString, "/build/ql/test/data/warehouse/");
++      jarPath = new Path(new Path(fsUriString, "/user"), "hive");
++      userInstallPath = new Path(fsUriString, "/user");
++    }
++
++    warehousePath = fs.makeQualified(warehousePath);
++    jarPath = fs.makeQualified(jarPath);
++    userInstallPath = fs.makeQualified(userInstallPath);
++
++    conf.set(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY, fsUriString);
++
++    // Remote dirs
++    conf.setVar(ConfVars.METASTOREWAREHOUSE, warehousePath.toString());
++    conf.setVar(ConfVars.HIVE_JAR_DIRECTORY, jarPath.toString());
++    conf.setVar(ConfVars.HIVE_USER_INSTALL_DIR, userInstallPath.toString());
++    // ConfVars.SCRATCHDIR - {test.tmp.dir}/scratchdir
++
++    // Local dirs
++    // ConfVars.LOCALSCRATCHDIR - {test.tmp.dir}/localscratchdir
++
++    // TODO Make sure to cleanup created dirs.
++  }
++
++  private void createRemoteDirs() {
++    assert fs != null;
++    Path warehousePath = fs.makeQualified(new Path(conf.getVar(ConfVars.METASTOREWAREHOUSE)));
++    assert warehousePath != null;
++    Path hiveJarPath = fs.makeQualified(new Path(conf.getVar(ConfVars.HIVE_JAR_DIRECTORY)));
++    assert hiveJarPath != null;
++    Path userInstallPath = fs.makeQualified(new Path(conf.getVar(ConfVars.HIVE_USER_INSTALL_DIR)));
++    assert userInstallPath != null;
++    try {
++      fs.mkdirs(warehousePath);
++    } catch (IOException e) {
++      LOG.error("Failed to create path=" + warehousePath
++          + ". Continuing. Exception message=" + e.getMessage());
++    }
++    try {
++      fs.mkdirs(hiveJarPath);
++    } catch (IOException e) {
++      LOG.error("Failed to create path=" + warehousePath
++          + ". Continuing. Exception message=" + e.getMessage());
++    }
++    try {
++      fs.mkdirs(userInstallPath);
++    } catch (IOException e) {
++      LOG.error("Failed to create path=" + warehousePath
++          + ". Continuing. Exception message=" + e.getMessage());
++    }
++  }
++
+   public enum MiniClusterType {
+     mr,
+     tez,
+@@ -343,10 +414,10 @@ public static MiniClusterType valueForString(String type) {
+     }
+   }
+ 
+-  public QTestUtil(String outDir, String logDir, MiniClusterType clusterType, String hadoopVer,
+-                   String initScript, String cleanupScript)
++  public QTestUtil(String outDir, String logDir, MiniClusterType clusterType, String confDir,
++      String hadoopVer, String initScript, String cleanupScript)
+     throws Exception {
+-    this(outDir, logDir, clusterType, null, hadoopVer, initScript, cleanupScript);
++    this(outDir, logDir, clusterType, confDir, hadoopVer, initScript, cleanupScript, false, false);
+   }
+ 
+   private String getKeyProviderURI() {
+@@ -359,12 +430,15 @@ private String getKeyProviderURI() {
+   }
+ 
+   public QTestUtil(String outDir, String logDir, MiniClusterType clusterType,
+-      String confDir, String hadoopVer, String initScript, String cleanupScript)
++      String confDir, String hadoopVer, String initScript, String cleanupScript, boolean localMode,
++      boolean useLocalFs)
+     throws Exception {
+     LOG.info("Setting up QtestUtil with outDir=" + outDir + ", logDir=" + logDir
+-        + ", clusterType=" + clusterType + ", confDir=" + confDir + ", hadoopVer=" + hadoopVer
+-        +", initScript=" + initScript + ", cleanupScript=" + cleanupScript
+-        + ", useHbaseMetaStore=false, withLlapIo=false");
++                 + ", clusterType=" + clusterType + ", confDir=" + confDir + ", hadoopVer=" + hadoopVer
++                 +", initScript=" + initScript + ", cleanupScript=" + cleanupScript
++                 + ", useHbaseMetaStore=false, withLlapIo=false");
++    this.useLocalFs = useLocalFs;
++    this.localMode = localMode;
+     this.outDir = outDir;
+     this.logDir = logDir;
+     this.srcTables=getSrcTables();
+@@ -386,38 +460,13 @@ public QTestUtil(String outDir, String logDir, MiniClusterType clusterType,
+     this.clusterType = clusterType;
+ 
+     HadoopShims shims = ShimLoader.getHadoopShims();
+-    int numberOfDataNodes = 4;
+-
+-    if (clusterType != MiniClusterType.none && clusterType != MiniClusterType.spark) {
+-      FileSystem fs = null;
+-
+-      if (clusterType == MiniClusterType.encrypted) {
+-        // Set the security key provider so that the MiniDFS cluster is initialized
+-        // with encryption
+-        conf.set(SECURITY_KEY_PROVIDER_URI_NAME, getKeyProviderURI());
+-        conf.setInt("fs.trash.interval", 50);
+-
+-        dfs = shims.getMiniDfs(conf, numberOfDataNodes, true, null);
+-        fs = dfs.getFileSystem();
+ 
+-        // set up the java key provider for encrypted hdfs cluster
+-        hes = shims.createHdfsEncryptionShim(fs, conf);
++    setupFileSystem(shims);
+ 
+-        LOG.info("key provider is initialized");
+-      } else {
+-        dfs = shims.getMiniDfs(conf, numberOfDataNodes, true, null);
+-        fs = dfs.getFileSystem();
+-      }
++    setup = new QTestSetup();
++    setup.preTest(conf);
+ 
+-      String uriString = WindowsPathUtil.getHdfsUriString(fs.getUri().toString());
+-      if (clusterType == MiniClusterType.tez) {
+-        mr = shims.getMiniTezCluster(conf, 4, uriString, 1);
+-      } else if (clusterType == MiniClusterType.miniSparkOnYarn) {
+-        mr = shims.getMiniSparkCluster(conf, 4, uriString, 1);
+-      } else {
+-        mr = shims.getMiniMrCluster(conf, 4, uriString, 1);
+-      }
+-    }
++    setupMiniCluster(shims, confDir);
+ 
+     initConf();
+ 
+@@ -444,6 +493,75 @@ public QTestUtil(String outDir, String logDir, MiniClusterType clusterType,
+     init();
+   }
+ 
++  private void setupFileSystem(HadoopShims shims) throws IOException {
++
++    if (useLocalFs) {
++      Preconditions
++          .checkState(clusterType == MiniClusterType.tez,
++              "useLocalFs can currently only be set for tez or llap");
++    }
++
++    if (clusterType != MiniClusterType.none && clusterType != MiniClusterType.spark) {
++      int numDataNodes = 4;
++
++      if (clusterType == MiniClusterType.encrypted) {
++        // Set the security key provider so that the MiniDFS cluster is initialized
++        // with encryption
++        conf.set(SECURITY_KEY_PROVIDER_URI_NAME, getKeyProviderURI());
++        conf.setInt("fs.trash.interval", 50);
++
++        dfs = shims.getMiniDfs(conf, numDataNodes, true, null);
++        fs = dfs.getFileSystem();
++
++        // set up the java key provider for encrypted hdfs cluster
++        hes = shims.createHdfsEncryptionShim(fs, conf);
++
++        LOG.info("key provider is initialized");
++      } else {
++        if (!useLocalFs) {
++          dfs = shims.getMiniDfs(conf, numDataNodes, true, null);
++          fs = dfs.getFileSystem();
++        } else {
++          fs = FileSystem.getLocal(conf);
++        }
++      }
++    } else {
++      // Setup local file system
++      fs = FileSystem.getLocal(conf);
++    }
++  }
++
++  private void setupMiniCluster(HadoopShims shims, String confDir) throws
++      IOException {
++
++    if (localMode) {
++      Preconditions
++          .checkState(clusterType == MiniClusterType.tez,
++              "localMode can currently only be set for tez or llap");
++    }
++
++    String uriString = WindowsPathUtil.getHdfsUriString(fs.getUri().toString());
++
++    if (clusterType == MiniClusterType.tez) {
++      if (confDir != null && !confDir.isEmpty()) {
++        conf.addResource(new URL("file://" + new File(confDir).toURI().getPath()
++            + "/tez-site.xml"));
++      }
++      int numTrackers;
++      numTrackers = 4;
++      if (localMode) {
++        mr = shims.getLocalMiniTezCluster(conf, false);
++      } else {
++        mr = shims.getMiniTezCluster(conf, numTrackers, uriString, 1);
++      }
++    } else if (clusterType == MiniClusterType.miniSparkOnYarn) {
++      mr = shims.getMiniSparkCluster(conf, 4, uriString, 1);
++    } else if (clusterType == MiniClusterType.mr || clusterType == MiniClusterType.encrypted) {
++      mr = shims.getMiniMrCluster(conf, 4, uriString, 1);
++    }
++  }
++
++
+   public void shutdown() throws Exception {
+     if (System.getenv(QTEST_LEAVE_FILES) == null) {
+       cleanUp();
+@@ -815,6 +933,8 @@ public void cleanUp() throws Exception {
+       // Best effort
+     }
+ 
++    // TODO: Clean up all the other paths that are created.
++
+     FunctionRegistry.unregisterTemporaryUDF("test_udaf");
+     FunctionRegistry.unregisterTemporaryUDF("test_error");
+   }
+@@ -861,15 +981,20 @@ public void createSources() throws Exception {
+     LOG.info("Initial setup (" + initScript + "):\n" + initCommands);
+ 
+     int result = cliDriver.processLine(initCommands);
++    LOG.info("Result from cliDrriver.processLine in createSources=" + result);
+     if (result != 0) {
+-      Assert.fail("Failed during createSurces processLine with code=" + result);
++      Assert.fail("Failed during createSources processLine with code=" + result);
+     }
+ 
+     conf.setBoolean("hive.test.init.phase", false);
+   }
+ 
+   public void init() throws Exception {
+-    // System.out.println(conf.toString());
++    // Create remote dirs once.
++    if (mr != null) {
++      createRemoteDirs();
++    }
++
+     testWarehouse = conf.getVar(HiveConf.ConfVars.METASTOREWAREHOUSE);
+     // conf.logVars(System.out);
+     // System.out.flush();
+@@ -1804,7 +1929,7 @@ public void preTest(HiveConf conf) throws Exception {
+ 
+       if (zooKeeperCluster == null) {
+         //create temp dir
+-        String tmpBaseDir =  System.getProperty("test.tmp.dir");
++        String tmpBaseDir =  System.getProperty(TEST_TMP_DIR_PROPERTY);
+         File tmpDir = Utilities.createTempDir(tmpBaseDir);
+ 
+         zooKeeperCluster = new MiniZooKeeperCluster();
+@@ -1895,7 +2020,8 @@ public void run() {
+   {
+     QTestUtil[] qt = new QTestUtil[qfiles.length];
+     for (int i = 0; i < qfiles.length; i++) {
+-      qt[i] = new QTestUtil(resDir, logDir, MiniClusterType.none, null, "0.20", defaultInitScript, defaultCleanupScript);
++      qt[i] = new QTestUtil(resDir, logDir, MiniClusterType.none, null, "0.20",
++           defaultInitScript, defaultCleanupScript, false, false);
+       qt[i].addFile(qfiles[i]);
+       qt[i].clearTestSideEffects();
+     }
+@@ -2060,19 +2186,26 @@ public boolean accept(File dir, String name) {
+ 
+   public void failed(int ecode, String fname, String debugHint) {
+     String command = SessionState.get() != null ? SessionState.get().getLastCommand() : null;
+-    Assert.fail("Client Execution failed with error code = " + ecode +
+-        (command != null ? " running " + command : "") + (debugHint != null ? debugHint : ""));
++    String message = "Client execution failed with error code = " + ecode +
++        (command != null ? " running " + command : "") + "fname=" + fname +
++        (debugHint != null ? debugHint : "");
++    LOG.error(message);
++    Assert.fail(message);
+   }
+ 
+   // for negative tests, which is succeeded.. no need to print the query string
+   public void failed(String fname, String debugHint) {
+-    Assert.fail("Client Execution was expected to fail, but succeeded with error code 0 " +
+-        (debugHint != null ? debugHint : ""));
++    Assert.fail(
++        "Client Execution was expected to fail, but succeeded with error code 0 for fname=" +
++            fname + (debugHint != null ? (" " + debugHint) : ""));
+   }
+ 
+   public void failedDiff(int ecode, String fname, String debugHint) {
+-    Assert.fail("Client Execution results failed with error code = " + ecode +
+-        (debugHint != null ? debugHint : ""));
++    String message =
++        "Client Execution results failed with error code = " + ecode + " while executing fname=" +
++            fname + (debugHint != null ? (" " + debugHint) : "");
++    LOG.error(message);
++    Assert.fail(message);
+   }
+ 
+   public void failed(Throwable e, String fname, String debugHint) {
+@@ -2174,7 +2307,7 @@ public static void setupMetaStoreTableColumnStatsFor30TBTPCDSWorkload(HiveConf c
+       File tabParamsCsv = new File(mdbPath+"csv/TABLE_PARAMS.txt");
+ 
+       // Set up the foreign key constraints properly in the TAB_COL_STATS data
+-      String tmpBaseDir =  System.getProperty("test.tmp.dir");
++      String tmpBaseDir =  System.getProperty(TEST_TMP_DIR_PROPERTY);
+       File tmpFileLoc1 = new File(tmpBaseDir+"/TAB_COL_STATS.txt");
+       File tmpFileLoc2 = new File(tmpBaseDir+"/TABLE_PARAMS.txt");
+       FileUtils.copyFile(tabColStatsCsv, tmpFileLoc1);
+diff --git a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+index fd637af..b3febd5 100644
+--- a/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
++++ b/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java
+@@ -93,6 +93,8 @@
+ import org.apache.hadoop.util.Progressable;
+ import org.apache.hadoop.util.Tool;
+ import org.apache.hadoop.yarn.conf.YarnConfiguration;
++import org.apache.tez.dag.api.TezConfiguration;
++import org.apache.tez.runtime.library.api.TezRuntimeConfiguration;
+ import org.apache.tez.test.MiniTezCluster;
+ 
+ import com.google.common.base.Joiner;
+@@ -366,6 +368,49 @@ public void setupConfiguration(Configuration conf) {
+     }
+   }
+ 
++  @Override
++  public HadoopShims.MiniMrShim getLocalMiniTezCluster(Configuration conf, boolean usingLlap) {
++    return new MiniTezLocalShim(conf, usingLlap);
++  }
++
++  public class MiniTezLocalShim extends Hadoop23Shims.MiniMrShim {
++    private final Configuration conf;
++    private final boolean isLlap;
++
++    public MiniTezLocalShim(Configuration conf, boolean usingLlap) {
++      this.conf = conf;
++      this.isLlap = usingLlap;
++      setupConfiguration(conf);
++    }
++
++    @Override
++    public int getJobTrackerPort() throws UnsupportedOperationException {
++      throw new UnsupportedOperationException("No JobTracker port for local mode");
++    }
++
++    @Override
++    public void setupConfiguration(Configuration conf) {
++      conf.setBoolean(TezConfiguration.TEZ_LOCAL_MODE, true);
++
++      conf.setBoolean(TezRuntimeConfiguration.TEZ_RUNTIME_OPTIMIZE_LOCAL_FETCH, true);
++
++      conf.setBoolean(TezConfiguration.TEZ_IGNORE_LIB_URIS, true);
++
++      // TODO Force fs to file://, setup staging dir?
++      //      conf.set("fs.defaultFS", "file:///");
++      //      conf.set(TezConfiguration.TEZ_AM_STAGING_DIR, "/tmp");
++
++      if (!isLlap) {
++        conf.setBoolean("hive.llap.io.enabled", false);
++      }
++    }
++
++    @Override
++    public void shutdown() throws IOException {
++      // Nothing to do
++    }
++  }
++
+   /**
+    * Returns a shim to wrap MiniMrTez
+    */
+@@ -418,20 +463,6 @@ public void setupConfiguration(Configuration conf) {
+       for (Map.Entry<String, String> pair: config) {
+         conf.set(pair.getKey(), pair.getValue());
+       }
+-
+-      Path jarPath = new Path("hdfs:///user/hive");
+-      Path hdfsPath = new Path("hdfs:///user/");
+-      try {
+-        FileSystem fs = cluster.getFileSystem();
+-        jarPath = fs.makeQualified(jarPath);
+-        conf.set("hive.jar.directory", jarPath.toString());
+-        fs.mkdirs(jarPath);
+-        hdfsPath = fs.makeQualified(hdfsPath);
+-        conf.set("hive.user.install.directory", hdfsPath.toString());
+-        fs.mkdirs(hdfsPath);
+-      } catch (Exception e) {
+-        e.printStackTrace();
+-      }
+     }
+   }
+ 
+@@ -498,20 +529,6 @@ public void setupConfiguration(Configuration conf) {
+       for (Map.Entry<String, String> pair : config) {
+         conf.set(pair.getKey(), pair.getValue());
+       }
+-
+-      Path jarPath = new Path("hdfs:///user/hive");
+-      Path hdfsPath = new Path("hdfs:///user/");
+-      try {
+-        FileSystem fs = cluster.getFileSystem();
+-        jarPath = fs.makeQualified(jarPath);
+-        conf.set("hive.jar.directory", jarPath.toString());
+-        fs.mkdirs(jarPath);
+-        hdfsPath = fs.makeQualified(hdfsPath);
+-        conf.set("hive.user.install.directory", hdfsPath.toString());
+-        fs.mkdirs(hdfsPath);
+-      } catch (Exception e) {
+-        e.printStackTrace();
+-      }
+     }
+   }
+ 
+diff --git a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+index 214caf1..d29fcc9 100644
+--- a/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
++++ b/shims/common/src/main/java/org/apache/hadoop/hive/shims/HadoopShims.java
+@@ -94,6 +94,8 @@ public MiniMrShim getMiniMrCluster(Configuration conf, int numberOfTaskTrackers,
+   public MiniMrShim getMiniTezCluster(Configuration conf, int numberOfTaskTrackers,
+       String nameNode, int numDir) throws IOException;
+ 
++  public MiniMrShim getLocalMiniTezCluster(Configuration conf, boolean usingLlap);
++
+   public MiniMrShim getMiniSparkCluster(Configuration conf, int numberOfTaskTrackers,
+       String nameNode, int numDir) throws IOException;
+ 
+-- 
+1.7.9.5
+

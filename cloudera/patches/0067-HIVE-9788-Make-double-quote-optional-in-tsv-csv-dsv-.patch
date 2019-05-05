@@ -1,0 +1,229 @@
+From c61d62a70a27834e72e23f607975f9a102e0d188 Mon Sep 17 00:00:00 2001
+From: Xuefu Zhang <xuefu@apache.org>
+Date: Thu, 5 Mar 2015 14:28:14 +0000
+Subject: [PATCH 0067/1164] HIVE-9788: Make double quote optional in
+ tsv/csv/dsv output (Ferdinand via Xuefu, Reviewed
+ by Brock)
+
+git-svn-id: https://svn.apache.org/repos/asf/hive/trunk@1664354 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../hive/beeline/SeparatedValuesOutputFormat.java  |   48 ++++++++---
+ .../apache/hive/beeline/TestBeeLineWithArgs.java   |   85 +++++++++++++++++++-
+ 2 files changed, 121 insertions(+), 12 deletions(-)
+
+diff --git a/beeline/src/java/org/apache/hive/beeline/SeparatedValuesOutputFormat.java b/beeline/src/java/org/apache/hive/beeline/SeparatedValuesOutputFormat.java
+index 75441bc..61b84ef 100644
+--- a/beeline/src/java/org/apache/hive/beeline/SeparatedValuesOutputFormat.java
++++ b/beeline/src/java/org/apache/hive/beeline/SeparatedValuesOutputFormat.java
+@@ -33,27 +33,31 @@
+  * OutputFormat for values separated by a delimiter.
+  */
+ class SeparatedValuesOutputFormat implements OutputFormat {
+-  /**
+-   *
+-   */
++  public final static String DISABLE_QUOTING_FOR_SV = "disable.quoting.for.sv";
+   private final BeeLine beeLine;
+-  private CsvPreference csvPreference;
++  private CsvPreference quotedCsvPreference;
++  private CsvPreference unquotedCsvPreference;
+ 
+   SeparatedValuesOutputFormat(BeeLine beeLine, char separator) {
+     this.beeLine = beeLine;
+-    csvPreference = new CsvPreference.Builder('"', separator, "").build();
++    unquotedCsvPreference = new CsvPreference.Builder('\0', separator, "").build();
++    quotedCsvPreference = new CsvPreference.Builder('"', separator, "").build();
+   }
+ 
+   private void updateCsvPreference() {
+     if (beeLine.getOpts().getOutputFormat().equals("dsv")) {
+       // check whether delimiter changed by user
+-      char curDel = (char) csvPreference.getDelimiterChar();
++      char curDel = (char) getCsvPreference().getDelimiterChar();
+       char newDel = beeLine.getOpts().getDelimiterForDSV();
+       // if delimiter changed, rebuild the csv preference
+       if (newDel != curDel) {
+         // "" is passed as the end of line symbol in following function, as
+         // beeline itself adds newline
+-        csvPreference = new CsvPreference.Builder('"', newDel, "").build();
++        if (isQuotingDisabled()) {
++          unquotedCsvPreference = new CsvPreference.Builder('\0', newDel, "").build();
++        } else {
++          quotedCsvPreference = new CsvPreference.Builder('"', newDel, "").build();
++        }
+       }
+     }
+   }
+@@ -69,7 +73,7 @@ public int print(Rows rows) {
+         count++;
+         continue;
+       }
+-      printRow(rows, (Rows.Row) rows.next());
++      printRow((Rows.Row) rows.next());
+       count++;
+     }
+     return count - 1; // sans header row
+@@ -77,7 +81,7 @@ public int print(Rows rows) {
+ 
+   private String getFormattedStr(String[] vals) {
+     StringWriter strWriter = new StringWriter();
+-    CsvListWriter writer = new CsvListWriter(strWriter, csvPreference);
++    CsvListWriter writer = new CsvListWriter(strWriter, getCsvPreference());
+     if (vals.length > 0) {
+       try {
+         writer.write(vals);
+@@ -90,9 +94,33 @@ private String getFormattedStr(String[] vals) {
+     return strWriter.toString();
+   }
+ 
+-  public void printRow(Rows rows, Rows.Row row) {
++  private void printRow(Rows.Row row) {
+     String[] vals = row.values;
+     String formattedStr = getFormattedStr(vals);
+     beeLine.output(formattedStr);
+   }
++
++  private boolean isQuotingDisabled() {
++    String quotingDisabledStr = System.getProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV);
++    if (quotingDisabledStr == null || quotingDisabledStr.isEmpty()) {
++      // default is disabling the double quoting for separated value
++      return true;
++    }
++    String parsedOptionStr = quotingDisabledStr.toLowerCase();
++    if (parsedOptionStr.equals("false") || parsedOptionStr.equals("true")) {
++      return Boolean.valueOf(parsedOptionStr);
++    } else {
++      beeLine.error("System Property disable.quoting.for.sv is now " + parsedOptionStr
++          + " which only accepts boolean value");
++      return true;
++    }
++  }
++
++  private CsvPreference getCsvPreference() {
++    if (isQuotingDisabled()) {
++      return unquotedCsvPreference;
++    } else {
++      return quotedCsvPreference;
++    }
++  }
+ }
+diff --git a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+index 1f3e484..f66229f 100644
+--- a/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
++++ b/itests/hive-unit/src/test/java/org/apache/hive/beeline/TestBeeLineWithArgs.java
+@@ -352,7 +352,7 @@ public void testDSVOutput() throws Throwable {
+     argList.add("--outputformat=dsv");
+     argList.add("--delimiterForDSV=;");
+ 
+-    final String EXPECTED_PATTERN = "1;NULL;defg;\"ab\"\"c\";1.0";
++    final String EXPECTED_PATTERN = "1;NULL;defg;ab\"c;1.0";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
+@@ -365,7 +365,7 @@ public void testTSV2Output() throws Throwable {
+     List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
+     argList.add("--outputformat=tsv2");
+ 
+-    final String EXPECTED_PATTERN = "1\tNULL\tdefg\t\"ab\"\"c\"\t1.0";
++    final String EXPECTED_PATTERN = "1\tNULL\tdefg\tab\"c\t1.0";
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
+@@ -382,6 +382,81 @@ public void testTSVOutput() throws Throwable {
+     testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
+   }
+ 
++  /**
++   * Test writing output using new TSV format
++   */
++  @Test
++  public void testTSV2OutputWithDoubleQuotes() throws Throwable {
++    String SCRIPT_TEXT = getFormatTestQueryForEableQuotes();
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    argList.add("--outputformat=tsv2");
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV,"false");
++
++    final String EXPECTED_PATTERN = "1\tNULL\tdefg\t\"ab\"\"c\"\t\"\"\"aa\"\"\"\t1.0";
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "true");
++  }
++
++  /**
++   * Test writing output using TSV deprecated format
++   */
++  @Test
++  public void testTSVOutputWithDoubleQuotes() throws Throwable {
++    String SCRIPT_TEXT = getFormatTestQueryForEableQuotes();
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    argList.add("--outputformat=tsv");
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "false");
++
++    final String EXPECTED_PATTERN = "'1'\t'NULL'\t'defg'\t'ab\"c'\t'\"aa\"'\t'1.0'";
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "true");
++  }
++
++  /**
++   * Test writing output using new CSV format
++   */
++  @Test
++  public void testCSV2OutputWithDoubleQuotes() throws Throwable {
++    String SCRIPT_TEXT = getFormatTestQueryForEableQuotes();
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    argList.add("--outputformat=csv2");
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "false");
++
++    final String EXPECTED_PATTERN = "1,NULL,defg,\"ab\"\"c\",\"\"\"aa\"\"\",1.0";
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "true");
++  }
++
++  /**
++   * Test writing output using CSV deprecated format
++   */
++  @Test
++  public void testCSVOutputWithDoubleQuotes() throws Throwable {
++    String SCRIPT_TEXT = getFormatTestQueryForEableQuotes();
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    argList.add("--outputformat=csv");
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "false");
++
++    final String EXPECTED_PATTERN = "'1','NULL','defg','ab\"c','\"aa\"','1.0'";
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "true");
++  }
++
++  /**
++   * Test writing output using DSV format, with custom delimiter ";"
++   */
++  @Test
++  public void testDSVOutputWithDoubleQuotes() throws Throwable {
++    String SCRIPT_TEXT = getFormatTestQueryForEableQuotes();
++    List<String> argList = getBaseArgs(miniHS2.getBaseJdbcURL());
++    argList.add("--outputformat=dsv");
++    argList.add("--delimiterForDSV=;");
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "false");
++
++    final String EXPECTED_PATTERN = "1;NULL;defg;\"ab\"\"c\";\"\"\"aa\"\"\";1.0";
++    testScriptFile(SCRIPT_TEXT, EXPECTED_PATTERN, true, argList);
++    System.setProperty(SeparatedValuesOutputFormat.DISABLE_QUOTING_FOR_SV, "true");
++  }
+ 
+   /**
+    * Test writing output using TSV deprecated format
+@@ -428,6 +503,12 @@ private String getFormatTestQuery() {
+     return "set hive.support.concurrency = false;\n" +
+         "select 1, null, 'defg', 'ab\"c', 1.0D from " + tableName + " limit 1 ;\n";
+   }
++
++  private String getFormatTestQueryForEableQuotes() {
++    return "set hive.support.concurrency = false;\n" +
++        "select 1, null, 'defg', 'ab\"c', '\"aa\"', 1.0D from " + tableName + " limit 1 ;\n";
++  }
++
+   /**
+    * Select null from table , check if setting null to empty string works - Using beeling cmd line
+    *  argument.
+-- 
+1.7.9.5
+

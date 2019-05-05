@@ -1,0 +1,115 @@
+From e497715bece8346bd29e8654100709399126d704 Mon Sep 17 00:00:00 2001
+From: Jimmy Xiang <jxiang@cloudera.com>
+Date: Mon, 5 Oct 2015 14:52:31 -0700
+Subject: [PATCH 0345/1164] CDH-26013: HIVE-12046: Re-create spark client if
+ connection is dropped (Jimmy, reviewed by Xuefu)
+
+---
+ .../hive/ql/exec/spark/RemoteHiveSparkClient.java  |   22 ++++++++++++++++++++
+ .../org/apache/hive/spark/client/SparkClient.java  |    5 +++++
+ .../apache/hive/spark/client/SparkClientImpl.java  |    5 +++++
+ .../java/org/apache/hive/spark/client/rpc/Rpc.java |    4 ++++
+ 4 files changed, 36 insertions(+)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+index d7c3703..2ef8163 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/spark/RemoteHiveSparkClient.java
+@@ -75,6 +75,7 @@
+   private static final long MAX_PREWARM_TIME = 30000; // 30s
+   private static final transient Splitter CSV_SPLITTER = Splitter.on(",").omitEmptyStrings();
+ 
++  private transient Map<String, String> conf;
+   private transient SparkClient remoteClient;
+   private transient SparkConf sparkConf;
+   private transient HiveConf hiveConf;
+@@ -89,6 +90,11 @@
+     sparkClientTimtout = hiveConf.getTimeVar(HiveConf.ConfVars.SPARK_CLIENT_FUTURE_TIMEOUT,
+         TimeUnit.SECONDS);
+     sparkConf = HiveSparkClientFactory.generateSparkConf(conf);
++    this.conf = conf;
++    createRemoteClient();
++  }
++
++  private void createRemoteClient() throws Exception {
+     remoteClient = SparkClientFactory.createClient(conf, hiveConf);
+ 
+     if (HiveConf.getBoolVar(hiveConf, ConfVars.HIVE_PREWARM_ENABLED) &&
+@@ -155,6 +161,20 @@ public int getDefaultParallelism() throws Exception {
+ 
+   @Override
+   public SparkJobRef execute(final DriverContext driverContext, final SparkWork sparkWork) throws Exception {
++    if (hiveConf.get("spark.master").startsWith("yarn-") && !remoteClient.isActive()) {
++      // Re-create the remote client if not active any more
++      close();
++      createRemoteClient();
++    }
++
++    try {
++      return submit(driverContext, sparkWork);
++    } catch (Throwable cause) {
++      throw new Exception("Failed to submit Spark work, please retry later", cause);
++    }
++  }
++
++  private SparkJobRef submit(final DriverContext driverContext, final SparkWork sparkWork) throws Exception {
+     final Context ctx = driverContext.getCtx();
+     final HiveConf hiveConf = (HiveConf) ctx.getConf();
+     refreshLocalResources(sparkWork, hiveConf);
+@@ -246,6 +266,8 @@ public void close() {
+     if (remoteClient != null) {
+       remoteClient.stop();
+     }
++    localFiles.clear();
++    localJars.clear();
+   }
+ 
+   private static class JobStatusJob implements Job<Serializable> {
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClient.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClient.java
+index 13c2dbc..3e921a5 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClient.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClient.java
+@@ -94,4 +94,9 @@
+    * Get default parallelism. For standalone mode, this can be used to get total number of cores.
+    */
+   Future<Integer> getDefaultParallelism();
++
++  /**
++   * Check if remote context is still active.
++   */
++  boolean isActive();
+ }
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+index 2546a46..ceebbb3 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/SparkClientImpl.java
+@@ -178,6 +178,11 @@ public void stop() {
+     return run(new GetDefaultParallelismJob());
+   }
+ 
++  @Override
++  public boolean isActive() {
++    return isAlive && driverRpc.isActive();
++  }
++
+   void cancel(String jobId) {
+     protocol.cancel(jobId);
+   }
+diff --git a/spark-client/src/main/java/org/apache/hive/spark/client/rpc/Rpc.java b/spark-client/src/main/java/org/apache/hive/spark/client/rpc/Rpc.java
+index 6d0b7cc..b2f133b 100644
+--- a/spark-client/src/main/java/org/apache/hive/spark/client/rpc/Rpc.java
++++ b/spark-client/src/main/java/org/apache/hive/spark/client/rpc/Rpc.java
+@@ -259,6 +259,10 @@ public void addListener(Listener l) {
+     return call(msg, Void.class);
+   }
+ 
++  public boolean isActive() {
++    return channel.isActive();
++  }
++
+   /**
+    * Send an RPC call to the remote endpoint and returns a future that can be used to monitor the
+    * operation.
+-- 
+1.7.9.5
+

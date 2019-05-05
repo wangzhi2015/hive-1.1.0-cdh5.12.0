@@ -1,0 +1,119 @@
+From 82e934357d4136898da41deace7e31ebfda9d3a6 Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Wed, 2 Sep 2015 11:05:44 -0700
+Subject: [PATCH 0492/1164] CDH-36981 : HIVE-11668 : make sure directsql calls
+ pre-query init when needed (Sergey Shelukhin,
+ reviewed by Sushanth Sowmyan)
+
+(cherry picked from commit 5a1957fc61da4d5e32c46e8e38bdf596eaeef8a3)
+
+Conflicts:
+	metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+
+Change-Id: Ie1a7a421c4ff82dc8ebcf4fec530abf2a4c9e03e
+---
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |   29 ++++++++++++++++----
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index 79c9224..2ac4703 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -172,7 +172,13 @@ private String getProductName() {
+ 
+   private boolean ensureDbInit() {
+     Transaction tx = pm.currentTransaction();
++    boolean doCommit = false;
++    if (!tx.isActive()) {
++      tx.begin();
++      doCommit = true;
++    }
+     Query dbQuery = null, tblColumnQuery = null, partColumnQuery = null;
++
+     try {
+       // Force the underlying db to initialize.
+       dbQuery = pm.newQuery(MDatabase.class, "name == ''");
+@@ -186,10 +192,14 @@ private boolean ensureDbInit() {
+ 
+       return true;
+     } catch (Exception ex) {
++      doCommit = false;
+       LOG.warn("Database initialization failed; direct SQL is disabled", ex);
+       tx.rollback();
+       return false;
+     } finally {
++      if (doCommit) {
++        tx.commit();
++      }
+       if (dbQuery != null) {
+         dbQuery.closeAll();
+       }
+@@ -204,23 +214,28 @@ private boolean ensureDbInit() {
+ 
+   private boolean runTestQuery() {
+     Transaction tx = pm.currentTransaction();
++    boolean doCommit = false;
+     if (!tx.isActive()) {
+       tx.begin();
++      doCommit = true;
+     }
+     Query query = null;
+     // Run a self-test query. If it doesn't work, we will self-disable. What a PITA...
+     String selfTestQuery = "select \"DB_ID\" from \"DBS\"";
+     try {
++      doDbSpecificInitializationsBeforeQuery();
+       query = pm.newQuery("javax.jdo.query.SQL", selfTestQuery);
+       query.execute();
+-      tx.commit();
+       return true;
+-    } catch (Exception ex) {
+-      LOG.warn("Self-test query [" + selfTestQuery + "] failed; direct SQL is disabled", ex);
++    } catch (Throwable t) {
++      doCommit = false;
++      LOG.warn("Self-test query [" + selfTestQuery + "] failed; direct SQL is disabled", t);
+       tx.rollback();
+       return false;
+-    }
+-    finally {
++    } finally {
++      if (doCommit) {
++        tx.commit();
++      }
+       if (query != null) {
+         query.closeAll();
+       }
+@@ -517,7 +532,6 @@ private boolean isViewTable(String dbName, String tblName) throws MetaException
+     + "where \"PART_ID\" in (" + partIds + ") order by \"PART_NAME\" asc";
+     long start = doTrace ? System.nanoTime() : 0;
+     Query query = pm.newQuery("javax.jdo.query.SQL", queryText);
+-    @SuppressWarnings("unchecked")
+     List<Object[]> sqlResult = executeWithArray(query, null, queryText);
+     long queryTime = doTrace ? System.nanoTime() : 0;
+     Deadline.checkTimeout();
+@@ -1087,6 +1101,7 @@ public ColumnStatistics getTableStats(
+     if (colNames.isEmpty()) {
+       return null;
+     }
++    doDbSpecificInitializationsBeforeQuery();
+     boolean doTrace = LOG.isDebugEnabled();
+     long start = doTrace ? System.nanoTime() : 0;
+     String queryText = "select " + STATS_COLLIST + " from \"TAB_COL_STATS\" "
+@@ -1151,6 +1166,7 @@ private long partsFoundForPartitions(String dbName, String tableName,
+   private List<ColumnStatisticsObj> columnStatisticsObjForPartitions(
+       String dbName, String tableName, List<String> partNames,
+       List<String> colNames, long partsFound) throws MetaException {
++    doDbSpecificInitializationsBeforeQuery();
+     // TODO: all the extrapolation logic should be moved out of this class,
+     //       only mechanical data retrieval should remain here.
+     String commonPrefix = "select \"COLUMN_NAME\", \"COLUMN_TYPE\", "
+@@ -1398,6 +1414,7 @@ private ColumnStatisticsObj prepareCSObj (Object[] row, int i) throws MetaExcept
+       return Lists.newArrayList();
+     }
+     boolean doTrace = LOG.isDebugEnabled();
++    doDbSpecificInitializationsBeforeQuery();
+     long start = doTrace ? System.nanoTime() : 0;
+     String queryText = "select \"PARTITION_NAME\", " + STATS_COLLIST + " from \"PART_COL_STATS\""
+       + " where \"DB_NAME\" = ? and \"TABLE_NAME\" = ? and \"COLUMN_NAME\" in ("
+-- 
+1.7.9.5
+

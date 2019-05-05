@@ -1,0 +1,63 @@
+From 27ebf02b7c8c002a04868968ac9ed02aaa21840c Mon Sep 17 00:00:00 2001
+From: Thejas Nair <thejas@hortonworks.com>
+Date: Wed, 10 Jun 2015 15:10:57 -0700
+Subject: [PATCH 0761/1164] CDH-44389: HIVE-10965 : direct SQL for stats fails
+ in 0-column case (Sergey Shelukhin reviewed by
+ Ashutosh Chauhan)
+
+Change-Id: I8d465ef2f28c5bb52c6fc0d5bd79f4a610014534
+---
+ .../hadoop/hive/metastore/HiveMetaStoreClient.java |    1 +
+ .../hadoop/hive/metastore/MetaStoreDirectSql.java  |    2 ++
+ .../apache/hadoop/hive/ql/stats/StatsUtils.java    |    3 ++-
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+index 78f22c1..9d36f44 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/HiveMetaStoreClient.java
+@@ -2109,6 +2109,7 @@ protected void drop_table_with_environment_context(String dbname, String name,
+   @Override
+   public AggrStats getAggrColStatsFor(String dbName, String tblName,
+     List<String> colNames, List<String> partNames) throws NoSuchObjectException, MetaException, TException {
++    if (colNames.isEmpty()) return null; // Nothing to aggregate.
+     PartitionsStatsRequest req = new PartitionsStatsRequest(dbName, tblName, colNames, partNames);
+     return client.get_aggr_stats_for(req);
+   }
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+index 14cd8d9..5607533 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/MetaStoreDirectSql.java
+@@ -1184,6 +1184,7 @@ public ColumnStatistics getTableStats(
+ 
+   public AggrStats aggrColStatsForPartitions(String dbName, String tableName,
+       List<String> partNames, List<String> colNames) throws MetaException {
++    if (colNames.isEmpty() || partNames.isEmpty()) return new AggrStats(); // Nothing to aggregate.
+     long partsFound = partsFoundForPartitions(dbName, tableName, partNames, colNames);
+     List<ColumnStatisticsObj> stats = columnStatisticsObjForPartitions(dbName,
+         tableName, partNames, colNames, partsFound);
+@@ -1192,6 +1193,7 @@ public AggrStats aggrColStatsForPartitions(String dbName, String tableName,
+ 
+   private long partsFoundForPartitions(String dbName, String tableName,
+       List<String> partNames, List<String> colNames) throws MetaException {
++    assert !colNames.isEmpty() && !partNames.isEmpty();
+     long partsFound = 0;
+     boolean doTrace = LOG.isDebugEnabled();
+     String queryText = "select count(\"COLUMN_NAME\") from \"PART_COL_STATS\""
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java b/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java
+index 88d16c4..b1b5921 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/stats/StatsUtils.java
+@@ -249,7 +249,8 @@ public static Statistics collectStatistics(HiveConf conf, PrunedPartitionList pa
+         neededColumns = processNeededColumns(schema, neededColumns);
+         AggrStats aggrStats = Hive.get().getAggrColStatsFor(table.getDbName(), table.getTableName(),
+             neededColumns, partNames);
+-        if (null == aggrStats) {
++        if (null == aggrStats || null == aggrStats.getColStats()
++            || aggrStats.getColStatsSize() == 0) {
+           // There are some partitions with no state (or we didn't fetch any state).
+           // Update the stats with empty list to reflect that in the
+           // state/initialize structures.
+-- 
+1.7.9.5
+

@@ -1,0 +1,152 @@
+From 3516c773ebf0be824aba38cf58abee03503079b9 Mon Sep 17 00:00:00 2001
+From: Aihua Xu <aihuaxu@gmail.com>
+Date: Fri, 5 Jun 2015 18:01:00 -0700
+Subject: [PATCH 0243/1164] HIVE-10906 : Value based UDAF function without
+ orderby expression throws NPE (Aihua Xu via
+ Ashutosh Chauhan)
+
+Signed-off-by: Ashutosh Chauhan <hashutosh@apache.org>
+---
+ .../apache/hadoop/hive/ql/parse/WindowingSpec.java |   38 ++++++++++++++------
+ .../queries/clientpositive/windowing_windowspec3.q |    6 ++--
+ .../clientpositive/windowing_windowspec3.q.out     |   26 ++++++++++++++
+ 3 files changed, 57 insertions(+), 13 deletions(-)
+
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java b/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java
+index ccbac32..6631341 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/parse/WindowingSpec.java
+@@ -134,7 +134,7 @@ public void validateAndMakeEffective() throws SemanticException {
+       }
+ 
+       // 2. A Window Spec with no Parition Spec, is Partitioned on a Constant(number 0)
+-      applyContantPartition(wdwSpec);
++      applyConstantPartition(wdwSpec);
+ 
+       // 3. For missing Wdw Frames or for Frames with only a Start Boundary, completely
+       //    specify them by the rules in {@link effectiveWindowFrame}
+@@ -143,8 +143,8 @@ public void validateAndMakeEffective() throws SemanticException {
+       // 4. Validate the effective Window Frames with the rules in {@link validateWindowFrame}
+       validateWindowFrame(wdwSpec);
+ 
+-      // 5. If there is no Order, then add the Partition expressions as the Order.
+-      wdwSpec.ensureOrderSpec();
++      // 5. Add the Partition expressions as the Order if there is no Order and validate Order spec.
++      setAndValidateOrderSpec(wdwSpec);
+     }
+   }
+ 
+@@ -185,7 +185,7 @@ private void fillInWindowSpec(String sourceId, WindowSpec dest, ArrayList<String
+     }
+   }
+ 
+-  private void applyContantPartition(WindowSpec wdwSpec) {
++  private void applyConstantPartition(WindowSpec wdwSpec) {
+     PartitionSpec partSpec = wdwSpec.getPartition();
+     if ( partSpec == null ) {
+       partSpec = new PartitionSpec();
+@@ -266,20 +266,36 @@ private void validateWindowFrame(WindowSpec wdwSpec) throws SemanticException {
+         start.getAmt() == BoundarySpec.UNBOUNDED_AMOUNT ) {
+       throw new SemanticException("End of a WindowFrame cannot be UNBOUNDED PRECEDING");
+     }
+-
+-    validateValueBoundary(wFrame.getStart(), wdwSpec.getOrder());
+-    validateValueBoundary(wFrame.getEnd(), wdwSpec.getOrder());
+   }
+ 
+-  private void validateValueBoundary(BoundarySpec bs, OrderSpec order) throws SemanticException {
+-    if ( bs instanceof ValueBoundarySpec ) {
+-      ValueBoundarySpec vbs = (ValueBoundarySpec) bs;
++  /**
++   * Add default order spec if there is no order and validate order spec for valued based
++   * windowing since only one sort key is allowed.
++   * @param wdwSpec
++   * @throws SemanticException
++   */
++  private void setAndValidateOrderSpec(WindowSpec wdwSpec) throws SemanticException {
++    wdwSpec.ensureOrderSpec();
++
++    WindowFrameSpec wFrame = wdwSpec.getWindowFrame();
++    OrderSpec order = wdwSpec.getOrder();
++
++    BoundarySpec start = wFrame.getStart();
++    BoundarySpec end = wFrame.getEnd();
++
++    if (start instanceof ValueBoundarySpec || end instanceof ValueBoundarySpec) {
+       if ( order != null ) {
+         if ( order.getExpressions().size() > 1 ) {
+           throw new SemanticException("Range based Window Frame can have only 1 Sort Key");
+         }
++
++        if (start instanceof ValueBoundarySpec) {
++          ((ValueBoundarySpec)start).setExpression(order.getExpressions().get(0).getExpression());
++        }
++        if (end instanceof ValueBoundarySpec) {
++          ((ValueBoundarySpec)end).setExpression(order.getExpressions().get(0).getExpression());
++        }
+       }
+-      vbs.setExpression(order.getExpressions().get(0).getExpression());
+     }
+   }
+ 
+diff --git a/ql/src/test/queries/clientpositive/windowing_windowspec3.q b/ql/src/test/queries/clientpositive/windowing_windowspec3.q
+index d00e939..c87aaff 100644
+--- a/ql/src/test/queries/clientpositive/windowing_windowspec3.q
++++ b/ql/src/test/queries/clientpositive/windowing_windowspec3.q
+@@ -16,6 +16,10 @@ create table emp(empno smallint,
+ 
+ load data local inpath '../../data/files/emp2.txt' into table emp;
+ 
++-- No order by
++select hirets, salary, sum(salary) over (partition by hirets range between current row and unbounded following) from emp;
++
++
+ -- Support date datatype
+ select deptno, empno, hiredate, salary,
+     sum(salary) over (partition by deptno order by hiredate range 90 preceding),
+@@ -25,5 +29,3 @@ select deptno, empno, hiredate, salary,
+     sum(salary) over (partition by deptno order by hiredate range between 10 following and unbounded following),
+     sum(salary) over (partition by deptno order by hiredate range between unbounded preceding and 10 following)
+ from emp;
+-
+-
+diff --git a/ql/src/test/results/clientpositive/windowing_windowspec3.q.out b/ql/src/test/results/clientpositive/windowing_windowspec3.q.out
+index a5eae5b..bf7797a 100644
+--- a/ql/src/test/results/clientpositive/windowing_windowspec3.q.out
++++ b/ql/src/test/results/clientpositive/windowing_windowspec3.q.out
+@@ -42,6 +42,32 @@ POSTHOOK: query: load data local inpath '../../data/files/emp2.txt' into table e
+ POSTHOOK: type: LOAD
+ #### A masked pattern was here ####
+ POSTHOOK: Output: default@emp
++PREHOOK: query: -- No order by
++select hirets, salary, sum(salary) over (partition by hirets range between current row and unbounded following) from emp
++PREHOOK: type: QUERY
++PREHOOK: Input: default@emp
++#### A masked pattern was here ####
++POSTHOOK: query: -- No order by
++select hirets, salary, sum(salary) over (partition by hirets range between current row and unbounded following) from emp
++POSTHOOK: type: QUERY
++POSTHOOK: Input: default@emp
++#### A masked pattern was here ####
++NULL	1500.0	3000.0
++NULL	1500.0	3000.0
++1980-12-17 00:00:00	800.0	800.0
++1981-02-20 00:00:00	1600.0	1600.0
++1981-02-22 00:00:00	1250.0	1250.0
++1981-04-02 00:00:00	2975.0	2975.0
++1981-05-01 00:00:00	2850.0	2850.0
++1981-06-09 00:00:00	2450.0	2450.0
++1981-09-08 00:00:00	1500.0	1500.0
++1981-09-28 00:00:00	1250.0	1250.0
++1981-11-17 00:00:00	5000.0	5000.0
++1981-12-03 00:00:00	3000.0	3950.0
++1981-12-03 00:00:00	950.0	3950.0
++1982-01-23 00:00:00	1300.0	1300.0
++1982-12-09 00:00:00	3000.0	3000.0
++1983-01-12 00:00:00	1100.0	1100.0
+ PREHOOK: query: -- Support date datatype
+ select deptno, empno, hiredate, salary,
+     sum(salary) over (partition by deptno order by hiredate range 90 preceding),
+-- 
+1.7.9.5
+

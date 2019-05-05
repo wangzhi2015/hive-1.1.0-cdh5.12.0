@@ -1,0 +1,177 @@
+From 5b15ca68c5555a5414971d9633306a0a08fc29c7 Mon Sep 17 00:00:00 2001
+From: Sergey Shelukhin <sershe@apache.org>
+Date: Thu, 3 Sep 2015 19:57:40 -0700
+Subject: [PATCH 0273/1164] CDH-31436: HIVE-11657 : HIVE-2573 introduces some
+ issues during metastore init (and CLI init)
+ (Sergey Shelukhin, reviewed by Sushanth Sowmyan)
+
+Conflicts:
+	metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
+	ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+---
+ .../hive/metastore/RetryingMetaStoreClient.java    |   31 +++++++----
+ .../apache/hadoop/hive/ql/exec/FunctionTask.java   |    2 +-
+ .../org/apache/hadoop/hive/ql/metadata/Hive.java   |   57 ++++++++++++++++----
+ 3 files changed, 70 insertions(+), 20 deletions(-)
+
+diff --git a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
+index b4f02fc..3f08ebf 100644
+--- a/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
++++ b/metastore/src/java/org/apache/hadoop/hive/metastore/RetryingMetaStoreClient.java
+@@ -93,19 +93,32 @@ public Object invoke(Object proxy, Method method, Object[] args) throws Throwabl
+       } catch (UndeclaredThrowableException e) {
+         throw e.getCause();
+       } catch (InvocationTargetException e) {
+-        if ((e.getCause() instanceof TApplicationException) ||
+-            (e.getCause() instanceof TProtocolException) ||
+-            (e.getCause() instanceof TTransportException)) {
+-          caughtException = (TException) e.getCause();
+-        } else if ((e.getCause() instanceof MetaException) &&
+-            e.getCause().getMessage().matches("(?s).*JDO[a-zA-Z]*Exception.*")) {
+-          caughtException = (MetaException) e.getCause();
++        Throwable t = e.getCause();
++        if (t instanceof TApplicationException) {
++          TApplicationException tae = (TApplicationException)t;
++          switch (tae.getType()) {
++          case TApplicationException.UNSUPPORTED_CLIENT_TYPE:
++          case TApplicationException.UNKNOWN_METHOD:
++          case TApplicationException.WRONG_METHOD_NAME:
++          case TApplicationException.INVALID_PROTOCOL:
++            throw t;
++          default:
++            // TODO: most other options are probably unrecoverable... throw?
++            caughtException = tae;
++          }
++        } else if ((t instanceof TProtocolException) || (t instanceof TTransportException)) {
++          // TODO: most protocol exceptions are probably unrecoverable... throw?
++          caughtException = (TException)t;
++        } else if ((t instanceof MetaException) && t.getMessage().matches(
++            "(?s).*(JDO[a-zA-Z]*|TProtocol|TTransport)Exception.*")) {
++          caughtException = (MetaException)t;
+         } else {
+-          throw e.getCause();
++          throw t;
+         }
+       }
+ 
+-      if (retriesMade >=  retryLimit) {
++
++      if (retriesMade >= retryLimit) {
+         throw caughtException;
+       }
+       retriesMade++;
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java
+index a5722bf..a34c095 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/exec/FunctionTask.java
+@@ -101,7 +101,7 @@ public int execute(DriverContext driverContext) {
+ 
+     if (work.getReloadFunctionDesc() != null) {
+       try {
+-        Hive.reloadFunctions();
++        Hive.get().reloadFunctions();
+       } catch (Exception e) {
+         setException(e);
+         LOG.error(stringifyException(e));
+diff --git a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+index f6ab09d..cf97712 100644
+--- a/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
++++ b/ql/src/java/org/apache/hadoop/hive/ql/metadata/Hive.java
+@@ -120,7 +120,7 @@
+ import org.apache.thrift.TException;
+ 
+ import com.google.common.collect.Sets;
+-
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * This class has functions that implement meta data/DDL operations using calls
+@@ -155,24 +155,61 @@ public synchronized void remove() {
+     }
+   };
+ 
++  // Note that while this is an improvement over static initialization, it is still not,
++  // technically, valid, cause nothing prevents us from connecting to several metastores in
++  // the same process. This will still only get the functions from the first metastore.
++  private final static AtomicInteger didRegisterAllFuncs = new AtomicInteger(0);
++  private final static int REG_FUNCS_NO = 0, REG_FUNCS_DONE = 2, REG_FUNCS_PENDING = 1;
++
+   // register all permanent functions. need improvement
+-  static {
++  private void registerAllFunctionsOnce() {
++    boolean breakLoop = false;
++    while (!breakLoop) {
++      int val = didRegisterAllFuncs.get();
++      switch (val) {
++      case REG_FUNCS_NO: {
++        if (didRegisterAllFuncs.compareAndSet(val, REG_FUNCS_PENDING)) {
++          breakLoop = true;
++          break;
++        }
++        continue;
++      }
++      case REG_FUNCS_PENDING: {
++        synchronized (didRegisterAllFuncs) {
++          try {
++            didRegisterAllFuncs.wait(100);
++          } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            return;
++          }
++        }
++        continue;
++      }
++      case REG_FUNCS_DONE: return;
++      default: throw new AssertionError(val);
++      }
++    }
+     try {
+       reloadFunctions();
+     } catch (Exception e) {
+-      LOG.warn("Failed to access metastore. This class should not accessed in runtime.",e);
++      LOG.warn("Failed to register all functions.", e);
++    } finally {
++      boolean result = didRegisterAllFuncs.compareAndSet(REG_FUNCS_PENDING, REG_FUNCS_DONE);
++      assert result;
++      synchronized (didRegisterAllFuncs) {
++        didRegisterAllFuncs.notifyAll();
++      }
+     }
+   }
+ 
+-  public static void reloadFunctions() throws HiveException {
+-    Hive db = Hive.get();
+-    for (Function function : db.getAllFunctions()) {
++  public void reloadFunctions() throws HiveException {
++    for (Function function : getAllFunctions()) {
+       String functionName = function.getFunctionName();
+       try {
+         LOG.info("Registering function " + functionName + " " + function.getClassName());
+-        FunctionRegistry.registerPermanentFunction(
+-                FunctionUtils.qualifyFunctionName(functionName, function.getDbName()), function.getClassName(),
+-                false, FunctionTask.toFunctionResource(function.getResourceUris()));
++        FunctionRegistry.registerPermanentFunction(FunctionUtils.qualifyFunctionName(
++                    functionName, function.getDbName()), function.getClassName(), false,
++                    FunctionTask.toFunctionResource(function.getResourceUris()));
+       } catch (Exception e) {
+         LOG.warn("Failed to register persistent function " +
+                 functionName + ":" + function.getClassName() + ". Ignore and continue.");
+@@ -263,6 +300,7 @@ public static void closeCurrent() {
+    */
+   private Hive(HiveConf c) throws HiveException {
+     conf = c;
++    registerAllFunctionsOnce();
+   }
+ 
+ 
+@@ -2580,7 +2618,6 @@ static protected boolean needToCopy(Path srcf, Path destf, FileSystem srcFs, Fil
+     }
+ 
+     //Check if different encryption zones
+-    HadoopShims.HdfsFileStatus destStatus = null;
+     HadoopShims.HdfsEncryptionShim hdfsEncryptionShim = SessionState.get().getHdfsEncryptionShim();
+     return hdfsEncryptionShim != null && (hdfsEncryptionShim.isPathEncrypted(srcf) || hdfsEncryptionShim.isPathEncrypted(destf))
+       && !hdfsEncryptionShim.arePathsOnSameEncryptionZone(srcf, destf);
+-- 
+1.7.9.5
+
